@@ -133,6 +133,8 @@ All four segments must be numeric. Both `src/pypnm/version.py` and `pyproject.to
 
 For major, minor, and maintenance bumps, the release script will ask whether you want a release candidate tag. If you opt in, it adds a `-rcX` suffix to the git tag (for example `v0.3.0.0-rc1`). The version files remain numeric (`0.3.0.0`); only the git tag (and README/docs TAG placeholders) carry the RC suffix. Build bumps do not prompt for RC tags.
 
+GitHub releases are created from tags. RC tags create GitHub prereleases, while GA tags create normal releases.
+
 ## 4. Release Script Overview (`tools/release/release.py`)
 
 The `tools/release/release.py` script is the primary entry point for performing a release. It is responsible for:

@@ -1,8 +1,10 @@
 name: Release Deploy Bundle
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*.*.*.*"
+      - "v*.*.*.*-rc*"
 
 jobs:
   deploy-bundle:
@@ -17,7 +19,10 @@ jobs:
         run: |
           make deploy-bundle DEPLOY_VERSION=${GITHUB_REF_NAME}
 
-      - name: Upload release asset
+      - name: Create GitHub release and upload asset
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
           files: build/pypnm-deploy-${{ github.ref_name }}.tar.gz
