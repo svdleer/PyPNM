@@ -67,7 +67,9 @@ def _init_release_logging() -> None:
     """Create a temporary directory for failed-command logs and announce it."""
     global RELEASE_LOG_DIR
     if RELEASE_LOG_DIR is None:
-        RELEASE_LOG_DIR = Path(tempfile.mkdtemp(prefix="pypnm-release-logs-"))
+        logs_dir = Path(REPORT_DIR_NAME) / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        RELEASE_LOG_DIR = Path(tempfile.mkdtemp(prefix="pypnm-release-logs-", dir=str(logs_dir)))
         print(f"[release] Command failures will be logged under: {RELEASE_LOG_DIR}")
 
 
@@ -341,6 +343,31 @@ def _write_release_report(
     else:
         lines.append("_No files detected._")
     lines.append("")
+    if SUMMARY:
+        lines.extend(
+            [
+                "## Release step summary",
+                "",
+            ]
+        )
+        for label, state in SUMMARY.items():
+            lines.append(f"- {state.upper()} {label}")
+        lines.append("")
+
+    if RELEASE_LOG_DIR:
+        log_files = sorted(RELEASE_LOG_DIR.glob("*.log"))
+        lines.extend(
+            [
+                "## Failure logs",
+                "",
+                f"- Log directory: `{RELEASE_LOG_DIR}`",
+            ]
+        )
+        if log_files:
+            lines.extend(f"- `{log_file}`" for log_file in log_files)
+        else:
+            lines.append("- _No failure logs generated._")
+        lines.append("")
     if extra_sections:
         lines.extend(extra_sections)
         if lines[-1] != "":
@@ -932,13 +959,13 @@ def main() -> None:
     tag_name = _create_tag(new_version, tag_prefix)
     _push_branch_and_tag(branch, tag_name)
 
+    _print_status("Release report", "pass")
     report_mode = "test-release" if test_release else "release"
     report_path = _write_release_report(report_commit, new_version, tag_name, branch, report_mode)
     counts = _summarize_sections(_collect_commit_files(report_commit))
     print("\nRelease change summary (last commit):")
     print(_render_table(counts))
     print(f"Release report saved to {report_path}")
-    _print_status("Release report", "pass")
 
     print(f"Release {new_version} completed on branch '{branch}' with tag '{tag_name}'.")
 
