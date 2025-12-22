@@ -1,0 +1,27 @@
+# Scripts Reference
+
+Utility scripts located in `scripts/` that support installation, quality control, and day-to-day development tasks.
+
+## Secrets and environment setup
+
+| Script | Purpose | Typical usage |
+|--------|---------|---------------|
+| `init_secrets_key.sh` | Generates the Fernet key and `.env` entries required for encrypted `system.json` secrets. | Run once per repo clone: `./scripts/init_secrets_key.sh` (prompts before overwriting existing keys). |
+| `install_py_path.sh` | Ensures the project path is appended to the user’s `PYTHONPATH` for CLI tooling. | `./scripts/install_py_path.sh` (adds exports to `~/.bashrc`). |
+| `install_aliases.sh` | Installs convenience shell aliases (e.g., `config-menu`, `pypnm-clean`). | `./scripts/install_aliases.sh` after initial `./install.sh`. |
+| `update_env.sh` | Activates the local venv and exports common dev env vars. | `./scripts/update_env.sh .env` (or with your venv path). |
+
+## Build, update, and quality control
+
+| Script | Purpose | Typical usage |
+|--------|---------|---------------|
+| `update-dep.sh` | Batch-updates pinned dependencies (uses `pip-tools` under the hood). | `./scripts/update-dep.sh --all` before cutting a release. |
+| `setup-and-test.sh` | One-shot script for CI/local QC: installs dependencies, runs lint/tests. | `./scripts/setup-and-test.sh` in clean CI images or before PRs. |
+
+## Service lifecycle
+
+| Script | Purpose | Typical usage |
+|--------|---------|---------------|
+| `start-fastapi-service.sh` | Launches the FastAPI service with sensible defaults (reads from `.env`). | `./scripts/start-fastapi-service.sh --reload` during local dev. |
+
+> **See also:** Additional tooling lives in [`tools/`](../tools/index.md) (e.g., support bundles, config menus). Use this page for the core scripts shipped in `scripts/`.

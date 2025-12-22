@@ -1,0 +1,82 @@
+site_name: PyPNM Docs
+site_url: https://pypnm.io/
+repo_url: https://github.com/svdleer/PyPNM
+repo_name: svdleer/PyPNM
+edit_uri: edit/main/docs/
+
+dev_addr: 127.0.0.1:8001
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+
+plugins:
+  - search
+
+markdown_extensions:
+  - attr_list
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - js/mathjax-config.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - API:
+      - Overview: api/index.md
+      - FastAPI:
+          - Overview: api/fast-api/index.md
+          - Common:
+              - Requests: api/fast-api/common/request.md
+              - Responses: api/fast-api/common/response.md
+          - Single Capture: api/fast-api/single/index.md
+          - Multi Capture: api/fast-api/multi/index.md
+          - Status Codes: api/fast-api/status/fast-api-status-codes.md
+      - Python: api/python/index.md
+  - Examples:
+      - Index: examples/index.md
+  - Tools:
+      - MIB compiler: tools/pypnm-mib-compiler.md
+      - Clean: tools/pypnm-clean.md
+  - Docker:
+    - Install: docker/install.md
+    - Commands: docker/commands.md
+    - Install Docker prerequisites: docker/install-docker.md
+  - Kubernetes:
+    - kind install: kubernetes/kind-install.md
+    - Quickstart: kubernetes/quickstart.md
+    - PyPNM deploy: kubernetes/pypnm-deploy.md
+    - kind + FreeLens (VM): kubernetes/kind-freelens.md
+    - Single namespace (10 replicas): kubernetes/scale-replicas-kind.md
+    - 10 namespaces (multi-port): kubernetes/ten-instances-kind.md
+    - Multiple kind clusters: kubernetes/multi-cluster-kind.md
+    - Commands: kubernetes/commands.md
+    - Pros and cons: kubernetes/pros-cons.md
+  - Gallery: gallery/index.md
+  - Tests:
+      - Index: tests/index.md

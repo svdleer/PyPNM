@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "pypnm-docsis"
+version         = "1.0.55.0"
+description     = "DOCSIS 3.x/4.0 Proactive Network Maintenance Toolkit"
+readme          = "README.md"
+requires-python = ">=3.10"
+license         = "Apache-2.0"
+
+authors = [
+  { name = "Maurice Garcia", email = "mgarcia01752@outlook.com" }
+]
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Framework :: FastAPI",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+
+license-files = ["LICENSE", "NOTICE"]
+
+dependencies = [
+  "fastapi==0.115.12",
+  "uvicorn[standard]==0.34.2",
+  "python-multipart>=0.0.20",
+  "numpy==2.2.6",
+  "scipy==1.15.1",
+  "pydantic>=2.12.4,<2.13",
+  "pysmi==1.6.1",
+  "pysnmp==7.1.17",
+  "python-dotenv>=1.0.0",
+  "requests==2.32.3",
+  "pandas==2.2.3",
+  "paramiko==3.5.1",
+  "tftpy==0.8.5",
+  "matplotlib==3.10.8",
+  "typing-extensions>=4.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-cov>=5.0.0",
+  "pytest-asyncio>=0.23.5",
+  "black>=24.0.0",
+  "pydantic-settings>=2.6.0",
+  "ruff>=0.14.7",
+  "pycycle>=0.0.8",
+  "pyright>=1.1.407",
+  "pyyaml>=6.0.2",
+]
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+  "pymdown-extensions>=10.8",
+]
+reports = []
+
+[project.urls]
+Homepage    = "https://www.pypnm.io"
+Repository  = "https://github.com/svdleer/PyPNM"
+Bug-Tracker = "https://github.com/svdleer/PyPNM/issues"
+Documentation = "https://www.pypnm.io"
+
+[project.scripts]
+pypnm      = "pypnm.cli:main"
+docs-serve = "mkdocs.__main__:serve"
+docs-build = "mkdocs.__main__:build"
+pypnm-software-qa-checker  = "pypnm.tools.qa_checker:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where   = ["src"]
+include = ["pypnm*"]
+
+[tool.setuptools.package-data]
+"pypnm" = [
+  "settings/*.json",
+  "py.typed",
+]
+
+[tool.pytest.ini_options]
+minversion   = "8.0"
+pythonpath   = ["src"]
+testpaths    = ["tests"]
+addopts      = "-ra -q --strict-markers --tb=short -m 'not cm_it'"
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(levelname)s %(name)s:%(lineno)d | %(message)s"
+log_cli_date_format = "%H:%M:%S"
+markers = [
+  "asyncio: mark test as asyncio-based (requires pytest-asyncio)",
+  "cm_it: cable modem integration tests (enable with -m cm_it)",
+  "slow: slow tests",
+  "net: network-required tests",
+  "pnm: PNM file parsing tests",
+]
+filterwarnings = [
+  "ignore:getReadersFromUrls is deprecated:DeprecationWarning:pysnmp",
+  "ignore:smiV1Relaxed is deprecated:DeprecationWarning:pysnmp",
+  "ignore:.*getReadersFromUrls.*:DeprecationWarning:pysmi.reader.url",
+  "ignore:.*addSources.*:DeprecationWarning:pysnmp.smi.compiler",
+  "ignore:.*addSearchers.*:DeprecationWarning:pysnmp.smi.compiler",
+  "ignore:.*addBorrowers.*:DeprecationWarning:pysnmp.smi.compiler",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["pypnm"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+src            = ["src"]
+target-version = "py310"
+exclude        = [
+  "tools",
+  "src/pypnm/lib/matplot/manager.py",
+  "src/pypnm/lib/csv/manager.py",
+  "src/pypnm/api/routes/common/extended/common_messaging_service.py",
+  "src/pypnm/api/routes/common/extended/common_measure_service.py",
+  "src/pypnm/examples/",
+]
+
+[tool.ruff.lint]
+# Common, high-signal rulesets:
+# F   = Pyflakes (real errors)
+# E,W = pycodestyle
+# I   = import sorting
+# B   = flake8-bugbear
+# UP  = pyupgrade
+#
+# Ignore:
+# E501 - https://docs.astral.sh/ruff/rules/line-too-long/
+# B006 - https://docs.astral.sh/ruff/rules/mutable-argument-default/
+#
+# ---------------------------------------------------------------------------
+# Ruff Roadmap (do NOT enable by default; turn on gradually when ready)
+# ---------------------------------------------------------------------------
+# Phase 1 (current):
+#   - Focus on correctness + core style only.
+#   - Enabled rule families:
+#       F, E, W, I, B, UP
+#
+# Phase 2 (optional): Naming rules
+#   - Add N (pep8-naming) when public API naming is stable.
+#   - This enforces conventional names for functions, classes, etc.
+#   - Example change (for later, DO NOT UNCOMMENT YET):
+#       select = ["F", "E", "W", "I", "B", "UP", "N"]
+#
+# Phase 3 (optional): Type-annotation rules
+#   - Add ANN to enforce more consistent type hints once F/E/W noise is low.
+#   - You can selectively ignore strict ANN codes if needed (e.g., ANN101/ANN102).
+#   - Example (for later):
+#       select = ["F", "E", "W", "I", "B", "UP", "ANN"]
+#       ignore = ["E501", "B006", "ANN101", "ANN102"]
+#
+# Phase 4 (optional): Simplification & performance hints
+#   - Enable SIM (flake8-simplify) to flag redundant or over-complicated logic.
+#   - Enable PERF to catch obvious performance footguns in hot paths.
+#   - Recommended approach:
+#       - First, run ad-hoc from CLI without adding to select:
+#           ruff check src --select SIM,PERF
+#       - Fix only the diagnostics you agree with.
+#   - If you like the results, you can later extend select:
+#       select = ["F", "E", "W", "I", "B", "UP", "N", "ANN", "SIM", "PERF"]
+#
+# Packs to generally avoid for PyPNM (unless explicitly desired later):
+#   - D (pydocstyle): conflicts with custom docstring rules.
+#   - C90 / PL (mccabe / pylint families): very noisy, low signal for this project.
+
+select = ["F", "E", "W", "I", "B", "UP", "ANN", "SIM", "PERF"]
+ignore = [
+  "E501",
+  "B006"
+]
+
+[tool.pyright]
+pythonVersion = "3.10"
+pythonPlatform = "Linux"
+
+include = ["src"]
+exclude = [
+  "tools",
+  "src/pypnm/examples/",
+  "**/__pycache__",
+]
+
+# VSCode + .env venv
+venvPath = "."
+venv = ".env"
+
+reportMissingImports = "warning"
+reportMissingTypeStubs = "warning"
+typeCheckingMode = "basic"

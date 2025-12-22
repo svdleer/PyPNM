@@ -1,0 +1,268 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+"""
+Schemas for CMTS Upstream Triggered Spectrum Capture (UTSC) operations.
+
+This module provides Pydantic models for CMTS-side UTSC measurements
+as defined in DOCS-PNM-MIB (docsPnmCmtsUtscCfgTable, docsPnmCmtsUtscCtrlTable,
+docsPnmCmtsUtscStatusTable).
+"""
+
+from __future__ import annotations
+
+from enum import IntEnum
+from typing import Optional, List
+from pydantic import BaseModel, Field
+
+
+class TriggerMode(IntEnum):
+    """UTSC Trigger Mode (docsPnmCmtsUtscCfgTriggerMode)
+    
+    Cisco cBR-8 supports: OTHER(1), FREE_RUNNING(2), CM_MAC(7)
+    CommScope E6000 supports: FREE_RUNNING(2), CM_MAC(6)
+    """
+    OTHER = 1
+    FREE_RUNNING = 2
+    MINI_SLOT_COUNT = 3
+    SID = 4
+    IDLE_SID = 5
+    MINISLOT_NUMBER = 6
+    CM_MAC = 7
+    QUIET_PROBE_SYMBOL = 8
+
+
+class OutputFormat(IntEnum):
+    """UTSC Output Format (docsPnmCmtsUtscCfgOutputFormat)
+    
+    Cisco cBR-8 supports: TIME_IQ(1), FFT_POWER(2) only
+    CommScope E6000 supports: all formats including FFT_AMPLITUDE(5)
+    """
+    TIME_IQ = 1
+    FFT_POWER = 2
+    RAW_ADC = 3
+    FFT_IQ = 4
+    FFT_AMPLITUDE = 5
+    FFT_DB = 6
+
+
+class WindowFunction(IntEnum):
+    """UTSC Window Function (docsPnmCmtsUtscCfgWindow)"""
+    OTHER = 1
+    RECTANGULAR = 2
+    HANN = 3
+    BLACKMAN_HARRIS = 4
+    HAMMING = 5
+    FLAT_TOP = 6
+    GAUSSIAN = 7
+    CHEBYSHEV = 8
+
+
+class MeasStatus(IntEnum):
+    """Measurement Status (docsPnmCmtsUtscStatusMeasStatus)"""
+    OTHER = 1
+    INACTIVE = 2
+    BUSY = 3
+    SAMPLE_READY = 4
+    ERROR = 5
+    RESOURCE_UNAVAILABLE = 6
+    SAMPLE_TRUNCATED = 7
+
+
+class CmtsSnmpConfig(BaseModel):
+    """CMTS SNMP configuration."""
+    cmts_ip: str = Field(..., description="CMTS IP address")
+    community: str = Field(default="private", description="SNMP community string")
+    write_community: Optional[str] = Field(default=None, description="SNMP write community (defaults to community)")
+
+
+class UtscRfPort(BaseModel):
+    """RF Port information."""
+    rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
+    description: Optional[str] = Field(None, description="Port description")
+    cfg_index: int = Field(default=1, description="Config table index (usually 1)")
+
+
+class UtscListPortsRequest(BaseModel):
+    """Request to list available RF ports for UTSC."""
+    cmts: CmtsSnmpConfig
+
+
+class UtscListPortsResponse(BaseModel):
+    """Response with list of RF ports."""
+    success: bool
+    rf_ports: List[UtscRfPort] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class UtscConfigureRequest(BaseModel):
+    """Request to configure UTSC test parameters."""
+    cmts: CmtsSnmpConfig
+    rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
+    cfg_index: int = Field(default=1, description="Config table index (usually 1)")
+    
+    # Trigger settings
+    trigger_mode: int = Field(default=2, ge=1, le=8, description="Trigger mode: 1=other, 2=freeRunning, 3=minislotCount, 4=sid, 5=idleSid, 6=minislotNumber, 7=cmMac, 8=quietProbeSymbol")
+    cm_mac_address: Optional[str] = Field(None, description="CM MAC address (required for trigger_mode=7 cmMac)")
+    logical_ch_ifindex: Optional[int] = Field(None, description="Logical channel ifIndex for CM MAC trigger")
+    
+    # Spectrum settings
+    center_freq_hz: int = Field(default=50000000, description="Center frequency in Hz")
+    span_hz: int = Field(default=80000000, description="Frequency span in Hz")
+    num_bins: int = Field(default=800, description="Number of FFT bins")
+    
+    # Output settings
+    output_format: Optional[int] = Field(None, ge=0, le=6, description="Output format: 0=auto-detect (tries 5 then 2), 1=timeIq, 2=fftPower (Cisco+E6000), 3=rawAdc, 4=fftIq, 5=fftAmplitude (E6000), 6=fftDb")
+    window_function: int = Field(default=2, ge=1, le=8, description="Window: 1=other, 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming (Cisco supports 2-5 only)")
+    
+    # Timing settings
+    # Casa E6000 constraints: RepeatPeriod>=100ms, FreeRunDuration>=120s, files=FreeRun/Repeat<=300
+    repeat_period_us: int = Field(default=400000, description="Repeat period in microseconds (Casa min: 100000=100ms; default 400ms satisfies 120s/300files)")
+    freerun_duration_ms: int = Field(default=0, description="Free run duration in milliseconds (0=auto: service enforces Casa min 120000ms)")
+    trigger_count: int = Field(default=1, description="Trigger count (number of captures)")
+    
+    # File settings
+    filename: str = Field(default="utsc_capture", description="Output filename")
+    destination_index: int = Field(default=1, ge=0, description="Bulk transfer destination index (1=TFTP upload, 0=local only)")
+
+
+class UtscConfigureResponse(BaseModel):
+    """Response from configuring UTSC."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    cfg_index: Optional[int] = None
+    trigger_mode: Optional[int] = None
+    filename: Optional[str] = None
+    row_status: Optional[str] = Field(None, description="RowStatus after configure: active, notReady, etc.")
+    verify: Optional[dict] = Field(None, description="Parameter verification results")
+    warnings: Optional[List[str]] = Field(None, description="Values that were auto-clamped to meet vendor constraints")
+    applied: Optional[dict] = Field(None, description="Actual values applied after clamping (repeat_period_us, freerun_duration_ms)")
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscStartRequest(BaseModel):
+    """Request to start UTSC test."""
+    cmts: CmtsSnmpConfig
+    rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
+    cfg_index: int = Field(default=0, description="Config table index (0=auto-probe by TriggerMode, required for Casa which always uses createAndWait rows)")
+    trigger_mode: int = Field(default=2, description="TriggerMode to match during auto-probe (default 2=freeRunning)")
+
+
+class UtscStartResponse(BaseModel):
+    """Response from starting UTSC test."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    cfg_index: Optional[int] = None
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscStopRequest(BaseModel):
+    """Request to stop UTSC test."""
+    cmts: CmtsSnmpConfig
+    rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
+    cfg_index: int = Field(default=1, description="Config table index")
+
+
+class UtscStopResponse(BaseModel):
+    """Response from stopping UTSC test."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    cfg_index: Optional[int] = None
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscStatusRequest(BaseModel):
+    """Request to get UTSC status."""
+    cmts: CmtsSnmpConfig
+    rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
+    cfg_index: int = Field(default=1, description="Config table index")
+
+
+class UtscStatusResponse(BaseModel):
+    """Response with UTSC status."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    cfg_index: Optional[int] = None
+    meas_status: Optional[int] = None
+    meas_status_name: Optional[str] = None
+    is_ready: bool = False
+    is_busy: bool = False
+    is_error: bool = False
+    avg_power: Optional[float] = Field(None, description="Average power in dB")
+    filename: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscGetConfigRequest(BaseModel):
+    """Request to get current UTSC configuration."""
+    cmts: CmtsSnmpConfig
+    rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
+    cfg_index: int = Field(default=1, description="Config table index")
+
+
+class UtscBulkDestRequest(BaseModel):
+    """Request to configure docsPnmCcapBulkDataControlTable for UTSC/RxMER upload."""
+    cmts: CmtsSnmpConfig
+    dest_ip: str = Field(..., description="TFTP server IP address")
+    dest_path: str = Field(default="./", description="Destination path on TFTP server")
+    index: int = Field(default=1, description="Table row index (1-10)")
+    pnm_types: List[str] = Field(
+        default=["utsc"],
+        description=(
+            "PNM test types to associate with this destination. "
+            "Valid values: 'utsc' (bit8 usTriggeredSpectrumCapture), "
+            "'rxmer' (bit5 usOfdmaRxMerPerSubcarrier), 'both'."
+        )
+    )
+
+
+class UtscBulkDestResponse(BaseModel):
+    """Response from bulk destination configuration."""
+    success: bool
+    index: int = Field(default=1)
+    dest_ip: Optional[str] = None
+    pnm_test_selector_hex: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscDiscoverRequest(BaseModel):
+    """Request to discover RF port for a cable modem."""
+    cmts_ip: str
+    community: str = "public"
+    cm_mac_address: str
+
+
+class UtscDiscoverResponse(BaseModel):
+    """Response with discovered RF port for a cable modem."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    rf_port_description: Optional[str] = None
+    cm_index: Optional[int] = None
+    us_channels: List[int] = Field(default_factory=list)
+    logical_channel: Optional[int] = None
+    error: Optional[str] = None
+
+
+class UtscGetConfigResponse(BaseModel):
+    """Response with current UTSC configuration."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    cfg_index: Optional[int] = None
+    trigger_mode: Optional[int] = None
+    trigger_mode_name: Optional[str] = None
+    center_freq_hz: Optional[int] = None
+    span_hz: Optional[int] = None
+    num_bins: Optional[int] = None
+    output_format: Optional[int] = None
+    output_format_name: Optional[str] = None
+    window_function: Optional[int] = None
+    repeat_period_us: Optional[int] = None
+    freerun_duration_ms: Optional[int] = None
+    trigger_count: Optional[int] = None
+    filename: Optional[str] = None
+    destination_index: Optional[int] = None
+    row_status: Optional[int] = None
+    error: Optional[str] = None

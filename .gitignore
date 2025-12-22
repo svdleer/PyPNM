@@ -1,0 +1,57 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.env/
+.venv/
+test-env/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs
+*.log
+
+# PyPNM 
+archive/
+.data/
+data/
+output/*
+pypnm-version-control/*
+logs/*
+backup/*
+issues/*
+deploy/docker/compose/.env
+AGENTS.md
+release-reports/
+tools/release-review/*
+
+# PyPNM Dev tools
+log-level-rewriter.py
+test-pypi-build.sh
+pypi-build.sh
+testpypi_release.py
+pypi_release.py
+
+
+# PyPNM Backups
+system.bak*
+
+#mkdocs
+site/*
+
+# Test, security-checks and coverage artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+gitleaks-report.json

@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pypnm-api
+  labels:
+    app: pypnm-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pypnm-api
+  template:
+    metadata:
+      labels:
+        app: pypnm-api
+    spec:
+      containers:
+        - name: pypnm-api
+          image: pypnm:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: pypnm-config
+              mountPath: /app/config
+            - name: pypnm-logs
+              mountPath: /app/logs
+            - name: pypnm-data
+              mountPath: /app/.data
+            - name: pypnm-output
+              mountPath: /app/output
+      volumes:
+        - name: pypnm-config
+          emptyDir: {}
+        - name: pypnm-logs
+          emptyDir: {}
+        - name: pypnm-data
+          emptyDir: {}
+        - name: pypnm-output
+          emptyDir: {}

@@ -1,0 +1,115 @@
+{
+    "FastApiRequestDefault": {
+        "mac_address": "aa:bb:cc:dd:ee:ff",
+        "ip_address": "192.168.0.1"
+    },
+    "SNMP": {
+        "timeout": 2,
+        "version": {
+            "2c": {
+                "enable": true,
+                "retries": 3,
+                "read_community": "public",
+                "write_community": "private"
+            },
+            "3": {
+                "enable": false,
+                "retries": 3,
+                "username": "user",
+                "securityLevel": "authPriv",
+                "authProtocol": "SHA",
+                "authPassword": "pass",
+                "privProtocol": "AES",
+                "privPassword": "privpass"
+            }
+        }
+    },
+    "PnmBulkDataTransfer": {
+        "method": "tftp",
+        "tftp": {
+            "ip_v4": "192.168.0.10",
+            "ip_v6": "::1",
+            "remote_dir": ""
+        },
+        "http": {
+            "base_url": "http://files.example.com/",
+            "port": 80
+        },
+        "https": {
+            "base_url": "https://files.example.com/",
+            "port": 443
+        }
+    },
+    "PnmFileRetrieval": {
+        "pnm_dir": "demo/.demo/pnm",
+        "csv_dir": "demo/.demo/csv",
+        "json_dir": "demo/.demo/json",
+        "xlsx_dir": "demo/.demo/xlsx",
+        "png_dir": "demo/.demo/png",
+        "archive_dir": "demo/.demo/archive",
+        "msg_rsp_dir": "demo/.demo/msg_rsp",
+        "transaction_db": "demo/.demo/db/transactions.json",
+        "capture_group_db": "demo/.demo/db/capture_group.json",
+        "session_group_db": "demo/.demo/db/session_group.json",
+        "operation_db": "demo/.demo/db/operation_capture.json",
+        "json_transaction_db": "demo/.demo/db/json_transactions.json",
+        "retries": 5,
+        "retrieval_method": {
+            "method": "local",
+            "methods": {
+                "local": {
+                    "src_dir": "/srv/tftp"
+                },
+                "tftp": {
+                    "host": "localhost",
+                    "port": 69,
+                    "timeout": 5,
+                    "remote_dir": ""
+                },
+                "ftp": {
+                    "host": "localhost",
+                    "port": 21,
+                    "tls": false,
+                    "timeout": 5,
+                    "user": "test",
+                    "password_enc": "",
+                    "remote_dir": "/srv/tftp"
+                },
+                "sftp": {
+                    "host": "localhost",
+                    "port": 22,
+                    "user": "test",
+                    "password_enc": "",
+                    "remote_dir": "/srv/tftp"
+                },
+                "http": {
+                    "base_url": "http://STUB/",
+                    "port": 80
+                },
+                "https": {
+                    "base_url": "https://STUB/",
+                    "port": 443
+                }
+            }
+        }
+    },
+    "logging": {
+        "log_level": "INFO",
+        "log_dir": "logs",
+        "log_filename": "pypnm.log"
+    },
+    "TestMode": {
+        "global": {
+            "mode": {
+                "enable": true
+            }
+        },
+        "class_name": {
+            "DsScQamChannelSpectrumAnalyzer": {
+                "mode": {
+                    "enable": true
+                }
+            }
+        }
+    }
+}

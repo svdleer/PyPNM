@@ -1,0 +1,20 @@
+# MANIFEST.in
+
+# Core top-level files that should always be in the sdist
+include LICENSE
+include README.md
+include pyproject.toml
+
+# Optionally include docs (if you want them in the sdist)
+recursive-include docs *.md
+
+# Exclude local release helper scripts from the sdist
+exclude tools/test-pypi-build.sh
+exclude tools/pypi-build.sh
+exclude tools/build/log-level-rewriter.py
+exclude tools/build/add-required-python-headers.py
+exclude tools/release/testpypi_release.py
+exclude tools/pypi_release.py
+
+# Exclude local data
+exclude .data/*

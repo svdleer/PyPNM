@@ -1,0 +1,60 @@
+name: Kubernetes (kind)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  kind-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          curl -fsSL https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o /tmp/kubectl
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+      - name: Install kind
+        run: |
+          curl -fsSL https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64 -o /tmp/kind
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Create cluster
+        run: |
+          kind create cluster --name pypnm-dev
+          kubectl get nodes
+
+      - name: Build image
+        run: |
+          docker build -t pypnm:local --build-arg PYTHON_VERSION=3.12 .
+
+      - name: Load image into kind
+        run: |
+          kind load docker-image pypnm:local --name pypnm-dev
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -k deploy/kubernetes
+          kubectl rollout status deploy/pypnm-api --timeout=120s
+
+      - name: Health check
+        run: |
+          kubectl port-forward deploy/pypnm-api 8000:8000 > /tmp/pf.log 2>&1 &
+          PF_PID=$!
+          sleep 3
+          curl -fsS http://127.0.0.1:8000/health
+          kill "$PF_PID"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe pod -l app=pypnm-api
+          kubectl logs -l app=pypnm-api --tail=200

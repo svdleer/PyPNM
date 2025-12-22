@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pypnm-api
+  labels:
+    app: pypnm-api
+spec:
+  type: ClusterIP
+  selector:
+    app: pypnm-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

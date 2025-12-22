@@ -1,0 +1,57 @@
+services:
+  pypnm-api:
+    container_name: pypnm-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+#      args:
+#        http_proxy: ${http_proxy}
+#        https_proxy: ${https_proxy}
+      args:
+        PYTHON_VERSION: "3.12"
+    image: pypnm:latest
+    network_mode: host
+    environment:
+      - PYPNM_CONFIG_PATH=/app/deploy/config/system.json
+    volumes:
+      - pypnm_config:/app/config
+      - pypnm_logs:/app/logs
+      - pypnm_data:/app/.data
+      - pypnm_output:/app/output
+      - /var/lib/tftpboot:/var/lib/tftpboot
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs').read()\""]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+
+  config-menu:
+    image: pypnm:latest
+    command: ["python", "tools/system_config/menu.py"]
+    stdin_open: true
+    tty: true
+    restart: "no"
+    volumes:
+      - pypnm_config:/app/config
+      - pypnm_logs:/app/logs
+      - pypnm_data:/app/.data
+      - pypnm_output:/app/output
+
+  pypnm-sftp:
+    image: atmoz/sftp:alpine
+    profiles:
+      - sftp
+    command: "pypnm:changeme:10001:10001:/data"
+    volumes:
+      - pypnm_data:/data
+    ports:
+      - "2222:22"
+    restart: unless-stopped
+
+volumes:
+  pypnm_config:
+  pypnm_logs:
+  pypnm_data:
+  pypnm_output:
+

@@ -1,0 +1,642 @@
+# PyPNM Channel Stats API Router
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+"""
+Optimized channel statistics endpoint using parallel bulk walks via agent.
+
+This endpoint returns comprehensive DS/US channel information:
+- DS SC-QAM: frequency, power, SNR, RxMER, modulation, FEC stats
+- DS OFDM: PLC frequency, power, MER, subcarrier info (DOCSIS 3.1)
+- US ATDMA: frequency, width, TX power, T3/T4 timeouts, type
+- US OFDMA: frequency, TX power, subcarrier info (DOCSIS 3.1)
+
+Performance: ~8-10 seconds via parallel bulk walks (vs ~60+ seconds sequential)
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from enum import Enum
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+# In-process cache: (cmts_ip, mac) -> (cm_index, expires_at)
+_CM_INDEX_CACHE: dict = {}
+_CM_INDEX_TTL = 3600  # 1 hour
+
+
+def _get_cached_cm_index(cmts_ip: str, mac: str):
+    key = (cmts_ip, mac.lower())
+    entry = _CM_INDEX_CACHE.get(key)
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    return None
+
+
+def _set_cached_cm_index(cmts_ip: str, mac: str, cm_index: int):
+    key = (cmts_ip, mac.lower())
+    _CM_INDEX_CACHE[key] = (cm_index, time.time() + _CM_INDEX_TTL)
+
+from pypnm.api.agent.manager import get_agent_manager
+from .parser import parse_channel_stats_raw
+
+logger = logging.getLogger(__name__)
+
+
+class ChannelStatsRequest(BaseModel):
+    """Request model for channel stats."""
+    mac_address: str = Field(..., description="Cable modem MAC address")
+    modem_ip: str = Field(..., description="Cable modem IP address")
+    community: str = Field(default="public", description="SNMP community string")
+    cmts_ip: Optional[str] = Field(default=None, description="CMTS IP address for fiber node lookup")
+    cmts_community: Optional[str] = Field(default=None, description="CMTS SNMP community string")
+    skip_connectivity_check: bool = Field(default=False, description="Skip ping/SNMP check")
+    cmts_stats: bool = Field(default=False, description="Fetch CMTS-side OFDMA MeanRxMer and IUC profile stats (slower)")
+
+
+class ChannelStatsResponse(BaseModel):
+    """Response model for channel stats."""
+    success: bool
+    status: int = 0
+    mac_address: Optional[str] = None
+    modem_ip: Optional[str] = None
+    fiber_node: Optional[str] = None
+    timestamp: Optional[str] = None
+    timing: Optional[dict] = None
+    downstream: Optional[dict] = None
+    upstream: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class ChannelStatsRouter:
+    """
+    FastAPI router for optimized channel statistics endpoint.
+    
+    Uses parallel bulk walks via remote agent for fast data collection (~8-10s).
+    """
+    
+    def __init__(
+        self,
+        prefix: str = "/cm/channel-stats",
+        tags: list[str | Enum] = None
+    ) -> None:
+        if tags is None:
+            tags = ["Cable Modem Channel Stats"]
+        self.router = APIRouter(prefix=prefix, tags=tags)
+        self.logger = logging.getLogger(__name__)
+        # Ensure logger level is set to INFO
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+        self._register_routes()
+    
+    def _register_routes(self) -> None:
+        @self.router.post(
+            "",
+            response_model=ChannelStatsResponse,
+            summary="Get Cable Modem Channel Statistics",
+            description="Fetch comprehensive DS/US channel stats using optimized parallel bulk walks.",
+        )
+        async def get_channel_stats(request: ChannelStatsRequest) -> ChannelStatsResponse:
+            """
+            Get comprehensive channel statistics for a cable modem.
+            
+            Uses optimized parallel bulk walks via the remote agent for fast data collection.
+            
+            Tables walked in parallel:
+            - docsIfDownChannelTable: DS SC-QAM freq, power, modulation
+            - docsIfSigQTable: DS SC-QAM SNR, codewords
+            - docsIf3SignalQualityExtTable: DS SC-QAM RxMER
+            - docsIf31CmDsOfdmChanTable: DS OFDM (DOCSIS 3.1)
+            - docsIfUpChannelTable: US ATDMA freq, width, type
+            - docsIf3CmStatusUsTable: US ATDMA TX power, T3 timeouts
+            - docsIf31CmUsOfdmaChanTable: US OFDMA (DOCSIS 3.1)
+            
+            Returns:
+                ChannelStatsResponse with DS/US channel data
+            """
+            agent_manager = get_agent_manager()
+            if not agent_manager:
+                raise HTTPException(status_code=503, detail="Agent manager not initialized")
+            
+            # Find an available agent
+            agents = agent_manager.get_available_agents()
+            if not agents:
+                raise HTTPException(status_code=503, detail="No agents available")
+            
+            agent_id = agents[0].get("agent_id")
+            if not agent_id:
+                raise HTTPException(status_code=503, detail="No valid agent found")
+            
+            self.logger.info(f"Getting channel stats for {request.modem_ip} via agent {agent_id}")
+            
+            try:
+                # Define table OIDs - agent will walk these in parallel
+                table_oids = [
+                    '1.3.6.1.2.1.10.127.1.1.1',     # docsIfDownChannelTable
+                    '1.3.6.1.2.1.10.127.1.1.4',     # docsIfSigQTable
+                    '1.3.6.1.4.1.4491.2.1.20.1.24', # docsIf3SignalQualityExtTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.9',  # docsIf31CmDsOfdmChanTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.11', # docsIf31CmDsOfdmChannelPowerTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.2',  # docsIf31RxChStatusTable (OFDM profiles)
+                    '1.3.6.1.4.1.4491.2.1.28.1.10', # docsIf31CmDsOfdmProfileStatsTable (OFDM codewords)
+                    '1.3.6.1.2.1.10.127.1.1.2',     # docsIfUpChannelTable
+                    '1.3.6.1.4.1.4491.2.1.20.1.2',  # docsIf3CmStatusUsTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.13', # docsIf31CmUsOfdmaChanTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.12', # docsIf31CmStatusOfdmaUsTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.14', # docsIf31CmUsOfdmaProfileStatsTable (OFDMA IUC stats)
+                    '1.3.6.1.4.1.4491.2.1.27.1.2.5', # docsPnmCmDsOfdmRxMerTable (OFDM DS MER mean)
+                ]
+                
+                # Send parallel walk task to agent
+                import time
+                start_time = time.time()
+                
+                # Do connectivity check first if not skipped
+                if not request.skip_connectivity_check:
+                    # Quick SNMP check
+                    check_task_id = await agent_manager.send_task(
+                        agent_id, "snmp_get",
+                        {"target_ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", "community": request.community},
+                        timeout=5.0
+                    )
+                    check_result = await agent_manager.wait_for_task_async(check_task_id, timeout=5.0)
+                    if not check_result or not check_result.get("result", {}).get("success"):
+                        return ChannelStatsResponse(
+                            success=False,
+                            status=-1,
+                            error="SNMP not responding on modem"
+                        )
+                
+                # Send modem parallel walk task
+                task_id = await agent_manager.send_task(
+                    agent_id,
+                    "snmp_parallel_walk",
+                    {
+                        "ip": request.modem_ip,
+                        "oids": table_oids,
+                        "community": request.community,
+                        "timeout": 30
+                    },
+                    timeout=40.0
+                )
+
+                # Concurrently send CMTS OFDMA walk + fiber node lookup tasks
+                # (Cisco modems return empty modem-side OFDMA; CMTS walk runs in
+                # parallel so it adds zero extra wall-clock time)
+                cmts_ofdma_task_id = None
+                cmts_rxmer_task_id = None
+                cmts_cmindex_task_id = None
+                cmts_chanid_task_id = None
+                cmts_profile_task_id = None
+                fiber_node_sg_task_id = None
+                cached_cm_index = None
+                if request.cmts_ip and request.mac_address:
+                    cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
+                    if cached_cm_index is not None:
+                        # Fast path: direct snmpget for SG ID using known cm_index (runs in parallel with modem walk)
+                        try:
+                            fiber_node_sg_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_get",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=5.0,
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"Fiber node pre-task failed: {e}")
+
+                if request.cmts_ip and request.cmts_stats:
+                    try:
+                        if cached_cm_index is None:
+                            cmts_ofdma_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                        if cached_cm_index is not None:
+                            # Scoped walks — tiny, fast
+                            cmts_rxmer_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                            cmts_profile_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.5.1.1.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                        else:
+                            # Full walks + MAC walk to resolve cm_index
+                            cmts_rxmer_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                            cmts_cmindex_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                            cmts_profile_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send CMTS OFDMA task: {e}")
+
+                # Wait for modem walk result
+                result = await agent_manager.wait_for_task_async(task_id, timeout=40.0)
+
+                if not result:
+                    return ChannelStatsResponse(
+                        success=False,
+                        status=-1,
+                        error="Agent task timed out"
+                    )
+
+                # Extract raw SNMP walk results
+                agent_result = result.get("result", {})
+                if not agent_result.get("success"):
+                    return ChannelStatsResponse(
+                        success=False,
+                        status=-1,
+                        error=agent_result.get("error") or "SNMP walk failed"
+                    )
+
+                raw_results = agent_result.get("results", {})
+                walk_time = time.time() - start_time
+
+                # Collect CMTS OFDMA result (already running in parallel)
+                ofdma_oid = '1.3.6.1.4.1.4491.2.1.28.1.13'
+                modem_ofdma_empty = not raw_results.get(ofdma_oid)
+                if modem_ofdma_empty and cmts_ofdma_task_id:
+                    try:
+                        cmts_result = await agent_manager.wait_for_task_async(cmts_ofdma_task_id, timeout=15.0)
+                        if cmts_result and cmts_result.get("result", {}).get("success"):
+                            cmts_ofdma_entries = cmts_result.get("result", {}).get("results", [])
+                            if cmts_ofdma_entries:
+                                raw_results[ofdma_oid] = cmts_ofdma_entries
+                                self.logger.info(
+                                    f"Injected {len(cmts_ofdma_entries)} CMTS OFDMA entries "
+                                    f"(Cisco fallback, ran in parallel)"
+                                )
+                    except Exception as cmts_ofdma_err:
+                        self.logger.warning(f"CMTS OFDMA fallback failed: {cmts_ofdma_err}")
+
+                # Parse results in API (NOT in agent)
+                parsed = parse_channel_stats_raw(
+                    raw_results, walk_time, request.mac_address, request.modem_ip
+                )
+
+                # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
+                # First: resolve cm_index (needed for both rxmer and fiber node)
+                cm_index = cached_cm_index
+                if cmts_cmindex_task_id and cm_index is None and request.mac_address:
+                    try:
+                        cmidx_result = await agent_manager.wait_for_task_async(cmts_cmindex_task_id, timeout=15.0)
+                        if cmidx_result and cmidx_result.get('result', {}).get('success'):
+                            mac_clean = request.mac_address.replace(':', '').lower()
+                            for entry in cmidx_result.get('result', {}).get('results', []):
+                                val = entry.get('value', '')
+                                if isinstance(val, str):
+                                    entry_mac = val.replace(' ', '').replace(':', '').lower()
+                                    if entry_mac == mac_clean:
+                                        oid = entry.get('oid', '')
+                                        suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
+                                        try:
+                                            cm_index = int(suffix.strip('.'))
+                                        except ValueError:
+                                            pass
+                                        break
+                        if cm_index is not None:
+                            self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
+                            _set_cached_cm_index(request.cmts_ip, request.mac_address, cm_index)
+                            # Now that we have cm_index, pre-fetch SG ID for fiber node
+                            try:
+                                fiber_node_sg_task_id = await agent_manager.send_task(
+                                    agent_id, "snmp_get",
+                                    {
+                                        "target_ip": request.cmts_ip,
+                                        "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}',
+                                        "community": request.cmts_community or "public",
+                                    },
+                                    timeout=5.0,
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        self.logger.debug(f'cm_index resolution failed: {e}')
+
+                if cmts_rxmer_task_id and parsed.get('success'):
+                    try:
+                        rxmer_result = await agent_manager.wait_for_task_async(cmts_rxmer_task_id, timeout=15.0)
+                        if rxmer_result and rxmer_result.get('result', {}).get('success'):
+                            rxmer_entries = rxmer_result.get('result', {}).get('results', [])
+                            base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
+                            cm_rxmer_list = []
+                            for entry in rxmer_entries:
+                                oid = entry.get('oid', '')
+                                suffix = oid.replace(base_oid + '.', '').lstrip('.')
+                                parts = suffix.split('.')
+                                if len(parts) == 2:
+                                    try:
+                                        entry_cm_index = int(parts[0])
+                                        ofdma_ifindex = int(parts[1])
+                                        if cm_index is None or entry_cm_index == cm_index:
+                                            val = entry.get('value')
+                                            if val is not None:
+                                                cm_rxmer_list.append((ofdma_ifindex, round(int(val) / 100, 2)))
+                                    except (ValueError, TypeError):
+                                        pass
+                            cm_rxmer_list.sort(key=lambda x: x[0])
+                            ofdma_channels = sorted(
+                                parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
+                                key=lambda c: c.get('index', 0)
+                            )
+                            for i, ch in enumerate(ofdma_channels):
+                                if i < len(cm_rxmer_list):
+                                    ch['rx_mer'] = cm_rxmer_list[i][1]
+                            if cm_rxmer_list:
+                                self.logger.info(f'Injected CMTS MeanRxMer for {len(cm_rxmer_list)} OFDMA channels (positional)')
+                    except Exception as rxmer_err:
+                        self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
+
+                # Collect CMTS OFDMA profile stats (IUC codewords) and inject active_iucs
+                if cmts_profile_task_id and parsed.get('success'):
+                    try:
+                        prof_result = await agent_manager.wait_for_task_async(cmts_profile_task_id, timeout=15.0)
+                        if prof_result and prof_result.get('result', {}).get('success'):
+                            prof_entries = prof_result.get('result', {}).get('results', [])
+                            base_oid = '1.3.6.1.4.1.4491.2.1.28.1.5.1.1'
+                            # Build: ofdma_ifindex -> {iuc_id -> codewords}
+                            ifindex_iuc_map = {}
+                            for entry in prof_entries:
+                                oid = entry.get('oid', '')
+                                suffix = oid.replace(base_oid + '.', '').lstrip('.')
+                                parts = suffix.split('.')
+                                # OID suffix: cm_index.ofdma_ifindex.iuc_id
+                                if len(parts) == 3:
+                                    try:
+                                        entry_cm_index = int(parts[0])
+                                        ofdma_ifindex = int(parts[1])
+                                        iuc_id = int(parts[2])
+                                        if cm_index is None or entry_cm_index == cm_index:
+                                            val = int(entry.get('value') or 0)
+                                            if ofdma_ifindex not in ifindex_iuc_map:
+                                                ifindex_iuc_map[ofdma_ifindex] = {}
+                                            ifindex_iuc_map[ofdma_ifindex][iuc_id] = val
+                                    except (ValueError, TypeError):
+                                        pass
+
+                            # Match positionally (sorted ifindex order = sorted channel index order)
+                            sorted_ifindices = sorted(ifindex_iuc_map.keys())
+                            ofdma_channels = sorted(
+                                parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
+                                key=lambda c: c.get('index', 0)
+                            )
+                            for i, ch in enumerate(ofdma_channels):
+                                if i < len(sorted_ifindices):
+                                    iuc_data = ifindex_iuc_map[sorted_ifindices[i]]
+                                    iuc_stats = [
+                                        {'iuc': iuc_id, 'codewords': cw}
+                                        for iuc_id, cw in sorted(iuc_data.items())
+                                        if cw > 0
+                                    ]
+                                    if iuc_stats:
+                                        ch['iuc_stats'] = iuc_stats
+                                        ch['active_iucs'] = [s['iuc'] for s in iuc_stats]
+                                        ch['current_iuc'] = iuc_stats[-1]['iuc']  # highest active IUC
+                            self.logger.info(f'Injected CMTS IUC stats for {len(sorted_ifindices)} OFDMA channels')
+                    except Exception as prof_err:
+                        self.logger.warning(f'CMTS profile stats collection failed: {prof_err}')
+                    except Exception as rxmer_err:
+                        self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
+
+                # Resolve fiber node
+                fiber_node = None
+                if request.cmts_ip and request.mac_address:
+                    try:
+                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
+                        if fiber_node_sg_task_id and fn_cm_index is not None:
+                            # Fast path: use pre-fetched SG ID (sent before modem walk)
+                            sg_result = await agent_manager.wait_for_task_async(fiber_node_sg_task_id, timeout=5.0)
+                            cm_sg_id = None
+                            if sg_result and sg_result.get('result', {}).get('success'):
+                                cm_sg_id = sg_result.get('result', {}).get('value')
+                            if cm_sg_id:
+                                fn_task_id = await agent_manager.send_task(
+                                    agent_id, "snmp_walk",
+                                    {"target_ip": request.cmts_ip, "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3', "community": request.cmts_community or "public"},
+                                    timeout=10.0,
+                                )
+                                fn_result = await agent_manager.wait_for_task_async(fn_task_id, timeout=10.0)
+                                if fn_result and fn_result.get('result', {}).get('success'):
+                                    for entry in fn_result.get('result', {}).get('results', []):
+                                        if entry.get('oid', '').endswith(f'.{cm_sg_id}'):
+                                            parts = entry.get('oid', '').split('.')
+                                            for i in range(len(parts) - 1, 1, -1):
+                                                try:
+                                                    length = int(parts[i])
+                                                    if 1 <= length <= 50:
+                                                        ascii_parts = parts[i+1:i+1+length]
+                                                        if len(ascii_parts) == length:
+                                                            vals = [int(p) for p in ascii_parts]
+                                                            if all(32 <= v <= 126 for v in vals):
+                                                                fiber_node = ''.join(chr(v) for v in vals)
+                                                                break
+                                                except (ValueError, IndexError):
+                                                    continue
+                                            if fiber_node:
+                                                break
+                        else:
+                            # First call: full sequential lookup (also caches cm_index)
+                            fiber_node = await self._get_fiber_node_from_cmts(
+                                agent_manager, agent_id, request.cmts_ip,
+                                request.mac_address, request.cmts_community or "public"
+                            )
+                    except Exception as fn_err:
+                        self.logger.debug(f'Fiber node lookup failed: {fn_err}')
+
+                if parsed.get("success"):
+                    return ChannelStatsResponse(
+                        success=True,
+                        status=0,
+                        mac_address=parsed.get("mac_address"),
+                        modem_ip=parsed.get("modem_ip"),
+                        fiber_node=fiber_node,
+                        timestamp=parsed.get("timestamp"),
+                        timing=parsed.get("timing"),
+                        downstream=parsed.get("downstream"),
+                        upstream=parsed.get("upstream"),
+                    )
+                else:
+                    return ChannelStatsResponse(
+                        success=False,
+                        status=-1,
+                        error=parsed.get("error") or "Parsing failed"
+                    )
+
+            except ValueError as e:
+                self.logger.error(f"Agent error: {e}")
+                raise HTTPException(status_code=404, detail=str(e))
+            except Exception as e:
+                self.logger.error(f"Channel stats failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to get channel stats: {str(e)}")
+    
+    async def _get_fiber_node_from_cmts(
+        self, agent_manager, agent_id: str, cmts_ip: str, 
+        mac_address: str, community: str
+    ) -> str:
+        """Lookup fiber node from CMTS using agent SNMP commands."""
+        try:
+            self.logger.info(f"Looking up fiber node for {mac_address} on CMTS {cmts_ip}")
+            
+            # Normalize MAC address to match CMTS format (shortened, colons)
+            # CMTS stores MACs like 44:5:3f:d4:19:15 (no leading zeros in bytes)
+            mac_normalized_parts = []
+            mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '').lower()
+            for i in range(0, len(mac_clean), 2):
+                byte = mac_clean[i:i+2]
+                # Convert to hex without leading zero: '05' -> '5', '0f' -> 'f'
+                mac_normalized_parts.append(f"{int(byte, 16):x}")
+            mac_normalized = ':'.join(mac_normalized_parts)
+            self.logger.info(f"Normalized MAC: {mac_address} -> {mac_normalized}")
+            
+            # Walk docsIfCmtsCmStatusMacAddress table to find CM index
+            oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
+            
+            if not result or not result.get("result", {}).get("success"):
+                self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
+                return None
+            
+            # Find CM index by matching MAC address
+            cm_index = None
+            results = result.get("result", {}).get("results", [])
+            for entry in results:
+                cmts_mac = entry.get("value", "")
+                cmts_mac_parts = cmts_mac.split(':')
+                cmts_mac_normalized = ':'.join([f"{int(b, 16):x}" if b else '0' for b in cmts_mac_parts])
+                if cmts_mac_normalized.lower() == mac_normalized.lower():
+                    oid_parts = entry.get("oid", "").split(".")
+                    if oid_parts:
+                        cm_index = oid_parts[-1]
+                        break
+            
+            if not cm_index:
+                self.logger.warning(f"MAC {mac_address} not found in CMTS table")
+                return None
+
+            # Cache cm_index for future calls (avoids MAC table walk)
+            _set_cached_cm_index(cmts_ip, mac_address, int(cm_index))
+            
+            # Get CM's Service Group ID via snmpget (direct, no walk needed)
+            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}', "community": community}, timeout=5.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            
+            cm_sg_id = None
+            if result and result.get("result", {}).get("success"):
+                cm_sg_id = result.get("result", {}).get("value")
+            
+            if not cm_sg_id:
+                self.logger.warning(f"No Service Group ID found for CM index {cm_index}")
+                return None
+            
+            # Walk the full fiber node table and match by SG ID directly
+            # This approach works for both E6000 and Cisco without needing US/DS ifIndex mapping
+            # OID format: ...1.12.1.3.{mdIfIndex}.{length}.{ASCII bytes of FN name}.{sgId} = Gauge32: {dsSgId}
+            oid = '1.3.6.1.4.1.4491.2.1.20.1.12.1.3'  # docsIf3MdNodeStatusMdDsSgId
+            self.logger.info(f"Walking full fiber node table to find SG ID {cm_sg_id}: {oid}")
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
+            
+            if result and result.get("result", {}).get("success"):
+                results = result.get("result", {}).get("results", [])
+                self.logger.info(f"Fiber node table has {len(results)} entries, searching for SG ID {cm_sg_id}")
+                
+                # Find fiber node by matching SG ID in the OID index
+                # OID format: ...1.12.1.3.{mdIfIndex}.{length}.{ASCII bytes of FN name}.{sgId}
+                for entry in results:
+                    oid_str = entry.get("oid", "")
+                    
+                    # Check if OID ends with our SG ID
+                    if oid_str.endswith(f".{cm_sg_id}"):
+                        # Parse fiber node name from OID
+                        # Format: ...{mdIfIndex}.{length}.{ASCII bytes}.{sgId}
+                        parts = oid_str.split('.')
+                        try:
+                            # Find the length field (should be after mdIfIndex)
+                            # Walk backwards from sgId to find the name
+                            sg_id_pos = len(parts) - 1
+                            
+                            # The structure before sgId is: mdIfIndex.length.char1.char2...charN
+                            # We need to find the length to know how many chars to read
+                            # Try to find it by looking for a small number (name length) followed by ASCII values
+                            for i in range(sg_id_pos - 1, 1, -1):
+                                potential_length = int(parts[i])
+                                if 1 <= potential_length <= 50:  # Reasonable name length
+                                    # Check if next N parts are valid ASCII
+                                    ascii_parts = parts[i+1:i+1+potential_length]
+                                    if len(ascii_parts) == potential_length:
+                                        try:
+                                            ascii_values = [int(p) for p in ascii_parts]
+                                            if all(32 <= v <= 126 for v in ascii_values):  # Printable ASCII
+                                                fiber_node = ''.join(chr(v) for v in ascii_values)
+                                                self.logger.info(f"Found fiber node for {mac_address}: {fiber_node} (SG ID: {cm_sg_id})")
+                                                return fiber_node
+                                        except ValueError:
+                                            continue
+                            
+                            self.logger.warning(f"Could not parse fiber node name from OID {oid_str}")
+                        except (ValueError, IndexError) as e:
+                            self.logger.warning(f"Failed to parse fiber node from OID {oid_str}: {e}")
+                            continue
+                
+                self.logger.warning(f"No fiber node found matching SG ID {cm_sg_id}")
+            else:
+                self.logger.warning(f"Fiber node table walk failed")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get fiber node: {e}")
+            return None
+
+
+# Router instance for auto-discovery
+router = ChannelStatsRouter().router

@@ -1,0 +1,64 @@
+name: Publish PyPNM To PyPI
+
+on:
+  push:
+    tags:
+      - "v*.*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  tag-check:
+    runs-on: ubuntu-latest
+    outputs:
+      is_ga: ${{ steps.check.outputs.is_ga }}
+      is_on_main: ${{ steps.maincheck.outputs.is_on_main }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate GA tag
+        id: check
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is_ga=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "is_ga=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Validate tag is on main
+        id: maincheck
+        shell: bash
+        run: |
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main"; then
+            echo "is_on_main=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "is_on_main=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+  publish:
+    needs: tag-check
+    if: ${{ needs.tag-check.outputs.is_ga == 'true' && needs.tag-check.outputs.is_on_main == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

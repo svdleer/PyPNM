@@ -1,0 +1,7 @@
+title = "PyPNM gitleaks configuration"
+
+[allowlist]
+description = "Allow known benign secrets in vendor MIBs"
+paths = [
+  "mibs/CH-SP-MIB-PSDEV-C01-060728.txt"
+]

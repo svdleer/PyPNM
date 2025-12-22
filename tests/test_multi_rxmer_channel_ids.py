@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+import pytest
+
+from pypnm.api.routes.advance.common.operation_state import OperationState
+from pypnm.api.routes.advance.multi_rxmer import service as rxmer_service
+from pypnm.api.routes.advance.multi_rxmer.service import (
+    MultiRxMer_Ofdm_Performance_1_Service,
+    MultiRxMerService,
+)
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
+)
+from pypnm.api.routes.common.extended.common_messaging_service import (
+    MessageResponse,
+)
+from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
+from pypnm.lib.types import ChannelId, OperationId
+
+
+@pytest.mark.asyncio
+async def test_multi_rxmer_passes_channel_ids_to_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[DownstreamOfdmParameters | None] = []
+
+    class _FakeRxMerService:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def set_and_go(
+            self,
+            interface_parameters: DownstreamOfdmParameters | None = None,
+        ) -> MessageResponse:
+            captured.append(interface_parameters)
+            return MessageResponse(ServiceStatusCode.SUCCESS)
+
+    monkeypatch.setattr(rxmer_service, "CmDsOfdmRxMerService", _FakeRxMerService)
+
+    interface_parameters = DownstreamOfdmParameters(channel_id=[ChannelId(193)])
+    service = MultiRxMerService(
+        cm=object(),
+        duration=1,
+        interval=1,
+        interface_parameters=interface_parameters,
+    )
+
+    await service._capture_message_response()
+
+    assert captured == [interface_parameters]
+
+
+@pytest.mark.asyncio
+async def test_multi_rxmer_perf_mode_passes_channel_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[DownstreamOfdmParameters | None] = []
+
+    class _FakeRxMerService:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def set_and_go(
+            self,
+            interface_parameters: DownstreamOfdmParameters | None = None,
+        ) -> MessageResponse:
+            captured.append(interface_parameters)
+            return MessageResponse(ServiceStatusCode.SUCCESS)
+
+    class _FakeModProfileService:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def set_and_go(
+            self,
+            interface_parameters: DownstreamOfdmParameters | None = None,
+        ) -> MessageResponse:
+            return MessageResponse(ServiceStatusCode.SUCCESS)
+
+    class _FakeFecSummaryService:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def set_and_go(
+            self,
+            interface_parameters: DownstreamOfdmParameters | None = None,
+        ) -> MessageResponse:
+            return MessageResponse(ServiceStatusCode.SUCCESS)
+
+    monkeypatch.setattr(rxmer_service, "CmDsOfdmRxMerService", _FakeRxMerService)
+    monkeypatch.setattr(rxmer_service, "CmDsOfdmModProfileService", _FakeModProfileService)
+    monkeypatch.setattr(rxmer_service, "CmDsOfdmFecSummaryService", _FakeFecSummaryService)
+
+    interface_parameters = DownstreamOfdmParameters(channel_id=[ChannelId(193)])
+    service = MultiRxMer_Ofdm_Performance_1_Service(
+        cm=object(),
+        duration=1,
+        interval=1,
+        interface_parameters=interface_parameters,
+    )
+
+    operation_id = OperationId("op")
+    service._operation_id = operation_id
+    service._ops[operation_id] = {
+        "group_id": "group",
+        "state": OperationState.RUNNING,
+        "start_time": 0.0,
+        "duration": 1,
+        "interval": 1,
+        "time_remaining": 2,
+        "samples": [],
+        "final_invocation": False,
+    }
+
+    await service._capture_message_response()
+
+    assert captured == [interface_parameters]
