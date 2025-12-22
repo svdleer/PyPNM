@@ -316,6 +316,7 @@ def _write_release_report(
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     report_path = report_dir / f"{REPORT_FILE_PREFIX}-{version}-{timestamp}.md"
     files = _collect_commit_files(commit)
+    sorted_files = sorted(files)
     counts = _summarize_sections(files)
     mode = report_mode
 
@@ -332,7 +333,14 @@ def _write_release_report(
         "",
         _render_markdown_table(counts),
         "",
+        "## Files (commit)",
+        "",
     ]
+    if sorted_files:
+        lines.extend(f"- `{path}`" for path in sorted_files)
+    else:
+        lines.append("_No files detected._")
+    lines.append("")
     if extra_sections:
         lines.extend(extra_sections)
         if lines[-1] != "":
