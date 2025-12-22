@@ -6,7 +6,7 @@ Use it for throughput testing or simple HA without per-namespace isolation.
 ## Deploy (or update) and scale
 
 ```bash
-TAG="v1.0.2.8"
+TAG="v1.0.2.9"
 NAMESPACE="pypnm-default"
 REPLICAS="10"
 

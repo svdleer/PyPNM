@@ -79,7 +79,7 @@
                     "host": "localhost",
                     "port": 22,
                     "user": "dev01",
-                    "password_enc": "ENC[v1]:gAAAAABpPZXk8AyJkM9qfr32--dMZmTfuZMbosStbqHcQ7ScuDlr-mWIs0yzmU5OJueulRmiRQLRKCS0btK7cHYT0uNgSKPp4Q==",
+                    "password_enc": "",
                     "private_key_path": "~/.ssh/id_rsa_pypnm",
                     "remote_dir": "/srv/tftp"
                 },
