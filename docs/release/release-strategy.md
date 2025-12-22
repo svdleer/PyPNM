@@ -145,7 +145,7 @@ The `tools/release/release.py` script is the primary entry point for performing 
 * Creating a release commit.  
 * Tagging the release.  
 * Pushing branch and tags to `origin`.
-* Writing a markdown release report under `release-reports/` with a summary table of the last commit.
+* Writing a markdown release report under `release-reports/` with a summary table of the last commit and the workflow inventory.
 
 You typically run this script directly; it internally handles all version file changes.
 

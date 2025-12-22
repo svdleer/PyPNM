@@ -21,7 +21,7 @@ docker-logs:
 deploy-bundle:
 	mkdir -p $(BUILD_DIR)
 	tar -czf $(BUILD_DIR)/pypnm-deploy-$(DEPLOY_VERSION).tar.gz \
-		-C deploy README.md install.sh \
+		-C deploy/docker README.md install.sh \
 		config/system.json.template \
 		compose/docker-compose.yml \
 		compose/.env.example

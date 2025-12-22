@@ -23,6 +23,7 @@ PYPROJECT_FILE_PATH: Final[Path]         = Path("pyproject.toml")
 README_FILE_PATH: Final[Path]            = Path("README.md")
 DOCS_ROOT: Final[Path]                   = Path("docs")
 README_TAG_PATTERN: Final[re.Pattern[str]] = re.compile(r'TAG="v\d+\.\d+\.\d+\.\d+(?:-rc\d+)?"')
+WORKFLOWS_DIR: Final[Path]               = Path(".github") / "workflows"
 
 VERSION_PART_SEPARATOR: Final[str]       = "."
 EXPECTED_VERSION_PARTS: Final[int]       = 4
@@ -348,6 +349,32 @@ def _render_markdown_table(counts: dict[str, int]) -> str:
     return "\n".join(lines)
 
 
+def _read_workflow_name(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return path.name
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("name:"):
+            return stripped.split(":", 1)[1].strip() or path.name
+
+    return path.name
+
+
+def _collect_workflows() -> list[tuple[str, str]]:
+    if not WORKFLOWS_DIR.exists():
+        return []
+
+    workflows: list[tuple[str, str]] = []
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        workflows.append((_read_workflow_name(path), os.path.relpath(path, Path.cwd())))
+    for path in sorted(WORKFLOWS_DIR.glob("*.yaml")):
+        workflows.append((_read_workflow_name(path), os.path.relpath(path, Path.cwd())))
+    return workflows
+
+
 def _write_release_report(
     commit: str,
     version: str,
@@ -363,6 +390,7 @@ def _write_release_report(
     files = _collect_commit_files(commit)
     sorted_files = sorted(files)
     counts = _summarize_sections(files)
+    workflows = _collect_workflows()
     mode = report_mode
 
     lines = [
@@ -374,13 +402,24 @@ def _write_release_report(
         f"- Release version: `{version}`",
         f"- Release tag: `{tag_name}`",
         "",
-        "## Change summary (commit)",
+        "## Workflows",
+        "",
+    ]
+    if workflows:
+        lines.extend(f"- `{name}` (`{path}`)" for name, path in workflows)
+    else:
+        lines.append("_No workflows found._")
+    lines.extend(
+        [
+            "",
+            "## Change summary (commit)",
         "",
         _render_markdown_table(counts),
         "",
         "## Files (commit)",
         "",
-    ]
+        ]
+    )
     if sorted_files:
         lines.extend(f"- `{path}`" for path in sorted_files)
     else:
