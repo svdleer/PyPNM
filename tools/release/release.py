@@ -356,15 +356,16 @@ def _write_release_report(
 
     if RELEASE_LOG_DIR:
         log_files = sorted(RELEASE_LOG_DIR.glob("*.log"))
+        log_dir_display = os.path.relpath(RELEASE_LOG_DIR, Path.cwd())
         lines.extend(
             [
                 "## Failure logs",
                 "",
-                f"- Log directory: `{RELEASE_LOG_DIR}`",
+                f"- Log directory: `{log_dir_display}`",
             ]
         )
         if log_files:
-            lines.extend(f"- `{log_file}`" for log_file in log_files)
+            lines.extend(f"- `{os.path.relpath(log_file, Path.cwd())}`" for log_file in log_files)
         else:
             lines.append("- _No failure logs generated._")
         lines.append("")
