@@ -22,7 +22,7 @@ class BaseDeviceResponse(BaseModel):
         message (str, optional): Additional information or error details.
     """
 
-    mac_address: MacAddressStr                              = Field(default=SCSC.default_mac_address, description="MAC address of the cable modem, validated and normalized")
+    mac_address: MacAddressStr                              = Field(default_factory=SCSC.default_mac_address, description="MAC address of the cable modem, validated and normalized")
     status: ServiceStatusCode | OperationState | str   = Field(default="success", description="Status of the operation (e.g., 'success', 'error')")
     message: str | None                                  = Field(default=None, description="Additional informational or error message")
 
