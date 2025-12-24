@@ -123,7 +123,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo ">> Health check..."
-PF_LOG="/tmp/pypnm-k8s-pf.log"
+PF_LOG_DIR="release-reports/logs"
+PF_LOG="${PF_LOG_DIR}/pypnm-k8s-pf.log"
 PF_REQUESTED_PORT=""
 PF_LOCAL_PORT=""
 PF_PID=""
@@ -132,6 +133,7 @@ start_port_forward() {
   local port_spec="$1"
   PF_REQUESTED_PORT="${port_spec}"
   PF_LOCAL_PORT=""
+  mkdir -p "${PF_LOG_DIR}"
   : > "${PF_LOG}"
   kubectl port-forward deploy/pypnm-api "${port_spec}:8000" >"${PF_LOG}" 2>&1 &
   PF_PID=$!
