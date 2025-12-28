@@ -10,7 +10,15 @@ from typing import cast
 from pypnm.config.config_manager import ConfigManager
 from pypnm.lib.mac_address import MacAddress
 from pypnm.lib.secret.crypto_manager import SecretCryptoError, SecretCryptoManager
-from pypnm.lib.types import FileNameStr, InetAddressStr, IPv4Str, IPv6Str, MacAddressStr
+from pypnm.lib.types import (
+    FileNameStr,
+    InetAddressStr,
+    IPv4Str,
+    IPv6Str,
+    MacAddressStr,
+    SnmpReadCommunity,
+    SnmpWriteCommunity,
+)
 
 
 class SystemConfigSettings:
@@ -32,7 +40,7 @@ class SystemConfigSettings:
     _DEFAULT_LOG_DIR: str                   = "logs"
     _DEFAULT_LOG_FILENAME: str              = "pypnm.log"
     _DEFAULT_SNMP_READ_COMMUNITY: str       = "public"
-    _DEFAULT_SNMP_WRITE_COMMUNITY: str      = "private"
+    _DEFAULT_SNMP_WRITE_COMMUNITY: str      = ""
     _DEFAULT_PNM_DIR: str                   = ".data/pnm"
     _DEFAULT_CSV_DIR: str                   = ".data/csv"
     _DEFAULT_JSON_DIR: str                  = ".data/json"
@@ -294,12 +302,57 @@ class SystemConfigSettings:
 
 
     @classmethod
-    def snmp_read_community(cls) -> str:
-        return cls._get_str(cls._DEFAULT_SNMP_READ_COMMUNITY, "SNMP", "version", "2c", "read_community")
+    def snmp_read_community(cls) -> SnmpReadCommunity:
+        value = cls._cfg.get("SNMP", "version", "2c", "read_community")
+        if value is not None:
+            if isinstance(value, str) and value.strip() != "":
+                return cast(SnmpReadCommunity, value)
+            if not isinstance(value, str):
+                coerced = str(value)
+                cls._logger.error(
+                    "Non-string configuration value for '%s': %r; using coerced '%s'",
+                    cls._config_path("SNMP", "version", "2c", "read_community"),
+                    value,
+                    coerced,
+                )
+                return cast(SnmpReadCommunity, coerced)
+        legacy = cls._cfg.get("SNMP", "version", "2c", "community")
+        if legacy is not None:
+            if isinstance(legacy, str) and legacy.strip() != "":
+                return cast(SnmpReadCommunity, legacy)
+            if not isinstance(legacy, str):
+                coerced = str(legacy)
+                cls._logger.error(
+                    "Non-string configuration value for '%s': %r; using coerced '%s'",
+                    cls._config_path("SNMP", "version", "2c", "community"),
+                    legacy,
+                    coerced,
+                )
+                return cast(SnmpReadCommunity, coerced)
+        return cast(
+            SnmpReadCommunity,
+            cls._get_str(cls._DEFAULT_SNMP_READ_COMMUNITY, "SNMP", "version", "2c", "read_community"),
+        )
 
     @classmethod
-    def snmp_write_community(cls) -> str:
-        return cls._get_str(cls._DEFAULT_SNMP_WRITE_COMMUNITY, "SNMP", "version", "2c", "write_community")
+    def snmp_write_community(cls) -> SnmpWriteCommunity:
+        value = cls._cfg.get("SNMP", "version", "2c", "write_community")
+        if value is not None:
+            if isinstance(value, str) and value.strip() != "":
+                return cast(SnmpWriteCommunity, value)
+            if not isinstance(value, str):
+                coerced = str(value)
+                cls._logger.error(
+                    "Non-string configuration value for '%s': %r; using coerced '%s'",
+                    cls._config_path("SNMP", "version", "2c", "write_community"),
+                    value,
+                    coerced,
+                )
+                return cast(SnmpWriteCommunity, coerced)
+        return cast(
+            SnmpWriteCommunity,
+            cls._get_str(cls._DEFAULT_SNMP_WRITE_COMMUNITY, "SNMP", "version", "2c", "write_community"),
+        )
 
     # SNMP v3 settings
 

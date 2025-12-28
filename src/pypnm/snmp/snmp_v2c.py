@@ -25,7 +25,7 @@ from pypnm.config.pnm_config_manager import SystemConfigSettings
 from pypnm.lib.constants import T
 from pypnm.lib.inet import Inet
 from pypnm.lib.inet_utils import InetGenerate
-from pypnm.lib.types import InetAddressStr, InterfaceIndex, SnmpIndex
+from pypnm.lib.types import InetAddressStr, InterfaceIndex, SnmpIndex, SnmpReadCommunity, SnmpWriteCommunity
 from pypnm.snmp.compiled_oids import COMPILED_OIDS
 from pypnm.snmp.modules import InetAddressType
 
@@ -37,7 +37,8 @@ class Snmp_v2c:
     Attributes:
         host (str): Hostname or IP address of the SNMP agent.
         port (int): Port number used for SNMP (default is 161).
-        community (str): Community string for SNMP authentication (default 'private').
+        read_community (str): Community string for SNMP GET/WALK (default from config).
+        write_community (str): Community string for SNMP SET (default from config).
         _snmp_engine (SnmpEngine): Instance of pysnmp SnmpEngine.
 
     Class Attributes:
@@ -60,23 +61,45 @@ class Snmp_v2c:
 
     SNMP_PORT = 161
 
-    def __init__(self, host: Inet,
-                 community: str = SystemConfigSettings.snmp_write_community(),
-                 port: int      = SNMP_PORT,
-                 timeout: int   = SystemConfigSettings.snmp_timeout(),
-                 retries: int   = SystemConfigSettings.snmp_retries()) -> None:
+    def __init__(
+        self,
+        host: Inet,
+        community: str | None = None,
+        read_community: SnmpReadCommunity | None = None,
+        write_community: SnmpWriteCommunity | None = None,
+        port: int = SNMP_PORT,
+        timeout: int = SystemConfigSettings.snmp_timeout(),
+        retries: int = SystemConfigSettings.snmp_retries(),
+    ) -> None:
         """
         Initializes the SNMPv2c client.
 
         Args:
             host (Inet): Host address of the SNMP device.
-            community (str): Community string for SNMP access.
+            community (str | None): Legacy community string for SNMP access.
+            read_community (SnmpReadCommunity | None): Read community string override.
+            write_community (SnmpWriteCommunity | None): Write community string override.
             port (int): SNMP port (default 161).
         """
         self.logger     = logging.getLogger(self.__class__.__name__)
         self._host      = host.inet
         self._port      = port
-        self._community = community
+        if read_community is not None:
+            self._read_community = str(read_community)
+        elif community is not None:
+            self._read_community = str(community)
+        else:
+            self._read_community = str(SystemConfigSettings.snmp_read_community())
+
+        if write_community is not None:
+            self._write_community = str(write_community)
+        elif community is not None:
+            self._write_community = str(community)
+        else:
+            self._write_community = str(SystemConfigSettings.snmp_write_community())
+
+        if self._write_community == "":
+            self._write_community = self._read_community
         self._timeout   = timeout
         self._retries   = retries
         self._snmp_engine = SnmpEngine()
@@ -115,7 +138,7 @@ class Snmp_v2c:
 
         errorIndication, errorStatus, errorIndex, varBinds = await get_cmd(
             self._snmp_engine,
-            CommunityData(self._community, mpModel=1),
+            CommunityData(self._read_community, mpModel=1),
             await UdpTransportTarget.create((self._host, self._port),
                                             timeout=timeout_s,     # seconds
                                             retries=retries_n,     # count
@@ -155,7 +178,7 @@ class Snmp_v2c:
 
         objects = walk_cmd(
             self._snmp_engine,
-            CommunityData(self._community, mpModel=1),
+            CommunityData(self._read_community, mpModel=1),
             transport,
             ContextData(),
             obj
@@ -224,7 +247,7 @@ class Snmp_v2c:
 
         errorIndication, errorStatus, errorIndex, varBinds = await set_cmd(
             self._snmp_engine,
-            CommunityData(self._community, mpModel=1),
+            CommunityData(self._write_community, mpModel=1),
             transport,
             ContextData(),
             ObjectType(ObjectIdentity(oid), snmp_value),

@@ -340,3 +340,68 @@ def test_sftp_port_and_private_key_defaults_and_logs(
     text = caplog.text
     assert "Missing configuration value for 'PnmFileRetrieval.retrival_method.methods.sftp.port'" in text
     assert "Missing configuration value for 'PnmFileRetrieval.retrival_method.methods.sftp.private_key_path'" in text
+
+
+def test_snmp_read_community_defaults_to_public(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConfigManager()
+    monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
+
+    assert SystemConfigSettings.snmp_read_community() == "public"
+
+
+def test_snmp_write_community_defaults_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConfigManager()
+    monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
+
+    assert SystemConfigSettings.snmp_write_community() == ""
+
+
+def test_snmp_read_community_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConfigManager(
+        {"SNMP.version.2c.community": "legacy"}
+    )
+    monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
+
+    assert SystemConfigSettings.snmp_read_community() == "legacy"
+
+
+def test_snmp_read_community_prefers_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConfigManager(
+        {
+            "SNMP.version.2c.read_community": "read",
+            "SNMP.version.2c.community": "legacy",
+        }
+    )
+    monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
+
+    assert SystemConfigSettings.snmp_read_community() == "read"
+
+
+def test_snmp_write_community_does_not_use_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConfigManager(
+        {"SNMP.version.2c.community": "legacy"}
+    )
+    monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
+
+    assert SystemConfigSettings.snmp_write_community() == ""
+
+
+def test_snmp_write_community_uses_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConfigManager(
+        {"SNMP.version.2c.write_community": "private"}
+    )
+    monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
+
+    assert SystemConfigSettings.snmp_write_community() == "private"
