@@ -124,6 +124,8 @@ EntryIndex      = NewType("EntryIndex", int)
 
 # Network addressing (store as plain strings; validate elsewhere)
 HostNameStr     = NewType("HostNameStr", str)
+SnmpReadCommunity  = NewType("SnmpReadCommunity", str)
+SnmpWriteCommunity = NewType("SnmpWriteCommunity", str)
 MacAddressStr   = NewType("MacAddressStr", str)         # aa:bb:cc:dd:ee:ff | aa-bb-cc-dd-ee-ff | aabb.ccdd.eeff | aabbccddeeff | aabbcc:ddeeff |
 InetAddressStr  = NewType("InetAddressStr", str)        # 192.168.0.1 | 2001:db8::1
 IPv4Str         = NewType("IPv4Str", InetAddressStr)    # 192.168.0.1
@@ -204,6 +206,7 @@ __all__ = [
     "FrequencyHz", "BandwidthHz", "PowerdBmV", "PowerdB", "MERdB", "SNRdB", "SNRln",
     "ChannelId", "SubcarrierId",
     "OidStr", "OidNumTuple",
+    "SnmpReadCommunity", "SnmpWriteCommunity",
     "MacAddressStr", "IPv4Str", "IPv6Str",
     "FileStem", "FileExt", "FileName",
     # analysis tuples / series
