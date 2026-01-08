@@ -62,11 +62,12 @@
                 },
                 "sftp": {
                     "host": "172.19.8.28",
-                    "password_enc": "ENC[v1]:gAAAAABpXJq7oBMHXlJW3l4zACQDGViPYVi4-_suImey4NokmXHAlKdCWmIBiXh9oNty_ZXtsMtsYH6_fJ-VPQzWmV5IeGHc5A==",
+                    "password_enc": "",
                     "port": 22,
                     "private_key_path": "~/.ssh/id_rsa_pypnm",
                     "remote_dir": "/srv/tftp",
-                    "user": "dev01"
+                    "user": "dev01",
+                    "password": ""
                 },
                 "tftp": {
                     "host": "localhost",
