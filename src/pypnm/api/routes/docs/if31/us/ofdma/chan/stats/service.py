@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ import logging
 
 from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_connect_request import (
     SNMPConfig,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
+    SNMPv2c,
 )
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.docsis.data_type.DocsIf31CmUsOfdmaChanEntry import DocsIf31CmUsOfdmaChanEntry
@@ -20,7 +23,7 @@ class UsOfdmChannelService:
                  ip_address: InetAddressStr,
                  snmp_config: SNMPConfig | None = None) -> None:
         if snmp_config is None:
-            snmp_config = SNMPConfig()
+            snmp_config = SNMPConfig(snmp_v2c=SNMPv2c(community=None))
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cm = CableModem(mac_address=MacAddress(mac_address),
                              inet=Inet(ip_address),

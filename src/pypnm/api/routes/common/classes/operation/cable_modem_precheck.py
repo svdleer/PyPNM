@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ import logging
 from collections.abc import Iterable
 
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
-from pypnm.api.routes.docs.dev.service import SNMPConfig
+from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
+    SNMPConfig,
+    SNMPv2c,
+)
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.docsis.cm_snmp_operation import DocsPnmCmCtlStatus
 from pypnm.docsis.data_type.ClabsDocsisVersion import ClabsDocsisVersion
@@ -75,7 +78,7 @@ class CableModemServicePreCheck:
 
             if snmp_config is None:
                 self.logger.debug("No SNMPConfig provided, using default settings")
-                snmp_config = SNMPConfig()
+                snmp_config = SNMPConfig(snmp_v2c=SNMPv2c(community=None))
 
             self.cm = CableModem(
                 mac_address     =   MacAddress(mac_address),

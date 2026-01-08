@@ -3,6 +3,7 @@
 Shared Request Body Patterns For PyPNM Endpoints.
 
 When using Swagger UI, many parameters auto-fill from system settings. See [System Configuration](../../../system/system-config.md).
+For fields that accept defaults, use `null` to request the system.json value. Blank strings are rejected.
 
 ## PNM Operations With File Retrieval (TFTP)
 
@@ -15,7 +16,7 @@ Use this when the endpoint retrieves a file (for example, an RxMER capture writt
     "ip_address": "192.168.0.100",
     "pnm_parameters": {
       "tftp": {
-        "ipv4": "192.168.0.10",
+        "ipv4": null,
         "ipv6": "2001:db8::10"
       },
       "capture": {
@@ -24,7 +25,7 @@ Use this when the endpoint retrieves a file (for example, an RxMER capture writt
     },
     "snmp": {
       "snmpV2C": {
-        "community": "private"
+        "community": null
       }
     }
   }
@@ -60,10 +61,10 @@ Use this when the endpoint performs SNMP calls only.
 
 ### TFTP (Only For File-Retrieval Endpoints)
 
-| Field                      | Type   | Notes                    |
-| -------------------------- | ------ | ------------------------ |
-| `pnm_parameters.tftp.ipv4` | string | IPv4 of the TFTP server. |
-| `pnm_parameters.tftp.ipv6` | string | IPv6 of the TFTP server. |
+| Field                      | Type         | Notes                                            |
+| -------------------------- | ------------ | ------------------------------------------------ |
+| `pnm_parameters.tftp.ipv4` | string\|null | IPv4 of the TFTP server; null uses system.json. |
+| `pnm_parameters.tftp.ipv6` | string\|null | IPv6 of the TFTP server; null uses system.json. |
 
 ### Capture Filters (Optional)
 
@@ -75,9 +76,9 @@ Use this when the endpoint performs SNMP calls only.
 
 #### SNMPv2c
 
-| Field                    | Type   | Notes                     |
-| ------------------------ | ------ | ------------------------- |
-| `snmp.snmpV2C.community` | string | Read/write community key. |
+| Field                    | Type         | Notes                                            |
+| ------------------------ | ------------ | ------------------------------------------------ |
+| `snmp.snmpV2C.community` | string\|null | Read/write community key; null uses system.json. |
 
 #### SNMPv3
 
@@ -97,3 +98,4 @@ Use this when the endpoint performs SNMP calls only.
 * For **analysis** endpoints, `pnm_parameters` is **top-level** (not nested under `cable_modem`). Example:
   `{ "cable_modem": {...}, "pnm_parameters": {...}, "analysis": {...}, "output": {...} }`.
 * Choose **either** SNMPv2c **or** SNMPv3 fields—do not mix both in a single request.
+* For TFTP and SNMP override fields, `null` requests system.json defaults and blank strings are invalid.

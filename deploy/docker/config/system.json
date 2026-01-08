@@ -1,4 +1,11 @@
 {
+    "CmtsOrchestrator": {
+        "adapter": {
+            "community": "cmtspublic",
+            "hostname": "172.19.122.228",
+            "write_community": "cmtspublic"
+        }
+    },
     "FastApiRequestDefault": {
         "ip_address": "192.168.0.1",
         "mac_address": "aa:bb:cc:dd:ee:ff"
@@ -62,12 +69,12 @@
                 },
                 "sftp": {
                     "host": "172.19.8.28",
+                    "password": "",
                     "password_enc": "",
                     "port": 22,
                     "private_key_path": "~/.ssh/id_rsa_pypnm",
                     "remote_dir": "/srv/tftp",
-                    "user": "dev01",
-                    "password": ""
+                    "user": "dev01"
                 },
                 "tftp": {
                     "host": "localhost",
@@ -126,11 +133,6 @@
     "pypnm-cmts": {
         "cmts": [
             {
-                "device": {
-                    "hostname": "172.19.122.228",
-                    "model": "",
-                    "vendor": ""
-                },
                 "SNMP": {
                     "timeouts": {
                         "request_seconds": 5,
@@ -138,17 +140,17 @@
                     },
                     "version": {
                         "2c": {
-                            "port": 161,
                             "enable": true,
+                            "port": 161,
                             "read_community": "cmtspublic",
                             "retries": 3,
                             "write_community": "cmtspublic"
                         },
                         "3": {
-                            "enable": false,
-                            "port": 161,
                             "authPassword": "",
                             "authProtocol": "SHA",
+                            "enable": false,
+                            "port": 161,
                             "privPassword": "",
                             "privProtocol": "AES",
                             "retries": 3,
@@ -156,15 +158,13 @@
                             "username": "user"
                         }
                     }
+                },
+                "device": {
+                    "hostname": "172.19.122.228",
+                    "model": "",
+                    "vendor": ""
                 }
             }
         ]
-    },
-    "CmtsOrchestrator": {
-        "adapter": {
-            "hostname": "172.19.122.228",
-            "community": "cmtspublic",
-            "write_community": "cmtspublic"
-        }
     }
 }

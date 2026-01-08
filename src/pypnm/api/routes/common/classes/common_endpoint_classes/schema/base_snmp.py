@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 """
 Module: common_endpoint_classes.schema.base_snmp
@@ -23,13 +23,18 @@ class SNMPv2c(BaseModel):
     Attributes:
         community (str): Write community string. Must not be blank.
     """
-    community: str = Field(default=SCSC.snmp_write_community(), description=f"Write community string (default: {SCSC.snmp_write_community()})")
+    community: str | None = Field(
+        ...,
+        description=f"Write community string (null uses {SCSC.snmp_write_community()})",
+    )
 
     @field_validator("community")
-    def community_not_blank(cls, v: str) -> str:
+    def community_not_blank(cls, v: str | None) -> str | None:
         """
         Validate that the community string is not blank.
         """
+        if v is None:
+            return v
         if not v.strip():
             raise ValueError("SNMPv2c.community must not be blank")
         return v
@@ -72,7 +77,7 @@ class SNMPConfig(BaseModel):
     SNMP configuration model supporting both v2c and optional v3 settings.
     """
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-    snmp_v2c: SNMPv2c   = Field(default_factory=SNMPv2c, description="SNMP v2c settings")
+    snmp_v2c: SNMPv2c   = Field(..., description="SNMP v2c settings")
 
     if SCSC.snmp_v3_enable():
         snmp_v3: SNMPv3     = Field(default_factory=SNMPv3, description="SNMP v3 settings")

@@ -30,6 +30,7 @@ Refer to [Common → Request](../../../common/request.md).
 * The `primative` section is a normalized representation of the raw PNM file with added statistics (e.g., mean, std, kurtosis).
 * The `measurement_stats` section summarizes one-shot SNMP statistics collected at capture-time (useful for dashboards).
 * When `pnm_parameters.capture.channel_ids` is omitted or empty, RxMER captures all available OFDM channels.
+* For TFTP and SNMP overrides, use `null` to request system.json defaults; blank strings are rejected.
 
 ### Example Request
 
@@ -40,7 +41,7 @@ Refer to [Common → Request](../../../common/request.md).
     "ip_address": "192.168.0.100",
     "pnm_parameters": {
       "tftp": {
-        "ipv4": "192.168.0.10",
+        "ipv4": null,
         "ipv6": "2001:db8::10"
       },
       "capture": {
@@ -49,7 +50,7 @@ Refer to [Common → Request](../../../common/request.md).
     },
     "snmp": {
       "snmpV2C": {
-        "community": "private"
+        "community": null
       }
     }
   },

@@ -22,15 +22,18 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import (
     PnmAnalysisResponse,
     PnmSingleCaptureRequest,
 )
+from pypnm.api.routes.common.classes.common_endpoint_classes.request_defaults import (
+    RequestDefaultsResolver,
+)
 from pypnm.api.routes.common.classes.common_endpoint_classes.snmp.schemas import (
     SnmpResponse,
-)
-from pypnm.api.routes.common.extended.common_measure_schema import (
-    DownstreamOfdmParameters,
 )
 from pypnm.api.routes.common.classes.file_capture.file_type import FileType
 from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
     CableModemServicePreCheck,
+)
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
 )
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
 from pypnm.api.routes.common.extended.common_process_service import CommonProcessService
@@ -70,10 +73,8 @@ class RxMerRouter:
             """
             mac: MacAddressStr = request.cable_modem.mac_address
             ip: InetAddressStr = request.cable_modem.ip_address
-            community: str = request.cable_modem.snmp.snmp_v2c.community
-            tftp_server_ipv4 = Inet(cast(InetAddressStr, request.cable_modem.pnm_parameters.tftp.ipv4))
-            tftp_server_ipv6 = Inet(cast(InetAddressStr, request.cable_modem.pnm_parameters.tftp.ipv6))
-            tftp_servers = (tftp_server_ipv4, tftp_server_ipv6)
+            community = RequestDefaultsResolver.resolve_snmp_community(request.cable_modem.snmp)
+            tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
 
             self.logger.info(f"Starting RxMER measurement for MAC: {mac}, IP: {ip}")
 

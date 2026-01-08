@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ from fastapi import HTTPException
 
 from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_connect_request import (
     SNMPConfig,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
+    SNMPv2c,
 )
 from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import PnmResponse
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
@@ -26,7 +29,7 @@ class CmDocsDevService:
                  ip_address: InetAddressStr,
                  snmp_config: SNMPConfig | None = None) -> None:
         if snmp_config is None:
-            snmp_config = SNMPConfig()
+            snmp_config = SNMPConfig(snmp_v2c=SNMPv2c(community=None))
         self._mac = MacAddress(mac_address)
         self._ip = Inet(ip_address)
         self._cm = CableModem(mac_address   =   self._mac,

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from pypnm.api.routes.advance.common.operation_state import OperationState
 from pypnm.api.routes.common.classes.common_endpoint_classes.common.enum import (
@@ -13,6 +13,9 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.common.enum import 
 from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
     SNMPConfig,
 )
+from pypnm.api.routes.common.classes.common_endpoint_classes.request_validation import (
+    RequestListNormalizer,
+)
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.lib.mac_address import MacAddress, MacAddressFormat
@@ -21,15 +24,24 @@ from pypnm.lib.types import ChannelId, InetAddressStr, IPv4Str, IPv6Str, MacAddr
 
 default_mac: MacAddressStr = SystemConfigSettings.default_mac_address()
 default_ip: InetAddressStr = SystemConfigSettings.default_ip_address()
-default_tftp_ipv4: IPv4Str = SystemConfigSettings.bulk_tftp_ip_v4()
-default_tftp_ipv6: IPv6Str = SystemConfigSettings.bulk_tftp_ip_v6()
+TFTP_IPV4_DEFAULT_DESC = "null uses system.json PnmBulkDataTransfer.tftp.ip_v4"
+TFTP_IPV6_DEFAULT_DESC = "null uses system.json PnmBulkDataTransfer.tftp.ip_v6"
+ERROR_TFTP_BLANK = "tftp.{field} must be null or a valid IP address"
 
 class CommonOutput(BaseModel):
     type: OutputType = Field(default=OutputType.JSON, description="Desired output type for analysis results")
 
 class TftpConfig(BaseModel):
-    ipv4: IPv4Str | None = Field(default=default_tftp_ipv4, description="TFTP server IPv4 address")
-    ipv6: IPv6Str | None = Field(default=default_tftp_ipv6, description="TFTP server IPv6 address")
+    ipv4: IPv4Str | None = Field(..., description=f"TFTP server IPv4 address ({TFTP_IPV4_DEFAULT_DESC})")
+    ipv6: IPv6Str | None = Field(..., description=f"TFTP server IPv6 address ({TFTP_IPV6_DEFAULT_DESC})")
+
+    @field_validator("ipv4", "ipv6", mode="before")
+    def _reject_blank(cls, v: object, info: ValidationInfo) -> object:
+        if v is None:
+            return v
+        if isinstance(v, str) and v.strip() == "":
+            raise ValueError(ERROR_TFTP_BLANK.format(field=info.field_name))
+        return v
 
 class PnmCaptureConfig(BaseModel):
     channel_ids: list[ChannelId] | None = Field(
@@ -37,8 +49,12 @@ class PnmCaptureConfig(BaseModel):
         description="Optional channel id list for targeted captures (empty or missing means all channels).",
     )
 
+    @field_validator("channel_ids", mode="after")
+    def _dedupe_channel_ids(cls, v: list[ChannelId] | None) -> list[ChannelId] | None:
+        return RequestListNormalizer.dedupe_preserve_order(v)
+
 class PnmParameters(BaseModel):
-    tftp: TftpConfig = Field(default_factory=TftpConfig, description="TFTP configuration")
+    tftp: TftpConfig = Field(..., description="TFTP configuration")
     capture: PnmCaptureConfig = Field(default_factory=PnmCaptureConfig, description="Capture parameters")
 
 

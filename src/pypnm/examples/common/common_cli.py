@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -213,8 +213,8 @@ def send_cable_modem_pnm_and_analysis_request(
     mac: str,
     ip: str,
     community: str,
-    tftp_ipv4: str,
-    tftp_ipv6: str,
+    tftp_ipv4: str | None,
+    tftp_ipv6: str | None,
     analysis: Dict[str, Any],
     capture_parameters: Dict[str, Any] | None = None,
 ) -> int:
@@ -235,13 +235,16 @@ def send_cable_modem_pnm_and_analysis_request(
 
     base_payload: CableModemRequestPayload = build_cable_modem_payload(mac, ip, community)
 
+    tftp_ipv4_value = tftp_ipv4 if tftp_ipv4 and tftp_ipv4.strip() else None
+    tftp_ipv6_value = tftp_ipv6 if tftp_ipv6 and tftp_ipv6.strip() else None
+
     body: Dict[str, Any] = {
         "cable_modem": {
             **base_payload["cable_modem"],
             "pnm_parameters": {
                 "tftp": {
-                    "ipv4": tftp_ipv4,
-                    "ipv6": tftp_ipv6,
+                    "ipv4": tftp_ipv4_value,
+                    "ipv6": tftp_ipv6_value,
                 },
             },
         },
