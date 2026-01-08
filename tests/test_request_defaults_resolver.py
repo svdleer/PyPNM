@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
 
-from pypnm.api.main import app
+from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import (
+    PnmSingleCaptureRequest,
+)
 from pypnm.api.routes.common.classes.common_endpoint_classes.common_req_resp import (
     PnmCaptureConfig,
     TftpConfig,
@@ -66,7 +67,6 @@ def test_resolver_ignores_request_when_not_tftp(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_rxmer_request_rejects_blank_tftp_ipv4() -> None:
-    client = TestClient(app)
     payload = {
         "cable_modem": {
             "mac_address": "aa:bb:cc:dd:ee:ff",
@@ -98,9 +98,8 @@ def test_rxmer_request_rejects_blank_tftp_ipv4() -> None:
             },
         },
     }
-
-    response = client.post("/docs/pnm/ds/ofdm/rxMer/getCapture", json=payload)
-    assert response.status_code == 422
+    with pytest.raises(ValidationError):
+        PnmSingleCaptureRequest.model_validate(payload)
 
 
 def test_channel_ids_dedupe_preserves_order() -> None:
