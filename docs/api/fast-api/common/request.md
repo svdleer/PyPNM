@@ -17,6 +17,9 @@ Use this when the endpoint retrieves a file (for example, an RxMER capture writt
       "tftp": {
         "ipv4": "192.168.0.10",
         "ipv6": "2001:db8::10"
+      },
+      "capture": {
+        "channel_ids": []
       }
     },
     "snmp": {
@@ -61,6 +64,12 @@ Use this when the endpoint performs SNMP calls only.
 | -------------------------- | ------ | ------------------------ |
 | `pnm_parameters.tftp.ipv4` | string | IPv4 of the TFTP server. |
 | `pnm_parameters.tftp.ipv6` | string | IPv6 of the TFTP server. |
+
+### Capture Filters (Optional)
+
+| Field                                | Type     | Notes                                                              |
+| ------------------------------------ | -------- | ------------------------------------------------------------------ |
+| `pnm_parameters.capture.channel_ids` | int[]    | Optional list of channel IDs to target. Empty or missing means all. |
 
 ### SNMP (Choose One: v2c Or v3)
 

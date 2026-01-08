@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import (
 from pypnm.api.routes.common.classes.common_endpoint_classes.snmp.schemas import (
     SnmpResponse,
 )
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
+)
 from pypnm.api.routes.common.classes.file_capture.file_type import FileType
 from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
     CableModemServicePreCheck,
@@ -40,7 +43,7 @@ from pypnm.lib.dict_utils import DictGenerate
 from pypnm.lib.fastapi_constants import FAST_API_RESPONSE
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import InetAddressStr, MacAddressStr
+from pypnm.lib.types import ChannelId, InetAddressStr, MacAddressStr
 
 
 class RxMerRouter:
@@ -84,14 +87,17 @@ class RxMerRouter:
                 return SnmpResponse(mac_address=mac, status=status, message=msg)
 
             service: CmDsOfdmRxMerService = CmDsOfdmRxMerService(cm, tftp_servers)
-            msg_rsp: MessageResponse = await service.set_and_go()
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
+            interface_parameters = self._resolve_interface_parameters(channel_ids)
+            msg_rsp: MessageResponse = await service.set_and_go(interface_parameters=interface_parameters)
 
             if msg_rsp.status != ServiceStatusCode.SUCCESS:
                 err = "Unable to complete RxMER measurement."
                 return SnmpResponse(mac_address=mac, message=err, status=msg_rsp.status)
 
             measurement_stats:list[DocsPnmCmDsOfdmRxMerEntry] = \
-                cast(list[DocsPnmCmDsOfdmRxMerEntry], await service.getPnmMeasurementStatistics())
+                cast(list[DocsPnmCmDsOfdmRxMerEntry],
+                    await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
 
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()
@@ -125,6 +131,14 @@ class RxMerRouter:
                     mac_address =   mac,
                     status      =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
                     data        =   {},)
+
+    @staticmethod
+    def _resolve_interface_parameters(
+        channel_ids: list[ChannelId] | None,
+    ) -> DownstreamOfdmParameters | None:
+        if not channel_ids:
+            return None
+        return DownstreamOfdmParameters(channel_id=list(channel_ids))
 
 
 # Required for dynamic auto-registration

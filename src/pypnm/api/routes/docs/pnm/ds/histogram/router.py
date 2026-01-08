@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -104,8 +104,10 @@ class DsHistogramRouter:
                 self.logger.error(err)
                 return SnmpResponse(mac_address=mac, message=err, status=msg_rsp.status)
 
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
             measurement_stats:list[DocsPnmCmDsHistEntry] = \
-                cast(list[DocsPnmCmDsHistEntry], await service.getPnmMeasurementStatistics())
+                cast(list[DocsPnmCmDsHistEntry],
+                    await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
 
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()

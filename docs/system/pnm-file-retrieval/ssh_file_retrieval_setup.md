@@ -37,22 +37,22 @@ PyPNM supports both modes and treats them almost identically at a functional lev
 - **SCP**
   - Uses the external `scp` command (optionally via `sshpass` for password-based auth).
   - Good fit when you already use `scp` operationally and want behavior identical to the shell.
-  - In PyPNM, SCP is the default retrieval mode when `retrival_method.method` is set to `"scp"`.
+  - In PyPNM, SCP is the default retrieval mode when `retrieval_method.method` is set to `"scp"`.
 
 - **SFTP**
   - Uses the Paramiko SFTP client over an existing SSH connection.
   - Fully in-process, no external `scp` binary required once connected.
-  - In PyPNM, SFTP is the primary mode when `retrival_method.method` is set to `"sftp"`.
+  - In PyPNM, SFTP is the primary mode when `retrieval_method.method` is set to `"sftp"`.
 
 From the user’s perspective, you can treat them as interchangeable for file retrieval. The recommended pattern is:
 
 - Use **SCP** as the default.
-- Enable **SFTP** as a secondary option so you can flip between modes simply by changing `retrival_method.method` in
+- Enable **SFTP** as a secondary option so you can flip between modes simply by changing `retrieval_method.method` in
   `settings/system.json`.
 
 ## Configuration Summary
 
-All SSH-based retrieval settings live under `PnmFileRetrieval.retrival_method` in `settings/system.json`.
+All SSH-based retrieval settings live under `PnmFileRetrieval.retrieval_method` in `settings/system.json`.
 
 A typical configuration looks like:
 
@@ -60,7 +60,7 @@ A typical configuration looks like:
 {
   "PnmFileRetrieval": {
     "pnm_dir": ".data/pnm",
-    "retrival_method": {
+    "retrieval_method": {
       "method": "scp",
       "methods": {
         "scp": {
@@ -108,8 +108,8 @@ At a high level the helper:
 3. Generates a new SSH key pair if the configured `private_key_path` does not exist.
 4. Installs the public key onto the remote user’s `~/.ssh/authorized_keys` via SSH.
 5. Updates `settings/system.json` so that:
-   - `PnmFileRetrieval.retrival_method.methods.scp.private_key_path` is set.
-   - `PnmFileRetrieval.retrival_method.methods.sftp.private_key_path` is optionally set to the same path.
+   - `PnmFileRetrieval.retrieval_method.methods.scp.private_key_path` is set.
+   - `PnmFileRetrieval.retrieval_method.methods.sftp.private_key_path` is optionally set to the same path.
 6. Optionally adds the public key to the **local** `~/.ssh/authorized_keys` (useful for localhost testing).
 
 ### Basic Invocation
@@ -153,7 +153,7 @@ This is a typical localhost workflow where PyPNM and the TFTP/SSH server run on 
    ```json
    "PnmFileRetrieval": {
      "pnm_dir": ".data/pnm",
-     "retrival_method": {
+     "retrieval_method": {
        "method": "scp",
        "methods": {
          "scp": {
@@ -209,7 +209,7 @@ Once SSH and `system.json` are set up, switching methods is simply:
 
   ```json
   "PnmFileRetrieval": {
-    "retrival_method": {
+    "retrieval_method": {
       "method": "scp",
       ...
     }
@@ -220,7 +220,7 @@ Once SSH and `system.json` are set up, switching methods is simply:
 
   ```json
   "PnmFileRetrieval": {
-    "retrival_method": {
+    "retrieval_method": {
       "method": "sftp",
       ...
     }
@@ -265,7 +265,7 @@ to the remote user’s `authorized_keys`, or a different user is being used for 
 ## Notes And Operational Tips
 
 - You can safely keep both SCP and SFTP configured in `settings/system.json`. Only the method selected by
-  `retrival_method.method` is used at runtime.
+  `retrieval_method.method` is used at runtime.
 - For production environments, favor key-based auth:
   - `password` can be left empty once the key is working.
   - Rotate keys by generating a new keypair and re-running the setup helper.

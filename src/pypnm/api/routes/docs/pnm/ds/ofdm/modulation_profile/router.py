@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 from __future__ import annotations
 
 import logging
@@ -26,6 +26,7 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.snmp.schemas import
 from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
     CableModemServicePreCheck,
 )
+from pypnm.api.routes.common.extended.common_measure_schema import DownstreamOfdmParameters
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
 from pypnm.api.routes.common.extended.common_process_service import CommonProcessService
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
@@ -87,14 +88,20 @@ class ModulationProfileRouter:
                 return SnmpResponse(mac_address=mac, status=status, message=msg)
 
             service: CmDsOfdmModProfileService = CmDsOfdmModProfileService(cm, tftp_servers)
-            msg_rsp: MessageResponse = await service.set_and_go()
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
+            interface_parameters = None
+            if channel_ids:
+                interface_parameters = DownstreamOfdmParameters(channel_id=list(channel_ids))
+
+            msg_rsp: MessageResponse = await service.set_and_go(interface_parameters=interface_parameters)
 
             if msg_rsp.status != ServiceStatusCode.SUCCESS:
                 err = "Unable to complete Modulation Profile measurement."
                 return SnmpResponse(mac_address=mac, message=err, status=msg_rsp.status)
 
             measurement_stats:list[DocsPnmCmDsOfdmModProfEntry] = \
-                cast(list[DocsPnmCmDsOfdmModProfEntry], await service.getPnmMeasurementStatistics())
+                cast(list[DocsPnmCmDsOfdmModProfEntry],
+                    await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
 
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()

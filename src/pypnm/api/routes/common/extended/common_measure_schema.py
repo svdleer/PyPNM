@@ -39,7 +39,7 @@ class DownstreamOfdmParameters(InterfaceParameters):
             - Targets all available OFDM channels (default behavior).
     """
 
-    type: Literal["ofdm"]                   = Field(default="ofdm")
+    type: Literal["ofdm"]                = Field(default="ofdm")
     channel_id: list[ChannelId] | None   = Field(default=None)
 
 class UpstreamOfdmaParameters(InterfaceParameters):

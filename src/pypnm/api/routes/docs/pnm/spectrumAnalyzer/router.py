@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 import logging
 from typing import Any, cast
 
@@ -124,9 +124,10 @@ class SpectrumAnalyzerRouter:
                 self.logger.error("%s Status: %s", err, msg_rsp.status.name)
                 return SnmpResponse(mac_address=mac, status=msg_rsp.status, message=err)
 
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
             measurement_stats: list[DocsIf3CmSpectrumAnalysisEntry] = cast(
                 list[DocsIf3CmSpectrumAnalysisEntry],
-                await service.getPnmMeasurementStatistics(),)
+                await service.getPnmMeasurementStatistics(channel_ids=channel_ids),)
 
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()

@@ -14,7 +14,7 @@
         },
         "method": "tftp",
         "tftp": {
-            "ip_v4": "192.168.0.10",
+            "ip_v4": "172.19.8.28",
             "ip_v6": "::1",
             "remote_dir": ""
         }
@@ -30,8 +30,8 @@
         "png_dir": ".data/png",
         "pnm_dir": ".data/pnm",
         "retries": 5,
-        "retrival_method": {
-            "method": "local",
+        "retrieval_method": {
+            "method": "sftp",
             "methods": {
                 "ftp": {
                     "host": "localhost",
@@ -61,9 +61,8 @@
                     "src_dir": "/srv/tftp"
                 },
                 "sftp": {
-                    "host": "localhost",
-                    "password": "",
-                    "password_enc": "",
+                    "host": "172.19.8.28",
+                    "password_enc": "ENC[v1]:gAAAAABpXJq7oBMHXlJW3l4zACQDGViPYVi4-_suImey4NokmXHAlKdCWmIBiXh9oNty_ZXtsMtsYH6_fJ-VPQzWmV5IeGHc5A==",
                     "port": 22,
                     "private_key_path": "~/.ssh/id_rsa_pypnm",
                     "remote_dir": "/srv/tftp",
@@ -90,7 +89,7 @@
                 "enable": true,
                 "read_community": "public",
                 "retries": 3,
-                "write_community": "private"
+                "write_community": "public"
             },
             "3": {
                 "authPassword": "",
@@ -122,5 +121,49 @@
         "log_dir": "logs",
         "log_filename": "pypnm.log",
         "log_level": "INFO"
+    },
+    "pypnm-cmts": {
+        "cmts": [
+            {
+                "device": {
+                    "hostname": "172.19.122.228",
+                    "model": "",
+                    "vendor": ""
+                },
+                "SNMP": {
+                    "timeouts": {
+                        "request_seconds": 5,
+                        "retries": 1
+                    },
+                    "version": {
+                        "2c": {
+                            "port": 161,
+                            "enable": true,
+                            "read_community": "cmtspublic",
+                            "retries": 3,
+                            "write_community": "cmtspublic"
+                        },
+                        "3": {
+                            "enable": false,
+                            "port": 161,
+                            "authPassword": "",
+                            "authProtocol": "SHA",
+                            "privPassword": "",
+                            "privProtocol": "AES",
+                            "retries": 3,
+                            "securityLevel": "authPriv",
+                            "username": "user"
+                        }
+                    }
+                }
+            }
+        ]
+    },
+    "CmtsOrchestrator": {
+        "adapter": {
+            "hostname": "172.19.122.228",
+            "community": "cmtspublic",
+            "write_community": "cmtspublic"
+        }
     }
 }

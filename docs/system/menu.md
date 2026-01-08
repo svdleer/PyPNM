@@ -77,7 +77,7 @@ Select an option:
   1) Edit FastApiRequestDefault
   2) Edit SNMP
   3) Edit PnmBulkDataTransfer
-  4) Edit PnmFileRetrieval (retrival_method only)
+  4) Edit PnmFileRetrieval (retrieval_method only)
   5) Edit Logging
   6) Edit TestMode
   7) Run PnmFileRetrieval Setup (directory initialization)
@@ -142,18 +142,18 @@ It allows you to modify:
 Only the fields you explicitly change are updated; the rest of the section is
 preserved as-is.
 
-### 4. Edit PnmFileRetrieval (retrival_method only)
+### 4. Edit PnmFileRetrieval (retrieval_method only)
 
 - **Script**: `tools/system_config/pnm_file_retrieval.py`
-- **Config Section**: `PnmFileRetrieval.retrival_method`
+- **Config Section**: `PnmFileRetrieval.retrieval_method`
 
 This editor **only** touches the retrieval behavior, leaving all storage
 directories and JSON database paths unchanged.
 
 It manages:
 
-- `retrival_method.method`
-- `retrival_method.methods.local.src_dir`
+- `retrieval_method.method`
+- `retrieval_method.methods.local.src_dir`
 
 The prompt for the method uses the pipe-separated form:
 

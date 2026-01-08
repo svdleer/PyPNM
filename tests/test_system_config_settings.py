@@ -255,12 +255,12 @@ def test_reload_calls_config_reload_and_initializes_directories(
 def test_scp_settings_use_config_values(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeConfigManager(
         {
-            "PnmFileRetrieval.retrival_method.methods.scp.host": "scp-host",
-            "PnmFileRetrieval.retrival_method.methods.scp.port": "2222",
-            "PnmFileRetrieval.retrival_method.methods.scp.user": "scpuser",
-            "PnmFileRetrieval.retrival_method.methods.scp.password": "scppass",
-            "PnmFileRetrieval.retrival_method.methods.scp.private_key_path": "/home/test/.ssh/id_rsa_scp",
-            "PnmFileRetrieval.retrival_method.methods.scp.remote_dir": "/srv/tftp",
+            "PnmFileRetrieval.retrieval_method.methods.scp.host": "scp-host",
+            "PnmFileRetrieval.retrieval_method.methods.scp.port": "2222",
+            "PnmFileRetrieval.retrieval_method.methods.scp.user": "scpuser",
+            "PnmFileRetrieval.retrieval_method.methods.scp.password": "scppass",
+            "PnmFileRetrieval.retrieval_method.methods.scp.private_key_path": "/home/test/.ssh/id_rsa_scp",
+            "PnmFileRetrieval.retrieval_method.methods.scp.remote_dir": "/srv/tftp",
         }
     )
     monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
@@ -279,7 +279,7 @@ def test_scp_port_and_private_key_defaults_and_logs(
 ) -> None:
     fake = FakeConfigManager(
         {
-            "PnmFileRetrieval.retrival_method.methods.scp.host": "localhost",
+            "PnmFileRetrieval.retrieval_method.methods.scp.host": "localhost",
         }
     )
     monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
@@ -293,19 +293,19 @@ def test_scp_port_and_private_key_defaults_and_logs(
     assert key_path == ""
 
     text = caplog.text
-    assert "Missing configuration value for 'PnmFileRetrieval.retrival_method.methods.scp.port'" in text
-    assert "Missing configuration value for 'PnmFileRetrieval.retrival_method.methods.scp.private_key_path'" in text
+    assert "Missing configuration value for 'PnmFileRetrieval.retrieval_method.methods.scp.port'" in text
+    assert "Missing configuration value for 'PnmFileRetrieval.retrieval_method.methods.scp.private_key_path'" in text
 
 
 def test_sftp_settings_use_config_values(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeConfigManager(
         {
-            "PnmFileRetrieval.retrival_method.methods.sftp.host": "sftp-host",
-            "PnmFileRetrieval.retrival_method.methods.sftp.port": "2223",
-            "PnmFileRetrieval.retrival_method.methods.sftp.user": "sftpuser",
-            "PnmFileRetrieval.retrival_method.methods.sftp.password": "sftppass",
-            "PnmFileRetrieval.retrival_method.methods.sftp.private_key_path": "/home/test/.ssh/id_rsa_sftp",
-            "PnmFileRetrieval.retrival_method.methods.sftp.remote_dir": "/srv/tftp-sftp",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.host": "sftp-host",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.port": "2223",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.user": "sftpuser",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.password": "sftppass",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.private_key_path": "/home/test/.ssh/id_rsa_sftp",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.remote_dir": "/srv/tftp-sftp",
         }
     )
     monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
@@ -324,7 +324,7 @@ def test_sftp_port_and_private_key_defaults_and_logs(
 ) -> None:
     fake = FakeConfigManager(
         {
-            "PnmFileRetrieval.retrival_method.methods.sftp.host": "localhost",
+            "PnmFileRetrieval.retrieval_method.methods.sftp.host": "localhost",
         }
     )
     monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
@@ -338,8 +338,8 @@ def test_sftp_port_and_private_key_defaults_and_logs(
     assert key_path == ""
 
     text = caplog.text
-    assert "Missing configuration value for 'PnmFileRetrieval.retrival_method.methods.sftp.port'" in text
-    assert "Missing configuration value for 'PnmFileRetrieval.retrival_method.methods.sftp.private_key_path'" in text
+    assert "Missing configuration value for 'PnmFileRetrieval.retrieval_method.methods.sftp.port'" in text
+    assert "Missing configuration value for 'PnmFileRetrieval.retrieval_method.methods.sftp.private_key_path'" in text
 
 
 def test_snmp_read_community_defaults_to_public(

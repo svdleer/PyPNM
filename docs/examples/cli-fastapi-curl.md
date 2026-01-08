@@ -77,6 +77,9 @@ curl -X POST "http://127.0.0.1:8000/<endpoint>"   -H "Content-Type: application/
         "ipv4": "192.168.0.200",
         "ipv6": "::1",
         "dest_dir": ""
+      },
+      "capture": {
+        "channel_ids": []
       }
     }
   },
@@ -123,6 +126,9 @@ curl -X POST "http://127.0.0.1:8000/docs/pnm/ds/ofdm/rxMer/getCapture"   -H "Con
         "ipv4": "192.168.0.200",
         "ipv6": "::1",
         "dest_dir": ""
+      },
+      "capture": {
+        "channel_ids": []
       }
     }
   },
@@ -168,6 +174,9 @@ curl -X POST "http://127.0.0.1:8000/docs/pnm/ds/ofdm/chanEstimate/getCapture"   
         "ipv4": "192.168.0.200",
         "ipv6": "::1",
         "dest_dir": ""
+      },
+      "capture": {
+        "channel_ids": []
       }
     }
   },
@@ -212,6 +221,9 @@ curl -X POST "http://127.0.0.1:8000/docs/pnm/ds/ofdm/fecSummary/getCapture"   -H
         "ipv4": "192.168.0.200",
         "ipv6": "::1",
         "dest_dir": ""
+      },
+      "capture": {
+        "channel_ids": []
       }
     }
   },

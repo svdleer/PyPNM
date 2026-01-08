@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.lib.mac_address import MacAddress, MacAddressFormat
 from pypnm.lib.matplot.manager import ThemeType
-from pypnm.lib.types import InetAddressStr, IPv4Str, IPv6Str, MacAddressStr
+from pypnm.lib.types import ChannelId, InetAddressStr, IPv4Str, IPv6Str, MacAddressStr
 
 default_mac: MacAddressStr = SystemConfigSettings.default_mac_address()
 default_ip: InetAddressStr = SystemConfigSettings.default_ip_address()
@@ -31,9 +31,15 @@ class TftpConfig(BaseModel):
     ipv4: IPv4Str | None = Field(default=default_tftp_ipv4, description="TFTP server IPv4 address")
     ipv6: IPv6Str | None = Field(default=default_tftp_ipv6, description="TFTP server IPv6 address")
 
+class PnmCaptureConfig(BaseModel):
+    channel_ids: list[ChannelId] | None = Field(
+        default=None,
+        description="Optional channel id list for targeted captures (empty or missing means all channels).",
+    )
 
 class PnmParameters(BaseModel):
     tftp: TftpConfig = Field(default_factory=TftpConfig, description="TFTP configuration")
+    capture: PnmCaptureConfig = Field(default_factory=PnmCaptureConfig, description="Capture parameters")
 
 
 class CableModemPnmConfig(BaseModel):

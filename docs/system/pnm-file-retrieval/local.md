@@ -14,7 +14,7 @@ Select an option:
   1) Edit FastApiRequestDefault
   2) Edit SNMP
   3) Edit PnmBulkDataTransfer
-  4) Edit PnmFileRetrieval (retrival_method only)
+  4) Edit PnmFileRetrieval (retrieval_method only)
   5) Edit Logging
   6) Edit TestMode
   7) Run PnmFileRetrieval Setup (directory initialization)
@@ -47,7 +47,7 @@ Select an option:
   1) Edit FastApiRequestDefault
   2) Edit SNMP
   3) Edit PnmBulkDataTransfer
-  4) Edit PnmFileRetrieval (retrival_method only)
+  4) Edit PnmFileRetrieval (retrieval_method only)
   5) Edit Logging
   6) Edit TestMode
   7) Run PnmFileRetrieval Setup (directory initialization)
@@ -59,4 +59,4 @@ Exiting System Configuration Menu.
 
 In the example above, `local.src_dir` is set to `/srv/tftp`. This is the directory
 where the cable modem places PNM files and where PyPNM will look for them when
-`PnmFileRetrieval.retrival_method.method` is set to `local`.
+`PnmFileRetrieval.retrieval_method.method` is set to `local`.

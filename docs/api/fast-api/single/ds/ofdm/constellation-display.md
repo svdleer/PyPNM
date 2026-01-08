@@ -29,6 +29,9 @@ Refer to [Common → Request](../../../common/request.md).
       "tftp": {
         "ipv4": "192.168.0.10",
         "ipv6": "2001:db8::10"
+      },
+      "capture": {
+        "channel_ids": []
       }
     },
     "snmp": {
@@ -117,6 +120,7 @@ Offsets derived from the mixed orders:
 * Constellation points are reported as `[Real, Imaginary]` with `complex_unit = "[Real, Imaginary]"` in models.
 * If the selected `modulation_order_offset` corresponds to a stream for which the CMTS is not receiving
   traffic (user data or MAC messages), the CM may take a long time to reach the requested `number_sample_symbol`.
+* To capture specific channels, set `cable_modem.pnm_parameters.capture.channel_ids`. Empty or missing means all channels.
 
 ## Response
 

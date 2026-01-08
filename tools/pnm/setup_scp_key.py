@@ -158,7 +158,7 @@ class ScpKeySetup:
         else:
             self.logger.info(
                 "Ensure %s contains:\n"
-                "  PnmFileRetrieval.retrival_method.methods.scp.private_key_path = '%s'",
+                "  PnmFileRetrieval.retrieval_method.methods.scp.private_key_path = '%s'",
                 config_path,
                 effective_key_path,
             )
@@ -297,7 +297,7 @@ class ScpKeySetup:
         Update The SCP private_key_path In The System Configuration JSON.
 
         This function reads the JSON configuration file at config_path,
-        updates only the PnmFileRetrieval.retrival_method.methods.scp
+        updates only the PnmFileRetrieval.retrieval_method.methods.scp
         .private_key_path field, and writes the file back to disk.
         """
         if not os.path.exists(config_path):
@@ -317,12 +317,18 @@ class ScpKeySetup:
                 self.logger.error("Missing or invalid 'PnmFileRetrieval' section in %s", config_path)
                 return False
 
-            retrival_method = pnm_file_retrieval.get("retrival_method")
-            if not isinstance(retrival_method, dict):
-                self.logger.error("Missing or invalid 'retrival_method' section in %s", config_path)
-                return False
+            retrieval_method = pnm_file_retrieval.get("retrieval_method")
+            if not isinstance(retrieval_method, dict):
+                legacy = pnm_file_retrieval.get("retrival_method")
+                if isinstance(legacy, dict):
+                    retrieval_method = legacy
+                    pnm_file_retrieval["retrieval_method"] = retrieval_method
+                    pnm_file_retrieval.pop("retrival_method", None)
+                else:
+                    self.logger.error("Missing or invalid 'retrieval_method' section in %s", config_path)
+                    return False
 
-            methods = retrival_method.get("methods")
+            methods = retrieval_method.get("methods")
             if not isinstance(methods, dict):
                 self.logger.error("Missing or invalid 'methods' section in %s", config_path)
                 return False
@@ -352,7 +358,7 @@ class ScpKeySetup:
         Update The SFTP private_key_path In The System Configuration JSON.
 
         This function reads the JSON configuration file at config_path,
-        updates only the PnmFileRetrieval.retrival_method.methods.sftp
+        updates only the PnmFileRetrieval.retrieval_method.methods.sftp
         .private_key_path field, and writes the file back to disk.
         """
         if not os.path.exists(config_path):
@@ -372,12 +378,18 @@ class ScpKeySetup:
                 self.logger.error("Missing or invalid 'PnmFileRetrieval' section in %s", config_path)
                 return False
 
-            retrival_method = pnm_file_retrieval.get("retrival_method")
-            if not isinstance(retrival_method, dict):
-                self.logger.error("Missing or invalid 'retrival_method' section in %s", config_path)
-                return False
+            retrieval_method = pnm_file_retrieval.get("retrieval_method")
+            if not isinstance(retrieval_method, dict):
+                legacy = pnm_file_retrieval.get("retrival_method")
+                if isinstance(legacy, dict):
+                    retrieval_method = legacy
+                    pnm_file_retrieval["retrieval_method"] = retrieval_method
+                    pnm_file_retrieval.pop("retrival_method", None)
+                else:
+                    self.logger.error("Missing or invalid 'retrieval_method' section in %s", config_path)
+                    return False
 
-            methods = retrival_method.get("methods")
+            methods = retrieval_method.get("methods")
             if not isinstance(methods, dict):
                 self.logger.error("Missing or invalid 'methods' section in %s", config_path)
                 return False

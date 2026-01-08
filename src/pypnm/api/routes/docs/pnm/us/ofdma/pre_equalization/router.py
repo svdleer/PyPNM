@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 import logging
 from typing import Any, cast
 
@@ -89,8 +89,10 @@ class UsOfdmaPreEqualizationRouter:
                 err = "Unable to complete Upstream OFDMA Pre-Equalization measurement."
                 return SnmpResponse(mac_address=mac, message=err, status=msg_rsp.status)
 
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
             measurement_stats:list[DocsPnmCmUsPreEqEntry] = \
-                cast(list[DocsPnmCmUsPreEqEntry], await service.getPnmMeasurementStatistics())
+                cast(list[DocsPnmCmUsPreEqEntry],
+                    await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
 
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()

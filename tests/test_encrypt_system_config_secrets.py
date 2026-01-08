@@ -22,7 +22,7 @@ def _ensure_test_secret_key(monkeypatch: pytest.MonkeyPatch) -> None:
 def _get_methods(cfg: dict[str, Any]) -> dict[str, Any]:
     return (
         cfg.get("PnmFileRetrieval", {})
-           .get("retrival_method", {})
+           .get("retrieval_method", {})
            .get("methods", {})
     )
 
@@ -30,7 +30,7 @@ def _get_methods(cfg: dict[str, Any]) -> dict[str, Any]:
 def test_encryptor_moves_password_to_password_enc_and_roundtrips() -> None:
     cfg: dict[str, Any] = {
         "PnmFileRetrieval": {
-            "retrival_method": {
+            "retrieval_method": {
                 "methods": {
                     "ftp":  {"host": "ftp-host",  "user": "u", "password": "p"},
                     "sftp": {"host": "sftp-host", "user": "u", "password": "p"},
@@ -59,7 +59,7 @@ def test_encryptor_moves_password_to_password_enc_and_roundtrips() -> None:
 def test_encryptor_encrypts_plain_password_enc_and_removes_password_field() -> None:
     cfg: dict[str, Any] = {
         "PnmFileRetrieval": {
-            "retrival_method": {
+            "retrieval_method": {
                 "methods": {
                     "sftp": {"host": "sftp-host", "user": "u", "password": "p", "password_enc": "p"},
                 },
@@ -79,7 +79,7 @@ def test_encryptor_encrypts_plain_password_enc_and_removes_password_field() -> N
 def test_encryptor_keeps_empty_password_enc_but_never_keeps_password_key() -> None:
     cfg: dict[str, Any] = {
         "PnmFileRetrieval": {
-            "retrival_method": {
+            "retrieval_method": {
                 "methods": {
                     "ftp": {"host": "ftp-host", "user": "u", "password": ""},
                 },

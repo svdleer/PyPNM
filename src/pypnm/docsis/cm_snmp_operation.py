@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -980,9 +980,15 @@ class CmSnmpOperation:
         if not result:
             return []
 
-        idx_channelId:list[tuple[InterfaceIndex, ChannelId]] = Snmp_v2c.snmp_get_result_last_idx_value(result)
+        raw_pairs: list[tuple[int, int]] = Snmp_v2c.snmp_get_result_last_idx_force_value_type(
+            result,
+            value_type=int,
+        )
+        idx_channel_id: list[tuple[InterfaceIndex, ChannelId]] = [
+            (InterfaceIndex(idx), ChannelId(chan_id)) for idx, chan_id in raw_pairs
+        ]
 
-        return idx_channelId or []
+        return idx_channel_id or []
 
     async def getSysUpTime(self) -> str | None:
         """
@@ -1290,9 +1296,15 @@ class CmSnmpOperation:
         if not result:
             return []
 
-        idx_channelIdList: list[tuple[InterfaceIndex, ChannelId]] = Snmp_v2c.snmp_get_result_last_idx_value(result)
+        raw_pairs: list[tuple[int, int]] = Snmp_v2c.snmp_get_result_last_idx_force_value_type(
+            result,
+            value_type=int,
+        )
+        idx_channel_id_list: list[tuple[InterfaceIndex, ChannelId]] = [
+            (InterfaceIndex(idx), ChannelId(chan_id)) for idx, chan_id in raw_pairs
+        ]
 
-        return idx_channelIdList or []
+        return idx_channel_id_list or []
 
     async def getDocsIfCmUsTdmaChanChannelIdIndex(self) -> list[InterfaceIndex]:
         """

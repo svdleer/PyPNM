@@ -18,7 +18,7 @@ Select an option:
   1) Edit FastApiRequestDefault
   2) Edit SNMP
   3) Edit PnmBulkDataTransfer
-  4) Edit PnmFileRetrieval (retrival_method only)
+  4) Edit PnmFileRetrieval (retrieval_method only)
   5) Edit Logging
   6) Edit TestMode
   7) Run PnmFileRetrieval Setup (directory initialization)
@@ -54,7 +54,7 @@ Select an option:
   1) Edit FastApiRequestDefault
   2) Edit SNMP
   3) Edit PnmBulkDataTransfer
-  4) Edit PnmFileRetrieval (retrival_method only)
+  4) Edit PnmFileRetrieval (retrieval_method only)
   5) Edit Logging
   6) Edit TestMode
   7) Run PnmFileRetrieval Setup (directory initialization)

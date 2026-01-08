@@ -56,7 +56,7 @@ The helper script is tightly coupled to the following sections of `settings/syst
 
 ```json
 "PnmFileRetrieval": {
-  "retrival_method": {
+  "retrieval_method": {
     "method": "scp",
     "methods": {
       "scp": {
@@ -97,7 +97,7 @@ Typical first-time setup for key-based SCP/SFTP looks like this:
 
 1. **Ensure SCP/SFTP config is present**
 
-   Edit `settings/system.json` so the `PnmFileRetrieval.retrival_method.methods.scp` and `.sftp` blocks contain at least:
+   Edit `settings/system.json` so the `PnmFileRetrieval.retrieval_method.methods.scp` and `.sftp` blocks contain at least:
 
    - `host`, `port`, `user`
    - Optional `password` (for first-time installation)
@@ -170,8 +170,8 @@ If a `private_key_path` is already configured in `settings/system.json`, the hel
 
 3. Optionally allow the helper to:
 
-   - Set `PnmFileRetrieval.retrival_method.methods.scp.private_key_path` to an empty string.
-   - Set `PnmFileRetrieval.retrival_method.methods.sftp.private_key_path` to an empty string.
+   - Set `PnmFileRetrieval.retrieval_method.methods.scp.private_key_path` to an empty string.
+   - Set `PnmFileRetrieval.retrieval_method.methods.sftp.private_key_path` to an empty string.
 
 After this, SCP/SFTP falls back to password-based authentication using the configured `user` and `password` fields until
 you run the helper again to re-establish key-based access.

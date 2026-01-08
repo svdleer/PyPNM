@@ -22,8 +22,8 @@ class PnmFileRetrievalEditor(SystemJsonEditorBase):
     """
     Interactive Editor For PnmFileRetrieval Retrieval Method.
 
-    Only updates the 'retrival_method.method' and the
-    'retrival_method.methods.local.src_dir' field. Directory paths,
+    Only updates the 'retrieval_method.method' and the
+    'retrieval_method.methods.local.src_dir' field. Directory paths,
     database paths, and retry counts are left unchanged.
     """
 
@@ -43,26 +43,31 @@ class PnmFileRetrievalEditor(SystemJsonEditorBase):
         """
         section = self._section()
 
-        retrival_method = section.get("retrival_method")
-        if not isinstance(retrival_method, dict):
-            retrival_method = {}
-            section["retrival_method"] = retrival_method
+        retrieval_method = section.get("retrieval_method")
+        if not isinstance(retrieval_method, dict):
+            legacy = section.get("retrival_method")
+            if isinstance(legacy, dict):
+                retrieval_method = legacy
+            else:
+                retrieval_method = {}
+            section["retrieval_method"] = retrieval_method
+            section.pop("retrival_method", None)
 
-        methods = retrival_method.get("methods")
+        methods = retrieval_method.get("methods")
         if not isinstance(methods, dict):
             methods = {}
-            retrival_method["methods"] = methods
+            retrieval_method["methods"] = methods
 
         local = methods.get("local")
         if not isinstance(local, dict):
             local = {}
             methods["local"] = local
 
-        print("Editing PnmFileRetrieval (retrival_method only) in system.json\n")
+        print("Editing PnmFileRetrieval (retrieval_method only) in system.json\n")
 
         method_new = self.prompt_str(
             "Retrieval method (local | tftp | ftp | scp | sftp | http | https)",
-            retrival_method.get("method"),
+            retrieval_method.get("method"),
         )
         local_src_new = self.prompt_str(
             "Local src_dir for 'local' method",
@@ -74,7 +79,7 @@ class PnmFileRetrievalEditor(SystemJsonEditorBase):
             return 0
 
         if method_new is not None:
-            retrival_method["method"] = method_new
+            retrieval_method["method"] = method_new
         if local_src_new is not None:
             local["src_dir"] = local_src_new
 
@@ -83,7 +88,7 @@ class PnmFileRetrievalEditor(SystemJsonEditorBase):
             json.dumps(
                 {
                     "PnmFileRetrieval": {
-                        "retrival_method": retrival_method,
+                        "retrieval_method": retrieval_method,
                     },
                 },
                 indent=JSON_INDENT_WIDTH,

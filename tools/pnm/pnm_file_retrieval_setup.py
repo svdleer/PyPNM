@@ -134,7 +134,15 @@ class PnmFileRetrievalConfigurator:
 
     def _ensure_pnm_retrieval_section(self) -> dict[str, Any]:
         pnm       = self.config.setdefault("PnmFileRetrieval", {})
-        retrieval = pnm.setdefault("retrival_method", {})
+        retrieval = pnm.get("retrieval_method")
+        if not isinstance(retrieval, dict):
+            legacy = pnm.get("retrival_method")
+            if isinstance(legacy, dict):
+                retrieval = legacy
+            else:
+                retrieval = {}
+            pnm["retrieval_method"] = retrieval
+            pnm.pop("retrival_method", None)
 
         retrieval.setdefault("method", "local")
         retrieval.setdefault("methods", {})

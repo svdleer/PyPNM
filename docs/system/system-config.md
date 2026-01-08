@@ -140,7 +140,7 @@ Related Guide: [File Transfer Methods](pnm-file-retrieval/index.md)
   "operation_db": ".data/db/operation_capture.json",
   "json_transaction_db": ".data/db/json_transactions.json",
   "retries": 5,
-  "retrival_method": {
+  "retrieval_method": {
     "method": "local",
     "methods": {
       "local": {
@@ -205,16 +205,16 @@ Related Guide: [File Transfer Methods](pnm-file-retrieval/index.md)
 
 | Field                                  | Type   | Description                                                           |
 | -------------------------------------- | ------ | --------------------------------------------------------------------- |
-| retrival_method.method                 | string | Active retrieval method: `local`, `tftp`, `ftp`, `sftp`, `http`, `https`. |
-| retrival_method.methods.local.src_dir  | string | Source directory to watch/copy from when using `local`.               |
-| retrival_method.methods.tftp.*         | object | TFTP host/port/timeout and remote directory.                          |
-| retrival_method.methods.ftp.*          | object | FTP connection, credentials, and remote directory.                    |
-| retrival_method.methods.sftp.*         | object | SFTP connection and remote directory.                                 |
-| retrival_method.methods.http.*         | object | HTTP base URL and port.                                               |
-| retrival_method.methods.https.*        | object | HTTPS base URL and port.                                              |
+| retrieval_method.method                 | string | Active retrieval method: `local`, `tftp`, `ftp`, `sftp`, `http`, `https`. |
+| retrieval_method.methods.local.src_dir  | string | Source directory to watch/copy from when using `local`.               |
+| retrieval_method.methods.tftp.*         | object | TFTP host/port/timeout and remote directory.                          |
+| retrieval_method.methods.ftp.*          | object | FTP connection, credentials, and remote directory.                    |
+| retrieval_method.methods.sftp.*         | object | SFTP connection and remote directory.                                 |
+| retrieval_method.methods.http.*         | object | HTTP base URL and port.                                               |
+| retrieval_method.methods.https.*        | object | HTTPS base URL and port.                                              |
 | retries                                | number | Max attempts per retrieval operation.                                 |
 
-> The key name `retrival_method` is preserved as implemented.
+> The legacy key name `retrival_method` is accepted for backward compatibility.
 
 ## 5. Logging
 

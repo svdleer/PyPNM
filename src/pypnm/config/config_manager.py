@@ -61,6 +61,21 @@ class ConfigManager:
             raise FileNotFoundError(f"Config file not found: {self._config_path}")
         with open(actual_path) as f:
             self._config_data = json.load(f)
+        self._normalize_config()
+
+    def _normalize_config(self) -> None:
+        """
+        Normalize legacy configuration keys to their canonical names.
+        """
+        pnm = self._config_data.get("PnmFileRetrieval")
+        if not isinstance(pnm, dict):
+            return
+
+        if "retrieval_method" in pnm:
+            return
+
+        if "retrival_method" in pnm:
+            pnm["retrieval_method"] = pnm.get("retrival_method")
 
     def get(self, *keys: str, fallback: T | None = None) -> T | None:
         """

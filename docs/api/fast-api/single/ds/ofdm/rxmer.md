@@ -22,12 +22,14 @@ Refer to [Common → Request](../../../common/request.md).
 | `analysis.type`          | string | `"basic"`               | `"basic"` | Selects the analysis mode used during capture processing.                                                                                                                                      |
 | `analysis.output.type`   | string | `"json"`, `"archive"`   | `"json"`  | Output format. **`json`** returns an inline body under `data` (`analysis`, `primative`, `measurement_stats`). **`archive`** returns a downloadable ZIP (CSV exports and Matplotlib PNG plots). |
 | `analysis.plot.ui.theme` | string | `"light"`, `"dark"`     | `"dark"`  | Theme hint for plot generation (colors, grid, ticks). Does not affect raw metrics/CSV.                                                                                                         |
+| `pnm_parameters.capture.channel_ids` | array(int) | Channel IDs | omitted | Optional list of OFDM channel IDs to capture. Omitted or empty means all available channels. |
 
 ## Notes
 
 * When `analysis.output.type = "archive"`, the HTTP response body is the file (no `data` JSON payload).
 * The `primative` section is a normalized representation of the raw PNM file with added statistics (e.g., mean, std, kurtosis).
 * The `measurement_stats` section summarizes one-shot SNMP statistics collected at capture-time (useful for dashboards).
+* When `pnm_parameters.capture.channel_ids` is omitted or empty, RxMER captures all available OFDM channels.
 
 ### Example Request
 
@@ -40,6 +42,9 @@ Refer to [Common → Request](../../../common/request.md).
       "tftp": {
         "ipv4": "192.168.0.10",
         "ipv6": "2001:db8::10"
+      },
+      "capture": {
+        "channel_ids": [193, 194]
       }
     },
     "snmp": {

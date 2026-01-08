@@ -54,7 +54,7 @@ class SystemConfigMenu:
         print("  1) Edit FastApiRequestDefault")
         print("  2) Edit SNMP")
         print("  3) Edit PnmBulkDataTransfer")
-        print("  4) Edit PnmFileRetrieval (retrival_method only)")
+        print("  4) Edit PnmFileRetrieval (retrieval_method only)")
         print("  5) Edit Logging")
         print("  6) Edit TestMode")
         print("  7) Run PnmFileRetrieval Setup (directory initialization)")

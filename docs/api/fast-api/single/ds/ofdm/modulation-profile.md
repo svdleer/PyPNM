@@ -27,6 +27,10 @@ Refer to [Common → Request](../../../common/request.md).
 | `analysis.output.type`   | string | "json", "archive"   | "json"  | Output format: **`json`** returns inline `data`; **`archive`** returns a ZIP (CSV exports and PNG plots). |
 | `analysis.plot.ui.theme` | string | "light", "dark"     | "dark"  | Theme hint for plots (colors, grid, ticks). Does not affect raw metrics/CSV.                              |
 
+### Notes
+
+* To capture specific channels, set `cable_modem.pnm_parameters.capture.channel_ids`. Empty or missing means all channels.
+
 ### Example Request - `/getCapture`
 
 ```json
@@ -34,6 +38,15 @@ Refer to [Common → Request](../../../common/request.md).
   "cable_modem": {
     "mac_address": "aa:bb:cc:dd:ee:ff",
     "ip_address": "192.168.0.100",
+    "pnm_parameters": {
+      "tftp": {
+        "ipv4": "192.168.0.10",
+        "ipv6": "2001:db8::10"
+      },
+      "capture": {
+        "channel_ids": []
+      }
+    },
     "snmp": {
       "snmpV2C": { "community": "private" }
     }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -233,13 +233,12 @@ class CommonMeasureService(CommonMessagingService):
                 self.logger.info(f"{self.log_prefix} - Spectrum Amplitude Data collection COMPLETE, total bytes: {len(amp_data)}.")
                 #################################################################################################
                 # Build binary filename and save file - START
-                # TODO: Refactor filename generation to utility function, need to figure where best place first
                 #################################################################################################
-                prefix = DocsPnmCmCtlTest.SPECTRUM_ANALYZER_SNMP_AMP_DATA.name.lower()
-                filename = f"{prefix}_{self.cm.get_mac_address.to_mac_format()}_{int(time.time())}.bin"
-
-                tx_id = await PnmFileTransaction().insert(self.cm,
-                    DocsPnmCmCtlTest.SPECTRUM_ANALYZER_SNMP_AMP_DATA, filename)
+                filename = await self._pnm_file_generator(DocsPnmCmCtlTest.SPECTRUM_ANALYZER_SNMP_AMP_DATA)
+                tx_id = self._get_transaction_id_by_filename(filename)
+                if not tx_id:
+                    self.logger.error(f"{self.log_prefix} - Unable to find Transaction ID for PNM filename: {filename}")
+                    return self.build_send_msg(ServiceStatusCode.PNM_FILE_TRANSACTION_ID_NOT_FOUND)
 
                 pnm_dir = SystemConfigSettings.pnm_dir()
                 fpath = f"{pnm_dir}/{filename}"
@@ -345,7 +344,49 @@ class CommonMeasureService(CommonMessagingService):
         """
         return await self.cm.is_snmp_reachable()
 
-    async def getPnmMeasurementStatistics(self) -> list[MeasurementEntry]:
+    async def _filter_measurement_entries(
+        self,
+        entries: list[MeasurementEntry],
+        channel_ids: list[ChannelId] | None,
+    ) -> list[MeasurementEntry]:
+        if not channel_ids:
+            return entries
+
+        channel_id_set = {int(channel_id) for channel_id in channel_ids}
+        index_set: set[int] = set()
+
+        if self.pnm_test_type in (
+            DocsPnmCmCtlTest.DS_CONSTELLATION_DISP,
+            DocsPnmCmCtlTest.DS_OFDM_CHAN_EST_COEF,
+            DocsPnmCmCtlTest.DS_OFDM_CODEWORD_ERROR_RATE,
+            DocsPnmCmCtlTest.DS_OFDM_MODULATION_PROFILE,
+            DocsPnmCmCtlTest.DS_OFDM_RXMER_PER_SUBCAR,
+        ):
+            idx_channel_id = await self.cm.getDocsIf31CmDsOfdmChannelIdIndexStack()
+            index_set = {int(idx) for idx, channel_id in idx_channel_id if int(channel_id) in channel_id_set}
+
+        elif self.pnm_test_type == DocsPnmCmCtlTest.US_PRE_EQUALIZER_COEF:
+            idx_channel_id = await self.cm.getDocsIf31CmUsOfdmaChannelIdIndexStack()
+            index_set = {int(idx) for idx, channel_id in idx_channel_id if int(channel_id) in channel_id_set}
+
+        filtered: list[MeasurementEntry] = []
+        for entry in entries:
+            if isinstance(entry, (DocsPnmCmDsHistEntry, DocsIf3CmSpectrumAnalysisEntry)):
+                continue
+            if index_set:
+                if int(entry.index) in index_set:
+                    filtered.append(entry)
+                continue
+            if not hasattr(entry, "channel_id"):
+                continue
+            if int(entry.channel_id) in channel_id_set:
+                filtered.append(entry)
+        return filtered
+
+    async def getPnmMeasurementStatistics(
+        self,
+        channel_ids: list[ChannelId] | None = None,
+    ) -> list[MeasurementEntry]:
         """
         Retrieve PNM measurement entries for the currently configured `pnm_test_type`.
 
@@ -373,53 +414,64 @@ class CommonMeasureService(CommonMessagingService):
           fetched from the cable modem for the selected measurement type.
         - For strict typing, concrete lists are cast to `List[MeasurementEntry]`
           at return points (because `List` is invariant in the type system).
+        - If `channel_ids` is provided and not empty, results are filtered to only
+          include entries whose `channel_id` is in the list.
         """
         entries: list[MeasurementEntry] = []
 
         if self.pnm_test_type == DocsPnmCmCtlTest.SPECTRUM_ANALYZER:
             self.logger.debug(f"{self.log_prefix} - Running SPECTRUM_ANALYZER")
             concrete = await self.cm.getDocsIf3CmSpectrumAnalysisEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_OFDM_CHAN_EST_COEF:
             self.logger.debug(f"{self.log_prefix} - Running OFDM Channel Estimation Coefficient collection")
             concrete = await self.cm.getDocsPnmCmOfdmChanEstCoefEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_CONSTELLATION_DISP:
             self.logger.debug(f"{self.log_prefix} - Running OFDM Constellation Display collection")
             concrete = await self.cm.getDocsPnmCmDsConstDispMeasEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_OFDM_RXMER_PER_SUBCAR:
             self.logger.debug(f"{self.log_prefix} - Running RXMER entry collection")
             concrete = await self.cm.getDocsPnmCmDsOfdmRxMerEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_OFDM_CODEWORD_ERROR_RATE:
             self.logger.debug(f"{self.log_prefix} - Running DS_OFDM_CODEWORD_ERROR_RATE")
             concrete = await self.cm.getDocsPnmCmDsOfdmFecEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_HISTOGRAM:
             self.logger.debug(f"{self.log_prefix} - Running DS_HISTOGRAM")
             concrete = await self.cm.getDocsPnmCmDsHistEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.US_PRE_EQUALIZER_COEF:
             self.logger.debug(f"{self.log_prefix} - Running Upstream Pre-Equalization entry collection")
             concrete = await self.cm.getDocsPnmCmUsPreEqEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_OFDM_MODULATION_PROFILE:
             self.logger.debug(f"{self.log_prefix} - Running DS_OFDM_MODULATION_PROFILE")
             concrete = await self.cm.getDocsPnmCmDsOfdmModProfEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.SPECTRUM_ANALYZER_SNMP_AMP_DATA:
             self.logger.debug(f"{self.log_prefix} - Running SPECTRUM_ANALYZER_SNMP_AMP_DATA")
             concrete = await self.cm.getDocsIf3CmSpectrumAnalysisEntry()
-            return cast(list[MeasurementEntry], concrete)
+            entries = cast(list[MeasurementEntry], concrete)
+            return await self._filter_measurement_entries(entries, channel_ids)
 
         elif self.pnm_test_type == DocsPnmCmCtlTest.DS_OFDM_SYMBOL_CAPTURE:
             self.logger.warning(f"{self.log_prefix} - Stub handler: DS_OFDM_SYMBOL_CAPTURE")

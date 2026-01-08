@@ -394,7 +394,13 @@ class SecretCryptoManager:
           secret storage semantics for configured methods.
         """
         pnm = config.get("PnmFileRetrieval", {})
-        retrieval = pnm.get("retrival_method", {})
+        retrieval = pnm.get("retrieval_method")
+        if not isinstance(retrieval, dict):
+            legacy = pnm.get("retrival_method")
+            if isinstance(legacy, dict):
+                retrieval = legacy
+            else:
+                retrieval = {}
         methods = retrieval.get("methods", {})
 
         if not isinstance(methods, dict):

@@ -37,6 +37,7 @@ Refer to [Common → Request](../../../common/request.md).
 * Your project setting: **Type 2 corresponds to a 24‑hour interval**; **Type 3 corresponds to a 10‑minute interval**.  
 * The time‑series set count depends on the type (see *Return Structure* → `number_of_sets`).  
 * Profile `255` commonly refers to **NCP** (Next Codeword Pointer).
+* To capture specific channels, set `cable_modem.pnm_parameters.capture.channel_ids`. Empty or missing means all channels.
 
 ### Example Request
 
@@ -45,6 +46,15 @@ Refer to [Common → Request](../../../common/request.md).
   "cable_modem": {
     "mac_address": "aa:bb:cc:dd:ee:ff",
     "ip_address": "192.168.0.100",
+    "pnm_parameters": {
+      "tftp": {
+        "ipv4": "192.168.0.10",
+        "ipv6": "2001:db8::10"
+      },
+      "capture": {
+        "channel_ids": []
+      }
+    },
     "snmp": { "snmpV2C": { "community": "private" } }
   },
   "analysis": {

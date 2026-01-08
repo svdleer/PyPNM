@@ -119,7 +119,7 @@ class SystemConfigSettings:
     def _get_password_value_fallback(cls, require: bool, primary: tuple[str, ...], legacy: tuple[str, ...]) -> str:
         password_enc = cls._peek_str_fallback(primary + ("password_enc",), legacy + ("password_enc",))
         if password_enc.strip() != "":
-            decrypted = cls._maybe_decrypt(password_enc, *(legacy + ("password_enc",)))
+            decrypted = cls._maybe_decrypt(password_enc, *(primary + ("password_enc",)))
             if decrypted != "":
                 return decrypted
             if require:
@@ -130,11 +130,11 @@ class SystemConfigSettings:
             if require:
                 cls._logger.error(
                     "Missing configuration value for '%s'; expected password or password_enc",
-                    cls._config_path(*(legacy + ("password",))),
+                    cls._config_path(*(primary + ("password",))),
                 )
             return ""
 
-        return cls._maybe_decrypt(password, *(legacy + ("password",)))
+        return cls._maybe_decrypt(password, *(primary + ("password",)))
 
     @classmethod
     def _get_str(cls, default: str, *path: str) -> str:
@@ -180,8 +180,96 @@ class SystemConfigSettings:
                 )
                 return coerced
             if value == "":
-                return cls._get_str(default, *legacy)
-        return cls._get_str(default, *legacy)
+                legacy_value = cls._cfg.get(*legacy)
+                if legacy_value is not None:
+                    if not isinstance(legacy_value, str):
+                        coerced = str(legacy_value)
+                        cls._logger.error(
+                            "Non-string configuration value for '%s': %r; using coerced '%s'",
+                            cls._config_path(*primary),
+                            legacy_value,
+                            coerced,
+                        )
+                        return coerced
+                    if legacy_value != "":
+                        return legacy_value
+                cls._logger.error(
+                    "Empty configuration value for '%s'; using default '%s'",
+                    cls._config_path(*primary),
+                    default,
+                )
+                return default
+
+        legacy_value = cls._cfg.get(*legacy)
+        if legacy_value is None:
+            cls._logger.error(
+                "Missing configuration value for '%s'; using default '%s'",
+                cls._config_path(*primary),
+                default,
+            )
+            return default
+        if not isinstance(legacy_value, str):
+            coerced = str(legacy_value)
+            cls._logger.error(
+                "Non-string configuration value for '%s': %r; using coerced '%s'",
+                cls._config_path(*primary),
+                legacy_value,
+                coerced,
+            )
+            return coerced
+        if legacy_value == "":
+            cls._logger.error(
+                "Empty configuration value for '%s'; using default '%s'",
+                cls._config_path(*primary),
+                default,
+            )
+            return default
+        return legacy_value
+
+    @classmethod
+    def _get_str_allow_empty(cls, default: str, *path: str) -> str:
+        value = cls._cfg.get(*path)
+        if value is None:
+            return default
+        if not isinstance(value, str):
+            coerced = str(value)
+            cls._logger.error(
+                "Non-string configuration value for '%s': %r; using coerced '%s'",
+                cls._config_path(*path),
+                value,
+                coerced,
+            )
+            return coerced
+        return value
+
+    @classmethod
+    def _get_str_fallback_allow_empty(cls, default: str, primary: tuple[str, ...], legacy: tuple[str, ...]) -> str:
+        value = cls._cfg.get(*primary)
+        if value is not None:
+            if isinstance(value, str):
+                return value
+            coerced = str(value)
+            cls._logger.error(
+                "Non-string configuration value for '%s': %r; using coerced '%s'",
+                cls._config_path(*primary),
+                value,
+                coerced,
+            )
+            return coerced
+
+        legacy_value = cls._cfg.get(*legacy)
+        if legacy_value is None:
+            return default
+        if not isinstance(legacy_value, str):
+            coerced = str(legacy_value)
+            cls._logger.error(
+                "Non-string configuration value for '%s': %r; using coerced '%s'",
+                cls._config_path(*primary),
+                legacy_value,
+                coerced,
+            )
+            return coerced
+        return legacy_value
 
     @classmethod
     def _get_int(cls, default: int, *path: str) -> int:
@@ -217,7 +305,26 @@ class SystemConfigSettings:
                     value,
                     default,
                 )
-        return cls._get_int(default, *legacy)
+                return default
+
+        legacy_value = cls._cfg.get(*legacy)
+        if legacy_value is None:
+            cls._logger.error(
+                "Missing configuration value for '%s'; using default %d",
+                cls._config_path(*primary),
+                default,
+            )
+            return default
+        try:
+            return int(legacy_value)
+        except (TypeError, ValueError):
+            cls._logger.error(
+                "Invalid integer configuration value for '%s': %r; using default %d",
+                cls._config_path(*primary),
+                legacy_value,
+                default,
+            )
+            return default
 
     @classmethod
     def _get_bool(cls, default: bool, *path: str) -> bool:
@@ -252,7 +359,28 @@ class SystemConfigSettings:
         if isinstance(value, bool):
             return value
         if value is None:
-            return cls._get_bool(default, *legacy)
+            legacy_value = cls._cfg.get(*legacy)
+            if isinstance(legacy_value, bool):
+                return legacy_value
+            if legacy_value is None:
+                cls._logger.error(
+                    "Missing configuration value for '%s'; using default %s",
+                    cls._config_path(*primary),
+                    default,
+                )
+                return default
+            text = str(legacy_value).strip().lower()
+            if text in ("1", "true", "yes", "on"):
+                return True
+            if text in ("0", "false", "no", "off"):
+                return False
+            cls._logger.error(
+                "Invalid boolean configuration value for '%s': %r; using default %s",
+                cls._config_path(*primary),
+                legacy_value,
+                default,
+            )
+            return default
 
         text = str(value).strip().lower()
         if text in ("1", "true", "yes", "on"):
@@ -424,7 +552,7 @@ class SystemConfigSettings:
 
     @classmethod
     def bulk_tftp_remote_dir(cls) -> str:
-        return cls._get_str("", "PnmBulkDataTransfer", "tftp", "remote_dir")
+        return cls._get_str_allow_empty("", "PnmBulkDataTransfer", "tftp", "remote_dir")
 
     @classmethod
     def bulk_http_base_url(cls) -> str:
@@ -504,11 +632,7 @@ class SystemConfigSettings:
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "method")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "method")
 
-        value = cls._cfg.get(*primary)
-        if value is not None and str(value) != "":
-            return str(value)
-
-        return cls._get_str("", *legacy)
+        return cls._get_str_fallback("", primary, legacy)
 
     # Local method
     @classmethod
@@ -540,7 +664,7 @@ class SystemConfigSettings:
     def tftp_remote_dir(cls) -> str:
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "tftp", "remote_dir")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "tftp", "remote_dir")
-        return cls._get_str_fallback("", primary, legacy)
+        return cls._get_str_fallback_allow_empty("", primary, legacy)
 
     # FTP method
     @classmethod
@@ -587,7 +711,7 @@ class SystemConfigSettings:
     def ftp_remote_dir(cls) -> str:
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "remote_dir")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "remote_dir")
-        return cls._get_str_fallback("", primary, legacy)
+        return cls._get_str_fallback_allow_empty("", primary, legacy)
 
     # SCP method
     @classmethod
@@ -634,7 +758,7 @@ class SystemConfigSettings:
     def scp_remote_dir(cls) -> str:
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "scp", "remote_dir")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "scp", "remote_dir")
-        return cls._get_str_fallback("", primary, legacy)
+        return cls._get_str_fallback_allow_empty("", primary, legacy)
 
     # SFTP method
     @classmethod
@@ -681,7 +805,7 @@ class SystemConfigSettings:
     def sftp_remote_dir(cls) -> str:
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "sftp", "remote_dir")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "sftp", "remote_dir")
-        return cls._get_str_fallback("", primary, legacy)
+        return cls._get_str_fallback_allow_empty("", primary, legacy)
 
     # HTTP method
     @classmethod

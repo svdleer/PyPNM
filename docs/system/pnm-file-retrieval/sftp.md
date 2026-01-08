@@ -1,7 +1,7 @@
 # SFTP PNM File Retrieval Setup (Config Menu)
 
 This guide shows how to configure **SFTP** PNM file retrieval using the PyPNM `pnm_file_retrieval_setup.py` helper. The
-selected method becomes the active `PnmFileRetrieval.retrival_method.method` in `src/pypnm/settings/system.json`.
+selected method becomes the active `PnmFileRetrieval.retrieval_method.method` in `src/pypnm/settings/system.json`.
 
 When you provide credentials, the script tests SSH connectivity and reports success or failure. If you configure a private
 key, the script prints the corresponding RSA public key so you can install it on the remote host.
@@ -66,8 +66,8 @@ you configured for sftp file retrieval.
 
 SFTP settings are stored under:
 
-- `PnmFileRetrieval.retrival_method.method = "sftp"`
-- `PnmFileRetrieval.retrival_method.methods.sftp.*`
+- `PnmFileRetrieval.retrieval_method.method = "sftp"`
+- `PnmFileRetrieval.retrieval_method.methods.sftp.*`
 
 Typical keys written for SFTP:
 

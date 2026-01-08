@@ -1,6 +1,6 @@
 # PNM File Retrieval Topologies
 
-This page illustrates common network topologies for PNM file retrieval and how they map to the `PnmFileRetrieval.retrival_method.method` setting in `system.json`.
+This page illustrates common network topologies for PNM file retrieval and how they map to the `PnmFileRetrieval.retrieval_method.method` setting in `system.json`.
 
 ## Table Of Contents
 
@@ -18,7 +18,7 @@ Each topology shows how three components interact:
 - **TFTP Server** - Receives the PNM files from the CM.  
 - **PyPNM Host** - Retrieves the files from the server into the local `.data/pnm` tree and performs decoding and analysis.
 
-The selected topology is controlled by the `PnmFileRetrieval.retrival_method.method` value in `src/pypnm/settings/system.json` (for example: `local`, `tftp`, `scp`, `sftp`).  
+The selected topology is controlled by the `PnmFileRetrieval.retrieval_method.method` value in `src/pypnm/settings/system.json` (for example: `local`, `tftp`, `scp`, `sftp`).  
 
 Other methods (`ftp`, `http`, `https`) are currently stubbed in the configuration but not supported by the tools or helper scripts.
 
@@ -39,7 +39,7 @@ Typical Lab use-case:
 
 ```json
 "PnmFileRetrieval": {
-  "retrival_method": {
+  "retrieval_method": {
     "method": "local",
     "methods": {
       "local": {
@@ -70,7 +70,7 @@ Typical Production use-case:
 
 ```json
 "PnmFileRetrieval": {
-  "retrival_method": {
+  "retrieval_method": {
     "method": "scp",
     "methods": {
       "scp": {
@@ -90,7 +90,7 @@ or:
 
 ```json
 "PnmFileRetrieval": {
-  "retrival_method": {
+  "retrieval_method": {
     "method": "sftp",
     "methods": {
       "sftp": {
@@ -124,11 +124,11 @@ Typical Production (Non-Secure) use-case :
 - Simple environments where TFTP access from PyPNM is allowed.  
 - Legacy deployments that already use TFTP tooling and ACLs. 
 
-Note: `PnmFileRetrieval.retrival_method.tftp.remote_dir` is typically left as an empty string. In most deployments, the TFTP root directory is already defined on the TFTP server itself, and `remote_dir` would only be used if you need to pull from a specific subdirectory beneath that root.
+Note: `PnmFileRetrieval.retrieval_method.tftp.remote_dir` is typically left as an empty string. In most deployments, the TFTP root directory is already defined on the TFTP server itself, and `remote_dir` would only be used if you need to pull from a specific subdirectory beneath that root.
 
 ```json
 "PnmFileRetrieval": {
-  "retrival_method": {
+  "retrieval_method": {
     "method": "tftp",
     "methods": {
       "tftp": {
@@ -161,6 +161,6 @@ The helper will:
 - Back up `src/pypnm/settings/system.json` before any changes.  
 - Ask which retrieval method you want (`local`, `tftp`, `scp`, `sftp`).  
 - Prompt for host, port, user, password, private key path, and remote directory where applicable.  
-- Update the `PnmFileRetrieval.retrival_method` block to match the chosen topology.
+- Update the `PnmFileRetrieval.retrieval_method` block to match the chosen topology.
 
 You can re-run the script at any time if your lab topology changes (for example, moving from a local TFTP server to a remote SCP/SFTP-based workflow).
