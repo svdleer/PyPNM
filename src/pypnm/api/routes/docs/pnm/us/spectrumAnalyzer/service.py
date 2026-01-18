@@ -50,13 +50,21 @@ class CmtsUtscService:
             
             # 1. Configure Bulk Data Transfer (TFTP)
             bulk_idx = f".{self.cfg_idx}"
+            
+            # Convert IP address to hex bytes for SNMP
+            ip_parts = tftp_ip.split(".")
+            ip_hex = bytes([int(p) for p in ip_parts])
+            
             await self.snmp.set(f"{self.BULK_CFG_BASE}.3{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgDestHostIpAddrType (1=ipv4)
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", tftp_ip, OctetString)  # docsPnmBulkDataTransferCfgDestHostIpAddress
+            await self.snmp.set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString)  # docsPnmBulkDataTransferCfgDestHostIpAddress (hex)
             await self.snmp.set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "./", OctetString)  # docsPnmBulkDataTransferCfgDestBaseUri
             await self.snmp.set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgProtocol (1=TFTP)
             
-            # 2. Enable auto upload
-            await self.snmp.set(self.BULK_UPLOAD_CONTROL, 1, Integer32)  # docsPnmBulkUploadControl
+            # 2. Enable auto upload (may not exist on all CMTS)
+            try:
+                await self.snmp.set(self.BULK_UPLOAD_CONTROL, 1, Integer32)  # docsPnmBulkUploadControl
+            except Exception:
+                pass  # OID may not exist on this CMTS model
             
             # 3. Configure UTSC parameters
             await self.snmp.set(f"{self.UTSC_CFG_BASE}.3{idx}", trigger_mode, Integer32)
