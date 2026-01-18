@@ -20,6 +20,7 @@ class CmtsUtscService:
     
     # Bulk Data Transfer Configuration
     BULK_UPLOAD_CONTROL = "1.3.6.1.4.1.4491.2.1.27.1.1.1.4"
+    BULK_DEST_PATH = "1.3.6.1.4.1.4491.2.1.27.1.1.1.3"
     BULK_CFG_BASE = "1.3.6.1.4.1.4491.2.1.27.1.1.3.1.1"
     
     # UTSC Configuration (correct OIDs from DOCS-PNM-MIB)
@@ -55,9 +56,11 @@ class CmtsUtscService:
             ip_parts = tftp_ip.split(".")
             ip_hex = bytes([int(p) for p in ip_parts])
             
+            # Set destination path
+            await self.snmp.set(f"{self.BULK_DEST_PATH}.0", "./", OctetString)  # docsPnmBulkDestPath
+            
             await self.snmp.set(f"{self.BULK_CFG_BASE}.3{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgDestHostIpAddrType (1=ipv4)
             await self.snmp.set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString)  # docsPnmBulkDataTransferCfgDestHostIpAddress (hex)
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "./", OctetString)  # docsPnmBulkDataTransferCfgDestBaseUri
             await self.snmp.set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgProtocol (1=TFTP)
             
             # 2. Enable auto upload (may not exist on all CMTS)
