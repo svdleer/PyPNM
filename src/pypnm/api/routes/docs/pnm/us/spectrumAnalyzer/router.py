@@ -59,5 +59,5 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
         cmts_ip=str(request.cmts.cmts_ip),
         rf_port_ifindex=request.cmts.rf_port_ifindex,
         filename=request.capture_parameters.filename,
-        data={"message": "UTSC started", "tftp_path": "/pnm/utsc"}
+        data={"message": "UTSC started", "tftp_path": "./"}
     )
