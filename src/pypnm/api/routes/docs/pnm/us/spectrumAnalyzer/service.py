@@ -33,7 +33,7 @@ class CmtsUtscService:
         self.cmts_ip = cmts_ip
         self.rf_port_ifindex = rf_port_ifindex
         self.snmp = Snmp_v2c(cmts_ip, read_community=community, write_community=community)
-        self.cfg_idx = 3  # Use index 3 like the working script
+        self.cfg_idx = 1  # Use index .1 which exists on this CMTS
     
     async def configure(
         self, 
