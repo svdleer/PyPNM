@@ -23,7 +23,7 @@ class CmtsUtscService:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cmts_ip = cmts_ip
         self.rf_port_ifindex = rf_port_ifindex
-        self.snmp = Snmp_v2c(inet=cmts_ip, read_community=community, write_community=community)
+        self.snmp = Snmp_v2c(cmts_ip, read_community=community, write_community=community)
         self.cfg_idx = 1
     
     async def configure(
