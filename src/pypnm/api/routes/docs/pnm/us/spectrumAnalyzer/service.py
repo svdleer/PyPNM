@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 
+from pysnmp.proto.rfc1902 import Integer32, OctetString, Unsigned32
 from pypnm.lib.inet import Inet
 from pypnm.snmp.snmp_v2c import Snmp_v2c
 
@@ -40,18 +41,18 @@ class CmtsUtscService:
             base = self.UTSC_CFG_BASE
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
             
-            await self.snmp.set_int(f"{base}.3{idx}", trigger_mode)
-            await self.snmp.set_uint(f"{base}.8{idx}", center_freq_hz)
-            await self.snmp.set_uint(f"{base}.9{idx}", span_hz)
-            await self.snmp.set_uint(f"{base}.10{idx}", num_bins)
-            await self.snmp.set_int(f"{base}.17{idx}", 2)
-            await self.snmp.set_octet_string(f"{base}.13{idx}", filename)
+            await self.snmp.set(f"{base}.3{idx}", trigger_mode, Integer32)
+            await self.snmp.set(f"{base}.8{idx}", center_freq_hz, Unsigned32)
+            await self.snmp.set(f"{base}.9{idx}", span_hz, Unsigned32)
+            await self.snmp.set(f"{base}.10{idx}", num_bins, Unsigned32)
+            await self.snmp.set(f"{base}.17{idx}", 2, Integer32)
+            await self.snmp.set(f"{base}.13{idx}", filename, OctetString)
             
             # CM MAC trigger mode (6) requires MAC address
             if trigger_mode == 6 and cm_mac:
-                await self.snmp.set_mac_address(f"{base}.6{idx}", cm_mac)
+                await self.snmp.set(f"{base}.6{idx}", cm_mac, OctetString)
                 if logical_ch_ifindex:
-                    await self.snmp.set_int(f"{base}.2{idx}", logical_ch_ifindex)
+                    await self.snmp.set(f"{base}.2{idx}", logical_ch_ifindex, Integer32)
             
             return {"success": True, "cmts_ip": str(self.cmts_ip)}
         except Exception as e:
@@ -60,7 +61,7 @@ class CmtsUtscService:
     async def start(self) -> dict:
         try:
             oid = f"{self.UTSC_CTRL_BASE}.1.{self.rf_port_ifindex}.{self.cfg_idx}"
-            await self.snmp.set_int(oid, 1)
+            await self.snmp.set(oid, 1, Integer32)
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
