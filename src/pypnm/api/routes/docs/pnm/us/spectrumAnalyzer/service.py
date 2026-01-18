@@ -33,7 +33,7 @@ class CmtsUtscService:
         self.cmts_ip = cmts_ip
         self.rf_port_ifindex = rf_port_ifindex
         self.snmp = Snmp_v2c(cmts_ip, read_community=community, write_community=community)
-        self.cfg_idx = 1
+        self.cfg_idx = 3  # Use index 3 like the working script
     
     async def configure(
         self, 
@@ -67,7 +67,16 @@ class CmtsUtscService:
             except Exception:
                 pass  # OID may not exist on this CMTS model
             
-            # 3. Configure UTSC parameters
+            # 3. Set row status to createAndGo, then active
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.24{idx}", 6, Integer32)  # createAndGo
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.19{idx}", 12000000, Unsigned32)  # RepeatPeriod (12 seconds)
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.20{idx}", 12000, Unsigned32)  # FreeRunDuration (12ms)
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32)
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32)
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32)
+            await self.snmp.set(f"{self.UTSC_CFG_BASE}.13{idx}", filename, OctetString)
+            
+            # 6. Configure UTSC parameters
             await self.snmp.set(f"{self.UTSC_CFG_BASE}.3{idx}", trigger_mode, Integer32)
             await self.snmp.set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32)
             await self.snmp.set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32)
