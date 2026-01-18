@@ -26,8 +26,16 @@ class CmtsUtscService:
         self.snmp = Snmp_v2c(inet=cmts_ip, read_community=community, write_community=community)
         self.cfg_idx = 1
     
-    async def configure(self, center_freq_hz: int, span_hz: int, num_bins: int, 
-                       trigger_mode: int, filename: str) -> dict:
+    async def configure(
+        self, 
+        center_freq_hz: int, 
+        span_hz: int, 
+        num_bins: int, 
+        trigger_mode: int, 
+        filename: str,
+        cm_mac: str | None = None,
+        logical_ch_ifindex: int | None = None
+    ) -> dict:
         try:
             base = self.UTSC_CFG_BASE
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
@@ -38,6 +46,12 @@ class CmtsUtscService:
             await self.snmp.set_uint(f"{base}.10{idx}", num_bins)
             await self.snmp.set_int(f"{base}.17{idx}", 2)
             await self.snmp.set_octet_string(f"{base}.13{idx}", filename)
+            
+            # CM MAC trigger mode (6) requires MAC address
+            if trigger_mode == 6 and cm_mac:
+                await self.snmp.set_mac_address(f"{base}.6{idx}", cm_mac)
+                if logical_ch_ifindex:
+                    await self.snmp.set_int(f"{base}.2{idx}", logical_ch_ifindex)
             
             return {"success": True, "cmts_ip": str(self.cmts_ip)}
         except Exception as e:
