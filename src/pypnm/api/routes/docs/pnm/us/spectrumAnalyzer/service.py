@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from pysnmp.proto.rfc1902 import Integer32, OctetString, Unsigned32
@@ -32,8 +33,51 @@ class CmtsUtscService:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cmts_ip = cmts_ip
         self.rf_port_ifindex = rf_port_ifindex
-        self.snmp = Snmp_v2c(cmts_ip, read_community=community, write_community=community)
+        self.snmp = Snmp_v2c(cmts_ip, read_community=community, write_community=community, timeout=3, retries=1)
         self.cfg_idx = 1  # Use index .1 which exists on this CMTS
+    
+    async def _safe_snmp_set(self, oid: str, value, value_type, description: str = "") -> bool:
+        """Safe SNMP SET with timeout and error handling"""
+        try:
+            self.logger.debug(f"SNMP SET: {description} - OID={oid}")
+            result = await asyncio.wait_for(
+                self.snmp.set(oid, value, value_type),
+                timeout=5.0  # 5 second timeout per operation
+            )
+            if result:
+                self.logger.debug(f"SNMP SET SUCCESS: {description}")
+                return True
+            else:
+                self.logger.warning(f"SNMP SET returned None: {description} - OID={oid}")
+                return False
+        except asyncio.TimeoutError:
+            self.logger.error(f"SNMP SET TIMEOUT: {description} - OID={oid}")
+            return False
+        except Exception as e:
+            self.logger.error(f"SNMP SET ERROR: {description} - OID={oid} - {str(e)}")
+            return False
+    
+    async def _safe_snmp_get(self, oid: str, description: str = ""):
+        """Safe SNMP GET with timeout and error handling"""
+        try:
+            self.logger.debug(f"SNMP GET: {description} - OID={oid}")
+            result = await asyncio.wait_for(
+                self.snmp.get(oid),
+                timeout=5.0
+            )
+            return result
+        except asyncio.TimeoutError:
+            self.logger.error(f"SNMP GET TIMEOUT: {description} - OID={oid}")
+            return None
+        except Exception as e:
+            self.logger.debug(f"SNMP GET ERROR: {description} - OID={oid} - {str(e)}")
+            return None
+    
+    async def _check_row_exists(self, idx: str) -> bool:
+        """Check if UTSC configuration row already exists"""
+        oid = f"{self.UTSC_CFG_BASE}.24{idx}"  # docsPnmCmtsUtscCfgDestinationIndex
+        result = await self._safe_snmp_get(oid, f"Check row exists for {idx}")
+        return result is not None and len(result) > 0
     
     async def configure(
         self, 
@@ -46,58 +90,117 @@ class CmtsUtscService:
         cm_mac: str | None = None,
         logical_ch_ifindex: int | None = None
     ) -> dict:
+        """Configure UTSC with comprehensive error handling and timeouts"""
         try:
+            self.logger.info(f"Starting UTSC configuration for CMTS={self.cmts_ip}, RF Port={self.rf_port_ifindex}")
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
-            
-            # 1. Configure Bulk Data Transfer (TFTP)
             bulk_idx = f".{self.cfg_idx}"
+            errors = []
             
-            # Convert IP address to hex bytes for SNMP
-            ip_parts = tftp_ip.split(".")
-            ip_hex = bytes([int(p) for p in ip_parts])
+            # Check if row already exists
+            row_exists = await self._check_row_exists(idx)
+            self.logger.info(f"UTSC row exists check: {row_exists}")
             
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.3{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgDestHostIpAddrType (1=ipv4)
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString)  # docsPnmBulkDataTransferCfgDestHostIpAddress (hex)
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "/", OctetString)  # docsPnmBulkDataTransferCfgDestBaseUri = "/"
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgProtocol (1=TFTP)
-            
-            # 2. Enable auto upload (may not exist on all CMTS)
+            # 1. Configure Bulk Data Transfer (TFTP) - these are critical
+            self.logger.info("Step 1: Configuring Bulk Data Transfer (TFTP)")
             try:
-                await self.snmp.set(self.BULK_UPLOAD_CONTROL, 1, Integer32)  # docsPnmBulkUploadControl
-            except Exception:
-                pass  # OID may not exist on this CMTS model
+                ip_parts = tftp_ip.split(".")
+                ip_hex = bytes([int(p) for p in ip_parts])
+                
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.3{bulk_idx}", 1, Integer32, "TFTP IP Type (IPv4)"):
+                    errors.append("Failed to set TFTP IP type")
+                
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString, f"TFTP IP Address {tftp_ip}"):
+                    errors.append("Failed to set TFTP IP address")
+                
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "/", OctetString, "TFTP Base URI"):
+                    errors.append("Failed to set TFTP base URI")
+                
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32, "TFTP Protocol"):
+                    errors.append("Failed to set TFTP protocol")
+                    
+            except Exception as e:
+                errors.append(f"TFTP config error: {str(e)}")
             
-            # 3. Set row status to createAndGo, then active
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.24{idx}", 6, Integer32)  # createAndGo
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.19{idx}", 12000000, Unsigned32)  # RepeatPeriod (12 seconds)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.20{idx}", 12000, Unsigned32)  # FreeRunDuration (12ms)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.13{idx}", filename, OctetString)
+            # 2. Enable auto upload (optional - may not exist on all CMTS)
+            self.logger.info("Step 2: Enabling auto upload (optional)")
+            await self._safe_snmp_set(self.BULK_UPLOAD_CONTROL, 1, Integer32, "Bulk Upload Control (optional)")
             
-            # 6. Configure UTSC parameters
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.3{idx}", trigger_mode, Integer32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32)
-            await self.snmp.set(f"{self.UTSC_CFG_BASE}.13{idx}", filename, OctetString)
+            # 3. Create or update UTSC row
+            if not row_exists:
+                self.logger.info("Step 3: Creating new UTSC row with createAndGo")
+                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 4, Integer32, "Row Status createAndWait"):
+                    errors.append("Failed to create UTSC row")
+            else:
+                self.logger.info("Step 3: Row exists, setting to notInService for modification")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 2, Integer32, "Row Status notInService")
             
-            # 4. CM MAC for trigger mode 6
+            # 4. Configure UTSC timing parameters
+            self.logger.info("Step 4: Configuring UTSC timing parameters")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", 12000000, Unsigned32, "Repeat Period (12s)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", 12000, Unsigned32, "FreeRun Duration (12ms)")
+            
+            # 5. Configure UTSC capture parameters
+            self.logger.info("Step 5: Configuring UTSC capture parameters")
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.3{idx}", trigger_mode, Integer32, f"Trigger Mode ({trigger_mode})"):
+                errors.append("Failed to set trigger mode")
+            
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32, f"Center Freq ({center_freq_hz} Hz)"):
+                errors.append("Failed to set center frequency")
+            
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32, f"Span ({span_hz} Hz)"):
+                errors.append("Failed to set span")
+            
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32, f"Num Bins ({num_bins})"):
+                errors.append("Failed to set num bins")
+            
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.13{idx}", filename, OctetString, f"Filename ({filename})"):
+                errors.append("Failed to set filename")
+            
+            # 6. Configure CM MAC for trigger mode 6
             if trigger_mode == 6 and cm_mac:
-                await self.snmp.set(f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, OctetString)  # docsPnmCmtsUtscCfgCmMacAddr
+                self.logger.info("Step 6: Configuring CM MAC trigger")
+                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, OctetString, f"CM MAC ({cm_mac})"):
+                    errors.append("Failed to set CM MAC")
+                
                 if logical_ch_ifindex:
-                    await self.snmp.set(f"{self.UTSC_CFG_BASE}.2{idx}", logical_ch_ifindex, Integer32)
+                    await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.2{idx}", logical_ch_ifindex, Integer32, f"Logical Ch ifIndex ({logical_ch_ifindex})")
             
+            # 7. Activate the row
+            self.logger.info("Step 7: Activating UTSC row")
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Integer32, "Row Status active"):
+                errors.append("Failed to activate UTSC row")
+            
+            if errors:
+                error_msg = "; ".join(errors)
+                self.logger.error(f"UTSC configuration completed with errors: {error_msg}")
+                return {"success": False, "error": error_msg, "partial": True}
+            
+            self.logger.info("UTSC configuration completed successfully")
             return {"success": True, "cmts_ip": str(self.cmts_ip)}
+            
+        except asyncio.TimeoutError:
+            error_msg = "UTSC configuration timed out"
+            self.logger.error(error_msg)
+            return {"success": False, "error": error_msg}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            error_msg = f"UTSC configuration failed: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            return {"success": False, "error": error_msg}
     
     async def start(self) -> dict:
+        """Start UTSC capture with error handling"""
         try:
+            self.logger.info(f"Starting UTSC capture for RF Port {self.rf_port_ifindex}")
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
             oid = f"{self.UTSC_CTRL_BASE}.1{idx}"  # docsPnmCmtsUtscCtrlInitiateTest
-            await self.snmp.set(oid, 1, Integer32)
+            
+            if not await self._safe_snmp_set(oid, 1, Integer32, "Initiate UTSC Test"):
+                return {"success": False, "error": "Failed to initiate UTSC capture"}
+            
+            self.logger.info("UTSC capture initiated successfully")
             return {"success": True}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            error_msg = f"Failed to start UTSC: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            return {"success": False, "error": error_msg}

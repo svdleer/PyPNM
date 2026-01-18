@@ -11,9 +11,9 @@ import json
 PYPNM_API_URL = "http://localhost:8081"
 CMTS_IP = "172.16.6.212"
 CMTS_COMMUNITY = "Z1gg0@LL"
-RF_PORT_IFINDEX = 1  # REPLACE WITH ACTUAL RF PORT IFINDEX
+RF_PORT_IFINDEX = 1074339840  # us-conn 0 (upstream connector with existing UTSC config)
 MODEM_MAC = "00:00:00:00:00:00"  # OPTIONAL - for trigger mode 6
-TFTP_IP = "172.22.147.18"
+TFTP_IP = "172.16.6.101"  # Use TFTP from pypnm_system.json
 
 def test_utsc_freerunning():
     """Test UTSC with FreeRunning trigger mode (no modem MAC needed)"""
@@ -43,16 +43,20 @@ def test_utsc_freerunning():
     }
     
     try:
+        print(f"Sending request with payload: {json.dumps(payload, indent=2)}")
         response = requests.post(
             f"{PYPNM_API_URL}/docs/pnm/us/spectrumAnalyzer/getCapture",
             json=payload,
-            timeout=30
+            timeout=90
         )
         
         print(f"Status: {response.status_code}")
         print(f"Response: {json.dumps(response.json(), indent=2)}")
         
         return response.status_code == 200
+    except requests.exceptions.Timeout as e:
+        print(f"TIMEOUT: Request took longer than 90 seconds")
+        return False
     except Exception as e:
         print(f"ERROR: {e}")
         return False
@@ -89,16 +93,20 @@ def test_utsc_cm_mac():
     }
     
     try:
+        print(f"Sending request with payload: {json.dumps(payload, indent=2)}")
         response = requests.post(
             f"{PYPNM_API_URL}/docs/pnm/us/spectrumAnalyzer/getCapture",
             json=payload,
-            timeout=30
+            timeout=90
         )
         
         print(f"Status: {response.status_code}")
         print(f"Response: {json.dumps(response.json(), indent=2)}")
         
         return response.status_code == 200
+    except requests.exceptions.Timeout as e:
+        print(f"TIMEOUT: Request took longer than 90 seconds")
+        return False
     except Exception as e:
         print(f"ERROR: {e}")
         return False
