@@ -41,6 +41,7 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
         num_bins=request.capture_parameters.num_bins,
         trigger_mode=request.capture_parameters.trigger_mode,
         filename=request.capture_parameters.filename,
+        tftp_ip=str(request.tftp.ipv4),
         cm_mac=request.trigger.cm_mac,
         logical_ch_ifindex=request.trigger.logical_ch_ifindex
     )
