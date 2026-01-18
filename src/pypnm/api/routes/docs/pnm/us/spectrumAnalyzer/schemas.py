@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from pypnm.api.routes.common.classes.common_endpoint_classes.common_req_resp import (
     TftpConfig,
 )
-from pypnm.lib.types import IPv4Str, MacStr
+from pypnm.lib.types import IPv4Str, MacAddressStr
 
 
 class CmtsConfig(BaseModel):
@@ -20,7 +20,7 @@ class CmtsConfig(BaseModel):
 
 class UtscTriggerConfig(BaseModel):
     """UTSC Trigger Configuration (optional for CM MAC trigger mode)"""
-    cm_mac: MacStr | None = Field(default=None, description="Cable modem MAC address (required for trigger mode 6)")
+    cm_mac: MacAddressStr | None = Field(default=None, description="Cable modem MAC address (required for trigger mode 6)")
     logical_ch_ifindex: int | None = Field(default=None, description="Logical channel ifIndex for trigger (SC-QAM or OFDMA)")
 
 
