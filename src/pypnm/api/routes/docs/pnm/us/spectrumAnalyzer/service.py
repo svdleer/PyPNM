@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 
 from pypnm.lib.inet import Inet
-from pypnm.lib.snmp.snmp_v2c import Snmp_v2c
+from pypnm.snmp.snmp_v2c import Snmp_v2c
 
 
 class CmtsUtscService:
