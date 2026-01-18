@@ -10,7 +10,7 @@ import json
 # Test Configuration
 PYPNM_API_URL = "http://localhost:8081"
 CMTS_IP = "172.16.6.212"
-CMTS_COMMUNITY = "Z1gg0@LL"
+CMTS_COMMUNITY = "Z1gg0Sp3c1@l"  # Write community for SNMP SET operations
 RF_PORT_IFINDEX = 1074339840  # us-conn 0 (upstream connector with existing UTSC config)
 MODEM_MAC = "00:00:00:00:00:00"  # OPTIONAL - for trigger mode 6
 TFTP_IP = "172.16.6.101"  # Use TFTP from pypnm_system.json

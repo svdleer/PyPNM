@@ -113,7 +113,7 @@ class CmtsUtscService:
                 if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString, f"TFTP IP Address {tftp_ip}"):
                     errors.append("Failed to set TFTP IP address")
                 
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "/", OctetString, "TFTP Base URI"):
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "./", OctetString, "TFTP Base URI"):
                     errors.append("Failed to set TFTP base URI")
                 
                 if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32, "TFTP Protocol"):
@@ -154,7 +154,7 @@ class CmtsUtscService:
             if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32, f"Num Bins ({num_bins})"):
                 errors.append("Failed to set num bins")
             
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.13{idx}", filename, OctetString, f"Filename ({filename})"):
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.12{idx}", filename, OctetString, f"Filename ({filename})"):
                 errors.append("Failed to set filename")
             
             # 6. Configure CM MAC for trigger mode 6
@@ -166,10 +166,15 @@ class CmtsUtscService:
                 if logical_ch_ifindex:
                     await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.2{idx}", logical_ch_ifindex, Integer32, f"Logical Ch ifIndex ({logical_ch_ifindex})")
             
-            # 7. Activate the row
-            self.logger.info("Step 7: Activating UTSC row")
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Integer32, "Row Status active"):
-                errors.append("Failed to activate UTSC row")
+            # 7. Activate the row (only if we created it new)
+            if not row_exists:
+                self.logger.info("Step 7: Activating new UTSC row")
+                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Integer32, "Row Status active"):
+                    errors.append("Failed to activate UTSC row")
+            else:
+                self.logger.info("Step 7: Row already active, setting back to active")
+                # Row already exists and is active, just ensure it's active
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Integer32, "Row Status active (refresh)")
             
             if errors:
                 error_msg = "; ".join(errors)
