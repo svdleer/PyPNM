@@ -56,9 +56,11 @@ class CmtsUtscService:
             ip_parts = tftp_ip.split(".")
             ip_hex = bytes([int(p) for p in ip_parts])
             
+            # Set destination path (docsPnmBulkDestPath with index)
+            await self.snmp.set(f"{self.BULK_DEST_PATH}{bulk_idx}", "tftpboot/", OctetString)
+            
             await self.snmp.set(f"{self.BULK_CFG_BASE}.3{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgDestHostIpAddrType (1=ipv4)
             await self.snmp.set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString)  # docsPnmBulkDataTransferCfgDestHostIpAddress (hex)
-            await self.snmp.set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "./", OctetString)  # docsPnmBulkDataTransferCfgDestBaseUri
             await self.snmp.set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32)  # docsPnmBulkDataTransferCfgProtocol (1=TFTP)
             
             # 2. Enable auto upload (may not exist on all CMTS)
