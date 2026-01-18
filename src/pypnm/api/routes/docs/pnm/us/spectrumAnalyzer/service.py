@@ -75,7 +75,7 @@ class CmtsUtscService:
     
     async def _check_row_exists(self, idx: str) -> bool:
         """Check if UTSC configuration row already exists"""
-        oid = f"{self.UTSC_CFG_BASE}.24{idx}"  # docsPnmCmtsUtscCfgDestinationIndex
+        oid = f"{self.UTSC_CFG_BASE}.21{idx}"  # docsPnmCmtsUtscCfgStatus (RowStatus is field .21)
         result = await self._safe_snmp_get(oid, f"Check row exists for {idx}")
         return result is not None and len(result) > 0
     
@@ -113,11 +113,15 @@ class CmtsUtscService:
                 if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString, f"TFTP IP Address {tftp_ip}"):
                     errors.append("Failed to set TFTP IP address")
                 
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "./", OctetString, "TFTP Base URI"):
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "", OctetString, "TFTP Base URI (empty)"):
                     errors.append("Failed to set TFTP base URI")
                 
                 if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32, "TFTP Protocol"):
                     errors.append("Failed to set TFTP protocol")
+                
+                # Enable local store to produce file
+                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.8{bulk_idx}", 1, Integer32, "Local Store = true (produce file)"):
+                    errors.append("Failed to enable local store")
                     
             except Exception as e:
                 errors.append(f"TFTP config error: {str(e)}")
@@ -128,17 +132,22 @@ class CmtsUtscService:
             
             # 3. Create or update UTSC row
             if not row_exists:
-                self.logger.info("Step 3: Creating new UTSC row with createAndGo")
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 4, Integer32, "Row Status createAndWait"):
+                self.logger.info("Step 3: Creating new UTSC row with createAndWait")
+                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 4, Integer32, "Row Status createAndWait"):
                     errors.append("Failed to create UTSC row")
             else:
                 self.logger.info("Step 3: Row exists, setting to notInService for modification")
-                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 2, Integer32, "Row Status notInService")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService")
             
+            # 3a. Set DestinationIndex to enable Bulk File Transfer
+            self.logger.info("Step 3a: Setting DestinationIndex to enable auto-upload")
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Unsigned32, "DestinationIndex = 1 (enable bulk transfer)"):
+                errors.append("Failed to set DestinationIndex - bulk transfer may not work")            
             # 4. Configure UTSC timing parameters
             self.logger.info("Step 4: Configuring UTSC timing parameters")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", 12000000, Unsigned32, "Repeat Period (12s)")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", 12000, Unsigned32, "FreeRun Duration (12ms)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", 1000000, Unsigned32, "Repeat Period (1s = 1000000 microseconds)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", 12000, Unsigned32, "FreeRun Duration (12s = 12000 milliseconds)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", 1, Unsigned32, "Trigger Count (1)")
             
             # 5. Configure UTSC capture parameters
             self.logger.info("Step 5: Configuring UTSC capture parameters")
@@ -169,12 +178,12 @@ class CmtsUtscService:
             # 7. Activate the row (only if we created it new)
             if not row_exists:
                 self.logger.info("Step 7: Activating new UTSC row")
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Integer32, "Row Status active"):
+                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 1, Integer32, "Row Status active"):
                     errors.append("Failed to activate UTSC row")
             else:
                 self.logger.info("Step 7: Row already active, setting back to active")
                 # Row already exists and is active, just ensure it's active
-                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Integer32, "Row Status active (refresh)")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 1, Integer32, "Row Status active (refresh)")
             
             if errors:
                 error_msg = "; ".join(errors)
