@@ -31,9 +31,9 @@ class UtscCaptureParameters(BaseModel):
     span_hz: int = Field(default=80000000, description="Frequency span in Hz")
     num_bins: int = Field(default=800, description="Number of FFT bins")
     filename: str = Field(default="utsc_capture", description="Base filename for results")
-    repeat_period_ms: int = Field(default=3000, description="Repeat period in milliseconds (time between captures)")
+    repeat_period_ms: int = Field(default=1000, description="Repeat period in milliseconds (time between captures, max 1000ms on some CMTS)")
     freerun_duration_ms: int = Field(default=60000, description="Total duration for free-running mode in milliseconds")
-    trigger_count: int = Field(default=20, description="Number of captures to take")
+    trigger_count: int = Field(default=10, description="Number of captures to take (max 10 on Casa E6000, ignored in FreeRunning mode)")
 
 
 class UtscAnalysisConfig(BaseModel):

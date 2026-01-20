@@ -89,9 +89,9 @@ class CmtsUtscService:
         tftp_ip: str,
         cm_mac: str | None = None,
         logical_ch_ifindex: int | None = None,
-        repeat_period_ms: int = 3000,
+        repeat_period_ms: int = 1000,
         freerun_duration_ms: int = 60000,
-        trigger_count: int = 20
+        trigger_count: int = 10
     ) -> dict:
         """Configure UTSC with comprehensive error handling and timeouts"""
         try:
@@ -162,7 +162,8 @@ class CmtsUtscService:
             self.logger.info("Step 4: Configuring UTSC timing parameters")
             # Convert milliseconds to microseconds for RepeatPeriod
             repeat_period_us = repeat_period_ms * 1000
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_ms}ms = {repeat_period_us} microseconds)")
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_ms}ms = {repeat_period_us} microseconds)"):
+                errors.append(f"Failed to set RepeatPeriod to {repeat_period_ms}ms - may exceed CMTS maximum (typically 1000ms)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms = {freerun_duration_ms} milliseconds)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})")
             
