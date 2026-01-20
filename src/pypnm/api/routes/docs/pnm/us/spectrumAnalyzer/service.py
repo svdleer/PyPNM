@@ -134,13 +134,25 @@ class CmtsUtscService:
             await self._safe_snmp_set(self.BULK_UPLOAD_CONTROL, 1, Integer32, "Bulk Upload Control (optional)")
             
             # 3. Create or update UTSC row
+            if row_exists:
+                self.logger.info("Step 3: Row exists, attempting to delete it first to set fresh parameters")
+                # Casa E6000 CMTS doesn't allow modifying active rows, so try to destroy and recreate
+                if await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 6, Integer32, "Row Status destroy"):
+                    self.logger.info("Successfully destroyed existing row, will create new one")
+                    row_exists = False  # Now we need to create it
+                    import asyncio
+                    await asyncio.sleep(0.5)  # Give CMTS time to clean up
+                else:
+                    # Can't delete, try to set to notInService to modify
+                    self.logger.warning("Cannot destroy row, trying notInService instead")
+                    if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService"):
+                        self.logger.error("Cannot modify locked UTSC row - timing parameters will use previous values")
+                        errors.append("Row is locked - timing parameters cannot be updated. Delete row manually or restart CMTS.")
+            
             if not row_exists:
                 self.logger.info("Step 3: Creating new UTSC row with createAndWait")
                 if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 4, Integer32, "Row Status createAndWait"):
                     errors.append("Failed to create UTSC row")
-            else:
-                self.logger.info("Step 3: Row exists, setting to notInService for modification")
-                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService")
             
             # 3a. Set DestinationIndex to enable Bulk File Transfer
             self.logger.info("Step 3a: Setting DestinationIndex to enable auto-upload")
