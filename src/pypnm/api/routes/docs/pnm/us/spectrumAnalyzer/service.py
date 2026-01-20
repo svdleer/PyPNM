@@ -163,7 +163,7 @@ class CmtsUtscService:
             # Convert milliseconds to microseconds for RepeatPeriod
             repeat_period_us = repeat_period_ms * 1000
             if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_ms}ms = {repeat_period_us} microseconds)"):
-                errors.append(f"Failed to set RepeatPeriod to {repeat_period_ms}ms - may exceed CMTS maximum (typically 1000ms)")
+                errors.append(f"Failed to set RepeatPeriod to {repeat_period_ms}ms - may exceed CMTS maximum (1000ms on CommScope E6000)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms = {freerun_duration_ms} milliseconds)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})")
             

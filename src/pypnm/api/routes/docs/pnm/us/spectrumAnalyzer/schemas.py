@@ -33,7 +33,7 @@ class UtscCaptureParameters(BaseModel):
     filename: str = Field(default="utsc_capture", description="Base filename for results")
     repeat_period_ms: int = Field(default=1000, description="Repeat period in milliseconds (time between captures, max 1000ms on some CMTS)")
     freerun_duration_ms: int = Field(default=60000, description="Total duration for free-running mode in milliseconds")
-    trigger_count: int = Field(default=10, description="Number of captures to take (max 10 on Casa E6000, ignored in FreeRunning mode)")
+    trigger_count: int = Field(default=10, description="Number of captures to take (max 10 on CommScope E6000, ignored in FreeRunning mode)")
 
 
 class UtscAnalysisConfig(BaseModel):
