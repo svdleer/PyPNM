@@ -460,7 +460,16 @@ class CmSnmpOperation:
             self.logger.error(f'No results found for docsPnmCmCtlStatus: {DocsPnmCmCtlStatus.SNMP_ERROR}')
             return DocsPnmCmCtlStatus.SNMP_ERROR
 
-        status_value = int(Snmp_v2c.snmp_get_result_value(result)[0])
+        raw_value = Snmp_v2c.snmp_get_result_value(result)[0]
+        if raw_value == '' or raw_value is None:
+            self.logger.warning(f'Empty value returned for docsPnmCmCtlStatus, treating as not ready')
+            return DocsPnmCmCtlStatus.PNM_NOT_READY
+        
+        try:
+            status_value = int(raw_value)
+        except (ValueError, TypeError) as e:
+            self.logger.error(f'Invalid docsPnmCmCtlStatus value "{raw_value}": {e}')
+            return DocsPnmCmCtlStatus.SNMP_ERROR
 
         return DocsPnmCmCtlStatus(status_value)
 
