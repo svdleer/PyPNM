@@ -146,8 +146,7 @@ class CmtsUtscService:
                     # Can't delete, try to set to notInService to modify
                     self.logger.warning("Cannot destroy row, trying notInService instead")
                     if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService"):
-                        self.logger.error("Cannot modify locked UTSC row - timing parameters will use previous values")
-                        errors.append("Row is locked - timing parameters cannot be updated. Delete row manually or restart CMTS.")
+                        self.logger.warning("Row is locked but will try to overwrite parameters anyway")
             
             if not row_exists:
                 self.logger.info("Step 3: Creating new UTSC row with createAndWait")
