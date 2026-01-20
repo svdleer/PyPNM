@@ -88,7 +88,10 @@ class CmtsUtscService:
         filename: str,
         tftp_ip: str,
         cm_mac: str | None = None,
-        logical_ch_ifindex: int | None = None
+        logical_ch_ifindex: int | None = None,
+        repeat_period_ms: int = 3000,
+        freerun_duration_ms: int = 60000,
+        trigger_count: int = 20
     ) -> dict:
         """Configure UTSC with comprehensive error handling and timeouts"""
         try:
@@ -145,9 +148,11 @@ class CmtsUtscService:
                 errors.append("Failed to set DestinationIndex - bulk transfer may not work")            
             # 4. Configure UTSC timing parameters
             self.logger.info("Step 4: Configuring UTSC timing parameters")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", 1000000, Unsigned32, "Repeat Period (1s = 1000000 microseconds)")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", 12000, Unsigned32, "FreeRun Duration (12s = 12000 milliseconds)")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", 1, Unsigned32, "Trigger Count (1)")
+            # Convert milliseconds to microseconds for RepeatPeriod
+            repeat_period_us = repeat_period_ms * 1000
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_ms}ms = {repeat_period_us} microseconds)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms = {freerun_duration_ms} milliseconds)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})")
             
             # 5. Configure UTSC capture parameters
             self.logger.info("Step 5: Configuring UTSC capture parameters")

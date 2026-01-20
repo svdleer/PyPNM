@@ -31,6 +31,9 @@ class UtscCaptureParameters(BaseModel):
     span_hz: int = Field(default=80000000, description="Frequency span in Hz")
     num_bins: int = Field(default=800, description="Number of FFT bins")
     filename: str = Field(default="utsc_capture", description="Base filename for results")
+    repeat_period_ms: int = Field(default=3000, description="Repeat period in milliseconds (time between captures)")
+    freerun_duration_ms: int = Field(default=60000, description="Total duration for free-running mode in milliseconds")
+    trigger_count: int = Field(default=20, description="Number of captures to take")
 
 
 class UtscAnalysisConfig(BaseModel):

@@ -46,7 +46,10 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
                 filename=request.capture_parameters.filename,
                 tftp_ip=str(request.tftp.ipv4),
                 cm_mac=request.trigger.cm_mac,
-                logical_ch_ifindex=request.trigger.logical_ch_ifindex
+                logical_ch_ifindex=request.trigger.logical_ch_ifindex,
+                repeat_period_ms=request.capture_parameters.repeat_period_ms,
+                freerun_duration_ms=request.capture_parameters.freerun_duration_ms,
+                trigger_count=request.capture_parameters.trigger_count
             ),
             timeout=60.0
         )
