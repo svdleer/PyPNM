@@ -165,8 +165,10 @@ class CmtsUtscService:
                 errors.append(f"Failed to set RepeatPeriod to {repeat_period_ms}ms - may exceed CMTS maximum (1000ms on CommScope E6000)")
             if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)"):
                 errors.append(f"Failed to set FreeRunDuration to {freerun_duration_ms}ms - may exceed CMTS maximum (600000ms = 10 minutes)")
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})"):
-                errors.append(f"Failed to set TriggerCount to {trigger_count}")
+            # For FreeRunning mode (trigger_mode=2), set TriggerCount to 0 so E6000 uses FreeRunDuration instead
+            effective_trigger_count = 0 if trigger_mode == 2 else trigger_count
+            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", effective_trigger_count, Unsigned32, f"Trigger Count ({effective_trigger_count}) - FreeRunning uses duration not count"):
+                errors.append(f"Failed to set TriggerCount to {effective_trigger_count}")
             
             # 5. Configure UTSC capture parameters
             self.logger.info("Step 5: Configuring UTSC capture parameters")
