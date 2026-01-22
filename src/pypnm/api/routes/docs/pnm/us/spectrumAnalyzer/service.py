@@ -332,17 +332,24 @@ class UtscRfPortDiscoveryService:
         channels = []
         walk_result = await self._safe_walk(self.CM_US_STATUS_RXPOWER, "Get CM US channels")
         
+        # OID base is 1.3.6.1.4.1.4491.2.1.20.1.4.1.2
+        # Full OID format: {base}.{cm_idx}.{us_ch_ifindex}
+        base_oid = self.CM_US_STATUS_RXPOWER
+        
         for oid, value in walk_result:
             oid_str = str(oid)
-            # OID format: ...RxPower.{cm_idx}.{us_ch_ifindex}
-            if f'.{cm_index}.' in oid_str:
-                parts = oid_str.split('.')
-                for i, p in enumerate(parts):
-                    if p == str(cm_index) and i + 1 < len(parts):
-                        ch = parts[i + 1]
-                        if ch.isdigit():
-                            channels.append(int(ch))
-                        break
+            # Extract the suffix after base OID: "{cm_idx}.{us_ch}"
+            if oid_str.startswith(base_oid):
+                suffix = oid_str[len(base_oid) + 1:]  # Skip the dot
+                parts = suffix.split('.')
+                if len(parts) >= 2:
+                    try:
+                        cm_idx = int(parts[0])
+                        us_ch = int(parts[1])
+                        if cm_idx == cm_index:
+                            channels.append(us_ch)
+                    except ValueError:
+                        pass
         return list(set(channels))
     
     async def get_rf_ports(self) -> list[int]:
