@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -16,7 +16,9 @@ from pypnm.api.routes.common.extended.common_messaging_service import (
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.lib.file_processor import FileProcessor
-from pypnm.lib.types import MacAddressStr
+from pypnm.lib.log_files import LogFile
+from pypnm.lib.types import MacAddressStr, TransactionId, TransactionRecord
+from pypnm.lib.utils import Generate, TimeStamp, Utils
 from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
 from pypnm.pnm.parser.CmDsConstDispMeas import CmDsConstDispMeas
 from pypnm.pnm.parser.CmDsHist import CmDsHist
@@ -30,6 +32,9 @@ from pypnm.pnm.parser.CmUsOfdmaPreEq import CmUsOfdmaPreEq
 
 
 class CommonProcessService(CommonMessagingService):
+
+    Message = dict
+
     def __init__(self, message_response: MessageResponse, **extra_options: object) -> None:
         super().__init__()
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -49,7 +54,8 @@ class CommonProcessService(CommonMessagingService):
                         "message_type": "PNM_FILE_TRANSACTION",
                         "message": {
                             "transaction_id": "275de83146e904d7",
-                            "filename": "ds_ofdm_rxmer_per_subcar_00:50:f1:12:e2:63_954000000_1746501260.bin"
+                            "filename": "ds_ofdm_rxmer_per_subcar_xx:xx:xx:xx:xx:xx_954000000_1746501260.bin",
+                            "extension": dict, --Special Case: Optional extension data
                         }
                     },
                     ...
@@ -70,13 +76,14 @@ class CommonProcessService(CommonMessagingService):
                 continue
 
             if message_type == MessageResponseType.PNM_FILE_TRANSACTION.name:
-                transaction_id = message.get('transaction_id')
+                transaction_id:TransactionId = message.get('transaction_id')
                 transaction_record = PnmFileTransaction().get_record(transaction_id)
 
                 if not transaction_record:
                     self.build_msg(ServiceStatusCode.TRANSACTION_RECORD_GET_FAILED)
-                    pass
+                    continue
 
+                transaction_record["transaction_id"] = transaction_id
                 self._process_pnm_measure_test(transaction_record)
 
             elif message_type == MessageResponseType.SNMP_DATA_RTN_SPEC_ANALYSIS.name:
@@ -84,16 +91,21 @@ class CommonProcessService(CommonMessagingService):
                 self.logger.debug(f'process() -> Found TransactionID: {transaction_id}')
 
                 transaction_record = PnmFileTransaction().get_record(transaction_id)
+                if not transaction_record:
+                    self.build_msg(ServiceStatusCode.TRANSACTION_RECORD_GET_FAILED)
+                    continue
+
+                transaction_record["transaction_id"] = transaction_id
                 self._process_pnm_measure_test(transaction_record)
 
         return self.send_msg()
 
-    def _process_pnm_measure_test(self, transaction_record: dict) -> ServiceStatusCode:
+    def _process_pnm_measure_test(self, transaction_record: TransactionRecord) -> ServiceStatusCode:
         """
         Processes the provided PNM transaction record based on its test type.
 
         Args:
-            transaction_record (dict): The transaction metadata including test type and filename.
+            transaction_record (TransactionRecord): The transaction metadata including test type and filename.
 
         Returns:
             ServiceStatusCode: The result of the operation, indicating success or error type.
@@ -153,9 +165,11 @@ class CommonProcessService(CommonMessagingService):
             self.build_msg(ServiceStatusCode.SUCCESS, pnm_dict)
 
         elif pnm_test_type == DocsPnmCmCtlTest.SPECTRUM_ANALYZER_SNMP_AMP_DATA.name:
-            self.logger.info(f"Processing {pnm_test_type} PNM data")
+            self.logger.debug(f"Processing {pnm_test_type} PNM data")
             pnm_dict = self._add_device_details(CmSpectrumAnalysisSnmp(pnm_data).to_dict(), device_details)
+            self._update_pnm_data_from_message_response_extension(transaction_record, pnm_dict)
             pnm_dict['mac_address'] = MacAddressStr(transaction_record[PnmFileTransaction.MAC_ADDRESS])
+            self.logger.debug(f"Spectrum Analysis SNMP Data PNM Dict: {pnm_dict}")
             self.build_msg(ServiceStatusCode.SUCCESS, pnm_dict)
 
         else:
@@ -163,6 +177,7 @@ class CommonProcessService(CommonMessagingService):
             return ServiceStatusCode.UNSUPPORTED_TEST_TYPE
 
         return ServiceStatusCode.SUCCESS
+
 
     def _add_device_details(self, pnm_data: dict, device_details: dict[str, str]) -> dict:
         """
@@ -178,4 +193,46 @@ class CommonProcessService(CommonMessagingService):
         if PnmFileTransaction.DEVICE_DETAILS not in pnm_data:
             pnm_data[PnmFileTransaction.DEVICE_DETAILS] = {}
         pnm_data[PnmFileTransaction.DEVICE_DETAILS].update(device_details)
+        return pnm_data
+
+    def  _update_pnm_data_from_message_response_extension(self,
+                                                          transaction_record: TransactionRecord,
+                                                          pnm_data: dict) -> dict:
+        """
+        Update extension data from the MessageResponse payload into the PNM data dictionary.
+
+        Args:
+            transaction_record (TransactionRecord): The transaction record containing the transaction ID.
+            pnm_data (dict): The PNM data dictionary to update.
+
+        Returns:
+            dict: Updated PNM data dictionary with extension data.
+        """
+        transaction_id = transaction_record.get("transaction_id")
+        if not transaction_id:
+            self.logger.warning("Transaction record missing transaction ID.")
+            return pnm_data
+
+        if self._msg_rsp.payload is None:
+            self.logger.warning("Message response payload is empty.")
+            return pnm_data
+
+        for payload in self._msg_rsp.payload:
+            _status, _message_type, message = MessageResponse.get_payload_msg(payload)
+            if not isinstance(message, dict):
+                continue
+
+            if message.get("transaction_id") != transaction_id:
+                continue
+
+            extension_data = message.get(PnmFileTransaction.EXTENSION)
+            if not isinstance(extension_data, dict):
+                self.logger.warning("No extension data found in message response.")
+                return pnm_data
+
+            self.logger.debug(f"Extension-Data: {extension_data}")
+            pnm_data.update(extension_data)
+            return pnm_data
+
+        self.logger.warning("No message found for transaction record.")
         return pnm_data

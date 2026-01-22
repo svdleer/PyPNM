@@ -25,6 +25,7 @@ from pypnm.api.routes.common.extended.common_messaging_service import (
     CommonMessagingService,
     MessageResponse,
 )
+from pypnm.api.routes.common.extended.types import CommonMessagingServiceExtension as CMSE
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.config.config_manager import ConfigManager
 from pypnm.config.pnm_config_manager import PnmConfigManager
@@ -71,6 +72,7 @@ from pypnm.pnm.data_type.DocsIf3CmSpectrumAnalysisCtrlCmd import (
 from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
 from pypnm.snmp.modules import DocsisIfType
 from pypnm.snmp.snmp_v2c import Snmp_v2c
+from pypnm.api.routes.common.extended.types import CommonMessagingServiceExtension as CMSE
 
 
 class MeasureServiceReturnTypes(Enum):
@@ -245,11 +247,14 @@ class CommonMeasureService(CommonMessagingService):
                 self.logger.debug(f'SpectrumAmplitudeData: - FNAME: {filename} - Length:{len(amp_data)} - TransactionID: {tx_id}')
 
                 FileProcessor(fpath).write_file(amp_data)
+                
                 #################################################################################################
                 # Build binary filename and save file - END
                 #################################################################################################
-
-                self.build_transaction_msg(tx_id, filename)
+                capture_para:SpecAnCapturePara = self.getSpectrumCaptureParameters()
+                self.build_transaction_msg_extension(tx_id, 
+                                                     filename, 
+                                                     extension={f'{CMSE.SPECTRUM_ANALYSIS_SNMP_CAPTURE_PARAMETER}': capture_para.model_dump()})
 
             return self.build_send_msg(status)
 
@@ -575,7 +580,7 @@ class CommonMeasureService(CommonMessagingService):
 
         elif self.pnm_test_type in (DocsPnmCmCtlTest.US_PRE_EQUALIZER_COEF,):
             ifParameters = self.getInterfaceParameters(DocsisIfType.docsOfdmaUpstream)
-            self.logger.info(f'{DocsPnmCmCtlTest.US_PRE_EQUALIZER_COEF} Measurement - IfParameters: {ifParameters.model_dump()}')
+            self.logger.debug(f'{DocsPnmCmCtlTest.US_PRE_EQUALIZER_COEF} Measurement - IfParameters: {ifParameters.model_dump()}')
 
         '''
         There is redundant code, but incase I may need to change due to
@@ -593,7 +598,7 @@ class CommonMeasureService(CommonMessagingService):
 
             if channel_id_list:
                 filtered = [tpl for tpl in idx_channelId if tpl[1] in channel_id_list]
-                self.logger.info(f'Downstream: {ifParameters.type} -> ChanID(s): {channel_id_list} -> Filtered: {filtered}')
+                self.logger.debug(f'Downstream: {ifParameters.type} -> ChanID(s): {channel_id_list} -> Filtered: {filtered}')
                 return ServiceStatusCode.SUCCESS, filtered
 
             self.logger.info(f'Downstream: {ifParameters.type} -> IDX,CHAN_ID: {idx_channelId}')

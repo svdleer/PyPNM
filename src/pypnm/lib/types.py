@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -12,9 +12,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 # TODO: New home for these
-GroupId         = NewType("GroupId", str)
-TransactionId   = NewType("TransactionId", str)
-OperationId     = NewType("OperationId", str)
+GroupId             = NewType("GroupId", str)
+TransactionId       = NewType("TransactionId", str)
+TransactionRecord  = NewType("TransactionRecord", dict)
+OperationId         = NewType("OperationId", str)
 
 HashStr = NewType("HashStr", str)
 ExitCode = NewType("ExitCode", int)
@@ -143,6 +144,9 @@ FileName      = NewType("FileName", str)
 RegressionCoeffs = tuple[float, float]              # (slope, intercept)
 RegressionStats  = tuple[float, float, float]       # (slope, intercept, r2)
 
+# Spectrum analysis extension payloads
+SpectrumAnalysisSnmpCaptureParameters: TypeAlias = dict[str, int | float]
+
 # RxMER / spectrum containers
 FrequencySeriesHz: TypeAlias = list[FrequencyHz]
 MerSeriesdB: TypeAlias       = FloatSeries
@@ -211,7 +215,7 @@ __all__ = [
     "MacAddressStr", "IPv4Str", "IPv6Str",
     "FileStem", "FileExt", "FileName",
     # analysis tuples / series
-    "RegressionCoeffs", "RegressionStats",
+    "RegressionCoeffs", "RegressionStats", "SpectrumAnalysisSnmpCaptureParameters",
     "FrequencySeriesHz", "MerSeriesdB", "ShannonSeriesdB", "MagnitudeSeries",
     # modulation/profile & misc
     "ProfileId", "BitsPerSymbol", "BitsPerSymbolSeries", "Microseconds",

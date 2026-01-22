@@ -71,7 +71,11 @@ PyPNM is a DOCSIS 3.x/4.0 Proactive Network Maintenance toolkit for engineers wh
 Fast install (helper script; latest release auto-detected):
 
 ```bash
+<<<<<<< HEAD
 TAG="v1.0.27.0"
+=======
+TAG="v1.0.26.0"
+>>>>>>> SpectrumAnalysis-Json-Return-Fix
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -90,6 +90,7 @@ from pypnm.lib.types import (
     IntSeries,
     MacAddressStr,
     ProfileId,
+    SpectrumAnalysisSnmpCaptureParameters,
 )
 from pypnm.pnm.data_type.DocsIf3CmSpectrumAnalysisCtrlCmd import WindowFunction
 from pypnm.pnm.data_type.DsOfdmModulationType import DsOfdmModulationType
@@ -110,7 +111,7 @@ from pypnm.pnm.parser.model.parser_rtn_models import (
     CmUsOfdmaPreEqModel,
 )
 from pypnm.pnm.parser.pnm_file_type import PnmFileType
-
+from pypnm.api.routes.common.extended.types import CommonMessagingServiceExtension as CMSE
 
 class RxMerCarrierType(Enum):
     """
@@ -179,10 +180,10 @@ class Analysis:
                  skip_automatic_process: bool = False) -> None:
 
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
-        self.analysis_type: AnalysisType      = analysis_type
-        self.msg_response: MessageResponse    = msg_response
+        self.analysis_type: AnalysisType        = analysis_type
+        self.msg_response: MessageResponse      = msg_response
         self._cable_type: CableType             = cable_type
-        payload: dict[int | str, Any]     = msg_response.payload_to_dict() or {}
+        payload: dict[int | str, Any]           = msg_response.payload_to_dict() or {}
         _raw_data                               = payload.get("data", [])
 
         self._result_model:list[BaseAnalysisModel] = []
@@ -198,6 +199,13 @@ class Analysis:
             self.measurement_data = [dict(m) for m in _raw_data]
         else:
             self.measurement_data = []
+
+        # Extract spectrum_analysis_snmp_capture_parameters from the first measurement dict.
+        self._msg_rsp_extension: SpectrumAnalysisSnmpCaptureParameters = {}
+        if self.measurement_data:
+            msg_rsp_extension = self.measurement_data[0].get(f'{CMSE.SPECTRUM_ANALYSIS_SNMP_CAPTURE_PARAMETER}', {})
+            if isinstance(msg_rsp_extension, dict):
+                self._msg_rsp_extension = cast(SpectrumAnalysisSnmpCaptureParameters, msg_rsp_extension)
 
         self._analysis_dict: list[dict[str, Any]] = []
 
@@ -258,7 +266,9 @@ class Analysis:
                 self.logger.error(f'Unknown AnalysisType: {self.analysis_type}')
                 raise
 
-    def _basic_analysis(self, pnm_file_type: str, measurement: dict[str, Any], analysis_para: AnalysisProcessParameters) -> None:
+    def _basic_analysis(self, pnm_file_type: str,
+                        measurement: dict[str, Any],
+                        analysis_para: AnalysisProcessParameters) -> None:
         """
         Route to the appropriate BASIC analysis handler.
 
@@ -354,7 +364,8 @@ class Analysis:
 
         elif pnm_file_type == PnmFileType.CM_SPECTRUM_ANALYSIS_SNMP_AMP_DATA.value:
             self.logger.debug("Processing: Basic Analysis -> CM_SPECTRUM_ANALYSIS_SNMP_AMP_DATA")
-            model = self.basic_analysis_spectrum_analyzer_snmp(measurement, analysis_para)
+            capture_parameters_update = self._msg_rsp_extension
+            model = self.basic_analysis_spectrum_analyzer_snmp(measurement, capture_parameters_update, analysis_para)
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
             self.__add_pnmType(PnmFileType.CM_SPECTRUM_ANALYSIS_SNMP_AMP_DATA)
@@ -1451,7 +1462,9 @@ class Analysis:
         )
 
     @classmethod
-    def basic_analysis_spectrum_analyzer_snmp(cls, measurement: dict[str, Any], analysis_parameters: AnalysisProcessParameters | None = None,) -> SpectrumAnalyzerAnalysisModel:
+    def basic_analysis_spectrum_analyzer_snmp(cls, measurement: dict[str, Any],
+                                              capture_parameters_update: SpectrumAnalysisSnmpCaptureParameters | None = None,
+                                              analysis_parameters: AnalysisProcessParameters | None = None,) -> SpectrumAnalyzerAnalysisModel:
         log = logging.getLogger(f"{cls.__name__}")
 
         freqs: FrequencySeriesHz = list(measurement.get("frequency", []) or [])
@@ -1510,6 +1523,15 @@ class Analysis:
         enbw_hz = float(measurement.get("equivalent_noise_bandwidth", 0.0))
         noise_bw_khz = int(round(enbw_hz / 1_000.0)) if enbw_hz > 0.0 else 0
 
+        # Since these values come from SNMP and not PNM, allow overrides
+        if capture_parameters_update:
+            inactivity_timeout:int = capture_parameters_update.get("inactivity_timeout", 60)
+            first_hz = FrequencyHz(capture_parameters_update.get("first_segment_center_freq", first_hz))
+            last_hz  = FrequencyHz(capture_parameters_update.get("last_segment_center_freq", last_hz))
+            span_hz  = FrequencyHz(capture_parameters_update.get("segment_freq_span", span_hz))
+            bins     = int(capture_parameters_update.get("num_bins_per_segment", bins))
+            noise_bw_khz = FrequencyHz(capture_parameters_update.get("noise_bw", noise_bw_khz))
+
         capture_parameters: SpecAnCapturePara = SpecAnCapturePara(
             first_segment_center_freq = FrequencyHz(first_hz),
             last_segment_center_freq  = FrequencyHz(last_hz),
@@ -1517,6 +1539,7 @@ class Analysis:
             num_bins_per_segment      = bins,
             noise_bw                  = noise_bw_khz,
             window_function           = WindowFunction.HANN,
+            inactivity_timeout        = inactivity_timeout,
         )
 
         return SpectrumAnalyzerAnalysisModel(

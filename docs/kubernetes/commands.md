@@ -74,7 +74,11 @@ Deploy from GHCR using a remote manifest (no repo clone required):
 curl -fsSL https://raw.githubusercontent.com/PyPNMApps/PyPNM/main/tools/k8s/pypnm_k8s_remote_deploy.sh \
   -o /tmp/pypnm_k8s_remote_deploy.sh
 
+<<<<<<< HEAD
 TAG="v1.0.27.0"
+=======
+TAG="v1.0.26.0"
+>>>>>>> SpectrumAnalysis-Json-Return-Fix
 NAMESPACE="pypnm-cmts-a"
 
 bash /tmp/pypnm_k8s_remote_deploy.sh --create --tag "${TAG}" --namespace "${NAMESPACE}" --replicas 1

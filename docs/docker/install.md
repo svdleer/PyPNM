@@ -15,7 +15,11 @@ PyPNM ships with Docker assets so you can run the API quickly on a workstation, 
 ## Fast path: PyPNM Docker container install
 
 ```bash
+<<<<<<< HEAD
 TAG="v1.0.27.0"
+=======
+TAG="v1.0.26.0"
+>>>>>>> SpectrumAnalysis-Json-Return-Fix
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \
@@ -47,7 +51,11 @@ curl -X GET http://127.0.0.1:${PORT}/pypnm/system/webService/reload -H 'accept: 
 ## Deploy bundle flow (tarball)
 
 ```bash
+<<<<<<< HEAD
 TAG="v1.0.27.0"
+=======
+TAG="v1.0.26.0"
+>>>>>>> SpectrumAnalysis-Json-Return-Fix
 WORKING_DIR="PyPNM-${TAG}"
 
 mkdir -p "${WORKING_DIR}"

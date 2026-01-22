@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import json
 from enum import Enum
+import logging
 from typing import Any
 
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.config.pnm_config_manager import SystemConfigSettings
 from pypnm.lib.log_files import LogFile
-from pypnm.lib.types import TransactionId
+from pypnm.lib.types import FileNameStr, TransactionId
 from pypnm.lib.utils import Generate, TimeUnit
 
 
@@ -136,6 +137,7 @@ class CommonMessagingService:
         """
         Initializes an empty messaging service instance.
         """
+        self.logger = logging.getLogger(self.__class__.__name__)
         self._messages: list[tuple[ServiceStatusCode, dict[str, Any]]] = []
         self._last_non_success_status = ServiceStatusCode.SUCCESS
 
@@ -197,14 +199,14 @@ class CommonMessagingService:
         self.build_msg(status, data)
         return self.send_msg()
 
-    def build_transaction_msg(self, transaction_id: TransactionId, filename: str,
+    def build_transaction_msg(self, transaction_id: TransactionId, filename: FileNameStr,
                               status: ServiceStatusCode = ServiceStatusCode.SUCCESS) -> None:
         """
         Adds a transaction message with an ID and filename to the message queue.
 
         Args:
-            transaction_id (str): Unique transaction identifier.
-            filename (str): File name tied to the transaction.
+            transaction_id (TransactionId): Unique transaction identifier.
+            filename (FileNameStr): File name tied to the transaction.
             status (ServiceStatusCode): Message status. Defaults to SUCCESS.
 
         Returns:
@@ -218,7 +220,33 @@ class CommonMessagingService:
             }
         })
 
-    def build_session_msg( self,session_id: str,transaction_ids: list[str],
+    def build_transaction_msg_extension(self, transaction_id: TransactionId, 
+                                        filename: FileNameStr,
+                                        extension: dict[Any, Any],
+                                        status: ServiceStatusCode = ServiceStatusCode.SUCCESS) -> None:
+        """
+        Adds a transaction message with an ID and filename to the message queue.
+
+        Args:
+            transaction_id (TransactionId): Unique transaction identifier.
+            filename (FileNameStr): File name tied to the transaction.
+            extension (dict[Any, Any]): Additional extension data for the transaction.
+            status (ServiceStatusCode): Message status. Defaults to SUCCESS.
+
+        Returns:
+            bool: True if message is successfully added.
+        """
+        self.logger.debug(f"Transaction-Extension-Data: {extension}")
+        self.build_msg(status, {
+            "message_type": MessageResponseType.PNM_FILE_TRANSACTION.name,
+            "message": {
+                "transaction_id": transaction_id,
+                "filename": filename,
+                "extension": extension
+            }
+        })
+
+    def build_session_msg( self,session_id: str,transaction_ids: list[TransactionId],
         status: ServiceStatusCode = ServiceStatusCode.SUCCESS) -> None:
         """
         Enqueue a PNM file transaction session message.
