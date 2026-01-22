@@ -11,8 +11,10 @@ from fastapi import APIRouter
 from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.schemas import (
     UtscRequest,
     UtscResponse,
+    UtscDiscoverRequest,
+    UtscDiscoverResponse,
 )
-from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.service import CmtsUtscService
+from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.service import CmtsUtscService, UtscRfPortDiscoveryService
 from pypnm.lib.inet import Inet
 
 router = APIRouter(prefix="/docs/pnm/us/spectrumAnalyzer", tags=["PNM - Upstream Spectrum (UTSC)"])
@@ -85,3 +87,44 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
         error_msg = f"UTSC operation failed: {str(e)}"
         logger.error(error_msg, exc_info=True)
         return UtscResponse(success=False, error=error_msg)
+
+
+@router.post("/discoverRfPort", response_model=UtscDiscoverResponse)
+async def discover_rf_port(request: UtscDiscoverRequest) -> UtscDiscoverResponse:
+    """
+    Discover the correct UTSC RF port for a cable modem.
+    
+    Uses the modem's upstream logical channel to find which RF port it belongs to.
+    This is much faster than manual discovery as it tests the logical channel
+    against each RF port until it finds a match.
+    """
+    logger.info(f"UTSC RF Port Discovery: CMTS={request.cmts_ip}, MAC={request.cm_mac_address}")
+    
+    try:
+        service = UtscRfPortDiscoveryService(
+            cmts_ip=Inet(request.cmts_ip),
+            community=request.community
+        )
+        
+        result = await asyncio.wait_for(
+            service.discover(request.cm_mac_address),
+            timeout=60.0
+        )
+        
+        return UtscDiscoverResponse(
+            success=result.get("success", False),
+            rf_port_ifindex=result.get("rf_port_ifindex"),
+            rf_port_description=result.get("rf_port_description"),
+            cm_index=result.get("cm_index"),
+            us_channels=result.get("us_channels", []),
+            error=result.get("error")
+        )
+        
+    except asyncio.TimeoutError:
+        error_msg = "RF port discovery timed out"
+        logger.error(error_msg)
+        return UtscDiscoverResponse(success=False, error=error_msg)
+    except Exception as e:
+        error_msg = f"RF port discovery failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return UtscDiscoverResponse(success=False, error=error_msg)

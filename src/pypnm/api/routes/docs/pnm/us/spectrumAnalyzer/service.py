@@ -239,3 +239,181 @@ class CmtsUtscService:
             error_msg = f"Failed to start UTSC: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
             return {"success": False, "error": error_msg}
+
+
+class UtscRfPortDiscoveryService:
+    """Service to discover the correct RF port for a modem's upstream channel.
+    
+    Uses the modem's upstream logical channel to find which UTSC RF port it belongs to.
+    """
+    
+    # docsIf3CmtsCmRegStatusMacAddr
+    CM_REG_STATUS_MAC = "1.3.6.1.4.1.4491.2.1.20.1.3.1.2"
+    # docsIf3CmtsCmUsStatusRxPower (to find US channels by CM index)
+    CM_US_STATUS_RXPOWER = "1.3.6.1.4.1.4491.2.1.20.1.4.1.2"
+    # docsPnmCmtsUtscCfgLogicalChIfIndex (to get RF ports)
+    UTSC_CFG_LOGICAL_CH = "1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1.2"
+    
+    def __init__(self, cmts_ip: Inet, community: str = "private") -> None:
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.cmts_ip = cmts_ip
+        self.snmp = Snmp_v2c(cmts_ip, read_community=community, write_community=community, timeout=3, retries=1)
+    
+    async def _safe_walk(self, oid: str, description: str = "") -> list:
+        """Safe SNMP WALK with timeout"""
+        try:
+            self.logger.debug(f"SNMP WALK: {description} - OID={oid}")
+            result = await asyncio.wait_for(
+                self.snmp.walk(oid),
+                timeout=15.0
+            )
+            return result if result else []
+        except asyncio.TimeoutError:
+            self.logger.error(f"SNMP WALK TIMEOUT: {description}")
+            return []
+        except Exception as e:
+            self.logger.error(f"SNMP WALK ERROR: {description} - {str(e)}")
+            return []
+    
+    async def _safe_get(self, oid: str, description: str = ""):
+        """Safe SNMP GET with timeout"""
+        try:
+            result = await asyncio.wait_for(
+                self.snmp.get(oid),
+                timeout=5.0
+            )
+            return result
+        except Exception as e:
+            self.logger.debug(f"SNMP GET ERROR: {description} - {str(e)}")
+            return None
+    
+    async def _safe_set(self, oid: str, value, value_type, description: str = "") -> bool:
+        """Safe SNMP SET with timeout - returns True if successful"""
+        try:
+            result = await asyncio.wait_for(
+                self.snmp.set(oid, value, value_type),
+                timeout=5.0
+            )
+            return result is not None
+        except Exception as e:
+            self.logger.debug(f"SNMP SET: {description} - {str(e)}")
+            return False
+    
+    async def find_cm_index(self, mac_address: str) -> int | None:
+        """Find CM index from MAC address."""
+        mac_upper = mac_address.upper().replace('-', ':')
+        walk_result = await self._safe_walk(self.CM_REG_STATUS_MAC, "Find CM by MAC")
+        
+        for oid, value in walk_result:
+            # Value should be MAC address
+            if mac_upper in str(value).upper():
+                # Extract CM index from OID suffix
+                oid_str = str(oid)
+                idx = oid_str.split('.')[-1]
+                try:
+                    return int(idx)
+                except:
+                    pass
+        return None
+    
+    async def get_modem_us_channels(self, cm_index: int) -> list[int]:
+        """Get modem's upstream channel ifIndexes."""
+        channels = []
+        walk_result = await self._safe_walk(self.CM_US_STATUS_RXPOWER, "Get CM US channels")
+        
+        for oid, value in walk_result:
+            oid_str = str(oid)
+            # OID format: ...RxPower.{cm_idx}.{us_ch_ifindex}
+            if f'.{cm_index}.' in oid_str:
+                parts = oid_str.split('.')
+                for i, p in enumerate(parts):
+                    if p == str(cm_index) and i + 1 < len(parts):
+                        ch = parts[i + 1]
+                        if ch.isdigit():
+                            channels.append(int(ch))
+                        break
+        return list(set(channels))
+    
+    async def get_rf_ports(self) -> list[int]:
+        """Get all UTSC RF port ifIndexes."""
+        rf_ports = []
+        walk_result = await self._safe_walk(self.UTSC_CFG_LOGICAL_CH, "Get UTSC RF ports")
+        
+        for oid, value in walk_result:
+            oid_str = str(oid)
+            parts = oid_str.split('.')
+            for p in parts:
+                try:
+                    ifidx = int(p)
+                    if ifidx > 1000000000:  # RF port ifindexes are large
+                        rf_ports.append(ifidx)
+                        break
+                except:
+                    pass
+        return list(set(rf_ports))
+    
+    async def get_rf_port_description(self, rf_port: int) -> str:
+        """Get RF port interface description."""
+        result = await self._safe_get(f"1.3.6.1.2.1.2.2.1.2.{rf_port}", "ifDescr")
+        if result:
+            for oid, val in result:
+                return str(val)
+        return f"RF Port {rf_port}"
+    
+    async def test_logical_channel_on_rf_port(self, rf_port: int, logical_ch: int) -> bool:
+        """Test if logical channel can be set on RF port (validates it belongs to that port)."""
+        oid = f"{self.UTSC_CFG_LOGICAL_CH}.{rf_port}.1"
+        success = await self._safe_set(oid, logical_ch, Integer32, f"Test ch {logical_ch} on RF {rf_port}")
+        if success:
+            # Reset to 0 after successful test
+            await self._safe_set(oid, 0, Integer32, "Reset logical channel")
+        return success
+    
+    async def discover(self, mac_address: str) -> dict:
+        """Discover the correct RF port for a modem."""
+        result = {
+            "success": False,
+            "rf_port_ifindex": None,
+            "rf_port_description": None,
+            "cm_index": None,
+            "us_channels": [],
+            "error": None
+        }
+        
+        self.logger.info(f"Discovering RF port for modem {mac_address}")
+        
+        # Step 1: Find CM index
+        cm_index = await self.find_cm_index(mac_address)
+        if not cm_index:
+            result["error"] = f"Modem {mac_address} not found on CMTS"
+            return result
+        result["cm_index"] = cm_index
+        self.logger.info(f"Found CM index: {cm_index}")
+        
+        # Step 2: Get modem's upstream channels
+        us_channels = await self.get_modem_us_channels(cm_index)
+        if not us_channels:
+            result["error"] = f"No upstream channels found for CM index {cm_index}"
+            return result
+        result["us_channels"] = us_channels
+        self.logger.info(f"Found {len(us_channels)} upstream channels")
+        
+        # Step 3: Get all RF ports
+        rf_ports = await self.get_rf_ports()
+        if not rf_ports:
+            result["error"] = "No UTSC RF ports found on CMTS"
+            return result
+        self.logger.info(f"Found {len(rf_ports)} RF ports")
+        
+        # Step 4: Test which RF port accepts the logical channel
+        first_ch = us_channels[0]
+        for rf_port in rf_ports:
+            if await self.test_logical_channel_on_rf_port(rf_port, first_ch):
+                result["success"] = True
+                result["rf_port_ifindex"] = rf_port
+                result["rf_port_description"] = await self.get_rf_port_description(rf_port)
+                self.logger.info(f"Found matching RF port: {rf_port}")
+                return result
+        
+        result["error"] = f"No RF port found for upstream channel {first_ch}"
+        return result

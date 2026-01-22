@@ -58,3 +58,20 @@ class UtscResponse(BaseModel):
     filename: str | None = None
     error: str | None = None
     data: dict | None = None
+
+
+class UtscDiscoverRequest(BaseModel):
+    """UTSC RF Port Discovery Request Schema"""
+    cmts_ip: IPv4Str = Field(description="CMTS IP address")
+    cm_mac_address: MacAddressStr = Field(description="Cable modem MAC address to find RF port for")
+    community: str = Field(default="private", description="SNMP community string")
+
+
+class UtscDiscoverResponse(BaseModel):
+    """UTSC RF Port Discovery Response Schema"""
+    success: bool
+    rf_port_ifindex: int | None = None
+    rf_port_description: str | None = None
+    cm_index: int | None = None
+    us_channels: list[int] = Field(default_factory=list)
+    error: str | None = None
