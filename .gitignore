@@ -32,7 +32,7 @@ issues/*
 deploy/docker/compose/.env
 AGENTS.md
 release-reports/
-tools/release-review/
+tools/release-review/*
 
 # PyPNM Dev tools
 log-level-rewriter.py
