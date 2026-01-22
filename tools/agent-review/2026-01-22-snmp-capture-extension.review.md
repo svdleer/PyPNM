@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Ensure SNMP spectrum capture extension is extracted from message response data.
+- Changes: Use enum value for extension key lookup in Analysis initialization.
+- Files: src/pypnm/api/routes/common/classes/analysis/analysis.py
+- Tests: python3 -m compileall src; ruff check src (fails: pre-existing import/order/unused issues); ruff format --check . (fails: many files would reformat); pytest -q (passed, 510 passed, 3 skipped: PNM_CM_IT)
+- Notes: Ruff failures appear pre-existing; behavior change is limited to extension key resolution.
+
+# FILE: src/pypnm/api/routes/common/classes/analysis/analysis.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
 
