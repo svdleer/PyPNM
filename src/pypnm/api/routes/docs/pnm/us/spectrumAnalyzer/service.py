@@ -133,14 +133,19 @@ class CmtsUtscService:
             self.logger.info("Step 2: Enabling auto upload (optional)")
             await self._safe_snmp_set(self.BULK_UPLOAD_CONTROL, 1, Integer32, "Bulk Upload Control (optional)")
             
-            # 3. Create or update UTSC row
+            # 3. Stop measurement first if row exists (allows modifying parameters)
             if row_exists:
-                self.logger.info("Step 3: Row exists, attempting to delete it first to set fresh parameters")
-                # Casa E6000 CMTS doesn't allow modifying active rows, so try to destroy and recreate
+                self.logger.info("Step 3: Stopping existing measurement before reconfiguring")
+                # MeasStatus: 1=initiate, 2=inactive/stop
+                await self._safe_snmp_set(f"{self.UTSC_CTRL_BASE}.1{idx}", 2, Integer32, "MeasStatus = stop")
+                import asyncio
+                await asyncio.sleep(0.3)  # Give CMTS time to stop
+                
+                # Try to destroy row for clean reconfiguration
+                self.logger.info("Step 3a: Attempting to destroy row for fresh parameters")
                 if await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 6, Integer32, "Row Status destroy"):
                     self.logger.info("Successfully destroyed existing row, will create new one")
                     row_exists = False  # Now we need to create it
-                    import asyncio
                     await asyncio.sleep(0.5)  # Give CMTS time to clean up
                 else:
                     # Can't delete, try to set to notInService to modify
