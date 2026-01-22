@@ -72,9 +72,9 @@ Fast install (helper script; latest release auto-detected):
 
 ```bash
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 PORT=8080
 

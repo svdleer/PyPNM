@@ -7,9 +7,9 @@ Use it for throughput testing or simple HA without per-namespace isolation.
 
 ```bash
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 NAMESPACE="pypnm-default"
 REPLICAS="10"

@@ -26,9 +26,9 @@ This workflow pulls the manifests from GitHub and deploys the GHCR image directl
 curl -fsSL https://raw.githubusercontent.com/PyPNMApps/PyPNM/main/tools/k8s/pypnm_k8s_remote_deploy.sh \\
   -o /tmp/pypnm_k8s_remote_deploy.sh
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 NAMESPACE="pypnm-cmts-a"
 

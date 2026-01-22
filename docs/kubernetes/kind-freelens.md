@@ -24,9 +24,9 @@ Pick a release tag, then deploy into a namespace (one namespace per CMTS). This 
 
 ```bash
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 NAMESPACE="pypnm-cmts-a"
 
@@ -116,9 +116,9 @@ Deploy a PyPNM instance per CMTS by assigning a unique namespace and configurati
 
 ```bash
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 
 for CMTS in cmts-a cmts-b cmts-c; do

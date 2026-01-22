@@ -4,9 +4,9 @@ Copy-paste flow using the current release tag:
 
 ```bash
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 tools/k8s/pypnm_k8s_toolkit.sh --create --image-source ghcr --tag ${TAG} --replicas 1
 ```
@@ -15,9 +15,9 @@ To target a specific namespace (useful for one PyPNM per CMTS):
 
 ```bash
 <<<<<<< HEAD
-TAG="v1.0.27.0"
+TAG="v1.0.28.0"
 =======
-TAG="v1.0.26.0"
+TAG="v1.0.28.0"
 >>>>>>> SpectrumAnalysis-Json-Return-Fix
 NAMESPACE="pypnm-cmts-a"
 tools/k8s/pypnm_k8s_toolkit.sh --create --image-source ghcr --tag ${TAG} --replicas 1 --namespace ${NAMESPACE}
