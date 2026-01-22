@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from importlib.machinery import EXTENSION_SUFFIXES
 import json
 import logging
 import time
@@ -17,7 +18,7 @@ from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.docsis.data_type.sysDescr import SystemDescriptor
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import FileName, TransactionId
+from pypnm.lib.types import FileName, TransactionId, TransactionRecord
 from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
 
 
@@ -64,6 +65,7 @@ class PnmFileTransaction:
     FILE_NAME      = "filename"
     DEVICE_DETAILS = "device_details"
     MAC_ADDRESS    = "mac_address"
+    EXTENSION      = "extension"
 
     def __init__(self) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -167,7 +169,7 @@ class PnmFileTransaction:
         db = self._load_db()
         return db.get(transaction_id)
 
-    def get_record(self, transaction_id: TransactionId) -> dict | None:
+    def get_record(self, transaction_id: TransactionId) -> TransactionRecord | None:
         """
         Fetch A Plain Dictionary Representation Of A Transaction Record.
 

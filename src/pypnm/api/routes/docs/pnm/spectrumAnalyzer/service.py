@@ -6,27 +6,27 @@ from __future__ import annotations
 import logging
 from typing import cast
 
-from pypnm.api.routes.common.classes.analysis.analysis import WindowFunction
-from pypnm.api.routes.common.extended.common_measure_service import CommonMeasureService
-from pypnm.api.routes.common.extended.common_process_service import MessageResponse
-from pypnm.api.routes.docs.pnm.spectrumAnalyzer.abstract.com_spec_chan_ana import (
+from pypnm.api.routes.common.classes.analysis.analysis import WindowFunction  # type: ignore[import-untyped]
+from pypnm.api.routes.common.extended.common_measure_service import CommonMeasureService  # type: ignore[import-untyped]
+from pypnm.api.routes.common.extended.common_process_service import MessageResponse  # type: ignore[import-untyped]
+from pypnm.api.routes.docs.pnm.spectrumAnalyzer.abstract.com_spec_chan_ana import (  # type: ignore[import-untyped]
     CommonChannelSpectumBwLut,
     CommonSpectrumBw,
     CommonSpectrumChannelAnalyzer,
     OfdmSpectrumBwLut,
     ScQamSpectrumBwLut,
 )
-from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import SpecAnCapturePara
-from pypnm.config.pnm_config_manager import PnmConfigManager
-from pypnm.docsis.cable_modem import CableModem
-from pypnm.docsis.cm_snmp_operation import (
+from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import SpecAnCapturePara  # type: ignore[import-untyped]
+from pypnm.config.pnm_config_manager import PnmConfigManager  # type: ignore[import-untyped]
+from pypnm.docsis.cable_modem import CableModem  # type: ignore[import-untyped]
+from pypnm.docsis.cm_snmp_operation import (  # type: ignore[import-untyped]
     DocsIf31CmDsOfdmChanChannelEntry,
     DocsIfDownstreamChannelEntry,
     SpectrumRetrievalType,
 )
-from pypnm.lib.inet import Inet
-from pypnm.lib.types import ChannelId, FrequencyHz, SubcarrierIdx
-from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
+from pypnm.lib.inet import Inet  # type: ignore[import-untyped]
+from pypnm.lib.types import ChannelId, FrequencyHz, SubcarrierIdx  # type: ignore[import-untyped]
+from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest  # type: ignore[import-untyped]
 
 
 class CmSpectrumAnalysisService(CommonMeasureService):
@@ -77,7 +77,7 @@ class CmSpectrumAnalysisService(CommonMeasureService):
             self.logger.setLevel(logging.INFO)
 
         if capture_parameters.spectrum_retrieval_type == SpectrumRetrievalType.SNMP:
-            self.logger.info('Selecting: SPECTRUM_ANALYZER_SNMP_AMP_DATA')
+            self.logger.debug('Selecting: SPECTRUM_ANALYZER_SNMP_AMP_DATA')
             pnmCmCtlTest = DocsPnmCmCtlTest.SPECTRUM_ANALYZER_SNMP_AMP_DATA
 
         super().__init__(
@@ -215,7 +215,7 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
         segment_freq_span       = 1_000_000
 
         for chan_id, (start_hz, plc_hz, end_hz) in bw_by_channel.items():
-            self.logger.info(
+            self.logger.debug(
                 f"OFDM - Mac: {self._cm.get_mac_address} - "
                 f"Channel Settings: {chan_id}, {start_hz}, {plc_hz}, {end_hz}"
             )
@@ -232,7 +232,7 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
                 spectrum_retrieval_type     = spectrum_retrieval_type,
             )
 
-            self.logger.info(
+            self.logger.debug(
                 f"OFDM - Mac: {self._cm.get_mac_address} - "
                 f"Capture Parameters: {capture_parameter.model_dump()}"
             )
@@ -287,7 +287,7 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
                 first_active is None or last_active is None or
                 sub_spacing is None or plc_freq is None ):
 
-                self.logger.info(
+                self.logger.debug(
                     "Skipping channel with missing data: "
                     f"id={chan_id}, zero_freq={zero_freq}, first_active={first_active}, "
                     f"last_active={last_active}, spacing={sub_spacing}, plc_freq={plc_freq}")
@@ -300,7 +300,7 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
 
             out[chan_id] = (FrequencyHz(start_freq), FrequencyHz(plc_freq), FrequencyHz(end_freq))
 
-            self.logger.info(
+            self.logger.debug(
                 "Computed OFDM channel frequencies: "
                 f"ch_id={chan_id}, start={start_freq}, plc={plc_freq}, end={end_freq}, "
                 f"first_active={first_active}, last_active={last_active}, spacing={sub_spacing}"
@@ -525,7 +525,7 @@ class DsScQamChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
             start: FrequencyHz = cast(FrequencyHz, cfreq - half_width)
             end: FrequencyHz = cast(FrequencyHz, cfreq + half_width)
 
-            self.logger.info(
+            self.logger.debug(
                 "Calculate SC-QAM Spectrum Settings: Mac: %s - Channel-Settings: Ch=%s, Start=%s, Center=%s, End=%s",
                 self._cm.get_mac_address, chan_id, start, cfreq, end,
             )
@@ -582,7 +582,7 @@ class DsScQamChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
 
         center_hz_global: FrequencyHz = FrequencyHz((start_hz_global + end_hz_global) // 2)
 
-        self.logger.info(
+        self.logger.debug(
             "SC-QAM overall bandwidth: start=%d Hz, end=%d Hz (width=%d Hz); nominal center=%d Hz",
             start_hz_global, end_hz_global, end_hz_global - start_hz_global, center_hz_global
         )

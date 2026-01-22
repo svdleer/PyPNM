@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Extract spectrum_analysis_snmp_capture_parameters into analysis processing and type it via shared types.
+- Changes: Removed stray JSON block, normalized capture parameter extraction after payload normalization, added shared type alias, updated SNMP capture overrides, and added a regression test.
+- Files: src/pypnm/api/routes/common/classes/analysis/analysis.py, src/pypnm/lib/types.py, tests/test_analysis_spectrum_snmp_extension.py
+- Tests: python3 -m compileall src; ruff check src (fails: pre-existing import/unused issues); ruff format --check . (fails: would reformat many files); pytest -q (510 passed, 3 skipped: PNM_CM_IT gated).
+- Notes: None.
+
+# FILE: src/pypnm/api/routes/common/classes/analysis/analysis.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
 
@@ -111,7 +119,7 @@ from pypnm.pnm.parser.model.parser_rtn_models import (
     CmUsOfdmaPreEqModel,
 )
 from pypnm.pnm.parser.pnm_file_type import PnmFileType
-from pypnm.api.routes.common.extended.types import CommonMessagingServiceExtension as CMSE
+
 
 class RxMerCarrierType(Enum):
     """
@@ -189,6 +197,7 @@ class Analysis:
         self._result_model:list[BaseAnalysisModel] = []
         self._processed_pnm_type:list[PnmFileType] = []
         self._skip_automatic_process = skip_automatic_process
+        LogFile.write(fname='analysis-payload.dict', data=payload)
 
         # Defining DataTypes
         self._analysis_para:AnalysisProcessParameters = AnalysisProcessParameters()
@@ -203,9 +212,11 @@ class Analysis:
         # Extract spectrum_analysis_snmp_capture_parameters from the first measurement dict.
         self._msg_rsp_extension: SpectrumAnalysisSnmpCaptureParameters = {}
         if self.measurement_data:
-            msg_rsp_extension = self.measurement_data[0].get(f'{CMSE.SPECTRUM_ANALYSIS_SNMP_CAPTURE_PARAMETER}', {})
+            msg_rsp_extension = self.measurement_data[0].get("spectrum_analysis_snmp_capture_parameters", {})
             if isinstance(msg_rsp_extension, dict):
                 self._msg_rsp_extension = cast(SpectrumAnalysisSnmpCaptureParameters, msg_rsp_extension)
+
+        LogFile.write(fname='analysis-extension.dict', data=self._msg_rsp_extension)
 
         self._analysis_dict: list[dict[str, Any]] = []
 
@@ -364,6 +375,7 @@ class Analysis:
 
         elif pnm_file_type == PnmFileType.CM_SPECTRUM_ANALYSIS_SNMP_AMP_DATA.value:
             self.logger.debug("Processing: Basic Analysis -> CM_SPECTRUM_ANALYSIS_SNMP_AMP_DATA")
+            self.logger.info(f"Message Response Extension Data: {self._msg_rsp_extension}")
             capture_parameters_update = self._msg_rsp_extension
             model = self.basic_analysis_spectrum_analyzer_snmp(measurement, capture_parameters_update, analysis_para)
             self.__update_result_model(model)
@@ -1524,8 +1536,8 @@ class Analysis:
         noise_bw_khz = int(round(enbw_hz / 1_000.0)) if enbw_hz > 0.0 else 0
 
         # Since these values come from SNMP and not PNM, allow overrides
+        log.info("Spectrum Analyzer (SNMP): applying capture parameter overrides: %s", capture_parameters_update)
         if capture_parameters_update:
-            inactivity_timeout:int = capture_parameters_update.get("inactivity_timeout", 60)
             first_hz = FrequencyHz(capture_parameters_update.get("first_segment_center_freq", first_hz))
             last_hz  = FrequencyHz(capture_parameters_update.get("last_segment_center_freq", last_hz))
             span_hz  = FrequencyHz(capture_parameters_update.get("segment_freq_span", span_hz))
@@ -1539,7 +1551,6 @@ class Analysis:
             num_bins_per_segment      = bins,
             noise_bw                  = noise_bw_khz,
             window_function           = WindowFunction.HANN,
-            inactivity_timeout        = inactivity_timeout,
         )
 
         return SpectrumAnalyzerAnalysisModel(
@@ -2365,3 +2376,268 @@ class Analysis:
         )
 
         return echo_report
+
+# FILE: src/pypnm/lib/types.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from enum import Enum
+from pathlib import Path
+from typing import NewType, TypeAlias
+
+import numpy as np
+from numpy.typing import NDArray
+
+# TODO: New home for these
+GroupId             = NewType("GroupId", str)
+TransactionId       = NewType("TransactionId", str)
+TransactionRecord  = NewType("TransactionRecord", dict)
+OperationId         = NewType("OperationId", str)
+
+HashStr = NewType("HashStr", str)
+ExitCode = NewType("ExitCode", int)
+
+# Enum String Type
+class StringEnum(str, Enum):
+    """Py3.10-compatible StrEnum shim."""
+    pass
+
+class FloatEnum(float, Enum):
+    """Float-like Enum base: members behave like floats."""
+    pass
+
+# Basic strings
+String: TypeAlias       = str
+StringArray: TypeAlias  = list[String]
+JsonScalar: TypeAlias   = str | int | float | bool | None
+JsonValue: TypeAlias    = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonObject: TypeAlias   = dict[str, JsonValue]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Core numerics
+# ────────────────────────────────────────────────────────────────────────────────
+Number       = int | float | np.number
+Float64      = np.float64
+ByteArray    = list[np.uint8]
+
+# Generic array-likes (inputs)
+# TODO: Review to remove -> _ArrayLike = Union[Sequence[Number], NDArray[object]]
+_ArrayLike   = Sequence[Number] | NDArray[np.generic]
+
+ArrayLike    = list[Number]
+ArrayLikeF64 = Sequence[float] | NDArray[np.float64]
+
+# Canonical ndarray outputs (internal processing should normalize to these)
+NDArrayF64: TypeAlias   = NDArray[np.float64]
+NDArrayI64: TypeAlias   = NDArray[np.int64]
+NDArrayC128: TypeAlias  = NDArray[np.complex128]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Simple series / containers  — use TypeAlias (recommended)
+# ────────────────────────────────────────────────────────────────────────────────
+IntSeries: TypeAlias        = list[int]
+FloatSeries: TypeAlias      = list[float]
+TwoDFloatSeries: TypeAlias  = list[FloatSeries]
+FloatSequence: TypeAlias    = Sequence[float]
+
+# Complex number encodings (JSON-safe)
+Complex                  = tuple[float, float]  # (re, im)
+ComplexArray: TypeAlias  = list[Complex]        # K × (re, im)
+ComplexSeries: TypeAlias = list[complex]        # Python complex list (internal use)
+ComplexMatrix: TypeAlias = list[ComplexArray]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Modulation profile identifiers
+# ────────────────────────────────────────────────────────────────────────────────
+ProfileId = NewType("ProfileId", int)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Paths / filesystem
+# ────────────────────────────────────────────────────────────────────────────────
+PathLike    = str | Path
+PathArray   = list[PathLike]
+FileNameStr = NewType("FileNameStr", str)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# JSON-like structures for REST I/O
+# ────────────────────────────────────────────────────────────────────────────────
+JSONScalar = str | int | float | bool | None
+JSONDict   = dict[str, "JSONValue"]
+JSONList   = list["JSONValue"]
+JSONValue  = JSONScalar | JSONDict | JSONList
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Unit-tagged NewTypes (scalars only; runtime = underlying type)
+# ────────────────────────────────────────────────────────────────────────────────
+# Time / index
+CaptureTime   = NewType("CaptureTime", int)
+TimeStamp     = NewType("TimeStamp", int)
+TimestampSec  = NewType("TimestampSec", int)
+TimestampMs   = NewType("TimestampMs", int)
+TimeStampUs   = NewType("TimeStampUs", int)
+TimeStampNs   = NewType("TimeStampNs", int)
+SampleIndex   = NewType("SampleIndex", int)
+
+# RF / PHY units (keep as scalars with units)
+FrequencyHz   = NewType("FrequencyHz", int)
+BandwidthHz   = NewType("BandwidthHz", int)
+
+PowerdBmV     = NewType("PowerdBmV", float)
+PowerdB       = NewType("PowerdB", float)
+MERdB         = NewType("MERdB", float)
+SNRdB         = NewType("SNRdB", float)
+SNRln         = NewType("SNRln", float)
+
+# DOCSIS identifiers
+ChannelId     = NewType("ChannelId", int)
+SubcarrierId  = NewType("SubcarrierId", int)
+SubcarrierIdx = NewType("SubcarrierIdx", int)
+
+# SNMP identifiers
+OidStr          = NewType("OidStr", str)              # symbolic or dotted-decimal
+OidNumTuple     = NewType("OidNumTuple", tuple[int, ...])
+SnmpIndex       = NewType("SnmpIndex", int)
+InterfaceIndex  = NewType("InterfaceIndex", int)
+EntryIndex      = NewType("EntryIndex", int)
+
+# Network addressing (store as plain strings; validate elsewhere)
+HostNameStr     = NewType("HostNameStr", str)
+SnmpReadCommunity  = NewType("SnmpReadCommunity", str)
+SnmpWriteCommunity = NewType("SnmpWriteCommunity", str)
+SnmpCommunity      = SnmpReadCommunity
+MacAddressStr   = NewType("MacAddressStr", str)         # aa:bb:cc:dd:ee:ff | aa-bb-cc-dd-ee-ff | aabb.ccdd.eeff | aabbccddeeff | aabbcc:ddeeff |
+InetAddressStr  = NewType("InetAddressStr", str)        # 192.168.0.1 | 2001:db8::1
+IPv4Str         = NewType("IPv4Str", InetAddressStr)    # 192.168.0.1
+IPv6Str         = NewType("IPv6Str", InetAddressStr)    # 2001:db8::1
+
+# File tokens
+FileStem      = NewType("FileStem", str)            # name without extension
+FileExt       = NewType("FileExt", str)             # ".csv", ".png", …
+FileName      = NewType("FileName", str)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Analysis-specific tuples / series
+# ────────────────────────────────────────────────────────────────────────────────
+RegressionCoeffs = tuple[float, float]              # (slope, intercept)
+RegressionStats  = tuple[float, float, float]       # (slope, intercept, r2)
+
+# Spectrum analysis extension payloads
+SpectrumAnalysisSnmpCaptureParameters: TypeAlias = dict[str, int | float]
+
+# RxMER / spectrum containers
+FrequencySeriesHz: TypeAlias = list[FrequencyHz]
+MerSeriesdB: TypeAlias       = FloatSeries
+ShannonSeriesdB: TypeAlias   = FloatSeries
+MagnitudeSeries: TypeAlias   = FloatSeries
+
+BitsPerSymbol       = NewType("BitsPerSymbol", int)
+BitsPerSymbolSeries: TypeAlias = list[BitsPerSymbol]
+
+Microseconds = NewType("Microseconds", float)
+
+# IFFT time response
+IfftTimeResponse: TypeAlias = tuple[NDArrayF64, NDArrayC128]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# HTTP return code type
+# ────────────────────────────────────────────────────────────────────────────────
+HttpRtnCode = NewType("HttpRtnCode", int)
+
+ScalarValue: TypeAlias = float | int | str
+
+# ────────────────────────────────────────────────────────────────────────────────
+# SSH return code type
+# ────────────────────────────────────────────────────────────────────────────────
+UserNameStr         = NewType("UserNameStr", str)
+
+SshOk: TypeAlias    = bool
+SshStdout           = NewType("SshStdout", str)
+SshStderr           = NewType("SshStderr", str)
+SshExitCode         = NewType("SshExitCode", int)
+SshCommandResult: TypeAlias = tuple[SshStdout, SshStderr, SshExitCode]
+
+RemoteDirEntry             = NewType("RemoteDirEntry", str)
+RemoteDirEntries: TypeAlias = list[RemoteDirEntry]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Explicit public surface
+# ────────────────────────────────────────────────────────────────────────────────
+__all__ = [
+    "SshOk", "SshStdout", "SshStderr", "SshExitCode", "SshCommandResult",
+    "RemoteDirEntry", "RemoteDirEntries", "UserNameStr",
+    "ScalarValue",
+    "HashStr",
+    "TransactionId", "GroupId", "OperationId",
+    # enums
+    "StringEnum", "FloatEnum",
+    # strings
+    "String", "StringArray",
+    "ByteArray",
+    # numerics
+    "Number", "Float64", "ArrayLike", "ArrayLikeF64", "NDArrayF64", "NDArrayI64",
+    "FloatSeries", "TwoDFloatSeries", "FloatSequence", "IntSeries",
+    # complex
+    "Complex", "ComplexArray", "ComplexSeries",
+    # paths
+    "PathLike", "PathArray", "FileNameStr",
+    # JSON
+    "JSONScalar", "JSONDict", "JSONList", "JSONValue",
+    # unit-tagged scalars
+    "CaptureTime", "TimeStamp", "TimestampSec", "TimestampMs", "TimeStampUs", "TimeStampNs",
+    "SampleIndex",
+    "FrequencyHz", "BandwidthHz", "PowerdBmV", "PowerdB", "MERdB", "SNRdB", "SNRln",
+    "ChannelId", "SubcarrierId",
+    "OidStr", "OidNumTuple",
+    "SnmpReadCommunity", "SnmpWriteCommunity", "SnmpCommunity",
+    "MacAddressStr", "IPv4Str", "IPv6Str",
+    "FileStem", "FileExt", "FileName",
+    # analysis tuples / series
+    "RegressionCoeffs", "RegressionStats", "SpectrumAnalysisSnmpCaptureParameters",
+    "FrequencySeriesHz", "MerSeriesdB", "ShannonSeriesdB", "MagnitudeSeries",
+    # modulation/profile & misc
+    "ProfileId", "BitsPerSymbol", "BitsPerSymbolSeries", "Microseconds",
+    "HttpRtnCode", "InterfaceIndex", "EntryIndex"
+]
+
+# FILE: tests/test_analysis_spectrum_snmp_extension.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+from pypnm.api.routes.common.classes.analysis.analysis import Analysis, AnalysisType
+from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
+from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
+
+
+def test_analysis_extracts_snmp_capture_parameters() -> None:
+    capture_parameters = {
+        "inactivity_timeout": 120,
+        "first_segment_center_freq": 262000000,
+        "last_segment_center_freq": 1030000000,
+        "segment_freq_span": 30000000,
+        "num_bins_per_segment": 100,
+        "noise_bw": 150,
+        "window_function": 1,
+        "num_averages": 1,
+        "spectrum_retrieval_type": 2,
+    }
+    payload = [
+        {
+            "status": "SUCCESS",
+            "spectrum_analysis_snmp_capture_parameters": capture_parameters,
+            "mac_address": "aa:bb:cc:dd:ee:ff",
+        }
+    ]
+    msg_response = MessageResponse(ServiceStatusCode.SUCCESS, payload=payload)
+
+    analysis = Analysis(
+        analysis_type=AnalysisType.BASIC,
+        msg_response=msg_response,
+        skip_automatic_process=True,
+    )
+
+    assert analysis._msg_rsp_extension == capture_parameters
