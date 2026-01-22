@@ -16,11 +16,7 @@ kind create cluster --name "${CLUSTER_B}"
 ## Deploy to each cluster
 
 ```bash
-<<<<<<< HEAD
-TAG="v1.0.28.0"
-=======
-TAG="v1.0.28.0"
->>>>>>> SpectrumAnalysis-Json-Return-Fix
+TAG="v1.0.29.0"
 NAMESPACE="pypnm-default"
 
 kubectl config use-context kind-pypnm-dev-a

@@ -27,11 +27,7 @@ kubectl get nodes
 ## Script-only deploy (no repo clone)
 
 ```bash
-<<<<<<< HEAD
-TAG="v1.0.28.0"
-=======
-TAG="v1.0.28.0"
->>>>>>> SpectrumAnalysis-Json-Return-Fix
+TAG="v1.0.29.0"
 NAMESPACE="pypnm-cmts-a"
 curl -fsSL https://raw.githubusercontent.com/PyPNMApps/PyPNM/main/tools/k8s/pypnm_k8s_remote_deploy.sh \
   -o /tmp/pypnm_k8s_remote_deploy.sh

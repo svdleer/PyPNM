@@ -6,11 +6,7 @@ Use it for throughput testing or simple HA without per-namespace isolation.
 ## Deploy (or update) and scale
 
 ```bash
-<<<<<<< HEAD
-TAG="v1.0.28.0"
-=======
-TAG="v1.0.28.0"
->>>>>>> SpectrumAnalysis-Json-Return-Fix
+TAG="v1.0.29.0"
 NAMESPACE="pypnm-default"
 REPLICAS="10"
 

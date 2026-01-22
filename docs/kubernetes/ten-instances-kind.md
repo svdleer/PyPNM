@@ -10,11 +10,7 @@ and exposes each instance on a unique local port.
 ## Deploy 10 namespaces (parallel)
 
 ```bash
-<<<<<<< HEAD
-TAG="v1.0.28.0"
-=======
-TAG="v1.0.28.0"
->>>>>>> SpectrumAnalysis-Json-Return-Fix
+TAG="v1.0.29.0"
 BASE_NS="pypnm-cmts"
 REPLICAS="1"
 COUNT="10"
