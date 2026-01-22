@@ -301,19 +301,30 @@ class UtscRfPortDiscoveryService:
     
     async def find_cm_index(self, mac_address: str) -> int | None:
         """Find CM index from MAC address."""
-        mac_upper = mac_address.upper().replace('-', ':')
+        # Normalize MAC to bytes for comparison
+        mac_clean = mac_address.upper().replace('-', '').replace(':', '')
+        mac_bytes = bytes.fromhex(mac_clean)
+        
         walk_result = await self._safe_walk(self.CM_REG_STATUS_MAC, "Find CM by MAC")
         
         for oid, value in walk_result:
-            # Value should be MAC address
-            if mac_upper in str(value).upper():
-                # Extract CM index from OID suffix
-                oid_str = str(oid)
-                idx = oid_str.split('.')[-1]
-                try:
+            # Compare as bytes (OctetString returns raw bytes)
+            try:
+                if hasattr(value, 'asOctets'):
+                    val_bytes = value.asOctets()
+                elif isinstance(value, bytes):
+                    val_bytes = value
+                else:
+                    # Try to get raw bytes from the value
+                    val_bytes = bytes(value)
+                
+                if val_bytes == mac_bytes:
+                    # Extract CM index from OID suffix
+                    oid_str = str(oid)
+                    idx = oid_str.split('.')[-1]
                     return int(idx)
-                except:
-                    pass
+            except Exception:
+                pass
         return None
     
     async def get_modem_us_channels(self, cm_index: int) -> list[int]:
