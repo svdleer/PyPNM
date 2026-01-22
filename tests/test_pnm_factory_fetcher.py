@@ -8,14 +8,14 @@ from struct import pack
 
 import pytest
 
-from pypnm.pnm.parser.fetch_pnm_process import PnmFileTypeObjectFetcher
-from pypnm.pnm.parser.CmDsOfdmRxMer import CmDsOfdmRxMer
-from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
 from pypnm.pnm.parser.CmDsConstDispMeas import CmDsConstDispMeas
 from pypnm.pnm.parser.CmDsHist import CmDsHist
+from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
 from pypnm.pnm.parser.CmDsOfdmFecSummary import CmDsOfdmFecSummary
 from pypnm.pnm.parser.CmDsOfdmModulationProfile import CmDsOfdmModulationProfile
+from pypnm.pnm.parser.CmDsOfdmRxMer import CmDsOfdmRxMer
 from pypnm.pnm.parser.CmSpectrumAnalysis import CmSpectrumAnalysis
+from pypnm.pnm.parser.fetch_pnm_process import PnmFileTypeObjectFetcher
 
 DATA_DIR = Path(__file__).parent / "files"
 

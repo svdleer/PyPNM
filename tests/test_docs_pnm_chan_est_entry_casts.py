@@ -2,13 +2,14 @@
 # Copyright (c) 2025 Maurice Garcia
 
 from __future__ import annotations
+
 import pytest
 
+from pypnm.docsis.cm_snmp_operation import MeasStatusType
 from pypnm.docsis.data_type.pnm.DocsPnmCmOfdmChanEstCoefEntry import (
     DocsPnmCmOfdmChanEstCoefEntry,
     DocsPnmCmOfdmChanEstCoefFields,
 )
-from pypnm.docsis.cm_snmp_operation import MeasStatusType
 from pypnm.snmp.snmp_v2c import Snmp_v2c
 
 

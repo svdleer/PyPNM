@@ -16,9 +16,7 @@ from pypnm.api.routes.common.extended.common_messaging_service import (
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.lib.file_processor import FileProcessor
-from pypnm.lib.log_files import LogFile
 from pypnm.lib.types import MacAddressStr, TransactionId, TransactionRecord
-from pypnm.lib.utils import Generate, TimeStamp, Utils
 from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
 from pypnm.pnm.parser.CmDsConstDispMeas import CmDsConstDispMeas
 from pypnm.pnm.parser.CmDsHist import CmDsHist

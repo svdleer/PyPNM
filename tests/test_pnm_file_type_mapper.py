@@ -3,12 +3,12 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Maurice Garcia
-
 import pytest
 
 from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
 from pypnm.pnm.parser.pnm_file_type import PnmFileType
 from pypnm.pnm.parser.pnm_type_header_mapper import PnmFileTypeMapper
+
 
 def test_test_to_file_type_mapping_round_trip() -> None:
     """

@@ -6,9 +6,15 @@ from __future__ import annotations
 import logging
 from typing import cast
 
-from pypnm.api.routes.common.classes.analysis.analysis import WindowFunction  # type: ignore[import-untyped]
-from pypnm.api.routes.common.extended.common_measure_service import CommonMeasureService  # type: ignore[import-untyped]
-from pypnm.api.routes.common.extended.common_process_service import MessageResponse  # type: ignore[import-untyped]
+from pypnm.api.routes.common.classes.analysis.analysis import (
+    WindowFunction,  # type: ignore[import-untyped]
+)
+from pypnm.api.routes.common.extended.common_measure_service import (
+    CommonMeasureService,  # type: ignore[import-untyped]
+)
+from pypnm.api.routes.common.extended.common_process_service import (
+    MessageResponse,  # type: ignore[import-untyped]
+)
 from pypnm.api.routes.docs.pnm.spectrumAnalyzer.abstract.com_spec_chan_ana import (  # type: ignore[import-untyped]
     CommonChannelSpectumBwLut,
     CommonSpectrumBw,
@@ -16,8 +22,12 @@ from pypnm.api.routes.docs.pnm.spectrumAnalyzer.abstract.com_spec_chan_ana impor
     OfdmSpectrumBwLut,
     ScQamSpectrumBwLut,
 )
-from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import SpecAnCapturePara  # type: ignore[import-untyped]
-from pypnm.config.pnm_config_manager import PnmConfigManager  # type: ignore[import-untyped]
+from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import (
+    SpecAnCapturePara,  # type: ignore[import-untyped]
+)
+from pypnm.config.pnm_config_manager import (
+    PnmConfigManager,  # type: ignore[import-untyped]
+)
 from pypnm.docsis.cable_modem import CableModem  # type: ignore[import-untyped]
 from pypnm.docsis.cm_snmp_operation import (  # type: ignore[import-untyped]
     DocsIf31CmDsOfdmChanChannelEntry,
@@ -25,8 +35,14 @@ from pypnm.docsis.cm_snmp_operation import (  # type: ignore[import-untyped]
     SpectrumRetrievalType,
 )
 from pypnm.lib.inet import Inet  # type: ignore[import-untyped]
-from pypnm.lib.types import ChannelId, FrequencyHz, SubcarrierIdx  # type: ignore[import-untyped]
-from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest  # type: ignore[import-untyped]
+from pypnm.lib.types import (  # type: ignore[import-untyped]
+    ChannelId,
+    FrequencyHz,
+    SubcarrierIdx,
+)
+from pypnm.pnm.data_type.pnm_test_types import (
+    DocsPnmCmCtlTest,  # type: ignore[import-untyped]
+)
 
 
 class CmSpectrumAnalysisService(CommonMeasureService):

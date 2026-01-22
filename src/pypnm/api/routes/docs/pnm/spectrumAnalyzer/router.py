@@ -11,17 +11,31 @@ from starlette.responses import FileResponse
 
 from pypnm.api.routes.basic.abstract.analysis_report import AnalysisRptMatplotConfig
 from pypnm.api.routes.basic.ofdm_spec_analyzer_rpt import OfdmSpecAnalyzerAnalysisReport
-from pypnm.api.routes.basic.scqam_spec_analyzer_rpt import ScQamSpecAnalyzerAnalysisReport
+from pypnm.api.routes.basic.scqam_spec_analyzer_rpt import (
+    ScQamSpecAnalyzerAnalysisReport,
+)
 from pypnm.api.routes.basic.spec_analyzer_analysis_rpt import SpectrumAnalyzerReport
 from pypnm.api.routes.common.classes.analysis.analysis import Analysis, AnalysisType
-from pypnm.api.routes.common.classes.analysis.model.process import AnalysisProcessParameters
+from pypnm.api.routes.common.classes.analysis.model.process import (
+    AnalysisProcessParameters,
+)
 from pypnm.api.routes.common.classes.analysis.multi_analysis import MultiAnalysis
-from pypnm.api.routes.common.classes.common_endpoint_classes.common.enum import OutputType
-from pypnm.api.routes.common.classes.common_endpoint_classes.request_defaults import RequestDefaultsResolver
-from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import PnmAnalysisResponse
-from pypnm.api.routes.common.classes.common_endpoint_classes.snmp.schemas import SnmpResponse
+from pypnm.api.routes.common.classes.common_endpoint_classes.common.enum import (
+    OutputType,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.request_defaults import (
+    RequestDefaultsResolver,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import (
+    PnmAnalysisResponse,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.snmp.schemas import (
+    SnmpResponse,
+)
 from pypnm.api.routes.common.classes.file_capture.file_type import FileType
-from pypnm.api.routes.common.classes.operation.cable_modem_precheck import CableModemServicePreCheck
+from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
+    CableModemServicePreCheck,
+)
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
 from pypnm.api.routes.common.extended.common_process_service import CommonProcessService
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
@@ -39,7 +53,9 @@ from pypnm.api.routes.docs.pnm.spectrumAnalyzer.service import (
     DsScQamChannelSpectrumAnalyzer,
 )
 from pypnm.docsis.cable_modem import CableModem
-from pypnm.docsis.data_type.pnm.DocsIf3CmSpectrumAnalysisEntry import DocsIf3CmSpectrumAnalysisEntry
+from pypnm.docsis.data_type.pnm.DocsIf3CmSpectrumAnalysisEntry import (
+    DocsIf3CmSpectrumAnalysisEntry,
+)
 from pypnm.lib.dict_utils import DictGenerate
 from pypnm.lib.fastapi_constants import FAST_API_RESPONSE
 from pypnm.lib.inet import Inet

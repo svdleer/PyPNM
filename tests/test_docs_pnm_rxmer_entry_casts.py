@@ -3,6 +3,7 @@
 
 # tests/test_docs_pnm_rxmer_entry_casts.py
 from __future__ import annotations
+
 import pytest
 
 from pypnm.docsis.data_type.pnm.DocsPnmCmDsOfdmRxMerEntry import (

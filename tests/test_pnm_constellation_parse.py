@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import math
+from pathlib import Path
+
 import pytest
 
 from pypnm.pnm.parser.CmDsConstDispMeas import CmDsConstDispMeas

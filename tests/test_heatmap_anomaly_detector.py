@@ -6,7 +6,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from pypnm.api.routes.advance.analysis.signal_analysis.detection.anolamaly.heatmap_anomaly_detection import HeatmapAnomalyDetector
+from pypnm.api.routes.advance.analysis.signal_analysis.detection.anolamaly.heatmap_anomaly_detection import (
+    HeatmapAnomalyDetector,
+)
+
 
 @pytest.mark.pnm
 def test_compute_zmap_basic_stats():

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ftplib
 from pathlib import Path
-from typing import Set
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -84,7 +83,7 @@ def test_upload_file_success(tmp_path: Path) -> None:
     ftp = MagicMock(spec=ftplib.FTP)
 
     # Track created directories so subsequent cwd to them succeeds
-    created: Set[str] = set()
+    created: set[str] = set()
 
     def cwd_side_effect(path: str) -> None:
         # Root always ok

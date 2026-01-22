@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
-from pypnm.api.routes.common.classes.analysis.analysis import SpecAnCapturePara
+
+from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import SpecAnCapturePara
 from pypnm.lib.types import StringEnum
+
 
 class CommonMessagingServiceExtension(StringEnum):
     SPECTRUM_ANALYSIS_SNMP_CAPTURE_PARAMETER = "spectrum_analysis_snmp_capture_parameters"

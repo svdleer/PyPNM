@@ -6,7 +6,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from pypnm.api.routes.advance.analysis.signal_analysis.detection.echo.ifft import IfftEchoDetector
+from pypnm.api.routes.advance.analysis.signal_analysis.detection.echo.ifft import (
+    IfftEchoDetector,
+)
 from pypnm.lib.constants import SPEED_OF_LIGHT as C0
 
 

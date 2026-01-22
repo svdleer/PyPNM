@@ -3,14 +3,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import time
+from pathlib import Path
+
 import pytest
 
-from pypnm.lib.types import CaptureTime
-from pypnm.pnm.parser.pnm_header import PnmHeader
-from pypnm.pnm.parser.pnm_file_type import PnmFileType
 from pypnm.lib.constants import DEFAULT_CAPTURE_TIME
+from pypnm.lib.types import CaptureTime
+from pypnm.pnm.parser.pnm_file_type import PnmFileType
+from pypnm.pnm.parser.pnm_header import PnmHeader
 
 DATA_DIR = Path(__file__).parent / "files"
 

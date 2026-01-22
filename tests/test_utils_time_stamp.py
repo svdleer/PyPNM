@@ -3,9 +3,10 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Maurice Garcia
-
 import time
-from pypnm.lib.utils import TimeUnit, Generate
+
+from pypnm.lib.utils import Generate, TimeUnit
+
 
 def test_time_unit_values() -> None:
     """

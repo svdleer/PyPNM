@@ -11,7 +11,6 @@ import pytest
 from pypnm.pnm.parser.CmDsOfdmModulationProfile import CmDsOfdmModulationProfile
 from pypnm.pnm.parser.model.parser_rtn_models import CmDsOfdmModulationProfileModel
 
-
 DATA_DIR = Path(__file__).parent / "files"
 MODPROF_PATH = DATA_DIR / "modulation_profile.bin"
 NON_MODPROF_PATH = DATA_DIR / "rxmer.bin"  # negative test sample
@@ -51,7 +50,7 @@ def test_profile_schemes_valid_and_decoded(modprof_bytes):
         assert isinstance(profile.schemes, list)
         for sch in profile.schemes:
             # Discriminated union: schema_type is 0 (range) or 1 (skip)
-            assert getattr(sch, "schema_type") in (0, 1)
+            assert sch.schema_type in (0, 1)
             if sch.schema_type == 0:
                 # Range schema
                 assert hasattr(sch, "modulation_order")

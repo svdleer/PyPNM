@@ -53,6 +53,9 @@ from pypnm.api.routes.common.classes.analysis.model.spectrum_analyzer_schema imp
     WindowAverage,
 )
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
+from pypnm.api.routes.common.extended.types import (
+    CommonMessagingServiceExtension as CMSE,
+)
 from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import SpecAnCapturePara
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.docsis.cm_snmp_operation import Generate
@@ -111,7 +114,7 @@ from pypnm.pnm.parser.model.parser_rtn_models import (
     CmUsOfdmaPreEqModel,
 )
 from pypnm.pnm.parser.pnm_file_type import PnmFileType
-from pypnm.api.routes.common.extended.types import CommonMessagingServiceExtension as CMSE
+
 
 class RxMerCarrierType(Enum):
     """

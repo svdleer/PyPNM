@@ -4,8 +4,8 @@
 # tests/test_shannon_series.py
 from __future__ import annotations
 
-import math
 import json
+import math
 
 import pytest
 

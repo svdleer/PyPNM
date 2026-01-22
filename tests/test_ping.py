@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import logging
 import subprocess
+
 import pytest
 
 from pypnm.lib.ping import Ping
+
 
 class DummyCompleted:
     def __init__(self, returncode: int) -> None:

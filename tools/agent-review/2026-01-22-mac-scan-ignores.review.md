@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Update MAC scan to skip logs and data directories.
+- Changes: Add logs, .data, and release-log to ignore list; update SPDX year.
+- Files: tools/security/scan-mac-addresses.py
+- Tests: python3 -m compileall src; ruff check src (fails: pre-existing import/order/unused issues); ruff format --check . (fails: many files would reformat); pytest -q (passed, 510 passed, 3 skipped: PNM_CM_IT)
+- Notes: Ruff failures appear pre-existing; warnings during pytest are expected in current suite.
+
+# FILE: tools/security/scan-mac-addresses.py
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia

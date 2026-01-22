@@ -4,14 +4,13 @@
 
 from __future__ import annotations
 
-from typing import List
-
 import numpy as np
 import pytest
 
 # Import your detector from its project path
 from pypnm.api.routes.advance.analysis.signal_analysis.detection.echo.echo_detector import (
-    EchoDetector,)
+    EchoDetector,
+)
 from pypnm.lib.types import ChannelId
 
 # Fixed PHY/Test parameters
@@ -34,7 +33,7 @@ def _bins_for_distance_ft(distance_ft: float, fs: float = FS, v: float = V) -> i
     return int(round(t * fs))
 
 
-def _make_freq_response_from_impulses(pulses: List[tuple[int, float]], nfft: int = NFFT) -> np.ndarray:
+def _make_freq_response_from_impulses(pulses: list[tuple[int, float]], nfft: int = NFFT) -> np.ndarray:
     """
     Build H(f) by FFT of h[n] with time-domain impulses:
     pulses = [(bin_index, amplitude), ...]

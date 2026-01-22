@@ -4,38 +4,37 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import pytest
 
 from pypnm.pnm.lib.fixed_point_decoder import (
     FixedPointDecoder,
-    IntegerBits,
     FractionalBits,
+    IntegerBits,
 )
 
 # ───────────────────────── helpers ─────────────────────────
 
-def _q(a: int, b: int) -> Tuple[IntegerBits, FractionalBits]:
+def _q(a: int, b: int) -> tuple[IntegerBits, FractionalBits]:
     return (IntegerBits(a), FractionalBits(b))
 
-def _bits_per_component(q: Tuple[IntegerBits, FractionalBits]) -> int:
+def _bits_per_component(q: tuple[IntegerBits, FractionalBits]) -> int:
     a, b = int(q[0]), int(q[1])
     return a + b + 1  # +1 sign bit
 
-def _bytes_per_component(q: Tuple[IntegerBits, FractionalBits]) -> int:
+def _bytes_per_component(q: tuple[IntegerBits, FractionalBits]) -> int:
     tbits = _bits_per_component(q)
     assert tbits % 8 == 0, "Test helper expects byte-aligned Q formats"
     return tbits // 8
 
-def _scale(q: Tuple[IntegerBits, FractionalBits]) -> int:
+def _scale(q: tuple[IntegerBits, FractionalBits]) -> int:
     return 1 << int(q[1])
 
 def _twos_wrap(n: int, total_bits: int) -> int:
     mask = (1 << total_bits) - 1
     return n & mask
 
-def _pack_component(value: float, q: Tuple[IntegerBits, FractionalBits], *, signed: bool, byteorder: str) -> bytes:
+def _pack_component(value: float, q: tuple[IntegerBits, FractionalBits], *, signed: bool, byteorder: str) -> bytes:
     """Pack one fixed-point component into bytes, respecting endianness."""
     frac = int(q[1])
     total_bits = _bits_per_component(q)
@@ -54,7 +53,7 @@ def _pack_component(value: float, q: Tuple[IntegerBits, FractionalBits], *, sign
     raw_u = max(0, min(max_u, raw))
     return raw_u.to_bytes(byte_len, byteorder=byteorder, signed=False)
 
-def _pack_q_pair(re: float, im: float, q: Tuple[IntegerBits, FractionalBits], *, signed: bool = True, endian: str = "little") -> bytes:
+def _pack_q_pair(re: float, im: float, q: tuple[IntegerBits, FractionalBits], *, signed: bool = True, endian: str = "little") -> bytes:
     """Encode one complex sample for generic Q(a,b), honoring endianness."""
     return (
         _pack_component(re, q, signed=signed, byteorder=endian) +

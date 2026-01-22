@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-from importlib.machinery import EXTENSION_SUFFIXES
 import json
 import logging
 import time
