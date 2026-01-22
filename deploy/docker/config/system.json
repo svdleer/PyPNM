@@ -38,7 +38,7 @@
         "pnm_dir": ".data/pnm",
         "retries": 5,
         "retrieval_method": {
-            "method": "sftp",
+            "method": "local",
             "methods": {
                 "ftp": {
                     "host": "localhost",
