@@ -104,6 +104,9 @@ SampleIndex   = NewType("SampleIndex", int)
 # RF / PHY units (keep as scalars with units)
 FrequencyHz   = NewType("FrequencyHz", int)
 BandwidthHz   = NewType("BandwidthHz", int)
+ResolutionBw  = NewType("ResolutionBw", int)
+SegmentFreqSpan = NewType("SegmentFreqSpan", int)
+NumBins       = NewType("NumBins", int)
 
 PowerdBmV     = NewType("PowerdBmV", float)
 PowerdB       = NewType("PowerdB", float)
@@ -146,6 +149,7 @@ RegressionStats  = tuple[float, float, float]       # (slope, intercept, r2)
 
 # Spectrum analysis extension payloads
 SpectrumAnalysisSnmpCaptureParameters: TypeAlias = dict[str, int | float]
+ResolutionBwSettings: TypeAlias = tuple[ResolutionBw, NumBins, SegmentFreqSpan]
 
 # RxMER / spectrum containers
 FrequencySeriesHz: TypeAlias = list[FrequencyHz]
@@ -208,14 +212,15 @@ __all__ = [
     # unit-tagged scalars
     "CaptureTime", "TimeStamp", "TimestampSec", "TimestampMs", "TimeStampUs", "TimeStampNs",
     "SampleIndex",
-    "FrequencyHz", "BandwidthHz", "PowerdBmV", "PowerdB", "MERdB", "SNRdB", "SNRln",
+    "FrequencyHz", "BandwidthHz", "ResolutionBw", "SegmentFreqSpan", "NumBins",
+    "PowerdBmV", "PowerdB", "MERdB", "SNRdB", "SNRln",
     "ChannelId", "SubcarrierId",
     "OidStr", "OidNumTuple",
     "SnmpReadCommunity", "SnmpWriteCommunity", "SnmpCommunity",
     "MacAddressStr", "IPv4Str", "IPv6Str",
     "FileStem", "FileExt", "FileName",
     # analysis tuples / series
-    "RegressionCoeffs", "RegressionStats", "SpectrumAnalysisSnmpCaptureParameters",
+    "RegressionCoeffs", "RegressionStats", "SpectrumAnalysisSnmpCaptureParameters", "ResolutionBwSettings",
     "FrequencySeriesHz", "MerSeriesdB", "ShannonSeriesdB", "MagnitudeSeries",
     # modulation/profile & misc
     "ProfileId", "BitsPerSymbol", "BitsPerSymbolSeries", "Microseconds",

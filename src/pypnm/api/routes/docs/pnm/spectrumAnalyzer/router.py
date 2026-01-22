@@ -60,7 +60,7 @@ from pypnm.lib.dict_utils import DictGenerate
 from pypnm.lib.fastapi_constants import FAST_API_RESPONSE
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import ChannelId, InetAddressStr, MacAddressStr, Path
+from pypnm.lib.types import ChannelId, FrequencyHz, InetAddressStr, MacAddressStr, Path
 
 
 class SpectrumAnalyzerRouter:
@@ -311,10 +311,13 @@ class SpectrumAnalyzerRouter:
 
             number_of_averages: int = request.capture_parameters.number_of_averages
             spectrum_retrieval_type = request.capture_parameters.spectrum_retrieval_type
+            resolution_bandwidth: FrequencyHz = request.capture_parameters.resolution_bandwidth
+
             service = DsScQamChannelSpectrumAnalyzer(
                 cable_modem             =   cm,
                 tftp_servers            =   tftp_servers,
                 number_of_averages      =   number_of_averages,
+                resolution_bandwidth    =   resolution_bandwidth,
                 spectrum_retrieval_type =   spectrum_retrieval_type,
             )
 

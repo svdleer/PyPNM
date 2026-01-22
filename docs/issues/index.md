@@ -19,6 +19,10 @@ sanitize sensitive information before sharing it with the PyPNM support team.
 Q: Why is extension data missing after processing a PNM transaction record?  
 A: Ensure the transaction record includes an `extension` mapping and that the update helper merges the extension into the PNM data before returning the result.
 
+Q: Why does US PreEq SNMP retrieval log validation errors about missing fields?  
+A: Some modems return sparse or empty entries for certain indices. Ensure the device supports the table and that the entry is populated; missing required fields will cause the entry to be skipped.
+
 ## TODO
 
 - Add or update a FAQ entry whenever an error is fixed so the resolution is documented.
+- Add FAQ entries when SNMP validation errors are addressed to capture the resolution.

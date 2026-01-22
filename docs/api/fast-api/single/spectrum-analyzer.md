@@ -53,6 +53,7 @@ These endpoints add optional `analysis` controls and a `capture_parameters` sect
 | `analysis.type`          | string | "basic"                 | "basic" | Selects the analysis mode used during processing.                                                         |
 | `analysis.output.type`   | string | "json", "archive"       | "json"  | Output format. **`json`** returns inline `data`; **`archive`** returns a ZIP (CSV exports and PNG plots). |
 | `analysis.plot.ui.theme` | string | "light", "dark"         | "dark"  | Theme hint for Matplotlib plots (colors, grid, ticks). Does not affect raw metrics/CSV.                   |
+| `analysis.spectrum_analysis.moving_average.points` | int | >= 1 | 10 | Window size for the moving average applied to spectrum magnitudes. |
 
 When `analysis.output.type = "archive"`, the HTTP response body is the file (no `data` JSON payload).
 
@@ -111,10 +112,23 @@ most flexible entry point and allows arbitrary sweep settings (within diplexer l
 | `capture_parameters.last_segment_center_freq`  | int  | Center frequency (Hz) of the last sweep segment.                             |
 | `capture_parameters.segment_freq_span`         | int  | Frequency span (Hz) covered by each sweep segment.                           |
 | `capture_parameters.num_bins_per_segment`      | int  | Number of FFT bins per segment.                                              |
-| `capture_parameters.noise_bw`                  | int  | Equivalent noise bandwidth for amplitude normalization.                      |
-| `capture_parameters.window_function`           | int  | Window function index (implementation-specific; e.g., Hanning, Rectangular). |
-| `capture_parameters.num_averages`              | int  | Number of averages per segment for noise reduction.                          |
-| `capture_parameters.spectrum_retrieval_type`   | int  | Retrieval mode flag: PNM_FILE(1) or SNMP(2).  |
+| `capture_parameters.noise_bw`                  | int  | Equivalent noise bandwidth in kHz.                                            |
+| `capture_parameters.window_function`           | int  | Window function enum value.                                                    |
+| `capture_parameters.num_averages`              | int  | Number of averages per segment for noise reduction.                           |
+| `capture_parameters.spectrum_retrieval_type`   | int  | Retrieval mode enum value (FILE = 1, SNMP = 2).                                 |
+
+#### Window Function Values
+
+| Value | Enum name |
+| ----- | --------- |
+| 0     | OTHER |
+| 1     | HANN |
+| 2     | BLACKMAN_HARRIS |
+| 3     | RECTANGULAR |
+| 4     | HAMMING |
+| 5     | FLAT_TOP |
+| 6     | GAUSSIAN |
+| 7     | CHEBYSHEV |
 
 #### Note
 

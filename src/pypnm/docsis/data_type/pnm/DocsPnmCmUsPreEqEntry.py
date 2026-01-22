@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 import logging
 from collections.abc import Callable
 from enum import Enum
@@ -132,28 +132,38 @@ class DocsPnmCmUsPreEqEntry(BaseModel):
             try:
                 result = await snmp.get(f"{oid}.{index}")
                 value = Snmp_v2c.get_result_value(result)
-                if value is None:
-                    return None
             except Exception as e:
                 logger.warning("Fetch error for %s.%s: %s", oid, index, e)
                 return None
+            if value is None:
                 return None
+            if cast_fn is None:
+                return value
+            return cast_fn(value)
 
-        fields = DocsPnmCmUsPreEqFields(
-            docsPnmCmUsPreEqFileEnable           = await fetch("docsPnmCmUsPreEqFileEnable", Snmp_v2c.truth_value),
-            docsPnmCmUsPreEqAmpRipplePkToPk      = await fetch("docsPnmCmUsPreEqAmpRipplePkToPk", cls.thousandth_db),
-            docsPnmCmUsPreEqAmpRippleRms         = await fetch("docsPnmCmUsPreEqAmpRippleRms", cls.thousandth_db),
-            docsPnmCmUsPreEqAmpSlope             = await fetch("docsPnmCmUsPreEqAmpSlope", cls.thousandth_db_per_mhz),
-            docsPnmCmUsPreEqGrpDelayRipplePkToPk = await fetch("docsPnmCmUsPreEqGrpDelayRipplePkToPk", cls.thousandth_ns),
-            docsPnmCmUsPreEqGrpDelayRippleRms    = await fetch("docsPnmCmUsPreEqGrpDelayRippleRms", cls.thousandth_ns),
-            docsPnmCmUsPreEqPreEqCoAdjStatus     = await fetch("docsPnmCmUsPreEqPreEqCoAdjStatus", cls.to_pre_eq_status_str),
-            docsPnmCmUsPreEqMeasStatus           = await fetch("docsPnmCmUsPreEqMeasStatus", measurement_status),
-            docsPnmCmUsPreEqLastUpdateFileName   = await fetch("docsPnmCmUsPreEqLastUpdateFileName", str),
-            docsPnmCmUsPreEqFileName             = await fetch("docsPnmCmUsPreEqFileName", str),
-            docsPnmCmUsPreEqAmpMean              = await fetch("docsPnmCmUsPreEqAmpMean", cls.thousandth_db),
-            docsPnmCmUsPreEqGrpDelaySlope        = await fetch("docsPnmCmUsPreEqGrpDelaySlope", cls.thousandth_ns_per_mhz),
-            docsPnmCmUsPreEqGrpDelayMean         = await fetch("docsPnmCmUsPreEqGrpDelayMean", cls.thousandth_ns),
-        )
+        raw_fields: dict[str, object | None] = {
+            "docsPnmCmUsPreEqFileEnable": await fetch("docsPnmCmUsPreEqFileEnable", Snmp_v2c.truth_value),
+            "docsPnmCmUsPreEqAmpRipplePkToPk": await fetch("docsPnmCmUsPreEqAmpRipplePkToPk", cls.thousandth_db),
+            "docsPnmCmUsPreEqAmpRippleRms": await fetch("docsPnmCmUsPreEqAmpRippleRms", cls.thousandth_db),
+            "docsPnmCmUsPreEqAmpSlope": await fetch("docsPnmCmUsPreEqAmpSlope", cls.thousandth_db_per_mhz),
+            "docsPnmCmUsPreEqGrpDelayRipplePkToPk": await fetch("docsPnmCmUsPreEqGrpDelayRipplePkToPk", cls.thousandth_ns),
+            "docsPnmCmUsPreEqGrpDelayRippleRms": await fetch("docsPnmCmUsPreEqGrpDelayRippleRms", cls.thousandth_ns),
+            "docsPnmCmUsPreEqPreEqCoAdjStatus": await fetch("docsPnmCmUsPreEqPreEqCoAdjStatus", cls.to_pre_eq_status_str),
+            "docsPnmCmUsPreEqMeasStatus": await fetch("docsPnmCmUsPreEqMeasStatus", measurement_status),
+            "docsPnmCmUsPreEqLastUpdateFileName": await fetch("docsPnmCmUsPreEqLastUpdateFileName", str),
+            "docsPnmCmUsPreEqFileName": await fetch("docsPnmCmUsPreEqFileName", str),
+            "docsPnmCmUsPreEqAmpMean": await fetch("docsPnmCmUsPreEqAmpMean", cls.thousandth_db),
+            "docsPnmCmUsPreEqGrpDelaySlope": await fetch("docsPnmCmUsPreEqGrpDelaySlope", cls.thousandth_ns_per_mhz),
+            "docsPnmCmUsPreEqGrpDelayMean": await fetch("docsPnmCmUsPreEqGrpDelayMean", cls.thousandth_ns),
+        }
+        missing_fields = [key for key, value in raw_fields.items() if value is None]
+        if missing_fields:
+            raise ValueError(f"Missing required SNMP fields: {', '.join(missing_fields)}")
+
+        fields_payload: dict[str, object] = {
+            key: value for key, value in raw_fields.items() if value is not None
+        }
+        fields = DocsPnmCmUsPreEqFields(**fields_payload)
 
         channel_id = await fetch("docsIf31CmUsOfdmaChanChannelId", ChannelId) or ChannelId(index)
         return cls(index=index, channel_id=channel_id, entry=fields)

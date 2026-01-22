@@ -73,6 +73,8 @@ Before introducing new types, validators, formats, or storage conventions:
   - Keep code self-documented; avoid method-level debug logging.
   - Logger pattern in classes: `self.logger = logging.getLogger(f"{self.__class__.__name__}")`.
 - Release hygiene / headers:
+  - Code files must include `SPDX-License-Identifier: Apache-2.0`.
+  - Copyright lines must include only the year or year range (no author names).
   - Any touched code files must have SPDX copyright year updated per Repo Hygiene rules (single year or range).
   - Do not add SPDX headers to Markdown files.
   - Remove SPDX lines embedded inside Markdown code blocks if encountered (especially SQL appendices).
