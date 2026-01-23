@@ -24,7 +24,7 @@ OUTPUT_DIR="/app/output"
 mkdir -p "${CONFIG_DIR}" "${LOG_DIR}" "${DATA_DIR}" "${OUTPUT_DIR}"
 
 # Resolve installed package settings path for system.json
-PKG_SETTINGS_DIR="$(python - <<'PY'
+PKG_SETTINGS_DIR="$(python3.12 - <<'PY'
 import pathlib, pypnm
 print((pathlib.Path(pypnm.__file__).parent / "settings").as_posix())
 PY
