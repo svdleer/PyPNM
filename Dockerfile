@@ -9,7 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_ROOT_USER_ACTION=ignore \
     DEBIAN_FRONTEND=noninteractive \
     MIBDIRS=/usr/share/snmp/mibs:/usr/share/snmp/mibs/iana:/usr/share/snmp/mibs/ietf \
-    MIBS=ALL
+    MIBS=ALL \
+    PYSNMP_MIB_DIRS=/usr/share/snmp/mibs:/home/pypnm/.pysnmp/mibs
 
 WORKDIR /app
 
