@@ -11,8 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates gosu iputils-ping \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends ca-certificates gosu iputils-ping snmp-mibs-downloader \
+ && rm -rf /var/lib/apt/lists/* \
+ && sed -i 's/^mibs :/#mibs :/' /etc/snmp/snmp.conf
 
 COPY pyproject.toml README.md LICENSE /app/
 COPY src/ /app/src/
