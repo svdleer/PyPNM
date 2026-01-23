@@ -33,8 +33,7 @@ COPY tools/ /app/tools/
 COPY mibs/ /app/mibs/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 
-RUN python3.12 -m pip install --upgrade pip --break-system-packages \
- && python3.12 -m pip install . --break-system-packages \
+RUN python3.12 -m pip install . --break-system-packages \
  && useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
  && chmod +x /app/entrypoint.sh \
  && if [ -f /app/deploy/config/system.json.template ] && [ ! -f /app/deploy/config/system.json ]; then cp /app/deploy/config/system.json.template /app/deploy/config/system.json; fi \
