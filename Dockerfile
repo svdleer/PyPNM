@@ -7,7 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_ROOT_USER_ACTION=ignore \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    MIBDIRS=/usr/share/snmp/mibs:/usr/share/snmp/mibs/iana:/usr/share/snmp/mibs/ietf \
+    MIBS=ALL
 
 WORKDIR /app
 
@@ -37,10 +39,11 @@ RUN python3.12 -m pip install . --break-system-packages \
  && useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
  && chmod +x /app/entrypoint.sh \
  && if [ -f /app/deploy/config/system.json.template ] && [ ! -f /app/deploy/config/system.json ]; then cp /app/deploy/config/system.json.template /app/deploy/config/system.json; fi \
- && mkdir -p /usr/share/snmp/mibs \
+ && mkdir -p /usr/share/snmp/mibs /home/pypnm/.pysnmp/mibs \
  && cp /app/mibs/*.my /usr/share/snmp/mibs/ 2>/dev/null || true \
  && cp /app/mibs/*.mib /usr/share/snmp/mibs/ 2>/dev/null || true \
- && cp /app/mibs/*.txt /usr/share/snmp/mibs/ 2>/dev/null || true
+ && cp /app/mibs/*.txt /usr/share/snmp/mibs/ 2>/dev/null || true \
+ && chown -R pypnm:pypnm /home/pypnm/.pysnmp
 
 EXPOSE 8000
 
