@@ -19,13 +19,18 @@ COPY src/ /app/src/
 COPY demo/ /app/demo/
 COPY deploy/docker/config/ /app/deploy/config/
 COPY tools/ /app/tools/
+COPY mibs/ /app/mibs/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 
 RUN python -m pip install --upgrade pip \
  && python -m pip install . \
  && useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
  && chmod +x /app/entrypoint.sh \
- && if [ -f /app/deploy/config/system.json.template ] && [ ! -f /app/deploy/config/system.json ]; then cp /app/deploy/config/system.json.template /app/deploy/config/system.json; fi
+ && if [ -f /app/deploy/config/system.json.template ] && [ ! -f /app/deploy/config/system.json ]; then cp /app/deploy/config/system.json.template /app/deploy/config/system.json; fi \
+ && mkdir -p /usr/share/snmp/mibs \
+ && cp /app/mibs/*.my /usr/share/snmp/mibs/ 2>/dev/null || true \
+ && cp /app/mibs/*.mib /usr/share/snmp/mibs/ 2>/dev/null || true \
+ && cp /app/mibs/*.txt /usr/share/snmp/mibs/ 2>/dev/null || true
 
 EXPOSE 8000
 
