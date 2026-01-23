@@ -44,7 +44,11 @@ RUN python3.12 -m pip install . --break-system-packages \
  && cp /app/mibs/*.my /usr/share/snmp/mibs/ 2>/dev/null || true \
  && cp /app/mibs/*.mib /usr/share/snmp/mibs/ 2>/dev/null || true \
  && cp /app/mibs/*.txt /usr/share/snmp/mibs/ 2>/dev/null || true \
- && chown -R pypnm:pypnm /home/pypnm/.pysnmp
+ && chown -R pypnm:pypnm /home/pypnm/.pysnmp \
+ && echo "Compiling MIBs for pysnmp..." \
+ && python3.12 -c "from pysmi.reader import FileReader; from pysmi.searcher import StubSearcher; from pysmi.writer import PyFileWriter; from pysmi.parser import SmiStarParser; from pysmi.codegen import PySnmpCodeGen; from pysmi.compiler import MibCompiler; import os; mibCompiler = MibCompiler(SmiStarParser(), PySnmpCodeGen(), PyFileWriter('/home/pypnm/.pysnmp/mibs')); mibCompiler.addSources(FileReader('/usr/share/snmp/mibs')); mibCompiler.addSearchers(StubSearcher(*PySnmpCodeGen.baseMibs)); [mibCompiler.compile(mib.replace('.mib', '').replace('.my', '').replace('.txt', '')) for mib in os.listdir('/usr/share/snmp/mibs') if mib.endswith(('.mib', '.my', '.txt'))]" 2>&1 | grep -E "(compiled|failed)" || true \
+ && chown -R pypnm:pypnm /home/pypnm/.pysnmp \
+ && ls -la /home/pypnm/.pysnmp/mibs/ | head -20
 
 EXPOSE 8000
 
