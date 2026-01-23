@@ -127,6 +127,9 @@ Python and remaining dependencies are handled by the installer.
 If you only need the library, install from PyPI:
 
   ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install --upgrade pip
   pip install pypnm-docsis
   ```
 
@@ -137,7 +140,7 @@ Uninstall and cleanup:
   rm -f ~/.ssh/pypnm_secrets.key
   ```
 
-For full FastAPI service usage and development, use the repository-based flow below.
+## FastAPI Service and Development
 
 ### 1) Clone
 
