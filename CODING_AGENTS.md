@@ -52,7 +52,7 @@ Before introducing new types, validators, formats, or storage conventions:
 ### Commit Message Format
 
 - One line summary (max 50 characters)
-- Detailed description (max 72 characters per line)
+- Detailed description (max 72 characters per line) preface with a `-`
 
 ## Agent Constraints
 

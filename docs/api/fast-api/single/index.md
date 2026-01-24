@@ -34,12 +34,12 @@ Poll DOCSIS 3.0/3.1 downstream metrics directly from the cable modem via SNMP-ba
 
 | Reference | Purpose |
 |-----------|---------|
-| [Diplexer configuration](diplexer-configuration.md) | Device-level diplexer settings. |
-| [DOCSIS base configuration](docsis-base-configuration.md) | Full DOCSIS configuration snapshot. |
-| [Event log](event-log.md) | Retrieve the CM event log. |
-| [Reset cable modem](reset-cm.md) | Invoke a remote reset. |
-| [System description](system-description.md) | SNMP `sysDescr`. |
-| [System uptime](up-time.md) | SNMP `sysUpTime`. |
+| [Diplexer configuration](general/diplexer-configuration.md) | Device-level diplexer settings. |
+| [DOCSIS base configuration](general/docsis-base-configuration.md) | Full DOCSIS configuration snapshot. |
+| [Event log](general/event-log.md) | Retrieve the CM event log. |
+| [Reset cable modem](general/reset-cm.md) | Invoke a remote reset. |
+| [System description](general/system-description.md) | SNMP `sysDescr`. |
+| [System uptime](general/up-time.md) | SNMP `sysUpTime`. |
 | [Interface statistics](pnm/interface/stats.md) | Interface-level counters. |
 
 ## Proactive network maintenance (PNM)

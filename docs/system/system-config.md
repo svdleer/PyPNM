@@ -11,7 +11,7 @@ Canonical Structure And Field Semantics For `system.json`.
 * [1. FastApiRequestDefault](#1-fastapirequestdefault)
 * [2. SNMP](#2-snmp)
 * [3. PnmBulkDataTransfer](#3-pnmbulkdatatransfer)
-* [4. PnmFileRetrieval](#4-pnmfileretrieval)
+* [4. PnmFileRetrieval](#pnmfileretrieval)
 * [5. Logging](#5-logging)
 * [6. TestMode](#6-testmode)
 * [Loading Configuration](#loading-configuration)
