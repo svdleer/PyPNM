@@ -137,21 +137,18 @@ class CmtsUtscService:
             if row_exists:
                 self.logger.info("Step 3: Stopping existing measurement before reconfiguring")
                 # MeasStatus: 1=initiate, 2=inactive/stop
-                await self._safe_snmp_set(f"{self.UTSC_CTRL_BASE}.1{idx}", 2, Integer32, "MeasStatus = stop")
-                import asyncio
-                await asyncio.sleep(0.3)  # Give CMTS time to stop
+                if not await self._safe_snmp_set(f"{self.UTSC_CTRL_BASE}.1{idx}", 2, Integer32, "MeasStatus = stop"):
+                    self.logger.warning("Failed to stop measurement, but will continue")
+                await asyncio.sleep(0.5)  # Give CMTS time to stop
                 
-                # Try to destroy row for clean reconfiguration
-                self.logger.info("Step 3a: Attempting to destroy row for fresh parameters")
-                if await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 6, Integer32, "Row Status destroy"):
-                    self.logger.info("Successfully destroyed existing row, will create new one")
-                    row_exists = False  # Now we need to create it
-                    await asyncio.sleep(0.5)  # Give CMTS time to clean up
-                else:
-                    # Can't delete, try to set to notInService to modify
-                    self.logger.warning("Cannot destroy row, trying notInService instead")
-                    if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService"):
-                        self.logger.warning("Row is locked but will try to overwrite parameters anyway")
+                # Row must be set to notInService to modify parameters
+                self.logger.info("Step 3a: Setting row to notInService to allow parameter changes")
+                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService"):
+                    self.logger.warning("Failed to set notInService, row may be locked")
+                    # Note: E6000 may reject this if row is active - this is a known firmware limitation
+                    # Continue anyway as some parameters may still be modifiable
+                
+                await asyncio.sleep(0.3)  # Give CMTS time to process
             
             if not row_exists:
                 self.logger.info("Step 3: Creating new UTSC row with createAndWait")

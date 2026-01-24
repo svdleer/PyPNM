@@ -83,14 +83,14 @@ class Snmp_v2c:
         Initializes the SNMPv2c client.
 
         Args:
-            host (Inet): Host address of the SNMP device.
+            host (Inet | str): Host address of the SNMP device (Inet object or string).
             community (str | None): Legacy community string for SNMP access.
             read_community (SnmpReadCommunity | None): Read community string override.
             write_community (SnmpWriteCommunity | None): Write community string override.
             port (int): SNMP port (default 161).
         """
         self.logger     = logging.getLogger(self.__class__.__name__)
-        self._host      = host.inet
+        self._host      = host.inet if hasattr(host, 'inet') else str(host)
         self._port      = port
         if read_community is not None:
             self._read_community = str(read_community)
