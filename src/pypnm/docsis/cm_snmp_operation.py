@@ -1032,8 +1032,14 @@ class CmSnmpOperation:
             return False
 
         try:
-            results = await self._snmp.walk(oid)
-        except Exception:
+
+            # TODO: Uncomment when ready to use
+            #results = await self._snmp.walk(oid)
+
+            results = await self._snmp.bulk_walk(oid, max_repetitions=1)
+
+        except Exception as e:
+            self.logger.warning(f"Amplitude data bulk walk failed for {oid}: {e}")
             return False
 
         return bool(results)

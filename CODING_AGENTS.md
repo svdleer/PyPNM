@@ -46,13 +46,13 @@ Before introducing new types, validators, formats, or storage conventions:
 - When adding new behavior, include tests covering the change.
 - New classes must have pytest coverage at a minimum for IPC and system calls.
 - Avoid broad refactors unless explicitly requested.
-- Keep a brief summary of user prompts after any request for a commit message so it can be referenced if asked again.
-- When asked for a commit message, respond with the specified format and keep it succinct.
+- Keep a brief summary of user prompts after any request for a commit message and track changes since the most recent commit message request.
+- When asked for a commit message, respond with the specified format, keep it succinct, and include all changes since the last commit message request.
 
 ### Commit Message Format
 
 - One line summary (max 50 characters)
-- Detailed description (max 72 characters per line) preface with a `-`
+- Detailed description lines (max 72 characters per line); every line after the first must start with `-`
 
 ## Agent Constraints
 

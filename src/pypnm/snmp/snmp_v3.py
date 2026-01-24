@@ -8,6 +8,8 @@ import re
 from enum import Enum
 from typing import NoReturn
 
+from pysnmp.hlapi.v3arch.asyncio import ObjectType
+
 from pypnm.lib.inet import Inet
 
 
@@ -130,6 +132,21 @@ class Snmp_v3:
         """
         self.logger.debug("Snmp_v3.walk(%r) called (stub).", oid)
         raise NotImplementedError("Snmp_v3.walk is not implemented yet.")
+
+    async def bulk_walk(
+        self,
+        oid: str | tuple[str, str, int],
+        non_repeaters: int = 0,
+        max_repetitions: int = 25
+    ) -> list[ObjectType] | None:
+        """
+        Stub for SNMP BULK WALK (v3).
+        """
+        self.logger.debug(
+            "Snmp_v3.bulk_walk(%r, %r, %r) called (stub).",
+            oid, non_repeaters, max_repetitions
+        )
+        raise NotImplementedError("Snmp_v3.bulk_walk is not implemented yet.")
 
     async def set(self, oid: str, value: str | int | float | bytes | bool, value_type: str) -> NoReturn:
         """

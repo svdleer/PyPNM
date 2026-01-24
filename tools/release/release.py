@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 import argparse
 import atexit
@@ -908,6 +908,11 @@ def main() -> None:
             print(f"Upstream: {pending_upstream}")
         print(f"Commit report saved to {report_path}")
         return
+
+    current_branch = _get_current_branch()
+    if current_branch not in ("main", "hot-fix"):
+        print("ERROR: release can only be done in main or hot-fix branch.", file=sys.stderr)
+        sys.exit(1)
 
     current_version   = _read_current_version()
     pyproject_version = _read_pyproject_version()

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import AsyncIterable
 from datetime import datetime, timedelta, timezone
 from typing import TypeVar
 
@@ -222,7 +223,8 @@ class Snmp_v2c:
         self,
         oid: str | tuple[str, str, int],
         non_repeaters: int = 0,
-        max_repetitions: int = 25
+        max_repetitions: int = 25,
+        suppress_no_such_name: bool = True,
     ) -> list[ObjectType] | None:
         """
         Perform an SNMP GETBULK operation (faster alternative to WALK).
@@ -250,54 +252,133 @@ class Snmp_v2c:
               * Large/slow networks: 10-25
               * Very fast networks: 50-100
         """
-        self.logger.debug(f"Starting SNMP BULK WALK with OID: {oid}, non_repeaters={non_repeaters}, max_repetitions={max_repetitions}")
         oid = Snmp_v2c.resolve_oid(oid)
-        self.logger.debug(f"Converted: {oid}")
 
         identity = self._to_object_identity(oid)
-        obj = ObjectType(identity)
-        results: list[ObjectType] = []
+        attempt_values: list[int] = []
+        for value in [max_repetitions, 10, 5, 1]:
+            if value > 0 and value not in attempt_values:
+                attempt_values.append(value)
 
-        transport = await UdpTransportTarget.create(
-            (self._host, self._port),
-            timeout=self._timeout,
-            retries=self._retries
-        )
+        last_error: str | None = None
 
-        objects = bulk_cmd(
-            self._snmp_engine,
-            CommunityData(self._read_community, mpModel=1),
-            transport,
-            ContextData(),
-            non_repeaters,
-            max_repetitions,
-            obj
-        )
+        for attempt in attempt_values:
+            self.logger.debug(
+                f"Starting SNMP BULK WALK with OID: {oid}, non_repeaters={non_repeaters}, max_repetitions={attempt}"
+            )
+            obj = ObjectType(identity)
+            results: list[ObjectType] = []
+            retry = False
+            hard_error = False
 
-        async for item in objects:
-            errorIndication, errorStatus, errorIndex, varBinds = item
+            transport = await UdpTransportTarget.create(
+                (self._host, self._port),
+                timeout=self._timeout,
+                retries=self._retries
+            )
 
-            try:
-                self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
-            except Exception as e:
-                self.logger.error(f"Failed bulk walk: {e}")
+            objects = await bulk_cmd(
+                self._snmp_engine,
+                CommunityData(self._read_community, mpModel=1),
+                transport,
+                ContextData(),
+                non_repeaters,
+                attempt,
+                obj
+            )
+
+            def _process_item(
+                item: tuple[object, object, object, list[ObjectType]],
+                attempt_value: int,
+                identity_value: object,
+                results_list: list[ObjectType],
+            ) -> tuple[bool, bool, bool, str | None]:
+                errorIndication, errorStatus, errorIndex, varBinds = item
+
+                if errorIndication or errorStatus:
+                    status_text = ""
+                    if errorStatus:
+                        pretty = getattr(errorStatus, "prettyPrint", None)
+                        status_text = pretty() if callable(pretty) else str(errorStatus)
+                    error_message = status_text or str(errorIndication)
+
+                    if status_text == "tooBig":
+                        self.logger.warning(
+                            f"Bulk walk tooBig with max_repetitions={attempt_value}; retrying with smaller value."
+                        )
+                        return True, True, False, error_message
+
+                    if status_text == "noSuchName" and suppress_no_such_name:
+                        self.logger.debug(f"Failed bulk walk: {error_message}")
+                    else:
+                        self.logger.error(f"Failed bulk walk: {error_message}")
+                    return True, False, True, error_message
+
+                if not varBinds:
+                    return False, False, False, None
+
+                for varBind in varBinds:
+                    oid_str = str(varBind[0])
+
+                    if not self._is_oid_in_subtree(oid_str, str(identity_value)):
+                        self.logger.debug   (
+                            f"End of OID subtree reached at {oid_str} -> {varBind} - List size {len(results_list)}"
+                        )
+                        return True, False, False, None
+
+                    results_list.append(varBind)
+
+                return False, False, False, None
+
+            if isinstance(objects, tuple) and len(objects) == 4:
+                done, retry, hard_error, error_message = _process_item(
+                    objects,
+                    attempt,
+                    identity,
+                    results,
+                )
+                if error_message:
+                    last_error = error_message
+                if done and results:
+                    return results
+            elif isinstance(objects, AsyncIterable):
+                async for item in objects:
+                    done, retry, hard_error, error_message = _process_item(
+                        item,
+                        attempt,
+                        identity,
+                        results,
+                    )
+                    if error_message:
+                        last_error = error_message
+                    if done:
+                        if results:
+                            return results
+                        break
+            else:
+                last_error = f"unexpected bulk_cmd result type: {type(objects).__name__}"
+                self.logger.error(f"Failed bulk walk: {last_error}")
+                hard_error = True
+
+            if hard_error:
+                break
+            if results:
+                self.logger.debug(f'Bulk walk completed - List size {len(results)}')
+                return results
+            if retry:
                 continue
 
-            if not varBinds:
-                continue
+            self.logger.debug(f"Bulk walk returned no data with max_repetitions={attempt}.")
 
-            for varBind in varBinds:
-                oid_str = str(varBind[0])
+        if last_error:
+            if last_error == "noSuchName" and suppress_no_such_name:
+                self.logger.debug(f"Bulk walk failed or empty ({last_error}); falling back to walk.")
+            else:
+                self.logger.warning(f"Bulk walk failed or empty ({last_error}); falling back to walk.")
+        else:
+            self.logger.warning("Bulk walk returned no data; falling back to walk.")
 
-                if not self._is_oid_in_subtree(oid_str, str(identity)):
-                    self.logger.debug(f"End of OID subtree reached at {oid_str} -> {varBind} - List size {len(results)}")
-                    return results if results else None
-
-                results.append(varBind)
-
-        self.logger.debug(f'Bulk walk completed - List size {len(results)}')
-
-        return results if results else None
+        return await self.walk(oid)
 
     async def set(self, oid: str, value: str | int, value_type: type)-> list[ObjectType] | None:
         """
