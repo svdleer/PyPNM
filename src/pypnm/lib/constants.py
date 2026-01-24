@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Final, Literal, TypeAlias, TypeVar, cast
 
 from pypnm.lib.types import (
+    STATUS,
     CaptureTime,
     ChannelId,
     FloatEnum,
@@ -90,7 +91,11 @@ FEC_SUMMARY_TYPE_LABEL: dict[int, str] = {
     3: "24-hour interval (60s cadence)",
 }
 
+STATUS_OK:STATUS = True
+STATUS_NOK:STATUS = False
+
 __all__ = [
+    "STATUS_OK", "STATUS_NOK",
     "DEFAULT_SSH_PORT",
     "HZ", "KHZ", "MHZ", "GHZ",
     "ZERO_FREQUENCY",

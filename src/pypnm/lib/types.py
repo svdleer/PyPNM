@@ -186,10 +186,13 @@ SshCommandResult: TypeAlias = tuple[SshStdout, SshStderr, SshExitCode]
 RemoteDirEntry             = NewType("RemoteDirEntry", str)
 RemoteDirEntries: TypeAlias = list[RemoteDirEntry]
 
+STATUS:TypeAlias = bool
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Explicit public surface
 # ────────────────────────────────────────────────────────────────────────────────
 __all__ = [
+    "STATUS",
     "SshOk", "SshStdout", "SshStderr", "SshExitCode", "SshCommandResult",
     "RemoteDirEntry", "RemoteDirEntries", "UserNameStr",
     "ScalarValue",

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from pypnm.lib.types import STATUS, ResolutionBw
 from pypnm.lib.utils import Generate
 
 
@@ -180,6 +181,118 @@ class DocsIf3CmSpectrumAnalysisCtrlCmd:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+
+    def autoScaleSpectrumAnalyzerRbw(self, rbw: ResolutionBw, adjust_segment_span: bool) -> tuple[STATUS, bool]:
+        """
+        This function take priority of the RBW, and calculate the following
+
+        RBW = SegementSpan/FreqSpan
+
+        Rules:
+            FreqSpan % SegementSpan == 0
+            if adjust_segment_span == true, update SegmentSpan to match RBW and adjust the frequency span inward at a minimum
+            if adjust_segment_span == false, keep the frequency span and find SegmentSpan to meet RBW within 5% (prefer exact)
+
+            at teh end, if if it is not achivable, then set STATUS to STATUS_NOK, else STATUS_OK
+
+        """
+        min_segment_span_hz = 1_000_000
+        max_segment_span_hz = 900_000_000
+        min_bins = 2
+        max_bins = 2048
+        tolerance_ratio = 0.05
+
+        if rbw <= 0:
+            self.logger.debug("RBW must be positive.")
+            return False, False
+
+        num_bins = int(self.docsIf3CmSpectrumAnalysisCtrlCmdNumBinsPerSegment)
+        if num_bins < min_bins or num_bins > max_bins:
+            self.logger.debug("NumBinsPerSegment out of range: %s", num_bins)
+            return False, False
+
+        first_center = int(self.docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency)
+        last_center = int(self.docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency)
+        total_span = last_center - first_center
+        if total_span <= 0:
+            self.logger.debug("Invalid frequency span: first=%s last=%s", first_center, last_center)
+            return False, False
+
+        current_segment_span = int(self.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan)
+        ideal_segment_span = int(rbw) * num_bins
+        if ideal_segment_span <= 0:
+            self.logger.debug("Computed segment span is invalid: %s", ideal_segment_span)
+            return False, False
+
+        if adjust_segment_span:
+            if (ideal_segment_span < min_segment_span_hz or
+                ideal_segment_span > max_segment_span_hz or
+                ideal_segment_span > total_span):
+                self.logger.debug(
+                    "Ideal segment span out of range: %s (total span %s)",
+                    ideal_segment_span,
+                    total_span,
+                )
+                return False, False
+
+            remainder = total_span % ideal_segment_span
+            new_first = first_center
+            new_last = last_center
+            if remainder != 0:
+                lower_adjust = remainder // 2
+                upper_adjust = remainder - lower_adjust
+                new_first = first_center + lower_adjust
+                new_last = last_center - upper_adjust
+                if new_last <= new_first:
+                    self.logger.debug("Adjusted frequency span is invalid after alignment.")
+                    return False, False
+
+            self.docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency = new_first
+            self.docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency = new_last
+            self.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan = ideal_segment_span
+
+            changed = (
+                new_first != first_center or
+                new_last != last_center or
+                ideal_segment_span != current_segment_span
+            )
+            return True, changed
+
+        max_segments = total_span // min_segment_span_hz
+        if max_segments < 1:
+            self.logger.debug("Total span too small for minimum segment span.")
+            return False, False
+
+        best_span = 0
+        best_diff = 1.0
+        best_distance = 0
+        target_rbw = float(rbw)
+
+        for segment_count in range(1, max_segments + 1):
+            if total_span % segment_count != 0:
+                continue
+            segment_span = total_span // segment_count
+            if segment_span < min_segment_span_hz or segment_span > max_segment_span_hz:
+                continue
+
+            actual_rbw = float(segment_span) / float(num_bins)
+            diff_ratio = abs(actual_rbw - target_rbw) / target_rbw
+            if diff_ratio > tolerance_ratio:
+                continue
+
+            distance = abs(segment_span - ideal_segment_span)
+            if diff_ratio < best_diff or (diff_ratio == best_diff and distance < best_distance):
+                best_span = segment_span
+                best_diff = diff_ratio
+                best_distance = distance
+
+        if best_span == 0:
+            self.logger.debug("No valid segment span found within RBW tolerance.")
+            return False, False
+
+        self.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan = best_span
+        changed = best_span != current_segment_span
+        return True, changed
 
     def precheck_spectrum_analyzer_settings(self) -> bool:
         """

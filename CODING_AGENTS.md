@@ -46,6 +46,13 @@ Before introducing new types, validators, formats, or storage conventions:
 - When adding new behavior, include tests covering the change.
 - New classes must have pytest coverage at a minimum for IPC and system calls.
 - Avoid broad refactors unless explicitly requested.
+- Keep a brief summary of user prompts after any request for a commit message so it can be referenced if asked again.
+- When asked for a commit message, respond with the specified format and keep it succinct.
+
+### Commit Message Format
+
+- One line summary (max 50 characters)
+- Detailed description (max 72 characters per line)
 
 ## Agent Constraints
 
@@ -64,9 +71,10 @@ Before introducing new types, validators, formats, or storage conventions:
   - Public/shared method types must be defined in `src/pypnm/lib/types.py`.
   - Only define local types in a module when the type is strictly private and not reused.
   - Common folder methods must use types defined in `src/pypnm/lib/types.py`.
-  - Prefer `match/case` over long if/else chains.
-  - No one-line if statements (E701 compliance).
-  - Avoid 3+ nested loops; 2 nested loops discouraged unless necessary.
+- Prefer `match/case` over long if/else chains.
+- No one-line if statements (E701 compliance).
+- Avoid 3+ nested loops; 2 nested loops discouraged unless necessary.
+- If `STATUS` is used as a return type, return `STATUS_OK` or `STATUS_NOK` for readability.
 - Code structure and documentation:
   - Prefer classes/static methods; minimize standalone global functions.
   - Public methods must have detailed docstrings; private methods minimal.

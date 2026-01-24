@@ -178,7 +178,6 @@ If you used the installer defaults, activate the `.env` environment:
   source .env/bin/activate
   ```
 
-
 ### 4) Configure system settings
 
 System configuration lives in [deploy/docker/config/system.json](https://github.com/PyPNMApps/PyPNM/blob/main/deploy/docker/config/system.json).
@@ -186,8 +185,6 @@ System configuration lives in [deploy/docker/config/system.json](https://github.
 - [Config menu](docs/system/menu.md): `source ~/.bashrc && config-menu`
 - [System Configuration Reference](docs/system/system-config.md): field-by-field descriptions and defaults
 If you installed with `--pnm-file-retrieval-setup`, it runs automatically and backs up `system.json` first.
-
-<!-- Removed duplicated Step 3/4 block -->
 
 ### 5) [Run the FastAPI service launcher](docs/system/pypnm-cli.md)
 
@@ -220,6 +217,11 @@ Installed services and docs are available at the following URLs:
 | [FastAPI Swagger UI](http://localhost:8000/docs)  | [FastAPI Swagger UI](http://localhost:8080/docs)  |
 | [FastAPI ReDoc](http://localhost:8000/redoc)      | [FastAPI ReDoc](http://localhost:8080/redoc)      |
 | [MkDocs docs](http://localhost:8001)              | [MkDocs docs](http://localhost:8081)              |
+
+## Recommendations
+
+Postman is a great tool for testing the FastAPI endpoints:
+- [Download Postman](https://www.postman.com/downloads/)
 
 ## Documentation
 

@@ -8,12 +8,12 @@ Retrieves Basic System Identity And Firmware Metadata From A DOCSIS Cable Modem 
 
 ## Request
 
-Use the SNMP-only format: [Common → Request](../common/request.md)
+Use the SNMP-only format: [Common → Request](../../common/request.md)
 TFTP parameters are not required.
 
 ## Response
 
-This endpoint returns the standard envelope described in [Common → Response](../common/response.md) (`mac_address`, `status`, `message`, `results`).
+This endpoint returns the standard envelope described in [Common → Response](../../common/response.md) (`mac_address`, `status`, `message`, `results`).
 `results.sys_descr` contains parsed fields from the device’s `sysDescr`.
 
 ### Example

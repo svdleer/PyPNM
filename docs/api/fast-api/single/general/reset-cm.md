@@ -8,12 +8,12 @@ Initiates A Remote Reset (Reboot) Of A DOCSIS Cable Modem Via SNMP.
 
 ## Request
 
-Use the SNMP-only format: [Common → Request](../common/request.md)
+Use the SNMP-only format: [Common → Request](../../common/request.md)
 TFTP parameters are not required.
 
 ## Response
 
-This endpoint returns the standard envelope described in [Common → Response](../common/response.md) (`mac_address`, `status`, `message`, `data`).
+This endpoint returns the standard envelope described in [Common → Response](../../common/response.md) (`mac_address`, `status`, `message`, `data`).
 
 ### Abbreviated Example
 

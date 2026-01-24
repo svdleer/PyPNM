@@ -8,12 +8,12 @@ Retrieves The Current System Uptime Of A DOCSIS Cable Modem Using SNMP.
 
 ## Request
 
-Use the SNMP-only format: [Common → Request](../common/request.md)
+Use the SNMP-only format: [Common → Request](../../common/request.md)
 TFTP parameters are not required.
 
 ## Response
 
-This endpoint returns the standard envelope described in [Common → Response](../common/response.md) (`mac_address`, `status`, `message`, `results`).
+This endpoint returns the standard envelope described in [Common → Response](../../common/response.md) (`mac_address`, `status`, `message`, `results`).
 
 ### Abbreviated Example
 

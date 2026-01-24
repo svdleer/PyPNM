@@ -8,12 +8,12 @@ Provides Insight Into The Diplexer Configuration Of A DOCSIS 3.1 Cable Modem (Up
 
 ## Request
 
-Use the SNMP-only format: [Common → Request](../common/request.md)
+Use the SNMP-only format: [Common → Request](../../common/request.md)
 TFTP parameters are not required.
 
 ## Response
 
-This endpoint returns the standard envelope described in [Common → Response](../common/response.md) (`mac_address`, `status`, `message`, `data`).
+This endpoint returns the standard envelope described in [Common → Response](../../common/response.md) (`mac_address`, `status`, `message`, `data`).
 
 ### Abbreviated Example
 

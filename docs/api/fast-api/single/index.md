@@ -66,4 +66,5 @@ Poll DOCSIS 3.0/3.1 downstream metrics directly from the cable modem via SNMP-ba
 
 | Reference | Purpose |
 |-----------|---------|
-| [Spectrum analyzer](spectrum-analyzer.md) | Capture downstream spectrum snapshots (SC-QAM and OFDM options within). |
+| [Spectrum analyzer endpoints](spectrum-analyzer/spectrum-analyzer.md) | Capture downstream spectrum snapshots (SC-QAM and OFDM options within). |
+| [Spectrum analyzer RBW permutations](spectrum-analyzer.md) | Reference RBW auto-scale outcomes for common and edge-case spans. |
