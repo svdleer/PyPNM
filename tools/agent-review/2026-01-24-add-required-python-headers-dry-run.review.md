@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Prevent dry-run from flagging files with year ranges already covering the current year.
+- Changes: Extend copyright parsing to handle year ranges and only update when the current year is outside the range.
+- Files: tools/maintenance/add-required-python-headers.py
+- Tests: Not run.
+- Notes: Review bundle includes full contents of modified files.
+
+# FILE: tools/maintenance/add-required-python-headers.py
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
