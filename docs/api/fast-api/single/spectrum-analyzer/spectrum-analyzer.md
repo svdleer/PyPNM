@@ -325,10 +325,22 @@ DOCSIS constraints:
     }
   },
   "capture_parameters": {
-    "number_of_averages": 10
+    "number_of_averages": 10,
+    "resolution_bandwidth_hz": 25000,
+    "spectrum_retrieval_type": 1
   }
 }
 ```
+
+### OFDM Capture Parameters
+
+| JSON path                                   | Type | Description                                                                  |
+| ------------------------------------------- | ---- | ---------------------------------------------------------------------------- |
+| `capture_parameters.number_of_averages`     | int  | Number of samples used to compute the per-bin average.                       |
+| `capture_parameters.resolution_bandwidth_hz`| int  | Resolution bandwidth (Hz) used to derive segment span and bin count.         |
+| `capture_parameters.spectrum_retrieval_type`| int  | Retrieval mode enum value (FILE = 1, SNMP = 2).                              |
+
+> `resolution_bandwidth_hz` is used to auto-scale RBW settings (segment span and bins per segment).
 
 ### Abbreviated JSON Response (OFDM View)
 
@@ -503,10 +515,22 @@ The response shape for SC-QAM captures mirrors the OFDM multi-channel layout:
     }
   },
   "capture_parameters": {
-    "number_of_averages": 10
+    "number_of_averages": 10,
+    "resolution_bandwidth_hz": 25000,
+    "spectrum_retrieval_type": 1
   }
 }
 ```
+
+### SC-QAM Capture Parameters
+
+| JSON path                                   | Type | Description                                                                  |
+| ------------------------------------------- | ---- | ---------------------------------------------------------------------------- |
+| `capture_parameters.number_of_averages`     | int  | Number of samples used to compute the per-bin average.                       |
+| `capture_parameters.resolution_bandwidth_hz`| int  | Resolution bandwidth (Hz) used to derive segment span and bin count.         |
+| `capture_parameters.spectrum_retrieval_type`| int  | Retrieval mode enum value (FILE = 1, SNMP = 2).                              |
+
+> `resolution_bandwidth_hz` is used to auto-scale RBW settings (segment span and bins per segment).
 
 ### SC-QAM Multi-Channel Return Structure
 

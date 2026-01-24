@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -68,6 +68,7 @@ class CmSpecAnaAnalysisResponse(PnmDataResponse):
 
 class OfdmSpecAna(BaseModel):
     number_of_averages: int  = Field(default=10, description="Number of samples to calculate the average per-bin")
+    resolution_bandwidth_hz: FrequencyHz = Field(default=FrequencyHz(25_000), description="Resolution Bandwidth in Hz")
     spectrum_retrieval_type: SpectrumRetrievalType = Field(default=SpectrumRetrievalType.FILE,
                                                            description=f"Method of spectrum data retrieval: "
                                                                        f"PNM ({SpectrumRetrievalType.FILE}) | "
@@ -84,7 +85,7 @@ class OfdmSpecAnaAnalysisResponse(PnmAnalysisResponse):
 
 class ScQamSpecAna(BaseModel):
     number_of_averages: int  = Field(default=10, description="Number of samples to calculate the average per-bin")
-    resolution_bandwidth: FrequencyHz = Field(default=FrequencyHz(300_000), description="Resolution Bandwidth in Hz")
+    resolution_bandwidth_hz: FrequencyHz = Field(default=FrequencyHz(25_000), description="Resolution Bandwidth in Hz")
     spectrum_retrieval_type: SpectrumRetrievalType = Field(default=SpectrumRetrievalType.FILE,
                                                            description=f"Method of spectrum data retrieval: "
                                                                        f"PNM ({SpectrumRetrievalType.FILE}) | "

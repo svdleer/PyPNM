@@ -219,6 +219,7 @@ class SpectrumAnalyzerRouter:
                 cable_modem             =   cm,
                 tftp_servers            =   tftp_servers,
                 number_of_averages      =   request.capture_parameters.number_of_averages,
+                resolution_bandwidth_hz =   request.capture_parameters.resolution_bandwidth_hz,
                 spectrum_retrieval_type =   request.capture_parameters.spectrum_retrieval_type)
 
             msg_responses: list[tuple[ChannelId, MessageResponse]] = await service.start()
@@ -311,13 +312,13 @@ class SpectrumAnalyzerRouter:
 
             number_of_averages: int = request.capture_parameters.number_of_averages
             spectrum_retrieval_type = request.capture_parameters.spectrum_retrieval_type
-            resolution_bandwidth: FrequencyHz = request.capture_parameters.resolution_bandwidth
+            resolution_bandwidth: FrequencyHz = request.capture_parameters.resolution_bandwidth_hz
 
             service = DsScQamChannelSpectrumAnalyzer(
                 cable_modem             =   cm,
                 tftp_servers            =   tftp_servers,
                 number_of_averages      =   number_of_averages,
-                resolution_bandwidth    =   resolution_bandwidth,
+                resolution_bandwidth_hz =   resolution_bandwidth,
                 spectrum_retrieval_type =   spectrum_retrieval_type,
             )
 

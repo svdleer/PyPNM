@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -167,6 +167,8 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
         Cable modem whose downstream OFDM channels will be analyzed.
     number_of_averages : int, default 2
         Number of averages to request per segment in the capture.
+    resolution_bandwidth : ResolutionBw, optional
+        Resolution bandwidth in Hz; defaults to 300 kHz if not provided.
     spectrum_retrieval_type : SpectrumRetrievalType, default SpectrumRetrievalType.FILE
         Data retrieval mechanism (file-based or SNMP amplitude data).
     """
@@ -174,10 +176,16 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
     def __init__(self, cable_modem: CableModem,
                  tftp_servers: tuple[Inet, Inet] = PnmConfigManager.get_tftp_servers(),
                  number_of_averages: int = 2,
+                 resolution_bandwidth_hz: ResolutionBw | None = None,
                  spectrum_retrieval_type:SpectrumRetrievalType = SpectrumRetrievalType.FILE,) -> None:
         super().__init__(cable_modem)
         self.logger = logging.getLogger(self.__class__.__name__)
         self._number_of_averages = number_of_averages
+        self._resolution_bandwidth = (
+            resolution_bandwidth_hz
+            if resolution_bandwidth_hz is not None
+            else RBWConversion.DEFAULT_RBW_HZ
+        )
         self._spectrum_retrieval_type = spectrum_retrieval_type
         self._pnm_test_type = DocsPnmCmCtlTest.SPECTRUM_ANALYZER
         self.log_prefix = f"DsOfdmChannelSpectrumAnalyzer - CM {self._cm.get_mac_address}"
@@ -225,13 +233,16 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
         # Compute the bandwidth mapping for all OFDM channels
         bw_by_channel: OfdmSpectrumBwLut = await self.calculate_channel_spectrum_bandwidth()
 
-        # Default capture settings = RBW: 300khz
-        num_bins_per_segment    = 4
+        rbw_settings: ResolutionBwSettings = RBWConversion.getSpectrumRbwSetttings(
+            self._resolution_bandwidth,
+        )
+
+        num_bins_per_segment    = rbw_settings[1]
         number_of_averages      = self._number_of_averages
         spectrum_retrieval_type = self._spectrum_retrieval_type
         inactivity_timeout      = 30
         noise_bw                = 150
-        segment_freq_span       = 1_000_000
+        segment_freq_span       = rbw_settings[2]
 
         for chan_id, (start_hz, plc_hz, end_hz) in bw_by_channel.items():
             self.logger.debug(
@@ -421,12 +432,12 @@ class DsScQamChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
     def __init__(self, cable_modem: CableModem,
                  tftp_servers: tuple[Inet, Inet] = PnmConfigManager.get_tftp_servers(),
                  number_of_averages: int = 1,
-                 resolution_bandwidth: ResolutionBw | None = None,
+                 resolution_bandwidth_hz: ResolutionBw | None = None,
                  spectrum_retrieval_type:SpectrumRetrievalType = SpectrumRetrievalType.FILE,) -> None:
         super().__init__(cable_modem)
         self.logger = logging.getLogger(self.__class__.__name__)
         self._number_of_averages = number_of_averages
-        self._resolution_bandwidth = resolution_bandwidth if resolution_bandwidth is not None else ResolutionBw(300_000)
+        self._resolution_bandwidth = resolution_bandwidth_hz if resolution_bandwidth_hz is not None else ResolutionBw(25_000)
         self._spectrum_retrieval_type = spectrum_retrieval_type
         self._tftp_servers = tftp_servers
 
