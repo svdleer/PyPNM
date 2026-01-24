@@ -1,9 +1,9 @@
 ## Agent Review Bundle Summary
-- Goal: Fix mkdocs strict link anchors and clarify nav update scope.
-- Changes: Corrected anchor links in docker install and system config docs; updated single capture links and docs organization earlier in task.
-- Files: AGENTS.md, CODING_AGENTS.md, README.md, docs/api/fast-api/file-manager/file-manager-api.md, docs/api/fast-api/index.md, docs/api/fast-api/single/general/diplexer-configuration.md, docs/api/fast-api/single/general/docsis-base-configuration.md, docs/api/fast-api/single/general/event-log.md, docs/api/fast-api/single/general/reset-cm.md, docs/api/fast-api/single/general/system-description.md, docs/api/fast-api/single/general/up-time.md, docs/api/fast-api/single/index.md, docs/api/fast-api/single/spectrum-analyzer.md, docs/api/fast-api/single/spectrum-analyzer/spectrum-analyzer.md, docs/docker/install.md, docs/gallery/index.md, docs/system/system-config.md, mkdocs.yml, src/pypnm/lib/constants.py, src/pypnm/lib/types.py, src/pypnm/pnm/data_type/DocsIf3CmSpectrumAnalysisCtrlCmd.py, tests/test_spectrum_analysis_ctrl_cmd_rbw.py.
-- Tests: `python3 -m compileall src`, `ruff check src`, `ruff format --check .` (fails: formatting drift), `pytest -q`, `mkdocs build --strict`.
-- Notes: Ruff format check reports pre-existing formatting drift across the repo. MkDocs still reports nav omissions for many existing pages.
+- Goal: Add pytest coverage for the new SNMP bulk_walk method and keep prior doc/link updates tracked.
+- Changes: Added bulk_walk tests with mocked SNMP machinery, kept single-capture doc moves/links, and fixed mkdocs anchor warnings earlier in task.
+- Files: AGENTS.md, CODING_AGENTS.md, README.md, docs/api/fast-api/file-manager/file-manager-api.md, docs/api/fast-api/index.md, docs/api/fast-api/single/general/diplexer-configuration.md, docs/api/fast-api/single/general/docsis-base-configuration.md, docs/api/fast-api/single/general/event-log.md, docs/api/fast-api/single/general/reset-cm.md, docs/api/fast-api/single/general/system-description.md, docs/api/fast-api/single/general/up-time.md, docs/api/fast-api/single/index.md, docs/api/fast-api/single/spectrum-analyzer.md, docs/api/fast-api/single/spectrum-analyzer/spectrum-analyzer.md, docs/docker/install.md, docs/gallery/index.md, docs/system/system-config.md, mkdocs.yml, src/pypnm/lib/constants.py, src/pypnm/lib/types.py, src/pypnm/pnm/data_type/DocsIf3CmSpectrumAnalysisCtrlCmd.py, tests/test_spectrum_analysis_ctrl_cmd_rbw.py, tests/test_snmp_v2c_bulk_walk.py.
+- Tests: `python3 -m compileall src`, `ruff check src`, `ruff format --check .` (fails: formatting drift), `pytest -q`.
+- Notes: Ruff format check reports pre-existing formatting drift across the repo.
 
 # FILE: AGENTS.md
 # AGENTS.md
@@ -443,7 +443,7 @@ PyPNM is a DOCSIS 3.x/4.0 Proactive Network Maintenance toolkit for engineers wh
 Fast install (helper script; latest release auto-detected):
 
 ```bash
-TAG="v1.0.35.0"
+TAG="v1.0.36.0"
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \
@@ -2213,7 +2213,7 @@ PyPNM ships with Docker assets so you can run the API quickly on a workstation, 
 ## Fast path: PyPNM Docker container install
 
 ```bash
-TAG="v1.0.35.0"
+TAG="v1.0.36.0"
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \
@@ -2245,7 +2245,7 @@ curl -X GET http://127.0.0.1:${PORT}/pypnm/system/webService/reload -H 'accept: 
 ## Deploy bundle flow (tarball)
 
 ```bash
-TAG="v1.0.35.0"
+TAG="v1.0.36.0"
 WORKING_DIR="PyPNM-${TAG}"
 
 mkdir -p "${WORKING_DIR}"
@@ -3571,3 +3571,85 @@ def test_auto_scale_rbw_selects_segment_span_without_frequency_shift() -> None:
     assert cmd.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan == 1_040_000
     assert cmd.docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency == 100_000_000
     assert cmd.docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency == 105_200_000
+
+# FILE: tests/test_snmp_v2c_bulk_walk.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+import pytest
+
+import pypnm.snmp.snmp_v2c as snmp_v2c_module
+from pypnm.lib.inet import Inet
+from pypnm.snmp.snmp_v2c import Snmp_v2c
+
+
+@pytest.mark.asyncio
+async def test_bulk_walk_returns_results_until_subtree_exit(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snmp = Snmp_v2c(Inet("192.168.0.100"), community="public")
+    oid = "1.3.6.1.2.1"
+
+    in_subtree = ("1.3.6.1.2.1.1.0", "value-1")
+    out_of_subtree = ("1.3.6.1.3.1.0", "value-2")
+
+    class FakeIdentity:
+        def __init__(self, oid_value: str) -> None:
+            self._oid_value = oid_value
+
+        def __str__(self) -> str:
+            return self._oid_value
+
+    def fake_object_type(identity: object) -> tuple[str, object]:
+        return ("object", identity)
+
+    async def fake_create(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+    async def fake_bulk_cmd(*_args: object, **_kwargs: object):
+        yield (None, None, 0, [in_subtree])
+        yield (None, None, 0, [out_of_subtree])
+
+    monkeypatch.setattr(snmp, "_to_object_identity", lambda oid_value: FakeIdentity(str(oid_value)))
+    monkeypatch.setattr(snmp_v2c_module.UdpTransportTarget, "create", fake_create)
+    monkeypatch.setattr(snmp_v2c_module, "ObjectType", fake_object_type)
+    monkeypatch.setattr(snmp_v2c_module, "bulk_cmd", fake_bulk_cmd)
+
+    results = await snmp.bulk_walk(oid)
+
+    assert results is not None
+    assert results == [in_subtree]
+
+
+@pytest.mark.asyncio
+async def test_bulk_walk_returns_none_on_empty_payload(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snmp = Snmp_v2c(Inet("192.168.0.100"), community="public")
+
+    class FakeIdentity:
+        def __init__(self, oid_value: str) -> None:
+            self._oid_value = oid_value
+
+        def __str__(self) -> str:
+            return self._oid_value
+
+    def fake_object_type(identity: object) -> tuple[str, object]:
+        return ("object", identity)
+
+    async def fake_create(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+    async def fake_bulk_cmd(*_args: object, **_kwargs: object):
+        yield (None, None, 0, [])
+
+    monkeypatch.setattr(snmp, "_to_object_identity", lambda oid_value: FakeIdentity(str(oid_value)))
+    monkeypatch.setattr(snmp_v2c_module.UdpTransportTarget, "create", fake_create)
+    monkeypatch.setattr(snmp_v2c_module, "ObjectType", fake_object_type)
+    monkeypatch.setattr(snmp_v2c_module, "bulk_cmd", fake_bulk_cmd)
+
+    results = await snmp.bulk_walk("1.3.6.1.2.1")
+
+    assert results is None
