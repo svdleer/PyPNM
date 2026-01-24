@@ -15,6 +15,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     ObjectType,
     SnmpEngine,
     UdpTransportTarget,
+    bulk_cmd,
     get_cmd,
     set_cmd,
     walk_cmd,
@@ -214,6 +215,87 @@ class Snmp_v2c:
                 results.append(varBind)
 
         self.logger.debug(f'List size {len(results)}')
+
+        return results if results else None
+
+    async def bulk_walk(
+        self,
+        oid: str | tuple[str, str, int],
+        non_repeaters: int = 0,
+        max_repetitions: int = 25
+    ) -> list[ObjectType] | None:
+        """
+        Perform an SNMP GETBULK operation (faster alternative to WALK).
+
+        GETBULK is an SNMPv2c/v3 operation that retrieves multiple variables
+        in a single request, making it significantly faster than traditional
+        WALK operations for large tables.
+
+        Args:
+            oid (str | Tuple[str, str, int]): The starting OID for the bulk walk.
+            non_repeaters (int): Number of OIDs from the start that should not be repeated.
+                                 Default is 0 (repeat all).
+            max_repetitions (int): Maximum number of repetitions for repeating variables.
+                                   Default is 25. Higher values = fewer requests but
+                                   larger packets. Typical range: 10-50.
+
+        Returns:
+            Optional[List[ObjectType]]: List of SNMP ObjectTypes retrieved, or None if no results.
+
+        Notes:
+            - GETBULK is more efficient than WALK for large MIB tables
+            - Not supported by SNMPv1 agents (will fall back to WALK)
+            - max_repetitions should be tuned based on network conditions:
+              * Small networks: 25-50
+              * Large/slow networks: 10-25
+              * Very fast networks: 50-100
+        """
+        self.logger.debug(f"Starting SNMP BULK WALK with OID: {oid}, non_repeaters={non_repeaters}, max_repetitions={max_repetitions}")
+        oid = Snmp_v2c.resolve_oid(oid)
+        self.logger.debug(f"Converted: {oid}")
+
+        identity = self._to_object_identity(oid)
+        obj = ObjectType(identity)
+        results: list[ObjectType] = []
+
+        transport = await UdpTransportTarget.create(
+            (self._host, self._port),
+            timeout=self._timeout,
+            retries=self._retries
+        )
+
+        objects = bulk_cmd(
+            self._snmp_engine,
+            CommunityData(self._read_community, mpModel=1),
+            transport,
+            ContextData(),
+            non_repeaters,
+            max_repetitions,
+            obj
+        )
+
+        async for item in objects:
+            errorIndication, errorStatus, errorIndex, varBinds = item
+
+            try:
+                self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
+            except Exception as e:
+                self.logger.error(f"Failed bulk walk: {e}")
+                continue
+
+            if not varBinds:
+                continue
+
+            for varBind in varBinds:
+                oid_str = str(varBind[0])
+
+                if not self._is_oid_in_subtree(oid_str, str(identity)):
+                    self.logger.debug(f"End of OID subtree reached at {oid_str} -> {varBind} - List size {len(results)}")
+                    return results if results else None
+
+                results.append(varBind)
+
+        self.logger.debug(f'Bulk walk completed - List size {len(results)}')
 
         return results if results else None
 
