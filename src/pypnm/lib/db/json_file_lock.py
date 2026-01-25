@@ -14,7 +14,15 @@ class JsonFileLock:
     """
     Cross-process lock for JSON DB files using a sidecar lock file.
     """
-    def __init__(self, target_path: Path, timeout: float = 5.0, poll_interval: float = 0.05) -> None:
+    DEFAULT_TIMEOUT: float = 30.0
+    DEFAULT_POLL_INTERVAL: float = 0.05
+
+    def __init__(
+        self,
+        target_path: Path,
+        timeout: float = DEFAULT_TIMEOUT,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+    ) -> None:
         self._lock_path = target_path.with_suffix(f"{target_path.suffix}.lock")
         self._timeout = timeout
         self._poll_interval = poll_interval
