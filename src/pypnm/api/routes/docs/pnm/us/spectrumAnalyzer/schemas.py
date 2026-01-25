@@ -69,8 +69,8 @@ class UtscCaptureParameters(BaseModel):
         description="Number of captures for IdleSID/cmMAC modes (1-10). Value 0 not supported. Ignored for FreeRunning."
     )
     output_format: Literal[1, 2, 4, 5] = Field(
-        default=2,
-        description="Output format: 1=timeIQ, 2=fftPower (required for repeat_period 1-49ms), 4=fftIQ, 5=fftAmplitude"
+        default=5,
+        description="Output format: 1=timeIQ, 2=fftPower (required for repeat_period 1-49ms), 4=fftIQ, 5=fftAmplitude (recommended)"
     )
     window: Literal[2, 3, 4, 5] = Field(
         default=2,

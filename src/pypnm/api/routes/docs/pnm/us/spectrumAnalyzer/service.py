@@ -172,7 +172,7 @@ class CmtsUtscService:
         repeat_period_ms: int = 100,
         freerun_duration_ms: int = 60000,
         trigger_count: int = 1,
-        output_format: int = 2,
+        output_format: int = 5,  # 5 = fftAmplitude (better for visualization)
         window: int = 2
     ) -> dict:
         """Configure UTSC per E6000 CER I-CCAP User Guide Release 13.0.
