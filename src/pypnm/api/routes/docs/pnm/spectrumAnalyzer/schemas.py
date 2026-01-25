@@ -3,18 +3,25 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from pypnm.api.routes.common.classes.common_endpoint_classes.common_req_resp import (
     CableModemPnmConfig,
     CommonSingleCaptureAnalysisType,
+    TftpConfig,
+    default_ip,
+    default_mac,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
+    SNMPConfig,
 )
 from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import (
     PnmAnalysisResponse,
     PnmDataResponse,
     PnmSingleCaptureRequest,
 )
-from pypnm.lib.types import FrequencyHz
+from pypnm.lib.mac_address import MacAddress
+from pypnm.lib.types import FrequencyHz, InetAddressStr, MacAddressStr
 from pypnm.pnm.data_type.DocsIf3CmSpectrumAnalysisCtrlCmd import (
     SpectrumRetrievalType,
     WindowFunction,
@@ -52,6 +59,28 @@ class ExtendPnmSingleCaptureRequest(PnmSingleCaptureRequest):
     moving_average:int = Field(...,description="")
 
 # -------------- MAIN REQUEST ------------------
+
+class SpectrumAnalyzerPnmParameters(BaseModel):
+    tftp: TftpConfig = Field(..., description="TFTP configuration")
+    model_config = {"extra": "forbid"}
+
+class SpectrumAnalyzerCableModemConfig(BaseModel):
+    mac_address: MacAddressStr                    = Field(default=default_mac, description="MAC address of the cable modem")
+    ip_address: InetAddressStr                    = Field(default=default_ip, description="Inet address of the cable modem")
+    pnm_parameters: SpectrumAnalyzerPnmParameters = Field(description="PNM parameters such as TFTP server configuration")
+    snmp: SNMPConfig                              = Field(description="SNMP configuration")
+
+    @field_validator("mac_address")
+    def validate_mac(cls, v: str) -> MacAddressStr:
+        try:
+            return MacAddress(v).mac_address
+        except Exception as e:
+            raise ValueError(f"Invalid MAC address: {v}, reason: ({e})") from e
+
+class SingleCaptureSpectrumAnalyzerRequest(BaseModel):
+    cable_modem: SpectrumAnalyzerCableModemConfig       = Field(description="Cable modem configuration")
+    analysis: ExtendCommonSingleCaptureAnalysisType     = Field(description="Analysis type to perform")
+    capture_parameters: SpecAnCapturePara               = Field(description="Spectrum capture Parameters.")
 
 class SingleCaptureSpectrumAnalyzer(ExtendSingleCaptureSpecAnaRequest):
     capture_parameters: SpecAnCapturePara       = Field(..., description="Spectrum capture Parameters.")

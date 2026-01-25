@@ -9,11 +9,11 @@ from pypnm.api.routes.common.extended.common_messaging_service import (
     MessageResponse,
 )
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
+from pypnm.api.routes.docs.pnm.spectrumAnalyzer import service as spectrum_service
 from pypnm.api.routes.docs.pnm.spectrumAnalyzer.abstract.com_spec_chan_ana import (
     CommonChannelSpectumBwLut,
 )
 from pypnm.api.routes.docs.pnm.spectrumAnalyzer.schemas import SpecAnCapturePara
-from pypnm.api.routes.docs.pnm.spectrumAnalyzer import service as spectrum_service
 from pypnm.api.routes.docs.pnm.spectrumAnalyzer.service import (
     DsOfdmChannelSpectrumAnalyzer,
 )

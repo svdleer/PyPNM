@@ -1,3 +1,141 @@
+## Agent Review Bundle Summary
+- Goal: Fix Ruff import order issues after schema updates.
+- Changes: Reorder imports in spectrum analyzer schema and move future import in RBW conversion module.
+- Files: src/pypnm/api/routes/docs/pnm/spectrumAnalyzer/schemas.py, src/pypnm/api/routes/docs/pnm/spectrumAnalyzer/router.py, src/pypnm/lib/conversions/rbw.py
+- Tests: ruff check src
+- Notes: Review bundle includes full contents of modified files.
+
+# FILE: src/pypnm/api/routes/docs/pnm/spectrumAnalyzer/schemas.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, field_validator
+
+from pypnm.api.routes.common.classes.common_endpoint_classes.common_req_resp import (
+    CableModemPnmConfig,
+    CommonSingleCaptureAnalysisType,
+    TftpConfig,
+    default_ip,
+    default_mac,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
+    SNMPConfig,
+)
+from pypnm.api.routes.common.classes.common_endpoint_classes.schemas import (
+    PnmAnalysisResponse,
+    PnmDataResponse,
+    PnmSingleCaptureRequest,
+)
+from pypnm.lib.mac_address import MacAddress
+from pypnm.lib.types import FrequencyHz, InetAddressStr, MacAddressStr
+from pypnm.pnm.data_type.DocsIf3CmSpectrumAnalysisCtrlCmd import (
+    SpectrumRetrievalType,
+    WindowFunction,
+)
+
+
+class SpecAnMovingAvgParameters(BaseModel):
+    points:int                                          = Field(default=10, description="")
+
+class SpecAnCapturePara(BaseModel):
+    inactivity_timeout       : int                      = Field(default=60, description="Timeout in seconds for inactivity during spectrum analysis.")
+    first_segment_center_freq: FrequencyHz              = Field(default=FrequencyHz(300_000_000), description="First segment center frequency in Hz.")
+    last_segment_center_freq : FrequencyHz              = Field(default=FrequencyHz(900_000_000), description="Last segment center frequency in Hz.")
+    segment_freq_span        : FrequencyHz              = Field(default=FrequencyHz(1_000_000), description="Frequency span of each segment in Hz.")
+    num_bins_per_segment     : int                      = Field(default=256, description="Number of FFT bins per segment.")
+    noise_bw                 : int                      = Field(default=150, description="Equivalent noise bandwidth in kHz.")
+    window_function          : WindowFunction           = Field(default=WindowFunction.HANN, description="FFT window function to apply. See WindowFunction enum for options.")
+    num_averages             : int                      = Field(default=1, description="Number of averages per segment.")
+    spectrum_retrieval_type  : SpectrumRetrievalType    = Field(default=SpectrumRetrievalType.FILE,
+                                                                description=f"Method of spectrum data retrieval: "
+                                                                            f"PNM ({SpectrumRetrievalType.FILE}) | "
+                                                                            f"SNMP({SpectrumRetrievalType.SNMP}).")
+
+class SpectrumAnalysisExtention(BaseModel):
+    moving_average:SpecAnMovingAvgParameters = Field(default=SpecAnMovingAvgParameters(), description="")
+
+class ExtendCommonSingleCaptureAnalysisType(CommonSingleCaptureAnalysisType):
+    spectrum_analysis: SpectrumAnalysisExtention = Field(description="Spectrum Analysis Extension")
+
+class ExtendSingleCaptureSpecAnaRequest(BaseModel):
+    cable_modem: CableModemPnmConfig                    = Field(description="Cable modem configuration")
+    analysis: ExtendCommonSingleCaptureAnalysisType     = Field(description="Analysis type to perform")
+
+class ExtendPnmSingleCaptureRequest(PnmSingleCaptureRequest):
+    moving_average:int = Field(...,description="")
+
+# -------------- MAIN REQUEST ------------------
+
+class SpectrumAnalyzerPnmParameters(BaseModel):
+    tftp: TftpConfig = Field(..., description="TFTP configuration")
+
+class SpectrumAnalyzerCableModemConfig(BaseModel):
+    mac_address: MacAddressStr                    = Field(default=default_mac, description="MAC address of the cable modem")
+    ip_address: InetAddressStr                    = Field(default=default_ip, description="Inet address of the cable modem")
+    pnm_parameters: SpectrumAnalyzerPnmParameters = Field(description="PNM parameters such as TFTP server configuration")
+    snmp: SNMPConfig                              = Field(description="SNMP configuration")
+
+    @field_validator("mac_address")
+    def validate_mac(cls, v: str) -> MacAddressStr:
+        try:
+            return MacAddress(v).mac_address
+        except Exception as e:
+            raise ValueError(f"Invalid MAC address: {v}, reason: ({e})") from e
+
+class SingleCaptureSpectrumAnalyzerRequest(BaseModel):
+    cable_modem: SpectrumAnalyzerCableModemConfig       = Field(description="Cable modem configuration")
+    analysis: ExtendCommonSingleCaptureAnalysisType     = Field(description="Analysis type to perform")
+    capture_parameters: SpecAnCapturePara               = Field(description="Spectrum capture Parameters.")
+
+class SingleCaptureSpectrumAnalyzer(ExtendSingleCaptureSpecAnaRequest):
+    capture_parameters: SpecAnCapturePara       = Field(..., description="Spectrum capture Parameters.")
+
+class CmSpecAnaAnalysisRequest(ExtendPnmSingleCaptureRequest):
+    capture_parameters: SpecAnCapturePara       = Field(..., description="Spectrum capture Parameters.")
+
+# -------------- MAIN-RESPONSE------------------
+
+class CmSpecAnaAnalysisResponse(PnmDataResponse):
+    """Generic response container for most PNM operations."""
+
+# -------------- MAIN-OFDM-REQUEST ------------------
+
+class OfdmSpecAna(BaseModel):
+    number_of_averages: int  = Field(default=10, description="Number of samples to calculate the average per-bin")
+    resolution_bandwidth_hz: FrequencyHz = Field(default=FrequencyHz(25_000), description="Resolution Bandwidth in Hz")
+    spectrum_retrieval_type: SpectrumRetrievalType = Field(default=SpectrumRetrievalType.FILE,
+                                                           description=f"Method of spectrum data retrieval: "
+                                                                       f"PNM ({SpectrumRetrievalType.FILE}) | "
+                                                                       f"SNMP({SpectrumRetrievalType.SNMP}).")
+class OfdmSpecAnaAnalysisRequest(ExtendSingleCaptureSpecAnaRequest):
+    capture_parameters:OfdmSpecAna = Field(default=OfdmSpecAna(), description="")
+
+# -------------- MAIN-OFDM-RESPONSE------------------
+
+class OfdmSpecAnaAnalysisResponse(PnmAnalysisResponse):
+    pass
+
+# -------------- MAIN-SCQAM-REQUEST ------------------
+
+class ScQamSpecAna(BaseModel):
+    number_of_averages: int  = Field(default=10, description="Number of samples to calculate the average per-bin")
+    resolution_bandwidth_hz: FrequencyHz = Field(default=FrequencyHz(25_000), description="Resolution Bandwidth in Hz")
+    spectrum_retrieval_type: SpectrumRetrievalType = Field(default=SpectrumRetrievalType.FILE,
+                                                           description=f"Method of spectrum data retrieval: "
+                                                                       f"PNM ({SpectrumRetrievalType.FILE}) | "
+                                                                       f"SNMP({SpectrumRetrievalType.SNMP}).")
+
+class ScQamSpecAnaAnalysisRequest(ExtendSingleCaptureSpecAnaRequest):
+    capture_parameters:ScQamSpecAna = Field(default=ScQamSpecAna(), description="")
+
+# -------------- MAIN-SCQAM-RESPONSE------------------
+
+class ScQamSpecAnaAnalysisResponse(PnmAnalysisResponse):
+    pass
+
+# FILE: src/pypnm/api/routes/docs/pnm/spectrumAnalyzer/router.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
 
@@ -369,3 +507,115 @@ class SpectrumAnalyzerRouter:
 
 # Required for dynamic auto-registration
 router = SpectrumAnalyzerRouter().router
+
+# FILE: src/pypnm/lib/conversions/rbw.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+from math import ceil, floor
+
+from pypnm.lib.types import (
+    FrequencyHz,
+    NumBins,
+    ResolutionBw,
+    ResolutionBwSettings,
+    SegmentFreqSpan,
+)
+
+DEFAULT_FREQUENCY_SPAN_HZ: FrequencyHz = FrequencyHz(0)
+
+
+class RBWConversion:
+    """Conversion utilities for Resolution Bandwidth (RBW) values."""
+
+    DEFAULT_SEGMENT_SPAN_HZ: SegmentFreqSpan = SegmentFreqSpan(1_000_000)
+    DEFAULT_RBW_HZ: ResolutionBw = ResolutionBw(300_000)
+    DEFAULT_NUM_BINS: NumBins = NumBins(256)
+    DEFAULT_NUM_BINS_300_KHZ: NumBins = NumBins(3)
+
+    @staticmethod
+    def getNumBin(
+        rbw: ResolutionBw = DEFAULT_RBW_HZ,
+        segment_freq_span: SegmentFreqSpan = DEFAULT_SEGMENT_SPAN_HZ,
+        to_floor: bool = True,
+    ) -> NumBins:
+        """
+        Calculate the number of bins for a given RBW and segment frequency span.
+
+        Args:
+            rbw: Resolution bandwidth for the segment in Hz.
+            segment_freq_span: Segment span in Hz to divide into bins.
+            to_floor: When True, floor the bin count; otherwise, ceil it.
+
+        Returns:
+            The computed number of bins.
+
+        Raises:
+            ValueError: When rbw or segment_freq_span is non-positive.
+        """
+        if rbw <= 0:
+            raise ValueError("rbw must be positive.")
+        if segment_freq_span <= 0:
+            raise ValueError("segment_freq_span must be positive.")
+
+        raw_bins = float(segment_freq_span) / float(rbw)
+        bins = int(floor(raw_bins)) if to_floor else int(ceil(raw_bins))
+
+        return NumBins(bins)
+
+    @staticmethod
+    def getSegementFreqSpan(
+        rbw: ResolutionBw = DEFAULT_RBW_HZ,
+        num_of_bins: NumBins = DEFAULT_NUM_BINS_300_KHZ,
+    ) -> SegmentFreqSpan:
+        """
+        Calculate segment frequency span from RBW and bin count.
+
+        Args:
+            rbw: Resolution bandwidth for the segment in Hz.
+            num_of_bins: Number of bins in the segment.
+
+        Returns:
+            The computed segment frequency span in Hz.
+
+        Raises:
+            ValueError: When rbw or num_of_bins is non-positive.
+        """
+        if rbw <= 0:
+            raise ValueError("rbw must be positive.")
+        if num_of_bins <= 0:
+            raise ValueError("num_of_bins must be positive.")
+
+        return SegmentFreqSpan(int(rbw) * int(num_of_bins))
+
+    @staticmethod
+    def getSpectrumRbwSetttings(
+        rbw: ResolutionBw,
+        frequency_span: FrequencyHz = DEFAULT_FREQUENCY_SPAN_HZ,
+        to_floor: bool = True,
+    ) -> ResolutionBwSettings:
+        """
+        Build RBW settings tuple for the provided resolution bandwidth.
+
+        Args:
+            rbw: Resolution bandwidth in Hz.
+            frequency_span: Frequency span in Hz (defaults to the standard span).
+            to_floor: When True, floor the bin count; otherwise, ceil it.
+
+        Returns:
+            Tuple of (rbw, num_bins, segment_freq_span).
+        """
+        segment_span = RBWConversion.DEFAULT_SEGMENT_SPAN_HZ
+        if frequency_span > 0:
+            span_hz = max(int(frequency_span), int(segment_span))
+            segment_span = SegmentFreqSpan(span_hz)
+
+        bins = RBWConversion.getNumBin(
+            rbw=rbw,
+            segment_freq_span=segment_span,
+            to_floor=to_floor,
+        )
+
+        return (rbw, bins, segment_span)
