@@ -1,3 +1,638 @@
+## Agent Review Bundle Summary
+- Goal: Validate upstream ATDMA group delay wiring with tests and docs.
+- Changes: Add group delay test coverage and keep docs/wiring updates included.
+- Files: src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; tests/test_docs_equalizer_group_delay.py
+- Tests: Not run (not requested).
+- Notes: None.
+
+# FILE: src/pypnm/pnm/analysis/atdma_group_delay.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from numpy.typing import NDArray
+from pydantic import BaseModel, Field
+
+from pypnm.lib.types import (
+    BandwidthHz,
+    FloatSeries,
+    Microseconds,
+    PreEqAtdmaCoefficients,
+)
+
+from pypnm.lib.constants import DOCSIS_ROLL_OFF_FACTOR
+
+MIN_CHANNEL_WIDTH_HZ: BandwidthHz = BandwidthHz(0)
+MIN_TAPS_PER_SYMBOL: int = 0
+MIN_ROLLOFF: float = 0.0
+ONE: float = 1.0
+TWO_PI: float = 2.0 * math.pi
+MICROSECONDS_PER_SECOND: float = 1_000_000.0
+
+
+class GroupDelayModel(BaseModel):
+    """Immutable ATDMA group delay results derived from pre-equalization taps.
+
+    Stores derived timing and delay series used for analysis and reporting.
+    """
+
+    channel_width_hz: BandwidthHz   = Field(..., description="ATDMA channel width in Hz.")
+    rolloff: float                  = Field(..., description=f"RRC roll-off factor α (typical DOCSIS = {DOCSIS_ROLL_OFF_FACTOR}).")
+    taps_per_symbol: int            = Field(..., description="Taps per symbol from the pre-EQ header.")
+    symbol_rate: float              = Field(..., description="Derived symbol rate (sym/s): BW / (1 + rolloff).")
+    symbol_time_us: Microseconds    = Field(..., description="Derived symbol time in microseconds (µs): 1/symbol_rate.")
+    sample_period_us: Microseconds  = Field(..., description="Sample period in microseconds (µs): Tsym / taps_per_symbol.")
+    fft_size: int                   = Field(..., description="FFT size used to evaluate the frequency response (N taps).")
+    delay_samples: FloatSeries      = Field(..., description="Group delay in samples per FFT bin (tap-period units).")
+    delay_us: FloatSeries           = Field(..., description="Group delay in microseconds per FFT bin.")
+    model_config = {"frozen": True}
+
+
+@dataclass(frozen=True, slots=True)
+class GroupDelayCalculator:
+    """Compute ATDMA group delay from upstream pre-equalization coefficients.
+
+    This calculator derives **group delay** (the negative slope of the unwrapped
+    phase response) from a 24-tap ATDMA upstream FIR equalizer. The input taps are
+    complex coefficients (real, imag) taken from `docsIf3CmStatusUsEqData.*`
+    after decoding to signed integers (your existing `DocsEqualizerData` class
+    already handles endianness + 12/16-bit interpretation and yields taps).
+
+    Conceptually, the equalizer taps represent a discrete-time FIR filter:
+
+        h[n] = re[n] + j·im[n]    for n = 0..N-1
+
+    The processing steps are:
+
+    1) **Time → Frequency conversion**
+       Compute the N-point FFT to obtain the complex frequency response:
+
+           H[k] = FFT{ h[n] } ,  k = 0..N-1
+
+    2) **Phase extraction and unwrap**
+       Extract the phase angle of each bin and unwrap it to remove 2π discontinuities:
+
+           φ[k] = unwrap(angle(H[k]))
+
+    3) **Group delay in samples**
+       Group delay is defined as:
+
+           τ(ω) = - dφ(ω) / dω
+
+       With FFT bins, ω[k] = 2π·k/N. We approximate the derivative numerically,
+       resulting in group delay measured in **tap-sample periods** (i.e., "samples").
+
+    4) **Convert delay from samples → microseconds**
+       To express delay in time units, we need the tap sample period.
+
+       For DOCSIS ATDMA upstream channels, symbol rate is typically derived from
+       channel width and roll-off (root-raised cosine shaping):
+
+           Rs = BW / (1 + α)
+
+       Then:
+
+           Tsym = 1 / Rs
+           Tsamp = Tsym / taps_per_symbol
+
+       Finally:
+
+           delay_us[k] = delay_samples[k] · Tsamp(µs)
+
+    Notes and expectations:
+
+    - This class does **not** assume the main tap location is centered; it reports
+      the group delay implied by the taps as provided.
+    - The FFT size is set to **N = number of taps** by default. If you later want
+      a smoother curve, you can zero-pad (e.g., 128/256 points) without changing
+      the underlying physics—only the sampling density in frequency.
+    - `taps_per_symbol` comes from the pre-EQ header byte (often 1).
+    - `channel_width_hz` must be provided to compute absolute time units (µs).
+      Without it, you can still compute delay in samples, but not in seconds.
+
+    Attributes:
+        channel_width_hz: ATDMA upstream channel width in Hz (e.g., 1_600_000).
+        taps_per_symbol: Tap sampling density per symbol from the pre-EQ header.
+                         Used to convert symbol time to tap-sample time.
+        rolloff: DOCSIS shaping roll-off factor α. Typical default is 0.25.
+
+    Returns:
+        A `GroupDelayModel` containing:
+        - derived symbol rate/time and sample period
+        - group delay arrays per FFT bin in samples and microseconds
+    """
+
+    channel_width_hz: BandwidthHz
+    taps_per_symbol: int
+    rolloff: float = DOCSIS_ROLL_OFF_FACTOR
+
+    def __post_init__(self) -> None:
+        if int(self.channel_width_hz) <= MIN_CHANNEL_WIDTH_HZ:
+            raise ValueError("channel_width_hz must be > 0.")
+        if self.taps_per_symbol <= MIN_TAPS_PER_SYMBOL:
+            raise ValueError("taps_per_symbol must be > 0.")
+        if not math.isfinite(self.rolloff):
+            raise ValueError("rolloff must be finite.")
+        if self.rolloff < MIN_ROLLOFF:
+            raise ValueError("rolloff must be >= 0.")
+
+    @staticmethod
+    def _to_complex_array(coefficients: list[PreEqAtdmaCoefficients]) -> NDArray[np.complex128]:
+        taps: NDArray[np.complex128] = np.empty(len(coefficients), dtype=np.complex128)
+        for i, (re, im) in enumerate(coefficients):
+            taps[i] = complex(float(re), float(im))
+        return taps
+
+    def symbol_rate(self) -> float:
+        bw = float(int(self.channel_width_hz))
+        return bw / (ONE + self.rolloff)
+
+    def symbol_time_us(self) -> Microseconds:
+        sr = self.symbol_rate()
+        ts = ONE / sr
+        return Microseconds(ts * MICROSECONDS_PER_SECOND)
+
+    def sample_period_us(self) -> Microseconds:
+        tsym_us = float(self.symbol_time_us())
+        return Microseconds(tsym_us / float(self.taps_per_symbol))
+
+    def compute(self, coefficients: list[PreEqAtdmaCoefficients]) -> GroupDelayModel:
+        if len(coefficients) == 0:
+            raise ValueError("coefficients cannot be empty.")
+
+        h_time = self._to_complex_array(coefficients)
+
+        n = int(h_time.shape[0])
+        h_freq = np.fft.fft(h_time, n=n)
+
+        phase = np.unwrap(np.angle(h_freq))
+        omega = TWO_PI * (np.arange(n, dtype=np.float64) / float(n))
+
+        dphi_domega = np.gradient(phase, omega)
+        delay_samples = -dphi_domega
+
+        tsamp_us = float(self.sample_period_us())
+        delay_us = delay_samples * tsamp_us
+
+        delay_samples_list: FloatSeries = [float(x) for x in delay_samples.tolist()]
+        delay_us_list: FloatSeries      = [float(x) for x in delay_us.tolist()]
+
+        sr = self.symbol_rate()
+        tsym_us = float(self.symbol_time_us())
+        tsamp = float(self.sample_period_us())
+
+        return GroupDelayModel(
+            channel_width_hz    =   BandwidthHz(int(self.channel_width_hz)),
+            rolloff             =   float(self.rolloff),
+            taps_per_symbol     =   int(self.taps_per_symbol),
+            symbol_rate         =   float(sr),
+            symbol_time_us      =   Microseconds(tsym_us),
+            sample_period_us    =   Microseconds(tsamp),
+            fft_size            =   int(n),
+            delay_samples       =   delay_samples_list,
+            delay_us            =   delay_us_list,
+        )
+# FILE: src/pypnm/pnm/data_type/DocsEqualizerData.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+import json
+import math
+from typing import Final, Literal
+
+from pydantic import BaseModel, Field
+
+from pypnm.lib.types import BandwidthHz, ImginaryInt, PreEqAtdmaCoefficients, RealInt
+from pypnm.lib.constants import DOCSIS_ROLL_OFF_FACTOR
+from pypnm.pnm.analysis.atdma_preeq_key_metrics import (
+    EqualizerMetrics,
+    EqualizerMetricsModel,
+)
+from pypnm.pnm.analysis.atdma_group_delay import GroupDelayCalculator, GroupDelayModel
+
+
+class UsEqTapModel(BaseModel):
+    real: int = Field(..., description="Tap real coefficient decoded as 2's complement.")
+    imag: int = Field(..., description="Tap imag coefficient decoded as 2's complement.")
+    magnitude: float = Field(..., description="Magnitude computed from real/imag.")
+    magnitude_power_dB: float | None = Field(..., description="Magnitude power in dB (10*log10(mag^2)); None when magnitude is 0.")
+    real_hex: str = Field(..., description="Raw 2-byte real coefficient as received, shown as 4 hex chars.")
+    imag_hex: str = Field(..., description="Raw 2-byte imag coefficient as received, shown as 4 hex chars.")
+
+    model_config = {"frozen": True}
+
+
+class UsEqDataModel(BaseModel):
+    main_tap_location: int = Field(..., description="Main tap location (header byte 0; HEX value).")
+    taps_per_symbol: int = Field(..., description="Taps per symbol (header byte 1; HEX value).")
+    num_taps: int = Field(..., description="Number of taps (header byte 2; HEX value).")
+    reserved: int = Field(..., description="Reserved (header byte 3; HEX value).")
+    header_hex: str = Field(..., description="Header bytes as hex (4 bytes).")
+    payload_hex: str = Field(..., description="Full payload as hex (space-separated bytes).")
+    payload_preview_hex: str = Field(..., description="Header + first N taps as hex preview (space-separated bytes).")
+    taps: list[UsEqTapModel] = Field(..., description="Decoded taps in order (real/imag pairs).")
+    metrics: EqualizerMetricsModel | None = Field(None, description="ATDMA pre-equalization key metrics when available.")
+    group_delay: GroupDelayModel | None = Field(None, description="ATDMA group delay derived from taps when channel_width_hz is provided.")
+
+    model_config = {"frozen": True}
+
+
+class DocsEqualizerData:
+    """
+    Parse DOCS-IF3 upstream pre-equalization tap data.
+
+    Notes:
+    - CM deployments have two common coefficient interpretations:
+      * four-nibble 2's complement (16-bit signed)
+      * three-nibble 2's complement (12-bit signed; upper nibble unused)
+    - Some deployments can be handled with a "universal" decoder: drop the first nibble and decode as 12-bit.
+
+    IMPORTANT:
+    - Pass raw SNMP OctetString bytes via add_from_bytes() whenever possible.
+    - If you pass a hex string, it must be real hex (e.g., 'FF FC 00 04 ...'), not a Unicode pretty string.
+    """
+
+    HEADER_SIZE: Final[int] = 4
+    COEFF_BYTES: Final[int] = 2
+    COMPLEX_TAP_SIZE: Final[int] = 4
+    MAX_TAPS: Final[int] = 64
+
+    U16_MASK: Final[int] = 0xFFFF
+    U12_MASK: Final[int] = 0x0FFF
+    U16_MSN_MASK: Final[int] = 0xF000
+
+    I16_SIGN: Final[int] = 0x8000
+    I12_SIGN: Final[int] = 0x0800
+    I16_RANGE: Final[int] = 0x10000
+    I12_RANGE: Final[int] = 0x1000
+
+    AUTO_ENDIAN_SAMPLE_MAX_TAPS: Final[int] = 16
+    AUTO_ENDIAN_BYTE_GOOD_0: Final[int] = 0x00
+    AUTO_ENDIAN_BYTE_GOOD_FF: Final[int] = 0xFF
+
+    def __init__(self) -> None:
+        self._coefficients_found: bool = False
+        self.equalizer_data: dict[int, UsEqDataModel] = {}
+
+    def add(
+        self,
+        us_idx: int,
+        payload_hex: str,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"] = "auto",
+        coeff_endianness: Literal["little", "big", "auto"] = "auto",
+        preview_taps: int = 8,
+        channel_width_hz: BandwidthHz | None = None,
+        rolloff: float = DOCSIS_ROLL_OFF_FACTOR,
+    ) -> bool:
+        """
+        Parse/store from a hex string payload.
+
+        payload_hex MUST be actual hex bytes (e.g., 'FF FC 00 04 ...').
+        If payload_hex contains non-hex characters (like 'ÿ'), this will return False.
+
+        coeff_encoding:
+        - four-nibble: decode as signed 16-bit (2's complement)
+        - three-nibble: decode as signed 12-bit (2's complement) after masking to 0x0FFF
+        - auto: prefer 16-bit when the upper nibble is used; otherwise decode as 12-bit ("universal" behavior)
+
+        coeff_endianness:
+        - little: interpret each 2-byte coefficient as little-endian
+        - big: interpret each 2-byte coefficient as big-endian
+        - auto: heuristic selection based on common small-coefficient patterns
+        """
+        try:
+            payload = self._hex_to_bytes_strict(payload_hex)
+            return self._add_parsed(
+                us_idx,
+                payload,
+                coeff_encoding=coeff_encoding,
+                coeff_endianness=coeff_endianness,
+                preview_taps=preview_taps,
+                channel_width_hz=channel_width_hz,
+                rolloff=rolloff,
+            )
+        except Exception:
+            return False
+
+    def add_from_bytes(
+        self,
+        us_idx: int,
+        payload: bytes,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"] = "auto",
+        coeff_endianness: Literal["little", "big", "auto"] = "auto",
+        preview_taps: int = 8,
+        channel_width_hz: BandwidthHz | None = None,
+        rolloff: float = DOCSIS_ROLL_OFF_FACTOR,
+    ) -> bool:
+        """
+        Parse/store from raw bytes (preferred for SNMP OctetString values).
+        """
+        try:
+            return self._add_parsed(
+                us_idx,
+                payload,
+                coeff_encoding=coeff_encoding,
+                coeff_endianness=coeff_endianness,
+                preview_taps=preview_taps,
+                channel_width_hz=channel_width_hz,
+                rolloff=rolloff,
+            )
+        except Exception:
+            return False
+
+    def coefficients_found(self) -> bool:
+        return self._coefficients_found
+
+    def get_record(self, us_idx: int) -> UsEqDataModel | None:
+        return self.equalizer_data.get(us_idx)
+
+    def to_dict(self) -> dict[int, dict]:
+        return {k: v.model_dump() for k, v in self.equalizer_data.items()}
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    def _add_parsed(
+        self,
+        us_idx: int,
+        payload: bytes,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"],
+        coeff_endianness: Literal["little", "big", "auto"],
+        preview_taps: int,
+        channel_width_hz: BandwidthHz | None,
+        rolloff: float,
+    ) -> bool:
+        if len(payload) < self.HEADER_SIZE:
+            return False
+
+        main_tap_location = payload[0]
+        taps_per_symbol = payload[1]
+        num_taps = payload[2]
+        reserved = payload[3]
+
+        if num_taps == 0:
+            return False
+
+        if num_taps > self.MAX_TAPS:
+            return False
+
+        expected_len = self.HEADER_SIZE + (num_taps * self.COMPLEX_TAP_SIZE)
+        if len(payload) < expected_len:
+            return False
+
+        header_hex = payload[: self.HEADER_SIZE].hex(" ", 1).upper()
+        payload_hex = payload[:expected_len].hex(" ", 1).upper()
+
+        preview_taps_clamped = preview_taps
+        if preview_taps_clamped < 0:
+            preview_taps_clamped = 0
+        if preview_taps_clamped > num_taps:
+            preview_taps_clamped = num_taps
+
+        preview_len = self.HEADER_SIZE + (preview_taps_clamped * self.COMPLEX_TAP_SIZE)
+        payload_preview_hex = payload[:preview_len].hex(" ", 1).upper()
+
+        taps_blob = payload[self.HEADER_SIZE : expected_len]
+        taps = self._parse_taps(
+            taps_blob,
+            coeff_encoding=coeff_encoding,
+            coeff_endianness=coeff_endianness,
+        )
+
+        metrics = self._build_metrics(taps)
+        group_delay = self._build_group_delay(
+            taps,
+            channel_width_hz=channel_width_hz,
+            taps_per_symbol=taps_per_symbol,
+            rolloff=rolloff,
+        )
+        self.equalizer_data[us_idx] = UsEqDataModel(
+            main_tap_location=main_tap_location,
+            taps_per_symbol=taps_per_symbol,
+            num_taps=num_taps,
+            reserved=reserved,
+            header_hex=header_hex,
+            payload_hex=payload_hex,
+            payload_preview_hex=payload_preview_hex,
+            taps=taps,
+            metrics=metrics,
+            group_delay=group_delay,
+        )
+
+        self._coefficients_found = True
+        return True
+
+    def _parse_taps(
+        self,
+        data: bytes,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"],
+        coeff_endianness: Literal["little", "big", "auto"],
+    ) -> list[UsEqTapModel]:
+        taps: list[UsEqTapModel] = []
+        step = self.COMPLEX_TAP_SIZE
+
+        endian = coeff_endianness
+        if endian == "auto":
+            endian = self._detect_coeff_endianness(data)
+
+        encoding = coeff_encoding
+        if encoding == "auto":
+            encoding = self._detect_coeff_encoding(data, coeff_endianness=endian)
+
+        tap_count = len(data) // step
+        for tap_idx in range(tap_count):
+            base = tap_idx * step
+            real_b = data[base : base + self.COEFF_BYTES]
+            imag_b = data[base + self.COEFF_BYTES : base + step]
+
+            real_u16 = int.from_bytes(real_b, byteorder=endian, signed=False)
+            imag_u16 = int.from_bytes(imag_b, byteorder=endian, signed=False)
+
+            real = self._decode_coeff(real_u16, coeff_encoding=encoding)
+            imag = self._decode_coeff(imag_u16, coeff_encoding=encoding)
+
+            magnitude = math.hypot(float(real), float(imag))
+            if magnitude > 0.0:
+                power_db = 10.0 * math.log10(magnitude * magnitude)
+            else:
+                power_db = None
+
+            taps.append(
+                UsEqTapModel(
+                    real=real,
+                    imag=imag,
+                    magnitude=round(magnitude, 2),
+                    magnitude_power_dB=(round(power_db, 2) if power_db is not None else None),
+                    real_hex=real_b.hex().upper(),
+                    imag_hex=imag_b.hex().upper(),
+                )
+            )
+
+        return taps
+
+    def _build_metrics(self, taps: list[UsEqTapModel]) -> EqualizerMetricsModel | None:
+        if len(taps) != EqualizerMetrics.EXPECTED_TAP_COUNT:
+            return None
+
+        coefficients: list[PreEqAtdmaCoefficients] = [
+            (RealInt(tap.real), ImginaryInt(tap.imag)) for tap in taps
+        ]
+        return EqualizerMetrics(coefficients=coefficients).to_model()
+
+    def _build_group_delay(
+        self,
+        taps: list[UsEqTapModel],
+        *,
+        channel_width_hz: BandwidthHz | None,
+        taps_per_symbol: int,
+        rolloff: float,
+    ) -> GroupDelayModel | None:
+        if channel_width_hz is None:
+            return None
+        if len(taps) == 0:
+            return None
+        if taps_per_symbol <= 0:
+            return None
+
+        coefficients: list[PreEqAtdmaCoefficients] = [
+            (RealInt(tap.real), ImginaryInt(tap.imag)) for tap in taps
+        ]
+        try:
+            calculator = GroupDelayCalculator(
+                channel_width_hz=channel_width_hz,
+                taps_per_symbol=taps_per_symbol,
+                rolloff=rolloff,
+            )
+            return calculator.compute(coefficients)
+        except Exception:
+            return None
+
+    def _detect_coeff_endianness(self, data: bytes) -> Literal["little", "big"]:
+        """
+        Heuristic endianness detection.
+
+        Many deployed pre-EQ taps are small-magnitude, so the MSB of each 16-bit word is often 0x00 (positive)
+        or 0xFF (negative). We score both interpretations by counting how often the MSB matches {0x00, 0xFF}.
+        """
+        if len(data) < self.COMPLEX_TAP_SIZE:
+            return "little"
+
+        max_taps = self.AUTO_ENDIAN_SAMPLE_MAX_TAPS
+        tap_count = len(data) // self.COMPLEX_TAP_SIZE
+        if tap_count < max_taps:
+            max_taps = tap_count
+
+        good = (self.AUTO_ENDIAN_BYTE_GOOD_0, self.AUTO_ENDIAN_BYTE_GOOD_FF)
+
+        score_little = 0
+        score_big = 0
+
+        for tap_idx in range(max_taps):
+            base = tap_idx * self.COMPLEX_TAP_SIZE
+
+            r0 = data[base]
+            r1 = data[base + 1]
+            i0 = data[base + 2]
+            i1 = data[base + 3]
+
+            if r1 in good:
+                score_little += 1
+            if i1 in good:
+                score_little += 1
+
+            if r0 in good:
+                score_big += 1
+            if i0 in good:
+                score_big += 1
+
+        if score_big > score_little:
+            return "big"
+        return "little"
+
+    def _detect_coeff_encoding(
+        self,
+        data: bytes,
+        *,
+        coeff_endianness: Literal["little", "big"],
+    ) -> Literal["four-nibble", "three-nibble"]:
+        """
+        Auto-select coefficient decoding:
+
+        - If any coefficient uses the upper nibble (0xF000 mask != 0), assume 16-bit signed (four-nibble).
+        - Otherwise, default to 12-bit signed (three-nibble), which matches the "universal" decoding guidance.
+        """
+        step = self.COMPLEX_TAP_SIZE
+        tap_count = len(data) // step
+
+        for tap_idx in range(tap_count):
+            base = tap_idx * step
+            real_b = data[base : base + self.COEFF_BYTES]
+            imag_b = data[base + self.COEFF_BYTES : base + step]
+
+            real_u16 = int.from_bytes(real_b, byteorder=coeff_endianness, signed=False)
+            imag_u16 = int.from_bytes(imag_b, byteorder=coeff_endianness, signed=False)
+
+            if (real_u16 & self.U16_MSN_MASK) != 0:
+                return "four-nibble"
+            if (imag_u16 & self.U16_MSN_MASK) != 0:
+                return "four-nibble"
+
+        return "three-nibble"
+
+    def _decode_coeff(self, raw_u16: int, *, coeff_encoding: Literal["four-nibble", "three-nibble"]) -> int:
+        match coeff_encoding:
+            case "four-nibble":
+                return self._decode_int16(raw_u16)
+            case "three-nibble":
+                return self._decode_int12(raw_u16)
+            case _:
+                raise ValueError(f"Unsupported coeff_encoding: {coeff_encoding}")
+
+    def _decode_int16(self, raw_u16: int) -> int:
+        value = raw_u16 & self.U16_MASK
+        if value & self.I16_SIGN:
+            return value - self.I16_RANGE
+        return value
+
+    def _decode_int12(self, raw_u16: int) -> int:
+        value = raw_u16 & self.U12_MASK
+        if value & self.I12_SIGN:
+            return value - self.I12_RANGE
+        return value
+
+    def _hex_to_bytes_strict(self, payload_hex: str) -> bytes:
+        text = payload_hex.strip()
+        text = text.replace("Hex-STRING:", "")
+        text = text.replace("0x", "")
+        text = " ".join(text.split())
+
+        if text == "":
+            return b""
+
+        for ch in text:
+            if ch == " ":
+                continue
+            if "0" <= ch <= "9":
+                continue
+            if "a" <= ch <= "f":
+                continue
+            if "A" <= ch <= "F":
+                continue
+            return b""
+
+        return bytes.fromhex(text)
+# FILE: src/pypnm/docsis/cm_snmp_operation.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
 
@@ -2448,3 +3083,226 @@ class CmSnmpOperation:
                 "Ensure Pre-Equalization is enabled on the upstream interface(s).")
 
         return ded
+# FILE: src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_connect_request import (
+    SNMPConfig,
+)
+from pypnm.docsis.cable_modem import CableModem
+from pypnm.lib.inet import Inet
+from pypnm.lib.mac_address import MacAddress
+from pypnm.lib.types import BandwidthHz, InetAddressStr, MacAddressStr
+from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
+
+
+class UsScQamChannelService:
+    """
+    Service for retrieving DOCSIS Upstream SC-QAM channel information and
+    pre-equalization data from a cable modem using SNMP.
+
+    Attributes:
+        cm (CableModem): An instance of the CableModem class used to perform SNMP operations.
+    """
+
+    def __init__(self, mac_address: MacAddressStr,
+                 ip_address: InetAddressStr,
+                 snmp_config: SNMPConfig) -> None:
+        """
+        Initializes the service with a MAC and IP address.
+
+        Args:
+            mac_address (str): MAC address of the target cable modem.
+            ip_address (str): IP address of the target cable modem.
+        """
+        self.cm = CableModem(mac_address=MacAddress(mac_address),
+                             inet=Inet(ip_address),
+                             write_community=snmp_config.snmp_v2c.community)
+
+    async def get_upstream_entries(self) -> list[dict]:
+        """
+        Fetches DOCSIS Upstream SC-QAM channel entries.
+
+        Returns:
+            List[dict]: A list of dictionaries representing upstream channel information.
+        """
+        entries = await self.cm.getDocsIfUpstreamChannelEntry()
+        return [entry.model_dump() for entry in entries]
+
+    async def get_upstream_pre_equalizations(self) ->  dict[int, dict]:
+        """
+        Fetches upstream pre-equalization coefficient data.
+
+        Returns:
+            List[dict]: A dictionary containing per-channel equalizer data with real, imag,
+                        magnitude, and power (dB) for each tap.
+        """
+        entries = await self.get_upstream_entries()
+        channel_widths: dict[int, BandwidthHz] = {}
+        for entry in entries:
+            index = entry.get("index")
+            entry_data = entry.get("entry") or {}
+            channel_width = entry_data.get("docsIfUpChannelWidth")
+            if isinstance(index, int) and isinstance(channel_width, int) and channel_width > 0:
+                channel_widths[index] = BandwidthHz(channel_width)
+
+        pre_eq_data: DocsEqualizerData = await self.cm.getDocsIf3CmStatusUsEqData(
+            channel_widths=channel_widths
+        )
+        return pre_eq_data.to_dict()
+# FILE: docs/api/fast-api/single/us/atdma/chan/pre-equalization.md
+# DOCSIS 3.0 Upstream ATDMA Pre-Equalization
+
+Provides Access To DOCSIS 3.0 Upstream SC-QAM (ATDMA) Pre-Equalization Tap Data For Plant Analysis (Reflections, Group Delay, Pre-Echo).
+
+## Endpoint
+
+**POST** `/docs/if30/us/atdma/chan/preEqualization`
+
+## Request
+
+Use the SNMP-only format: [Common → Request](../../../../common/request.md)  
+TFTP parameters are not required.
+
+## Response
+
+This endpoint returns the standard envelope described in [Common → Response](../../../../common/response.md) (`mac_address`, `status`, `message`, `data`).
+
+`data` is an **object** keyed by the **SNMP table index** of each upstream channel.  
+Each value contains decoded tap configuration, coefficient arrays, and optional group delay.
+
+### Abbreviated Example
+
+```json
+{
+  "mac_address": "aa:bb:cc:dd:ee:ff",
+  "status": 0,
+  "message": null,
+  "data": {
+    "80": {
+      "main_tap_location": 8,
+      "taps_per_symbol": 1,
+      "num_taps": 24,
+      "reserved": 0,
+      "header_hex": "08 01 18 00",
+      "payload_hex": "08 01 18 00 FE FF FE FF 03 00 FF FF 00 00 01 00",
+      "payload_preview_hex": "08 01 18 00 FE FF FE FF 03 00 FF FF 00 00 01 00",
+      "taps": [
+        { "real": -257, "imag": -257, "magnitude": 363.45, "magnitude_power_dB": 51.21, "real_hex": "FEFF", "imag_hex": "FEFF" },
+        { "real": 768, "imag": -1, "magnitude": 768.0, "magnitude_power_dB": 57.71, "real_hex": "0300", "imag_hex": "FFFF" }
+      ],
+      "metrics": {
+        "main_tap_energy": 4190209.0,
+        "total_tap_energy": 4190741.0,
+        "main_tap_ratio": 38.96
+      },
+      "group_delay": {
+        "channel_width_hz": 1600000,
+        "rolloff": 0.25,
+        "taps_per_symbol": 1,
+        "symbol_rate": 1280000.0,
+        "symbol_time_us": 0.78125,
+        "sample_period_us": 0.78125,
+        "fft_size": 24,
+        "delay_samples": [0.1, 0.2, 0.3],
+        "delay_us": [0.08, 0.16, 0.23]
+      }
+    }
+    /* ... other upstream channel indices elided ... */
+  }
+}
+```
+
+## Container Keys
+
+| Key (top-level under `data`) | Type   | Description                                                       |
+| ---------------------------- | ------ | ----------------------------------------------------------------- |
+| `"80"`, `"81"`, …            | string | **SNMP table index** for the upstream channel row (OID instance). |
+
+## Channel-Level Fields
+
+| Field               | Type    | Description                                                 |
+| ------------------- | ------- | ----------------------------------------------------------- |
+| `main_tap_location` | integer | Location of the main tap (typically near the filter center) |
+| `taps_per_symbol`   | integer | Taps per symbol from the pre-EQ header                      |
+| `num_taps`          | integer | Total number of taps                                        |
+| `reserved`          | integer | Reserved header byte                                        |
+| `header_hex`        | string  | Header bytes in hex                                         |
+| `payload_hex`       | string  | Full payload hex                                            |
+| `payload_preview_hex` | string | Header plus a preview window of taps in hex                 |
+| `taps`              | array   | Complex tap coefficients (real/imag pairs)                  |
+| `metrics`           | object  | ATDMA pre-equalization key metrics when available           |
+| `group_delay`       | object  | Group delay results when channel bandwidth is available     |
+
+## Coefficient Object Fields
+
+| Field                | Type  | Units | Description                          |
+| -------------------- | ----- | ----- | ------------------------------------ |
+| `real`               | int   | —     | Real part of the complex coefficient |
+| `imag`               | int   | —     | Imaginary part of the coefficient    |
+| `magnitude`          | float | —     | Magnitude of the complex tap         |
+| `magnitude_power_dB` | float | dB    | Power of the tap in dB               |
+| `real_hex`           | string | —    | Raw 2-byte real coefficient (hex)    |
+| `imag_hex`           | string | —    | Raw 2-byte imag coefficient (hex)    |
+
+## Notes
+
+* Each top-level key under `data` is the DOCSIS **SNMP index** for an upstream SC-QAM (ATDMA) channel.
+* Group delay is included only when the upstream channel bandwidth is available.
+* Use tap shapes and main-tap offset to infer echo path delay and alignment health.
+* Tap coefficients are signed integers; convert to floating-point as needed for analysis.
+# FILE: tests/test_docs_equalizer_group_delay.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+from pypnm.lib.types import BandwidthHz
+from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
+
+
+def _encode_i16(value: int) -> bytes:
+    if value < 0:
+        value = (1 << 16) + value
+    return value.to_bytes(2, byteorder="little", signed=False)
+
+
+def _build_payload(num_taps: int, taps_per_symbol: int) -> bytes:
+    header = bytes([8, taps_per_symbol, num_taps, 0])
+    taps = bytearray()
+    for _ in range(num_taps):
+        taps.extend(_encode_i16(1))
+        taps.extend(_encode_i16(0))
+    return header + taps
+
+
+def test_group_delay_included_with_channel_width() -> None:
+    payload = _build_payload(num_taps=24, taps_per_symbol=1)
+    ded = DocsEqualizerData()
+
+    added = ded.add_from_bytes(80, payload, channel_width_hz=BandwidthHz(1_600_000))
+    assert added is True
+
+    record = ded.get_record(80)
+    assert record is not None
+    assert record.group_delay is not None
+    assert int(record.group_delay.channel_width_hz) == 1_600_000
+    assert record.group_delay.taps_per_symbol == 1
+    assert record.group_delay.fft_size == 24
+    assert len(record.group_delay.delay_samples) == 24
+    assert len(record.group_delay.delay_us) == 24
+
+
+def test_group_delay_missing_without_channel_width() -> None:
+    payload = _build_payload(num_taps=24, taps_per_symbol=1)
+    ded = DocsEqualizerData()
+
+    added = ded.add_from_bytes(81, payload)
+    assert added is True
+
+    record = ded.get_record(81)
+    assert record is not None
+    assert record.group_delay is None

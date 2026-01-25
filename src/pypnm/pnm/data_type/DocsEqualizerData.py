@@ -9,11 +9,13 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, Field
 
-from pypnm.lib.types import ImginaryInt, PreEqAtdmaCoefficients, RealInt
+from pypnm.lib.types import BandwidthHz, ImginaryInt, PreEqAtdmaCoefficients, RealInt
+from pypnm.lib.constants import DOCSIS_ROLL_OFF_FACTOR
 from pypnm.pnm.analysis.atdma_preeq_key_metrics import (
     EqualizerMetrics,
     EqualizerMetricsModel,
 )
+from pypnm.pnm.analysis.atdma_group_delay import GroupDelayCalculator, GroupDelayModel
 
 
 class UsEqTapModel(BaseModel):
@@ -37,6 +39,7 @@ class UsEqDataModel(BaseModel):
     payload_preview_hex: str = Field(..., description="Header + first N taps as hex preview (space-separated bytes).")
     taps: list[UsEqTapModel] = Field(..., description="Decoded taps in order (real/imag pairs).")
     metrics: EqualizerMetricsModel | None = Field(None, description="ATDMA pre-equalization key metrics when available.")
+    group_delay: GroupDelayModel | None = Field(None, description="ATDMA group delay derived from taps when channel_width_hz is provided.")
 
     model_config = {"frozen": True}
 
@@ -86,6 +89,8 @@ class DocsEqualizerData:
         coeff_encoding: Literal["four-nibble", "three-nibble", "auto"] = "auto",
         coeff_endianness: Literal["little", "big", "auto"] = "auto",
         preview_taps: int = 8,
+        channel_width_hz: BandwidthHz | None = None,
+        rolloff: float = DOCSIS_ROLL_OFF_FACTOR,
     ) -> bool:
         """
         Parse/store from a hex string payload.
@@ -111,6 +116,8 @@ class DocsEqualizerData:
                 coeff_encoding=coeff_encoding,
                 coeff_endianness=coeff_endianness,
                 preview_taps=preview_taps,
+                channel_width_hz=channel_width_hz,
+                rolloff=rolloff,
             )
         except Exception:
             return False
@@ -123,6 +130,8 @@ class DocsEqualizerData:
         coeff_encoding: Literal["four-nibble", "three-nibble", "auto"] = "auto",
         coeff_endianness: Literal["little", "big", "auto"] = "auto",
         preview_taps: int = 8,
+        channel_width_hz: BandwidthHz | None = None,
+        rolloff: float = DOCSIS_ROLL_OFF_FACTOR,
     ) -> bool:
         """
         Parse/store from raw bytes (preferred for SNMP OctetString values).
@@ -134,6 +143,8 @@ class DocsEqualizerData:
                 coeff_encoding=coeff_encoding,
                 coeff_endianness=coeff_endianness,
                 preview_taps=preview_taps,
+                channel_width_hz=channel_width_hz,
+                rolloff=rolloff,
             )
         except Exception:
             return False
@@ -158,6 +169,8 @@ class DocsEqualizerData:
         coeff_encoding: Literal["four-nibble", "three-nibble", "auto"],
         coeff_endianness: Literal["little", "big", "auto"],
         preview_taps: int,
+        channel_width_hz: BandwidthHz | None,
+        rolloff: float,
     ) -> bool:
         if len(payload) < self.HEADER_SIZE:
             return False
@@ -197,6 +210,12 @@ class DocsEqualizerData:
         )
 
         metrics = self._build_metrics(taps)
+        group_delay = self._build_group_delay(
+            taps,
+            channel_width_hz=channel_width_hz,
+            taps_per_symbol=taps_per_symbol,
+            rolloff=rolloff,
+        )
         self.equalizer_data[us_idx] = UsEqDataModel(
             main_tap_location=main_tap_location,
             taps_per_symbol=taps_per_symbol,
@@ -207,6 +226,7 @@ class DocsEqualizerData:
             payload_preview_hex=payload_preview_hex,
             taps=taps,
             metrics=metrics,
+            group_delay=group_delay,
         )
 
         self._coefficients_found = True
@@ -269,6 +289,34 @@ class DocsEqualizerData:
             (RealInt(tap.real), ImginaryInt(tap.imag)) for tap in taps
         ]
         return EqualizerMetrics(coefficients=coefficients).to_model()
+
+    def _build_group_delay(
+        self,
+        taps: list[UsEqTapModel],
+        *,
+        channel_width_hz: BandwidthHz | None,
+        taps_per_symbol: int,
+        rolloff: float,
+    ) -> GroupDelayModel | None:
+        if channel_width_hz is None:
+            return None
+        if len(taps) == 0:
+            return None
+        if taps_per_symbol <= 0:
+            return None
+
+        coefficients: list[PreEqAtdmaCoefficients] = [
+            (RealInt(tap.real), ImginaryInt(tap.imag)) for tap in taps
+        ]
+        try:
+            calculator = GroupDelayCalculator(
+                channel_width_hz=channel_width_hz,
+                taps_per_symbol=taps_per_symbol,
+                rolloff=rolloff,
+            )
+            return calculator.compute(coefficients)
+        except Exception:
+            return None
 
     def _detect_coeff_endianness(self, data: bytes) -> Literal["little", "big"]:
         """

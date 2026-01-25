@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_connect
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import InetAddressStr, MacAddressStr
+from pypnm.lib.types import BandwidthHz, InetAddressStr, MacAddressStr
 from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
 
 
@@ -54,5 +54,16 @@ class UsScQamChannelService:
             List[dict]: A dictionary containing per-channel equalizer data with real, imag,
                         magnitude, and power (dB) for each tap.
         """
-        pre_eq_data: DocsEqualizerData = await self.cm.getDocsIf3CmStatusUsEqData()
+        entries = await self.get_upstream_entries()
+        channel_widths: dict[int, BandwidthHz] = {}
+        for entry in entries:
+            index = entry.get("index")
+            entry_data = entry.get("entry") or {}
+            channel_width = entry_data.get("docsIfUpChannelWidth")
+            if isinstance(index, int) and isinstance(channel_width, int) and channel_width > 0:
+                channel_widths[index] = BandwidthHz(channel_width)
+
+        pre_eq_data: DocsEqualizerData = await self.cm.getDocsIf3CmStatusUsEqData(
+            channel_widths=channel_widths
+        )
         return pre_eq_data.to_dict()

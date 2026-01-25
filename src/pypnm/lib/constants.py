@@ -41,6 +41,8 @@ DEFAULT_CAPTURE_TIME: Final[CaptureTime]            = cast(CaptureTime, 19700101
 
 CableTypes: TypeAlias = Literal["RG6", "RG59", "RG11"]
 
+DOCSIS_ROLL_OFF_FACTOR: Final[float] = 0.25
+
 # Velocity Factor (VF) by cable type (fraction of c0)
 CABLE_VF: Final[dict[CableTypes, float]] = {
     "RG6":  0.87,
@@ -95,6 +97,7 @@ STATUS_OK:STATUS = True
 STATUS_NOK:STATUS = False
 
 __all__ = [
+    "DOCSIS_ROLL_OFF_FACTOR",
     "STATUS_OK", "STATUS_NOK",
     "DEFAULT_SSH_PORT",
     "HZ", "KHZ", "MHZ", "GHZ",
