@@ -44,7 +44,16 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
             community=request.cmts.community
         )
         
-        # Configure UTSC with 60 second timeout
+        # Step 1: Reset port to clean state (stop any active capture, wait for ready)
+        reset_result = await asyncio.wait_for(
+            service.reset_port_state(),
+            timeout=15.0
+        )
+        if not reset_result.get("success"):
+            logger.warning(f"Port reset warning: {reset_result.get('error')}")
+            # Continue anyway - the port might still be usable
+        
+        # Step 2: Configure UTSC with 60 second timeout
         result = await asyncio.wait_for(
             service.configure(
                 center_freq_hz=request.capture_parameters.center_freq_hz,

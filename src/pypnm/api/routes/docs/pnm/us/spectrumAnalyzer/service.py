@@ -79,6 +79,86 @@ class CmtsUtscService:
         result = await self._safe_snmp_get(oid, f"Check row exists for {idx}")
         return result is not None and len(result) > 0
     
+    async def reset_port_state(self) -> dict:
+        """Reset UTSC port to a clean state before configuring.
+        
+        This ensures the port is not in an inconsistent state from previous
+        failed operations. Steps:
+        1. Stop any active capture (InitiateTest = false/2)
+        2. Wait for status to become inactive/sampleReady (not busy)
+        3. Verify row is in active state
+        
+        Returns:
+            dict: {"success": True/False, "status": status_value, "error": error_msg}
+        """
+        try:
+            self.logger.info(f"Resetting UTSC port state for RF Port {self.rf_port_ifindex}")
+            idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
+            
+            # Step 1: Stop any active capture
+            stop_oid = f"{self.UTSC_CTRL_BASE}.1{idx}"  # docsPnmCmtsUtscCtrlInitiateTest
+            self.logger.info("Stopping any active UTSC capture...")
+            await self._safe_snmp_set(stop_oid, 2, Integer32, "Stop UTSC (InitiateTest=false)")
+            
+            # Step 2: Wait for status to become not-busy (with timeout)
+            status_oid = f"{self.UTSC_STATUS_BASE}.1{idx}"  # docsPnmCmtsUtscStatusMeasStatus
+            max_wait_time = 10  # seconds
+            poll_interval = 0.5
+            waited = 0
+            
+            while waited < max_wait_time:
+                result = await self._safe_snmp_get(status_oid, "Check MeasStatus")
+                if result:
+                    try:
+                        # Extract status value
+                        status_value = int(result[0][1])
+                        self.logger.debug(f"UTSC MeasStatus = {status_value}")
+                        
+                        # Status values: 1=other, 2=inactive, 3=busy, 4=sampleReady, 5=error
+                        if status_value != 3:  # Not busy
+                            self.logger.info(f"Port is ready (status={status_value})")
+                            break
+                    except (IndexError, ValueError, TypeError):
+                        pass
+                
+                await asyncio.sleep(poll_interval)
+                waited += poll_interval
+            
+            if waited >= max_wait_time:
+                self.logger.warning(f"Timeout waiting for port to become ready (waited {max_wait_time}s)")
+            
+            # Step 3: Verify RowStatus is active
+            row_status_oid = f"{self.UTSC_CFG_BASE}.21{idx}"  # docsPnmCmtsUtscCfgStatus
+            result = await self._safe_snmp_get(row_status_oid, "Check RowStatus")
+            row_status = None
+            if result:
+                try:
+                    row_status = int(result[0][1])
+                    self.logger.info(f"Row status = {row_status} (1=active, 2=notInService)")
+                except (IndexError, ValueError, TypeError):
+                    pass
+            
+            # Get final status for return
+            final_status = None
+            result = await self._safe_snmp_get(status_oid, "Get final MeasStatus")
+            if result:
+                try:
+                    final_status = int(result[0][1])
+                except (IndexError, ValueError, TypeError):
+                    pass
+            
+            self.logger.info(f"Port state reset complete. Status={final_status}, RowStatus={row_status}")
+            return {
+                "success": True, 
+                "status": final_status,
+                "row_status": row_status
+            }
+            
+        except Exception as e:
+            error_msg = f"Failed to reset port state: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            return {"success": False, "error": error_msg}
+    
     async def configure(
         self, 
         center_freq_hz: int, 
