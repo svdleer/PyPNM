@@ -14,7 +14,8 @@ from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.schemas import (
     UtscDiscoverRequest,
     UtscDiscoverResponse,
 )
-from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.service import CmtsUtscService, UtscRfPortDiscoveryService
+from pypnm.api.routes.docs/pnm/us/spectrumAnalyzer.service import CmtsUtscService, UtscRfPortDiscoveryService
+from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.lib.inet import Inet
 
 router = APIRouter(prefix="/docs/pnm/us/spectrumAnalyzer", tags=["PNM - Upstream Spectrum (UTSC)"])
@@ -32,6 +33,11 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
     logger.info(f"UTSC: CMTS={request.cmts.cmts_ip}, RF Port={request.cmts.rf_port_ifindex}")
     
     try:
+        # Get TFTP IP from request or fall back to system config
+        tftp_ip = request.tftp.ipv4 if request.tftp.ipv4 else SystemConfigSettings.tftp_ipv4()
+        if not tftp_ip:
+            return UtscResponse(success=False, error="TFTP IPv4 address required but not provided in request or system config")
+        
         service = CmtsUtscService(
             cmts_ip=Inet(request.cmts.cmts_ip),
             rf_port_ifindex=request.cmts.rf_port_ifindex,
@@ -46,7 +52,7 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
                 num_bins=request.capture_parameters.num_bins,
                 trigger_mode=request.capture_parameters.trigger_mode,
                 filename=request.capture_parameters.filename,
-                tftp_ip=str(request.tftp.ipv4),
+                tftp_ip=str(tftp_ip),
                 cm_mac=request.trigger.cm_mac,
                 logical_ch_ifindex=request.trigger.logical_ch_ifindex,
                 repeat_period_ms=request.capture_parameters.repeat_period_ms,
