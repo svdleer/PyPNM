@@ -38,6 +38,7 @@ Refer to [Common → Request](../../common/request.md).
 * The CM accumulates hits per bin across the capture window. Dwell count is typically uniform per bin for equal sampling.  
 * A clipped transmitter path often shows one‑sided truncation and a spike in an end bin.  
 * Capture ends on command, timeout, or 32‑bit dwell counter overflow.
+* `pnm_parameters.capture.channel_ids` is not supported for this endpoint.
 
 ### Example Request
 
@@ -46,6 +47,12 @@ Refer to [Common → Request](../../common/request.md).
   "cable_modem": {
     "mac_address": "aa:bb:cc:dd:ee:ff",
     "ip_address": "192.168.0.100",
+    "pnm_parameters": {
+      "tftp": {
+        "ipv4": "192.168.0.10",
+        "ipv6": "2001:db8::10"
+      }
+    },
     "snmp": { "snmpV2C": { "community": "private" } }
   },
   "analysis": {

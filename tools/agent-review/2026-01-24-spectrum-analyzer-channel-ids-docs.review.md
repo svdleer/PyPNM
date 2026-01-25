@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Align spectrum analyzer examples with channel_ids support.
+- Changes: Remove channel_ids from single-capture example and add it to the OFDM example.
+- Files: docs/api/fast-api/single/spectrum-analyzer/spectrum-analyzer.md
+- Tests: Not run.
+- Notes: Review bundle includes full contents of modified files.
+
+# FILE: docs/api/fast-api/single/spectrum-analyzer/spectrum-analyzer.md
 # PNM Operations - Spectrum Analyzer
 
 Downstream Spectrum Capture And Per-Channel Analysis For DOCSIS 3.x/4.0 Cable Modems.

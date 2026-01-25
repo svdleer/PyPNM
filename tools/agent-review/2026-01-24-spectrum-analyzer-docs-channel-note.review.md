@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Document that single-capture spectrum analyzer does not support channel scoping.
+- Changes: Add a note to the spectrum analyzer FastAPI doc.
+- Files: docs/api/fast-api/single/spectrum-analyzer/spectrum-analyzer.md
+- Tests: Not run.
+- Notes: Review bundle includes full contents of modified files.
+
+# FILE: docs/api/fast-api/single/spectrum-analyzer/spectrum-analyzer.md
 # PNM Operations - Spectrum Analyzer
 
 Downstream Spectrum Capture And Per-Channel Analysis For DOCSIS 3.x/4.0 Cable Modems.
@@ -312,9 +320,6 @@ DOCSIS constraints:
       "tftp": {
         "ipv4": "192.168.0.10",
         "ipv6": "2001:db8::10"
-      },
-      "capture": {
-        "channel_ids": [193, 194]
       }
     },
     "snmp": {
@@ -348,8 +353,6 @@ DOCSIS constraints:
 | `capture_parameters.spectrum_retrieval_type`| int  | Retrieval mode enum value (FILE = 1, SNMP = 2).                              |
 
 > `resolution_bandwidth_hz` is used to auto-scale RBW settings (segment span and bins per segment).
-
-To scope captures to specific OFDM channels, set `pnm_parameters.capture.channel_ids`. Omit or use an empty list to capture all downstream OFDM channels.
 
 ### Abbreviated JSON Response (OFDM View)
 
@@ -507,9 +510,6 @@ The response shape for SC-QAM captures mirrors the OFDM multi-channel layout:
       "tftp": {
         "ipv4": "192.168.0.10",
         "ipv6": "2001:db8::10"
-      },
-      "capture": {
-        "channel_ids": [1, 2]
       }
     },
     "snmp": {
@@ -543,8 +543,6 @@ The response shape for SC-QAM captures mirrors the OFDM multi-channel layout:
 | `capture_parameters.spectrum_retrieval_type`| int  | Retrieval mode enum value (FILE = 1, SNMP = 2).                              |
 
 > `resolution_bandwidth_hz` is used to auto-scale RBW settings (segment span and bins per segment).
-
-To scope captures to specific SC-QAM channels, set `pnm_parameters.capture.channel_ids`. Omit or use an empty list to capture all downstream SC-QAM channels.
 
 ### SC-QAM Multi-Channel Return Structure
 
