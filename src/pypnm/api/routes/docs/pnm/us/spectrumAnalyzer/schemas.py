@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from pypnm.api.routes.common.classes.common_endpoint_classes.common_req_resp import (
     TftpConfig,
@@ -25,15 +25,79 @@ class UtscTriggerConfig(BaseModel):
 
 
 class UtscCaptureParameters(BaseModel):
-    """UTSC Capture Parameters"""
-    trigger_mode: int = Field(default=2, description="Trigger mode: 2=FreeRunning, 6=CM MAC Address")
-    center_freq_hz: int = Field(default=30000000, description="Center frequency in Hz (5-85 MHz typical)")
-    span_hz: int = Field(default=80000000, description="Frequency span in Hz")
-    num_bins: int = Field(default=800, description="Number of FFT bins")
-    filename: str = Field(default="utsc_capture", description="Base filename for results")
-    repeat_period_ms: int = Field(default=1000, description="Repeat period in milliseconds (time between captures, max 1000ms on some CMTS)")
-    freerun_duration_ms: int = Field(default=60000, description="Total duration for free-running mode in milliseconds")
-    trigger_count: int = Field(default=10, description="Number of captures to take (max 10 on CommScope E6000, ignored in FreeRunning mode)")
+    """UTSC Capture Parameters - validated against DOCS-PNM-MIB constraints
+    
+    MIB Reference: docsPnmCmtsUtscCfgEntry from DOCS-PNM-MIB
+    """
+    trigger_mode: int = Field(
+        default=2, 
+        ge=1, le=7,
+        description="Trigger mode: 1=other, 2=FreeRunning, 3=miniSlotCount, 4=sid, 5=idleSid, 6=cmMac, 7=burstIuc"
+    )
+    center_freq_hz: int = Field(
+        default=42500000,
+        ge=5000000, le=204000000,
+        description="Center frequency in Hz (5-204 MHz, must be within upstream frequency range)"
+    )
+    span_hz: int = Field(
+        default=80000000,
+        ge=100000, le=204000000,
+        description="Frequency span in Hz (100 kHz - 204 MHz)"
+    )
+    num_bins: int = Field(
+        default=800,
+        ge=1, le=4096,
+        description="Number of FFT bins (1-4096, power of 2 recommended: 256, 512, 800, 1024, 1600, 2048, 3200, 4096)"
+    )
+    filename: str = Field(
+        default="/pnm/utsc/utsc_capture",
+        max_length=255,
+        description="Base filename for results (max 255 chars, path like /pnm/utsc/name)"
+    )
+    repeat_period_ms: int = Field(
+        default=1000,
+        ge=20, le=86400000,
+        description="Repeat period in milliseconds (20ms - 86400000ms/24hr, MIB stores as microseconds)"
+    )
+    freerun_duration_ms: int = Field(
+        default=60000,
+        ge=1000, le=86400000,
+        description="Total duration for free-running mode in milliseconds (1s - 24hr)"
+    )
+    trigger_count: int = Field(
+        default=10,
+        ge=1, le=65535,
+        description="Number of captures (1-65535, but E6000 ignores in FreeRunning mode)"
+    )
+    
+    @field_validator('center_freq_hz', 'span_hz')
+    @classmethod
+    def validate_frequency_alignment(cls, v: int) -> int:
+        """Validate frequency is reasonable (Hz precision)"""
+        if v <= 0:
+            raise ValueError(f"Frequency must be positive, got {v}")
+        return v
+    
+    @field_validator('num_bins')
+    @classmethod
+    def validate_num_bins(cls, v: int) -> int:
+        """Validate num_bins is a reasonable FFT size"""
+        valid_bins = [256, 512, 800, 1024, 1600, 2048, 3200, 4096]
+        if v not in valid_bins:
+            # Allow any value but warn - some CMTS may accept non-standard values
+            pass  # Just accept it, CMTS will reject if invalid
+        return v
+    
+    @field_validator('filename')
+    @classmethod
+    def validate_filename(cls, v: str) -> str:
+        """Validate filename format"""
+        if not v:
+            raise ValueError("Filename cannot be empty")
+        # Ensure path format for CMTS
+        if not v.startswith('/'):
+            v = f"/pnm/utsc/{v}"
+        return v
 
 
 class UtscAnalysisConfig(BaseModel):
