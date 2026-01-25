@@ -31,7 +31,9 @@ from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
 from pypnm.api.routes.common.extended.common_process_service import CommonProcessService
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
-from pypnm.api.routes.docs.pnm.ds.histogram.schemas import PnmHistogramSingleCaptureRequest
+from pypnm.api.routes.docs.pnm.ds.histogram.schemas import (
+    PnmHistogramSingleCaptureRequest,
+)
 from pypnm.api.routes.docs.pnm.ds.histogram.service import CmDsHistogramService
 from pypnm.api.routes.docs.pnm.files.service import FileType, PnmFileService
 from pypnm.docsis.cable_modem import CableModem
