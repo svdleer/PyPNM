@@ -169,14 +169,28 @@ class CmtsUtscService:
         tftp_ip: str,
         cm_mac: str | None = None,
         logical_ch_ifindex: int | None = None,
-        repeat_period_ms: int = 1000,
+        repeat_period_ms: int = 100,
         freerun_duration_ms: int = 60000,
-        trigger_count: int = 10
+        trigger_count: int = 1,
+        output_format: int = 2,
+        window: int = 2
     ) -> dict:
-        """Configure UTSC - simplified to match working test script approach.
+        """Configure UTSC per E6000 CER I-CCAP User Guide Release 13.0.
         
-        The E6000 CMTS doesn't handle RowStatus manipulation well.
-        This simplified approach just sets parameters directly like the working test script.
+        OID field mapping (docsPnmCmtsUtscCfgEntry):
+        .2  = LogicalChIfIndex
+        .3  = TriggerMode (2=FreeRunning, 5=IdleSID, 6=cmMAC)
+        .6  = CmMacAddr
+        .8  = CenterFreq (Hz)
+        .9  = Span (Hz)
+        .10 = NumBins (200,400,800,1600,3200 or 256,512,1024,2048)
+        .12 = Filename
+        .16 = Window (2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming)
+        .17 = OutputFormat (1=timeIQ, 2=fftPower, 4=fftIQ, 5=fftAmplitude)
+        .18 = RepeatPeriod (microseconds, 0-1000000)
+        .19 = FreeRunDuration (milliseconds, 1000-600000)
+        .20 = TriggerCount (1-10)
+        .24 = DestinationIndex (1 = pre-configured TFTP)
         """
         try:
             self.logger.info(f"Starting UTSC configuration for CMTS={self.cmts_ip}, RF Port={self.rf_port_ifindex}")
@@ -184,9 +198,6 @@ class CmtsUtscService:
             
             # Convert ms to microseconds for RepeatPeriod
             repeat_period_us = repeat_period_ms * 1000
-            
-            # Just set parameters directly - don't manipulate RowStatus
-            # This matches the working test_utsc_simple.py approach
             
             # 1. Set trigger mode
             self.logger.info(f"Setting TriggerMode={trigger_mode}")
@@ -202,23 +213,34 @@ class CmtsUtscService:
             self.logger.info(f"Setting Span={span_hz} Hz")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32, f"Span ({span_hz} Hz)")
             
-            # 3. Set filename
+            # 3. Set output format and window
+            self.logger.info(f"Setting OutputFormat={output_format}")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.17{idx}", output_format, Integer32, f"Output Format ({output_format})")
+            
+            self.logger.info(f"Setting Window={window}")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.16{idx}", window, Integer32, f"Window ({window})")
+            
+            # 4. Set filename
             self.logger.info(f"Setting Filename={filename}")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.12{idx}", filename, OctetString, f"Filename ({filename})")
             
-            # 4. Set timing parameters
+            # 5. Set timing parameters
             self.logger.info(f"Setting RepeatPeriod={repeat_period_ms}ms ({repeat_period_us} us)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_us} us)")
             
             self.logger.info(f"Setting FreeRunDuration={freerun_duration_ms}ms")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)")
             
-            # 5. Set DestinationIndex = 1 (use pre-configured TFTP destination)
+            # 6. Set TriggerCount (for IdleSID/cmMAC modes)
+            self.logger.info(f"Setting TriggerCount={trigger_count}")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})")
+            
+            # 7. Set DestinationIndex = 1 (use pre-configured TFTP destination)
             self.logger.info("Setting DestinationIndex=1 (pre-configured TFTP)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Unsigned32, "Destination Index (1)")
             
-            # 6. For CM MAC trigger mode (mode 6), set CM info
-            if trigger_mode == 6 and cm_mac:
+            # 8. For CM MAC trigger mode (mode 6) or IdleSID (mode 5), set CM info
+            if trigger_mode in (5, 6) and cm_mac:
                 self.logger.info(f"Setting CM MAC={cm_mac}")
                 await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, OctetString, f"CM MAC ({cm_mac})")
                 if logical_ch_ifindex:

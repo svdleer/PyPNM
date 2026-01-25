@@ -66,7 +66,9 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
                 logical_ch_ifindex=request.trigger.logical_ch_ifindex,
                 repeat_period_ms=request.capture_parameters.repeat_period_ms,
                 freerun_duration_ms=request.capture_parameters.freerun_duration_ms,
-                trigger_count=request.capture_parameters.trigger_count
+                trigger_count=request.capture_parameters.trigger_count,
+                output_format=request.capture_parameters.output_format,
+                window=request.capture_parameters.window
             ),
             timeout=60.0
         )
