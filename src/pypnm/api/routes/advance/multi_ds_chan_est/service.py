@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 from __future__ import annotations
 
 import logging
 
 from pypnm.api.routes.advance.common.capture_service import AbstractCaptureService
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
+)
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.api.routes.docs.pnm.ds.ofdm.chan_est_coeff.service import (
@@ -35,7 +38,8 @@ class MultiChannelEstimationService(AbstractCaptureService):
     def __init__(self, cm: CableModem,
                 tftp_servers: tuple[Inet, Inet] = PnmConfigManager.get_tftp_servers(),
                 tftp_path: str = PnmConfigManager.get_tftp_path(),
-                 duration: float = 1, interval: float = 1) -> None:
+                 duration: float = 1, interval: float = 1,
+                 interface_parameters: DownstreamOfdmParameters | None = None,) -> None:
         """
         Initialize the MultiChannelEstimationService.
 
@@ -51,6 +55,7 @@ class MultiChannelEstimationService(AbstractCaptureService):
         self.tftp_servers = tftp_servers
         self.tftp_path = tftp_path
         self.logger = logging.getLogger(__name__)
+        self._interface_parameters = interface_parameters
 
     async def _capture_message_response(self) -> MessageResponse:
         """
@@ -65,8 +70,11 @@ class MultiChannelEstimationService(AbstractCaptureService):
             - Validates payload type and entry contents.
         """
         try:
-            msg_rsp: MessageResponse = \
-                await CmDsOfdmChanEstCoefService(self.cm, self.tftp_servers, self.tftp_path).set_and_go()
+            msg_rsp: MessageResponse = await CmDsOfdmChanEstCoefService(
+                self.cm,
+                self.tftp_servers,
+                self.tftp_path,
+            ).set_and_go(interface_parameters=self._interface_parameters)
 
         except Exception as exc:
             err_msg = f"Exception during ChannelEstimation SNMP/TFTP operation: {exc}"

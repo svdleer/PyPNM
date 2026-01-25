@@ -59,10 +59,19 @@ Starts a background multi-sample ChannelEstimation capture with a fixed duration
 {
   "cable_modem": {
     "mac_address": "aa:bb:cc:dd:ee:ff",
-    "ip_address": "192.168.0.100"
-  },
-  "snmp": {
-    "snmpV2C": { "community": "public" }
+    "ip_address": "192.168.0.100",
+    "pnm_parameters": {
+      "tftp": {
+        "ipv4": "192.168.0.10",
+        "ipv6": "2001:db8::10"
+      },
+      "capture": {
+        "channel_ids": [193, 194]
+      }
+    },
+    "snmp": {
+      "snmpV2C": { "community": "public" }
+    }
   },
   "capture": {
     "parameters": {
@@ -72,6 +81,8 @@ Starts a background multi-sample ChannelEstimation capture with a fixed duration
   }
 }
 ```
+
+When `pnm_parameters.capture.channel_ids` is omitted or empty, the capture includes all downstream OFDM channels.
 
 #### Response (MultiChanEstimationStartResponse)
 

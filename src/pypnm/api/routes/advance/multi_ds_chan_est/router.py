@@ -48,13 +48,16 @@ from pypnm.api.routes.common.classes.file_capture.file_type import FileType
 from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
     CableModemServicePreCheck,
 )
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
+)
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.api.routes.docs.pnm.files.service import PnmFileService
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.inet import Inet, InetAddressStr
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import GroupId, MacAddressStr, OperationId
+from pypnm.lib.types import ChannelId, GroupId, MacAddressStr, OperationId
 
 
 class MultiDsChanEstRouter(AbstractService):
@@ -82,6 +85,8 @@ class MultiDsChanEstRouter(AbstractService):
             ip_address: InetAddressStr = request.cable_modem.ip_address
             community = RequestDefaultsResolver.resolve_snmp_community(request.cable_modem.snmp)
             tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
+            interface_parameters = self._resolve_interface_parameters(channel_ids)
 
 
             self.logger.info(f"[start] Multi-ChanEst for MAC={mac_address}, duration={duration}s interval={interval}s")
@@ -98,7 +103,8 @@ class MultiDsChanEstRouter(AbstractService):
                                                             cm,
                                                             tftp_servers,
                                                             duration=duration,
-                                                            interval=interval,)
+                                                            interval=interval,
+                                                            interface_parameters=interface_parameters,)
             return MultiChanEstimationStartResponse(mac_address     =   mac_address,
                                                     status          =   OperationState.RUNNING,
                                                     message         =   None,
@@ -292,6 +298,14 @@ class MultiDsChanEstRouter(AbstractService):
                 status          =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
                 message         =   msg,
                 data            =   AnalysisDataModel(analysis_type=atype.name, results=[]))
+
+    @staticmethod
+    def _resolve_interface_parameters(
+        channel_ids: list[ChannelId] | None,
+    ) -> DownstreamOfdmParameters | None:
+        if not channel_ids:
+            return None
+        return DownstreamOfdmParameters(channel_id=list(channel_ids))
 
 # Auto-register
 router = MultiDsChanEstRouter().router

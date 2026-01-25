@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Clarify multi-RxMER channel_ids behavior in the API docs.
+- Changes: Add a channel scoping table describing channel_ids and empty list behavior.
+- Files: docs/api/fast-api/multi/multi-capture-rxmer.md
+- Tests: Not run.
+- Notes: Review bundle includes full contents of modified files.
+
+# FILE: docs/api/fast-api/multi/multi-capture-rxmer.md
 # Multi‑RxMER Capture & Analysis API
 
 A concise, implementation‑ready reference for orchestrating downstream OFDM RxMER captures, status polling, result retrieval,
