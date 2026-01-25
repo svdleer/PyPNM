@@ -157,7 +157,11 @@ class CmtsUtscService:
         try:
             self.logger.info(f"Starting UTSC capture for RF Port {self.rf_port_ifindex}")
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
-            oid = f"{self.UTSC_CTRL_BASE}.1{idx}"  # docsPnmCmtsUtscCtrlInitiateTest
+            # docsPnmCmtsUtscCtrlMeasStatus is column 1 of UTSC_CTRL table
+            # OID format: docsPnmCmtsUtscCtrlTable.docsPnmCmtsUtscCtrlEntry.docsPnmCmtsUtscCtrlMeasStatus.{rfPort}.{cfgIdx}
+            # UTSC_CTRL_BASE already points to docsPnmCmtsUtscCtrlEntry (1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1)
+            # Column 1 = MeasStatus, so full OID is: UTSC_CTRL_BASE.1.{rfPort}.{cfgIdx}
+            oid = f"{self.UTSC_CTRL_BASE}{idx}"  # docsPnmCmtsUtscCtrlMeasStatus (column 1 is implicit in entry)
             
             if not await self._safe_snmp_set(oid, 1, Integer32, "Initiate UTSC Test"):
                 return {"success": False, "error": "Failed to initiate UTSC capture"}
