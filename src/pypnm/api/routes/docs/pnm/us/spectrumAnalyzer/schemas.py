@@ -54,9 +54,9 @@ class UtscCaptureParameters(BaseModel):
         description="Base filename (no path). Files saved to TFTP root. Timestamp appended automatically."
     )
     repeat_period_ms: int = Field(
-        default=100,
+        default=50,
         ge=0, le=1000,
-        description="Repeat period in ms (0-1000). 0=capture once. 1-49=hardware-restricted mode (<2ms). 50-1000=configured value (50ms granularity)."
+        description="Repeat period in ms (0-1000). E6000 minimum: 50ms for FreeRunning. 0=capture once (FreeRunDuration ignored). 1-49=hardware-restricted mode. 50-1000=50ms granularity."
     )
     freerun_duration_ms: int = Field(
         default=60000,

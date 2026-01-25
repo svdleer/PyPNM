@@ -224,16 +224,25 @@ class CmtsUtscService:
             self.logger.info(f"Setting Filename={filename}")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.12{idx}", filename, OctetString, f"Filename ({filename})")
             
-            # 5. Set timing parameters
-            self.logger.info(f"Setting RepeatPeriod={repeat_period_ms}ms ({repeat_period_us} us)")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_us} us)")
+            # 5. Set timing parameters for FreeRunning mode
+            if trigger_mode == 2:
+                # RepeatPeriod: E6000 minimum is 50ms (50000 µs), granularity 50ms
+                repeat_period_us_validated = max(50000, repeat_period_us)
+                if repeat_period_us_validated != repeat_period_us:
+                    self.logger.warning(f"RepeatPeriod {repeat_period_us}µs is below E6000 minimum 50ms, using 50000µs")
+                
+                self.logger.info(f"Setting RepeatPeriod={repeat_period_us_validated}µs ({repeat_period_us_validated/1000}ms)")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us_validated, Unsigned32, f"Repeat Period ({repeat_period_us_validated} us)")
+                
+                self.logger.info(f"Setting FreeRunDuration={freerun_duration_ms}ms")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)")
             
-            self.logger.info(f"Setting FreeRunDuration={freerun_duration_ms}ms")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)")
-            
-            # 6. Set TriggerCount (for IdleSID/cmMAC modes)
-            self.logger.info(f"Setting TriggerCount={trigger_count}")
-            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})")
+            # 6. Set TriggerCount (ONLY for IdleSID/cmMAC trigger modes, NOT for FreeRunning)
+            if trigger_mode in (5, 6):
+                self.logger.info(f"Setting TriggerCount={trigger_count} (trigger mode {trigger_mode})")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})")
+            elif trigger_mode == 2:
+                self.logger.info("Skipping TriggerCount for FreeRunning mode (parameter ignored by CMTS)")
             
             # 7. Set DestinationIndex = 1 (use pre-configured TFTP destination)
             self.logger.info("Setting DestinationIndex=1 (pre-configured TFTP)")
