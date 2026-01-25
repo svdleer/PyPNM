@@ -49,9 +49,9 @@ class UtscCaptureParameters(BaseModel):
         description="Number of FFT bins. Non-TimeIQ: 200, 400, 800, 1600, 3200. TimeIQ: 256, 512, 1024, 2048"
     )
     filename: str = Field(
-        default="/pnm/utsc/utsc_capture",
+        default="utsc_capture",
         max_length=255,
-        description="Base filename. Use '/pnm/utsc/name' or just 'name'. Timestamp appended automatically."
+        description="Base filename (no path). Files saved to TFTP root. Timestamp appended automatically."
     )
     repeat_period_ms: int = Field(
         default=100,
@@ -107,8 +107,11 @@ class UtscCaptureParameters(BaseModel):
         if not v:
             raise ValueError("Filename cannot be empty")
         # E6000 accepts: "", "/pnm/utsc/filename", or "filename"
-        if not v.startswith('/'):
-            v = f"/pnm/utsc/{v}"
+        # We use just the filename - TFTP server expects files in /var/lib/tftpboot directly
+        if v.startswith('/pnm/utsc/'):
+            v = v.replace('/pnm/utsc/', '')
+        if v.startswith('/'):
+            v = v.lstrip('/')
         return v
     
     @model_validator(mode='after')
