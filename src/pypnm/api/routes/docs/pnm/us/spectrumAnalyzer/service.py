@@ -133,7 +133,11 @@ class CmtsUtscService:
             self.logger.info(f"Setting FreeRunDuration={freerun_duration_ms}ms")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)")
             
-            # 5. For CM MAC trigger mode (mode 6), set CM info
+            # 5. Set DestinationIndex = 1 (use pre-configured TFTP destination)
+            self.logger.info("Setting DestinationIndex=1 (pre-configured TFTP)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Unsigned32, "Destination Index (1)")
+            
+            # 6. For CM MAC trigger mode (mode 6), set CM info
             if trigger_mode == 6 and cm_mac:
                 self.logger.info(f"Setting CM MAC={cm_mac}")
                 await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, OctetString, f"CM MAC ({cm_mac})")
@@ -156,11 +160,11 @@ class CmtsUtscService:
         """Start UTSC capture with error handling"""
         try:
             self.logger.info(f"Starting UTSC capture for RF Port {self.rf_port_ifindex}")
-            # OID format: docsPnmCmtsUtscCtrlTable.docsPnmCmtsUtscCtrlEntry.Column1.{rfPort}.{cfgIdx}
-            # Test script uses: 1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.{rfPort}.{cfgIdx}
-            # UTSC_CTRL_BASE is 1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1 (docsPnmCmtsUtscCtrlEntry)
-            # We need: 1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.{rfPort}.{cfgIdx}
-            oid = f"{self.UTSC_CTRL_BASE}.{self.rf_port_ifindex}.{self.cfg_idx}"
+            # OID structure: docsPnmCmtsUtscCtrlTable.docsPnmCmtsUtscCtrlEntry.Column.{rfPort}.{cfgIdx}
+            # UTSC_CTRL_BASE = 1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1 (docsPnmCmtsUtscCtrlEntry)
+            # Column 1 = docsPnmCmtsUtscCtrlInitiateTest
+            # Full OID: {UTSC_CTRL_BASE}.1.{rfPort}.{cfgIdx} = 1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.1.{rf}.{idx}
+            oid = f"{self.UTSC_CTRL_BASE}.1.{self.rf_port_ifindex}.{self.cfg_idx}"
             
             if not await self._safe_snmp_set(oid, 1, Integer32, "Initiate UTSC Test"):
                 return {"success": False, "error": "Failed to initiate UTSC capture"}
