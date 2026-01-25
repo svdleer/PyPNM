@@ -9,13 +9,13 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, Field
 
-from pypnm.lib.types import BandwidthHz, ImginaryInt, PreEqAtdmaCoefficients, RealInt
 from pypnm.lib.constants import DOCSIS_ROLL_OFF_FACTOR
+from pypnm.lib.types import BandwidthHz, ImginaryInt, PreEqAtdmaCoefficients, RealInt
+from pypnm.pnm.analysis.atdma_group_delay import GroupDelayCalculator, GroupDelayModel
 from pypnm.pnm.analysis.atdma_preeq_key_metrics import (
     EqualizerMetrics,
     EqualizerMetricsModel,
 )
-from pypnm.pnm.analysis.atdma_group_delay import GroupDelayCalculator, GroupDelayModel
 
 
 class UsEqTapModel(BaseModel):

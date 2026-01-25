@@ -10,14 +10,13 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, Field
 
+from pypnm.lib.constants import DOCSIS_ROLL_OFF_FACTOR
 from pypnm.lib.types import (
     BandwidthHz,
     FloatSeries,
     Microseconds,
     PreEqAtdmaCoefficients,
 )
-
-from pypnm.lib.constants import DOCSIS_ROLL_OFF_FACTOR
 
 MIN_CHANNEL_WIDTH_HZ: BandwidthHz = BandwidthHz(0)
 MIN_TAPS_PER_SYMBOL: int = 0

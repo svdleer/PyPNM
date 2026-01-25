@@ -67,7 +67,13 @@ from pypnm.lib.constants import DEFAULT_SPECTRUM_ANALYZER_INDICES
 from pypnm.lib.inet import Inet
 from pypnm.lib.inet_utils import InetGenerate
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import BandwidthHz, ChannelId, EntryIndex, FrequencyHz, InterfaceIndex
+from pypnm.lib.types import (
+    BandwidthHz,
+    ChannelId,
+    EntryIndex,
+    FrequencyHz,
+    InterfaceIndex,
+)
 from pypnm.lib.utils import Generate
 from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
 from pypnm.pnm.data_type.DocsIf3CmSpectrumAnalysisCtrlCmd import (

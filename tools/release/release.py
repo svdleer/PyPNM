@@ -662,6 +662,26 @@ def _run_tests() -> None:
     _print_status("Tests", "pass")
 
 
+def _run_ruff_check(skip_failures: bool) -> None:
+    """Run ruff check against src before finalizing the release."""
+    if shutil.which("ruff") is None:
+        print("ERROR: ruff is not available in PATH. Aborting release.", file=sys.stderr)
+        _print_status("Ruff check", "fail")
+        if skip_failures:
+            return
+        sys.exit(1)
+
+    print("Running ruff check (src)...")
+    result = _run(["ruff", "check", "src"], check=False, label="ruff-check")
+    if result.returncode != 0:
+        print("ERROR: ruff check failed. Aborting release.", file=sys.stderr)
+        _print_status("Ruff check", "fail")
+        if skip_failures:
+            return
+        sys.exit(result.returncode)
+    _print_status("Ruff check", "pass")
+
+
 def _run_repo_hygiene_checks() -> None:
     """Run pre-release hygiene checks (secrets, MAC address scans, etc.)."""
     checks: list[tuple[str, list[str]]] = [
@@ -795,6 +815,11 @@ def main() -> None:
         help="Skip running pytest before committing and tagging.",
     )
     parser.add_argument(
+        "--ruff-check-skip-failures",
+        action="store_true",
+        help="Allow release to continue if ruff check fails.",
+    )
+    parser.add_argument(
         "--skip-docker-test",
         action="store_true",
         help="Skip local docker build/smoke preflight (tools/local/local_container_build.sh).",
@@ -831,6 +856,7 @@ def main() -> None:
     branch: str                  = args.branch
     tag_prefix: str              = args.tag_prefix
     skip_tests: bool             = args.skip_tests
+    ruff_check_skip_failures: bool = args.ruff_check_skip_failures
     skip_docker: bool            = args.skip_docker_test
     skip_k8s: bool               = args.skip_k8s_test
     dry_run: bool                = args.dry_run
@@ -993,6 +1019,8 @@ def main() -> None:
         _checkout_and_pull(branch)
 
     report_commit = _get_head_commit()
+
+    _run_ruff_check(ruff_check_skip_failures)
 
     print(f"Bumping version: {current_version} -> {new_version}")
     _bump_version(new_version)
