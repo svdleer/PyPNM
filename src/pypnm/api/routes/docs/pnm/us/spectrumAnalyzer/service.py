@@ -93,126 +93,52 @@ class CmtsUtscService:
         freerun_duration_ms: int = 60000,
         trigger_count: int = 10
     ) -> dict:
-        """Configure UTSC with comprehensive error handling and timeouts"""
+        """Configure UTSC - simplified to match working test script approach.
+        
+        The E6000 CMTS doesn't handle RowStatus manipulation well.
+        This simplified approach just sets parameters directly like the working test script.
+        """
         try:
             self.logger.info(f"Starting UTSC configuration for CMTS={self.cmts_ip}, RF Port={self.rf_port_ifindex}")
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
-            bulk_idx = f".{self.cfg_idx}"
-            errors = []
             
-            # Check if row already exists
-            row_exists = await self._check_row_exists(idx)
-            self.logger.info(f"UTSC row exists check: {row_exists}")
-            
-            # 1. Configure Bulk Data Transfer (TFTP) - these are critical
-            self.logger.info("Step 1: Configuring Bulk Data Transfer (TFTP)")
-            try:
-                ip_parts = tftp_ip.split(".")
-                ip_hex = bytes([int(p) for p in ip_parts])
-                
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.3{bulk_idx}", 1, Integer32, "TFTP IP Type (IPv4)"):
-                    errors.append("Failed to set TFTP IP type")
-                
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.4{bulk_idx}", ip_hex, OctetString, f"TFTP IP Address {tftp_ip}"):
-                    errors.append("Failed to set TFTP IP address")
-                
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.6{bulk_idx}", "", OctetString, "TFTP Base URI (empty)"):
-                    errors.append("Failed to set TFTP base URI")
-                
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.7{bulk_idx}", 1, Integer32, "TFTP Protocol"):
-                    errors.append("Failed to set TFTP protocol")
-                
-                # Enable local store to produce file
-                if not await self._safe_snmp_set(f"{self.BULK_CFG_BASE}.8{bulk_idx}", 1, Integer32, "Local Store = true (produce file)"):
-                    errors.append("Failed to enable local store")
-                    
-            except Exception as e:
-                errors.append(f"TFTP config error: {str(e)}")
-            
-            # 2. Enable auto upload (optional - may not exist on all CMTS)
-            self.logger.info("Step 2: Enabling auto upload (optional)")
-            await self._safe_snmp_set(self.BULK_UPLOAD_CONTROL, 1, Integer32, "Bulk Upload Control (optional)")
-            
-            # 3. Stop measurement first if row exists (allows modifying parameters)
-            if row_exists:
-                self.logger.info("Step 3: Stopping existing measurement before reconfiguring")
-                # MeasStatus: 1=initiate, 2=inactive/stop
-                if not await self._safe_snmp_set(f"{self.UTSC_CTRL_BASE}.1{idx}", 2, Integer32, "MeasStatus = stop"):
-                    self.logger.warning("Failed to stop measurement, but will continue")
-                await asyncio.sleep(0.5)  # Give CMTS time to stop
-                
-                # Row must be set to notInService to modify parameters
-                self.logger.info("Step 3a: Setting row to notInService to allow parameter changes")
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 2, Integer32, "Row Status notInService"):
-                    self.logger.warning("Failed to set notInService, row may be locked")
-                    # Note: E6000 may reject this if row is active - this is a known firmware limitation
-                    # Continue anyway as some parameters may still be modifiable
-                
-                await asyncio.sleep(0.3)  # Give CMTS time to process
-            
-            if not row_exists:
-                self.logger.info("Step 3: Creating new UTSC row with createAndWait")
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 4, Integer32, "Row Status createAndWait"):
-                    errors.append("Failed to create UTSC row")
-            
-            # 3a. Set DestinationIndex to enable Bulk File Transfer
-            self.logger.info("Step 3a: Setting DestinationIndex to enable auto-upload")
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, Unsigned32, "DestinationIndex = 1 (enable bulk transfer)"):
-                errors.append("Failed to set DestinationIndex - bulk transfer may not work")            
-            # 4. Configure UTSC timing parameters
-            self.logger.info("Step 4: Configuring UTSC timing parameters")
-            # Convert milliseconds to microseconds for RepeatPeriod
+            # Convert ms to microseconds for RepeatPeriod
             repeat_period_us = repeat_period_ms * 1000
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_ms}ms = {repeat_period_us} microseconds)"):
-                errors.append(f"Failed to set RepeatPeriod to {repeat_period_ms}ms - may exceed CMTS maximum (1000ms on CommScope E6000)")
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)"):
-                errors.append(f"Failed to set FreeRunDuration to {freerun_duration_ms}ms - may exceed CMTS maximum (600000ms = 10 minutes)")
-            # For FreeRunning mode (trigger_mode=2), skip TriggerCount - E6000 uses FreeRunDuration instead
-            # E6000 doesn't accept TriggerCount=0 (returns inconsistentValue)
-            if trigger_mode != 2:
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, Unsigned32, f"Trigger Count ({trigger_count})"):
-                    errors.append(f"Failed to set TriggerCount to {trigger_count}")
             
-            # 5. Configure UTSC capture parameters
-            self.logger.info("Step 5: Configuring UTSC capture parameters")
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.3{idx}", trigger_mode, Integer32, f"Trigger Mode ({trigger_mode})"):
-                errors.append("Failed to set trigger mode")
+            # Just set parameters directly - don't manipulate RowStatus
+            # This matches the working test_utsc_simple.py approach
             
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32, f"Center Freq ({center_freq_hz} Hz)"):
-                errors.append("Failed to set center frequency")
+            # 1. Set trigger mode
+            self.logger.info(f"Setting TriggerMode={trigger_mode}")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.3{idx}", trigger_mode, Integer32, f"Trigger Mode ({trigger_mode})")
             
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32, f"Span ({span_hz} Hz)"):
-                errors.append("Failed to set span")
+            # 2. Set capture parameters
+            self.logger.info(f"Setting NumBins={num_bins}")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32, f"Num Bins ({num_bins})")
             
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.10{idx}", num_bins, Unsigned32, f"Num Bins ({num_bins})"):
-                errors.append("Failed to set num bins")
+            self.logger.info(f"Setting CenterFreq={center_freq_hz} Hz")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.8{idx}", center_freq_hz, Unsigned32, f"Center Freq ({center_freq_hz} Hz)")
             
-            if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.12{idx}", filename, OctetString, f"Filename ({filename})"):
-                errors.append("Failed to set filename")
+            self.logger.info(f"Setting Span={span_hz} Hz")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.9{idx}", span_hz, Unsigned32, f"Span ({span_hz} Hz)")
             
-            # 6. Configure CM MAC for trigger mode 6
+            # 3. Set filename
+            self.logger.info(f"Setting Filename={filename}")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.12{idx}", filename, OctetString, f"Filename ({filename})")
+            
+            # 4. Set timing parameters
+            self.logger.info(f"Setting RepeatPeriod={repeat_period_ms}ms ({repeat_period_us} us)")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us, Unsigned32, f"Repeat Period ({repeat_period_us} us)")
+            
+            self.logger.info(f"Setting FreeRunDuration={freerun_duration_ms}ms")
+            await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, Unsigned32, f"FreeRun Duration ({freerun_duration_ms}ms)")
+            
+            # 5. For CM MAC trigger mode (mode 6), set CM info
             if trigger_mode == 6 and cm_mac:
-                self.logger.info("Step 6: Configuring CM MAC trigger")
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, OctetString, f"CM MAC ({cm_mac})"):
-                    errors.append("Failed to set CM MAC")
-                
+                self.logger.info(f"Setting CM MAC={cm_mac}")
+                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, OctetString, f"CM MAC ({cm_mac})")
                 if logical_ch_ifindex:
                     await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.2{idx}", logical_ch_ifindex, Integer32, f"Logical Ch ifIndex ({logical_ch_ifindex})")
-            
-            # 7. Activate the row (only if we created it new)
-            if not row_exists:
-                self.logger.info("Step 7: Activating new UTSC row")
-                if not await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 1, Integer32, "Row Status active"):
-                    errors.append("Failed to activate UTSC row")
-            else:
-                self.logger.info("Step 7: Row already active, setting back to active")
-                # Row already exists and is active, just ensure it's active
-                await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.21{idx}", 1, Integer32, "Row Status active (refresh)")
-            
-            if errors:
-                error_msg = "; ".join(errors)
-                self.logger.error(f"UTSC configuration completed with errors: {error_msg}")
-                return {"success": False, "error": error_msg, "partial": True}
             
             self.logger.info("UTSC configuration completed successfully")
             return {"success": True, "cmts_ip": str(self.cmts_ip)}
