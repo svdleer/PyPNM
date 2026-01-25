@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 from __future__ import annotations
 
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from pypnm.config.system_config_settings import SystemConfigSettings
+from pypnm.lib.db.json_file_lock import JsonFileLock
 from pypnm.lib.constants import cast
 from pypnm.lib.types import GroupId, OperationId
 
@@ -65,6 +66,9 @@ class OperationManager:
             Dict of operation mappings, or empty dict on parse error.
         """
         try:
+            if not self.db_path.exists():
+                self._atomic_write({})
+                return {}
             with self.db_path.open("r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
@@ -111,15 +115,16 @@ class OperationManager:
                 f"CaptureGroup '{self.capture_group_id}' does not exist"
             )
 
-        db = self._load()
-        db[self.operation_id] = {
-            "capture_group_id": self.capture_group_id,
-            "created": int(time.time())
-        }
-        self._save(db)
-        self.logger.info(
-            f"Registered operation {self.operation_id} for group {self.capture_group_id}"
-        )
+        with JsonFileLock(self.db_path):
+            db = self._load()
+            db[self.operation_id] = {
+                "capture_group_id": self.capture_group_id,
+                "created": int(time.time())
+            }
+            self._save(db)
+            self.logger.info(
+                f"Registered operation {self.operation_id} for group {self.capture_group_id}"
+            )
         return self.operation_id
 
     @classmethod
@@ -140,8 +145,9 @@ class OperationManager:
             db_str = SystemConfigSettings.operation_db()
             db_path = Path(db_str)
         try:
-            with db_path.open("r", encoding="utf-8") as f:
-                db = json.load(f)
+            with JsonFileLock(db_path):
+                with db_path.open("r", encoding="utf-8") as f:
+                    db = json.load(f)
             rec = db.get(operation_id)
             return rec.get("capture_group_id") if isinstance(rec, dict) else None
         except Exception as e:
@@ -164,8 +170,9 @@ class OperationManager:
             db_str = SystemConfigSettings.operation_db()
             db_path = Path(db_str)
         try:
-            with db_path.open("r", encoding="utf-8") as f:
-                return list(json.load(f).keys())
+            with JsonFileLock(db_path):
+                with db_path.open("r", encoding="utf-8") as f:
+                    return list(json.load(f).keys())
         except Exception as e:
             logging.getLogger(cls.__name__).error(f"Error listing operations: {e}")
             return []

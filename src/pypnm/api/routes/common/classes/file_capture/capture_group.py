@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from pypnm.config.system_config_settings import SystemConfigSettings
+from pypnm.lib.db.json_file_lock import JsonFileLock
 from pypnm.lib.types import GroupId, TransactionId
 
 
@@ -131,59 +132,71 @@ class CaptureGroup:
         Returns the group ID.
         """
         gid = self.get_group_id()
-        if gid not in self._db:
-            self._db[gid] = {"created": int(time.time()), "transactions": []}
-            self._save_db()
-            self.logger.info(f"Created new group: {gid}")
-        else:
-            self.logger.debug(f"Group {gid} already exists")
+        with JsonFileLock(self.db_path):
+            self._load_db()
+            if gid not in self._db:
+                self._db[gid] = {"created": int(time.time()), "transactions": []}
+                self._save_db()
+                self.logger.info(f"Created new group: {gid}")
+            else:
+                self.logger.debug(f"Group {gid} already exists")
         return gid
 
-    def add_transaction(self, txn_id: str) -> None:
+    def add_transaction(self, txn_id: TransactionId) -> None:
         """
         Append a transaction ID to this group, saving the DB.
         Raises ValueError if group missing.
         """
         gid = self.get_group_id()
-        if gid not in self._db:
-            raise ValueError("Group not found; create_group() first")
-        txns = self._db[gid].setdefault("transactions", [])
-        if txn_id not in txns:
-            txns.append(txn_id)
-            self._save_db()
-            self.logger.debug(f"Added txn {txn_id} to group {gid}")
+        with JsonFileLock(self.db_path):
+            self._load_db()
+            if gid not in self._db:
+                raise ValueError("Group not found; create_group() first")
+            txns = self._db[gid].setdefault("transactions", [])
+            if txn_id not in txns:
+                txns.append(txn_id)
+                self._save_db()
+                self.logger.debug(f"Added txn {txn_id} to group {gid}")
 
     def getTransactionIds(self) -> list[TransactionId]:
         """
         Return all transaction IDs for this group (empty list if none).
         """
-        return list(self._db.get(self.get_group_id(), {}).get("transactions", []))
+        with JsonFileLock(self.db_path):
+            self._load_db()
+            return list(self._db.get(self.get_group_id(), {}).get("transactions", []))
 
     def delete_group(self) -> None:
         """
         Remove this group and its transactions from the DB; resets group ID.
         """
         gid = self.get_group_id()
-        if gid in self._db:
-            del self._db[gid]
-            self._save_db()
-            self.logger.info(f"Deleted group: {gid}")
+        with JsonFileLock(self.db_path):
+            self._load_db()
+            if gid in self._db:
+                del self._db[gid]
+                self._save_db()
+                self.logger.info(f"Deleted group: {gid}")
         self._grp_id = None
 
-    def list_groups(self) -> list[str]:
+    def list_groups(self) -> list[GroupId]:
         """
         List all group IDs currently in the DB.
         """
-        return list(self._db.keys())
+        with JsonFileLock(self.db_path):
+            self._load_db()
+            return list(self._db.keys())
 
     def prune_older_than(self, seconds: int) -> None:
         """
         Remove groups older than the given age (seconds).
         """
         cutoff = int(time.time()) - seconds
-        to_delete = [gid for gid, info in self._db.items() if info.get("created", 0) < cutoff]
-        for gid in to_delete:
-            del self._db[gid]
-        if to_delete:
-            self._save_db()
-            self.logger.info(f"Pruned groups: {to_delete}")
+        with JsonFileLock(self.db_path):
+            self._load_db()
+            to_delete = [gid for gid, info in self._db.items() if info.get("created", 0) < cutoff]
+            for gid in to_delete:
+                del self._db[gid]
+            if to_delete:
+                self._save_db()
+                self.logger.info(f"Pruned groups: {to_delete}")
