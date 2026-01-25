@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ import math
 from typing import cast
 
 from pypnm.api.routes.advance.common.capture_service import AbstractCaptureService
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
+)
 from pypnm.api.routes.common.extended.common_messaging_service import MessageResponse
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.api.routes.docs.pnm.ds.ofdm.fec_summary.service import (
@@ -42,7 +45,8 @@ class MultiRxMerService(AbstractCaptureService):
     """
     def __init__(self, cm: CableModem, duration: float, interval: float,
                  tftp_servers: tuple[Inet, Inet] = PnmConfigManager.get_tftp_servers(),
-                 tftp_path: str = PnmConfigManager.get_tftp_path()) -> None:
+                 tftp_path: str = PnmConfigManager.get_tftp_path(),
+                 interface_parameters: DownstreamOfdmParameters | None = None,) -> None:
         """
         Initialize the MultiRxMerService.
 
@@ -56,6 +60,7 @@ class MultiRxMerService(AbstractCaptureService):
         self.tftp_servers = tftp_servers
         self.tftp_path = tftp_path
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._interface_parameters = interface_parameters
 
     async def _capture_message_response(self) -> MessageResponse:
         """
@@ -70,8 +75,11 @@ class MultiRxMerService(AbstractCaptureService):
             - Validates payload type and entry contents.
         """
         try:
-            msg_rsp: MessageResponse = \
-                await CmDsOfdmRxMerService(self.cm, self.tftp_servers, self.tftp_path).set_and_go()
+            msg_rsp: MessageResponse = await CmDsOfdmRxMerService(
+                self.cm,
+                self.tftp_servers,
+                self.tftp_path,
+            ).set_and_go(interface_parameters=self._interface_parameters)
 
         except Exception as exc:
             err_msg = f"Exception during RxMER SNMP/TFTP operation: {exc}"
@@ -106,7 +114,8 @@ class MultiRxMer_Ofdm_Performance_1_Service(AbstractCaptureService):
     def __init__(self, cm: CableModem,
                 tftp_servers: tuple[Inet, Inet] = PnmConfigManager.get_tftp_servers(),
                 tftp_path: str = PnmConfigManager.get_tftp_path(),
-                duration: float = 1, interval: float = 1) -> None:
+                duration: float = 1, interval: float = 1,
+                interface_parameters: DownstreamOfdmParameters | None = None,) -> None:
         """
         Initialize the MultiRxMerService.
 
@@ -122,6 +131,7 @@ class MultiRxMer_Ofdm_Performance_1_Service(AbstractCaptureService):
         self.tftp_path = tftp_path
         self._half_life = math.ceil(self.duration/2)
         self._mod_profile_done = False
+        self._interface_parameters = interface_parameters
 
         MIN_10 = 600
         self._fec_thresholds = list(range(int(self.duration), -1, -MIN_10))
@@ -160,8 +170,11 @@ class MultiRxMer_Ofdm_Performance_1_Service(AbstractCaptureService):
 
         # First, perform the primary RxMER capture
         try:
-            msg_rsp: MessageResponse = \
-                await CmDsOfdmRxMerService(self.cm, self.tftp_servers, self.tftp_path).set_and_go()
+            msg_rsp: MessageResponse = await CmDsOfdmRxMerService(
+                self.cm,
+                self.tftp_servers,
+                self.tftp_path,
+            ).set_and_go(interface_parameters=self._interface_parameters)
         except Exception as exc:
             self.logger.error(f"Exception during RxMER capture: {exc}", exc_info=True)
             return MessageResponse(ServiceStatusCode.DS_OFDM_RXMER_NOT_AVAILABLE)
@@ -172,7 +185,11 @@ class MultiRxMer_Ofdm_Performance_1_Service(AbstractCaptureService):
 
             self.logger.info(f'Collecting a Modulation Profile @ {time_remaining}s')
             try:
-                msg_rsp = await CmDsOfdmModProfileService(self.cm, self.tftp_servers, self.tftp_path).set_and_go()
+                msg_rsp = await CmDsOfdmModProfileService(
+                    self.cm,
+                    self.tftp_servers,
+                    self.tftp_path,
+                ).set_and_go(interface_parameters=self._interface_parameters)
 
             except Exception as exc:
                 self.logger.error(f"Exception during ModProfile capture: {exc}", exc_info=True)
@@ -195,9 +212,12 @@ class MultiRxMer_Ofdm_Performance_1_Service(AbstractCaptureService):
                 self.logger.info(f'Collecting a FEC Summary @ TimeRemaining={time_remaining}s (threshold={thresh})')
 
                 try:
-                    msg_rsp = await CmDsOfdmFecSummaryService(self.cm, FecSummaryType.TEN_MIN,
-                                                              tftp_servers = self.tftp_servers,
-                                                              tftp_path = self.tftp_path).set_and_go()
+                    msg_rsp = await CmDsOfdmFecSummaryService(
+                        self.cm,
+                        FecSummaryType.TEN_MIN,
+                        tftp_servers=self.tftp_servers,
+                        tftp_path=self.tftp_path,
+                    ).set_and_go(interface_parameters=self._interface_parameters)
 
                 except Exception as exc:
                     self.logger.error(f"Exception during FEC summary: {exc}", exc_info=True)

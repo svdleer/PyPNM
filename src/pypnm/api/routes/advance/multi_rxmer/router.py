@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Maurice Garcia
+# Copyright (c) 2025-2026 Maurice Garcia
 
 from __future__ import annotations
 
@@ -48,6 +48,9 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.snmp.schemas import
 from pypnm.api.routes.common.classes.operation.cable_modem_precheck import (
     CableModemServicePreCheck,
 )
+from pypnm.api.routes.common.extended.common_measure_schema import (
+    DownstreamOfdmParameters,
+)
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.api.routes.docs.pnm.files.service import FileType, PnmFileService
 from pypnm.config.system_config_settings import SystemConfigSettings
@@ -55,7 +58,7 @@ from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.fastapi_constants import FAST_API_RESPONSE
 from pypnm.lib.inet import Inet, InetAddressStr
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import GroupId, MacAddressStr, OperationId
+from pypnm.lib.types import ChannelId, GroupId, MacAddressStr, OperationId
 
 
 class MultiRxMerRouter(AbstractService):
@@ -124,6 +127,8 @@ class MultiRxMerRouter(AbstractService):
             tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
             duration = request.capture.parameters.measurement_duration
             interval = request.capture.parameters.sample_interval
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
+            interface_parameters = self._resolve_interface_parameters(channel_ids)
 
             measure_modes = request.measure.mode
             msg:str = ""
@@ -151,7 +156,8 @@ class MultiRxMerRouter(AbstractService):
                     cable_modem,
                     tftp_servers,
                     duration=duration,
-                    interval=interval,)
+                    interval=interval,
+                    interface_parameters=interface_parameters,)
 
             elif measure_modes == MultiRxMerMeasureModes.OFDM_PERFORMANCE_1:
                 msg=f'Starting Multi-RxMER-OFDM-Performance-1 capture for MAC={mac_address}'
@@ -161,7 +167,8 @@ class MultiRxMerRouter(AbstractService):
                     cable_modem,
                     tftp_servers,
                     duration=duration,
-                    interval=interval,)
+                    interval=interval,
+                    interface_parameters=interface_parameters,)
 
             else:
                 self.logger.error(f'Invalid Measure Mode Selected: ({measure_modes})')
@@ -466,6 +473,14 @@ class MultiRxMerRouter(AbstractService):
                     status      =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
                     message     =   f"Unsupported output type: {output_type}",
                     data        =   {},)
+
+    @staticmethod
+    def _resolve_interface_parameters(
+        channel_ids: list[ChannelId] | None,
+    ) -> DownstreamOfdmParameters | None:
+        if not channel_ids:
+            return None
+        return DownstreamOfdmParameters(channel_id=list(channel_ids))
 
 # For dynamic auto-registration
 router = MultiRxMerRouter().router
