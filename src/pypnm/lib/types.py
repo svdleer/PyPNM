@@ -188,6 +188,10 @@ RemoteDirEntries: TypeAlias = list[RemoteDirEntry]
 
 STATUS:TypeAlias = bool
 
+RealInt = NewType("RealInt", int)
+ImginaryInt  = NewType("ImginaryInt", int)
+PreEqAtdmaCoefficients = tuple[RealInt,ImginaryInt]
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Explicit public surface
 # ────────────────────────────────────────────────────────────────────────────────

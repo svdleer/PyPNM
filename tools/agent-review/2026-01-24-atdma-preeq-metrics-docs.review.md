@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Document equalizer metrics and frequency response fields for ATDMA pre-equalization.
+- Changes: Add metrics and frequency response field tables plus DC normalization note.
+- Files: docs/api/fast-api/single/us/atdma/chan/stats.md
+- Tests: python3 -m compileall src; ruff check src; ruff format --check . (fails: repo drift); pytest -q
+- Notes: Ruff format would reformat many existing files; no formatting applied.
+
+# FILE: docs/api/fast-api/single/us/atdma/chan/stats.md
 # DOCSIS 3.0 Upstream ATDMA Channel Statistics
 
 Provides Access To DOCSIS 3.0 Upstream SC-QAM (ATDMA) Channel Statistics.

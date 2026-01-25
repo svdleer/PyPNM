@@ -1,3 +1,904 @@
+## Agent Review Bundle Summary
+- Goal: Preserve raw SNMP OctetString bytes for upstream pre-eq decoding and document raw hex output.
+- Changes: Added octet-to-bytes normalization; switched pre-eq fetch to bytes path; adjusted lock helper structure; added regression tests for hex integrity; documented raw octet preservation in ATDMA stats docs.
+- Files: src/pypnm/snmp/snmp_v2c.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/lib/db/json_file_lock.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/api/routes/advance/common/operation_manager.py; tests/test_us_eq_octetstring_bytes.py; docs/api/fast-api/single/us/atdma/chan/stats.md.
+- Tests: python3 -m compileall src; ruff check src; ruff format --check . (fails: existing repo drift); pytest -q.
+- Notes: No downstream API schema change; pre-eq payload_hex now reflects raw octets.
+
+# FILE: src/pypnm/snmp/snmp_v2c.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import AsyncIterable
+from datetime import datetime, timedelta, timezone
+from typing import TypeVar
+
+from pysnmp.hlapi.v3arch.asyncio import (
+    CommunityData,
+    ContextData,
+    ObjectIdentity,
+    ObjectType,
+    SnmpEngine,
+    UdpTransportTarget,
+    bulk_cmd,
+    get_cmd,
+    set_cmd,
+    walk_cmd,
+)
+from pysnmp.proto.rfc1902 import Integer32, OctetString
+
+from pypnm.config.pnm_config_manager import SystemConfigSettings
+from pypnm.lib.constants import T
+from pypnm.lib.inet import Inet
+from pypnm.lib.inet_utils import InetGenerate
+from pypnm.lib.types import (
+    InetAddressStr,
+    InterfaceIndex,
+    SnmpIndex,
+    SnmpReadCommunity,
+    SnmpWriteCommunity,
+)
+from pypnm.snmp.compiled_oids import COMPILED_OIDS
+from pypnm.snmp.modules import InetAddressType
+
+
+class Snmp_v2c:
+    """
+    SNMPv2c Client for asynchronous GET, SET, and WALK operations.
+
+    Attributes:
+        host (str): Hostname or IP address of the SNMP agent.
+        port (int): Port number used for SNMP (default is 161).
+        read_community (str): Community string for SNMP GET/WALK (default from config).
+        write_community (str): Community string for SNMP SET (default from config).
+        _snmp_engine (SnmpEngine): Instance of pysnmp SnmpEngine.
+
+    Class Attributes:
+        COMPILE_MIBS (bool): Whether to compile MIBs for OID resolution.
+        SNMP_PORT (int): Default SNMP port.
+
+    Example:
+        >>> snmp = Snmp_v2c(Inet('192.168.1.1'), community='public')
+        >>> await snmp.get('1.3.6.1.2.1.1.1.0')
+        >>> await snmp.walk('1.3.6.1.2.1.2')
+        >>> await snmp.set('1.3.6.1.2.1.1.5.0', 'NewHostName')
+        >>> snmp.close()
+    """
+
+    DISABLE = 1
+    ENABLE = 2
+
+    TRUE = 1
+    FALSE = 2
+
+    SNMP_PORT = 161
+
+    def __init__(
+        self,
+        host: Inet,
+        community: str | None = None,
+        read_community: SnmpReadCommunity | None = None,
+        write_community: SnmpWriteCommunity | None = None,
+        port: int = SNMP_PORT,
+        timeout: int = SystemConfigSettings.snmp_timeout(),
+        retries: int = SystemConfigSettings.snmp_retries(),
+    ) -> None:
+        """
+        Initializes the SNMPv2c client.
+
+        Args:
+            host (Inet): Host address of the SNMP device.
+            community (str | None): Legacy community string for SNMP access.
+            read_community (SnmpReadCommunity | None): Read community string override.
+            write_community (SnmpWriteCommunity | None): Write community string override.
+            port (int): SNMP port (default 161).
+        """
+        self.logger     = logging.getLogger(self.__class__.__name__)
+        self._host      = host.inet
+        self._port      = port
+        if read_community is not None:
+            self._read_community = str(read_community)
+        elif community is not None:
+            self._read_community = str(community)
+        else:
+            self._read_community = str(SystemConfigSettings.snmp_read_community())
+
+        if write_community is not None:
+            self._write_community = str(write_community)
+        elif community is not None:
+            self._write_community = str(community)
+        else:
+            self._write_community = str(SystemConfigSettings.snmp_write_community())
+
+        if self._write_community == "":
+            self._write_community = self._read_community
+        self._timeout   = timeout
+        self._retries   = retries
+        self._snmp_engine = SnmpEngine()
+
+    async def get(
+        self,
+        oid: str | tuple[str, str, int],
+        timeout: float | None = None,
+        retries: int | None = None,
+    ) -> list[ObjectType] | None:
+        """
+        Perform an SNMP GET operation.
+
+        Notes
+        -----
+        `timeout` for UdpTransportTarget.create(...) is in **seconds**, not milliseconds.
+
+        Args:
+            oid: OID to fetch, either as a numeric string, symbolic name, or tuple.
+            timeout: Request timeout in **seconds**. If None, uses self._timeout.
+            retries: Number of retries. If None, uses self._retries.
+
+        Returns:
+            Optional[List[ObjectType]]: List of SNMP variable bindings or None if no result.
+
+        Raises:
+            RuntimeError: On SNMP errors (transport/protocol).
+        """
+        self.logger.debug(f"Input OID: {oid}, timeout: {timeout}, retries: {retries}")
+
+        resolved_oid = Snmp_v2c.resolve_oid(oid)
+        obj = ObjectType(self._to_object_identity(resolved_oid))
+
+        timeout_s = float(timeout if timeout is not None else self._timeout)
+        retries_n = int(retries if retries is not None else self._retries)
+
+        errorIndication, errorStatus, errorIndex, varBinds = await get_cmd(
+            self._snmp_engine,
+            CommunityData(self._read_community, mpModel=1),
+            await UdpTransportTarget.create((self._host, self._port),
+                                            timeout=timeout_s,     # seconds
+                                            retries=retries_n,     # count
+                                            ),
+            ContextData(),
+            obj,
+        )
+
+        try:
+            self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
+        except Exception as e:
+            self.logger.error(f"Failed GET for OID {resolved_oid}: {e}")
+
+        return varBinds
+
+    async def walk(self, oid: str | tuple[str, str, int]) -> list[ObjectType] | None:
+        """
+        Perform an SNMP WALK operation.
+
+        Args:
+            oid (str | Tuple[str, str, int]): The starting OID for the walk.
+
+        Returns:
+            Optional[List[ObjectType]]: List of walked SNMP ObjectTypes, or None if no results.
+        """
+        self.logger.debug(f"Starting SNMP WALK with OID: {oid}")
+        oid = Snmp_v2c.resolve_oid(oid)
+        self.logger.debug(f"Converted: {oid}")
+
+        identity = self._to_object_identity(oid)
+        obj = ObjectType(identity)
+        results: list[ObjectType] = []
+
+        transport = await UdpTransportTarget.create((self._host, self._port),
+                                                    timeout=self._timeout,
+                                                    retries=self._retries)
+
+        objects = walk_cmd(
+            self._snmp_engine,
+            CommunityData(self._read_community, mpModel=1),
+            transport,
+            ContextData(),
+            obj
+        )
+
+        async for item in objects:
+
+            errorIndication, errorStatus, errorIndex, varBinds = item
+
+            try:
+                self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
+
+            except Exception as e:
+                self.logger.error(f"Failed walk : {e}")
+                continue
+
+            if not varBinds:
+                continue
+
+            for varBind in varBinds:
+                oid_str = str(varBind[0])
+
+                if not self._is_oid_in_subtree(oid_str, str(identity)):
+                    self.logger.debug(f"End of OID subtree reached at {oid_str} -> {varBind} - List size {len(results)}")
+                    return results if results else None
+
+                results.append(varBind)
+
+        self.logger.debug(f'List size {len(results)}')
+
+        return results if results else None
+
+    async def bulk_walk(
+        self,
+        oid: str | tuple[str, str, int],
+        non_repeaters: int = 0,
+        max_repetitions: int = 25,
+        suppress_no_such_name: bool = True,
+    ) -> list[ObjectType] | None:
+        """
+        Perform an SNMP GETBULK operation (faster alternative to WALK).
+
+        GETBULK is an SNMPv2c/v3 operation that retrieves multiple variables
+        in a single request, making it significantly faster than traditional
+        WALK operations for large tables.
+
+        Args:
+            oid (str | Tuple[str, str, int]): The starting OID for the bulk walk.
+            non_repeaters (int): Number of OIDs from the start that should not be repeated.
+                                 Default is 0 (repeat all).
+            max_repetitions (int): Maximum number of repetitions for repeating variables.
+                                   Default is 25. Higher values = fewer requests but
+                                   larger packets. Typical range: 10-50.
+
+        Returns:
+            Optional[List[ObjectType]]: List of SNMP ObjectTypes retrieved, or None if no results.
+
+        Notes:
+            - GETBULK is more efficient than WALK for large MIB tables
+            - Not supported by SNMPv1 agents (will fall back to WALK)
+            - max_repetitions should be tuned based on network conditions:
+              * Small networks: 25-50
+              * Large/slow networks: 10-25
+              * Very fast networks: 50-100
+        """
+        oid = Snmp_v2c.resolve_oid(oid)
+
+        identity = self._to_object_identity(oid)
+        attempt_values: list[int] = []
+        for value in [max_repetitions, 10, 5, 1]:
+            if value > 0 and value not in attempt_values:
+                attempt_values.append(value)
+
+        last_error: str | None = None
+
+        for attempt in attempt_values:
+            self.logger.debug(
+                f"Starting SNMP BULK WALK with OID: {oid}, non_repeaters={non_repeaters}, max_repetitions={attempt}"
+            )
+            obj = ObjectType(identity)
+            results: list[ObjectType] = []
+            retry = False
+            hard_error = False
+
+            transport = await UdpTransportTarget.create(
+                (self._host, self._port),
+                timeout=self._timeout,
+                retries=self._retries
+            )
+
+            objects = await bulk_cmd(
+                self._snmp_engine,
+                CommunityData(self._read_community, mpModel=1),
+                transport,
+                ContextData(),
+                non_repeaters,
+                attempt,
+                obj
+            )
+
+            def _process_item(
+                item: tuple[object, object, object, list[ObjectType]],
+                attempt_value: int,
+                identity_value: object,
+                results_list: list[ObjectType],
+            ) -> tuple[bool, bool, bool, str | None]:
+                errorIndication, errorStatus, errorIndex, varBinds = item
+
+                if errorIndication or errorStatus:
+                    status_text = ""
+                    if errorStatus:
+                        pretty = getattr(errorStatus, "prettyPrint", None)
+                        status_text = pretty() if callable(pretty) else str(errorStatus)
+                    error_message = status_text or str(errorIndication)
+
+                    if status_text == "tooBig":
+                        self.logger.warning(
+                            f"Bulk walk tooBig with max_repetitions={attempt_value}; retrying with smaller value."
+                        )
+                        return True, True, False, error_message
+
+                    if status_text == "noSuchName" and suppress_no_such_name:
+                        self.logger.debug(f"Failed bulk walk: {error_message}")
+                    else:
+                        self.logger.error(f"Failed bulk walk: {error_message}")
+                    return True, False, True, error_message
+
+                if not varBinds:
+                    return False, False, False, None
+
+                for varBind in varBinds:
+                    oid_str = str(varBind[0])
+
+                    if not self._is_oid_in_subtree(oid_str, str(identity_value)):
+                        self.logger.debug   (
+                            f"End of OID subtree reached at {oid_str} -> {varBind} - List size {len(results_list)}"
+                        )
+                        return True, False, False, None
+
+                    results_list.append(varBind)
+
+                return False, False, False, None
+
+            if isinstance(objects, tuple) and len(objects) == 4:
+                done, retry, hard_error, error_message = _process_item(
+                    objects,
+                    attempt,
+                    identity,
+                    results,
+                )
+                if error_message:
+                    last_error = error_message
+                if done and results:
+                    return results
+            elif isinstance(objects, AsyncIterable):
+                async for item in objects:
+                    done, retry, hard_error, error_message = _process_item(
+                        item,
+                        attempt,
+                        identity,
+                        results,
+                    )
+                    if error_message:
+                        last_error = error_message
+                    if done:
+                        if results:
+                            return results
+                        break
+            else:
+                last_error = f"unexpected bulk_cmd result type: {type(objects).__name__}"
+                self.logger.error(f"Failed bulk walk: {last_error}")
+                hard_error = True
+
+            if hard_error:
+                break
+            if results:
+                self.logger.debug(f'Bulk walk completed - List size {len(results)}')
+                return results
+            if retry:
+                continue
+
+            self.logger.debug(f"Bulk walk returned no data with max_repetitions={attempt}.")
+
+        if last_error:
+            if last_error == "noSuchName" and suppress_no_such_name:
+                self.logger.debug(f"Bulk walk failed or empty ({last_error}); falling back to walk.")
+            else:
+                self.logger.warning(f"Bulk walk failed or empty ({last_error}); falling back to walk.")
+        else:
+            self.logger.warning("Bulk walk returned no data; falling back to walk.")
+
+        return await self.walk(oid)
+
+    async def set(self, oid: str, value: str | int, value_type: type)-> list[ObjectType] | None:
+        """
+        Perform an SNMP SET operation with explicit value type.
+
+        Args:
+            oid (str): The OID to set.
+            value (Union[str, int]): The value to set.
+            value_type (Type): pysnmp value type class (no default).
+
+                Examples:
+                    OctetString, Integer, Integer32, Counter32, Counter64, Gauge32, IpAddress.
+
+        Returns:
+            Dict[str, str]: Mapping of OID to the set value.
+
+        Raises:
+            ValueError: If value type instantiation fails.
+            RuntimeError: On SNMP errors.
+        """
+        if value_type is None:
+            raise ValueError("value_type must be explicitly specified")
+
+        self.logger.debug(f'SNMP-SET-OID: {oid} -> {value_type} -> {value}')
+
+        oid = Snmp_v2c.resolve_oid(oid)
+
+        transport = await UdpTransportTarget.create((self._host, self._port),
+                                                    timeout=self._timeout, retries=self._retries)
+
+        try:
+            snmp_value = value_type(value)
+        except Exception as e:
+            raise ValueError(f"Failed to create SNMP value of type {value_type}: {e}") from e
+
+        errorIndication, errorStatus, errorIndex, varBinds = await set_cmd(
+            self._snmp_engine,
+            CommunityData(self._write_community, mpModel=1),
+            transport,
+            ContextData(),
+            ObjectType(ObjectIdentity(oid), snmp_value),
+        )
+        try:
+            self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
+
+        except Exception as e:
+            self.logger.error(f"Error extracting SNMP value: {e}")
+            return None
+
+        return varBinds # type: ignore
+
+    def close(self) -> None:
+        """
+        Close the SNMP engine dispatcher and release resources.
+        """
+        self._snmp_engine.close_dispatcher()
+
+    @staticmethod
+    def resolve_oid(oid: str | tuple[str, str, int]) -> str:
+        """
+        Resolves symbolic OIDs with optional numeric suffixes.
+
+        Examples:
+            'ifDescr'             → '1.3.6.1.2.1.2.2.1.2'
+            'ifDescr.2'           → '1.3.6.1.2.1.2.2.1.2.2'
+            '1.3.6.1.2.1.2.2.1.2' → '1.3.6.1.2.1.2.2.1.2' (unchanged)
+
+        Returns:
+            str: Fully resolved numeric OID string.
+        """
+        if isinstance(oid, tuple):
+            # Optional support for Tuple format: (base, suffix1, suffix2)
+            oid = '.'.join(map(str, oid))
+
+        if Snmp_v2c.is_numeric_oid(oid):
+            return oid
+
+        # Split symbolic base from numeric suffix
+        match = re.match(r"^([a-zA-Z0-9_:]+)(\..+)?$", oid)
+        if not match:
+            return oid  # fallback: invalid pattern
+
+        base_sym, suffix = match.groups()
+        base_num = COMPILED_OIDS.get(base_sym, base_sym)
+        return f"{base_num}{suffix or ''}"
+
+    @staticmethod
+    def is_numeric_oid(oid: str) -> bool:
+        """
+        Returns True if the OID string is numeric.
+
+        Accepted formats:
+            - '1.3.6.1.2.1.2.2.1.2'
+            - '.1.3.6.1.2.1.2.2.1.2'  (leading dot is allowed)
+
+        Returns:
+            bool: True if the OID is numeric, False otherwise.
+        """
+        return bool(re.fullmatch(r"\.?(\d+\.)+\d+", oid))
+
+    @staticmethod
+    def get_result_value(pysnmp_get_result: ObjectType | tuple[ObjectType, ...] | None) -> str | None:
+        """
+        Extract the value from a pysnmp GET result.
+
+        Args:
+            pysnmp_get_result: SNMP response from get().
+
+        Returns:
+            Optional[str]: The extracted value as string, or None if not found.
+        """
+        try:
+            if isinstance(pysnmp_get_result, tuple):
+                pysnmp_get_result = pysnmp_get_result[0]
+
+            if isinstance(pysnmp_get_result, ObjectType):
+                value = pysnmp_get_result[1]
+                if isinstance(value, OctetString):
+                    return value.prettyPrint()
+                return str(value)
+
+            return None
+
+        except Exception as e:
+            logging.debug(f"Error extracting SNMP value: {e}")
+            return None
+
+    @staticmethod
+    def extract_last_oid_index(snmp_responses: list[ObjectType]) -> list[int]:
+        """
+        Extract the last index from a list of SNMP responses.
+
+        Parameters:
+        - snmp_responses: List of SNMP responses.
+
+        Returns:
+        - List of extracted indices.
+        """
+        last_oid_indexes = []
+        for response in snmp_responses:
+            oid = response[0]
+            index = Snmp_v2c.get_oid_index(oid)
+            logging.debug(f'extract_last_oid_index-IN-LOOP -> {response} -> {oid} -> {index}')
+            last_oid_indexes.append(index)
+        return last_oid_indexes
+
+    @staticmethod
+    def extract_oid_indices(snmp_responses: list[ObjectType],num_indices: int = 1) -> list[list[SnmpIndex]]:
+        """
+        Extract the last `num_indices` components from the OID index of each SNMP response.
+
+        Parameters:
+        - snmp_responses: List of SNMP responses.
+        - num_indices: Number of trailing OID index components to extract.
+
+        Returns:
+        - List of lists, each containing the extracted index components.
+        """
+        extracted_indices:list[list[SnmpIndex]] = []
+
+        for response in snmp_responses:
+            oid = response[0]
+            full_index = Snmp_v2c.get_oid_index(oid)
+
+            if isinstance(full_index, int):
+                indices = [full_index]
+            elif isinstance(full_index, (list, tuple)):
+                indices = list(full_index)
+            else:
+                logging.warning(f"Unexpected OID index format: {full_index}")
+                continue
+
+            selected = indices[-num_indices:] if len(indices) >= num_indices else indices
+            logging.debug(f"extract_oid_indices -> {response} -> {oid} -> {selected}")
+            extracted_indices.append(selected)
+
+        return extracted_indices
+
+    @staticmethod
+    def snmp_get_result_value(snmp_responses: list[ObjectType]) -> list[str]:
+        """
+        Extract the result value from a list of SNMP responses.
+
+        Args:
+            snmp_responses (List[ObjectType]): List of SNMP ObjectType responses.
+
+        Returns:
+            List[str]: List of extracted result values as strings.
+        """
+        return [str(value[1]) for value in snmp_responses]
+
+    @staticmethod
+    def snmp_get_result_bytes(snmp_responses: list[ObjectType]) -> list[bytes]:
+        """
+        Extract raw byte values from a list of SNMP ObjectType responses.
+
+        Args:
+            snmp_responses (List[ObjectType]): List of SNMP ObjectType responses.
+
+        Returns:
+            List[bytes]: List of extracted result values as bytes.
+        """
+        result = []
+        for varbind in snmp_responses:
+            value = varbind[1]
+            result.append(Snmp_v2c.snmp_octets_to_bytes(value))
+        return result
+
+    @staticmethod
+    def snmp_octets_to_bytes(value: object) -> bytes:
+        """
+        Normalize SNMP OctetString-like values into raw bytes.
+
+        Supports bytes/bytearray/memoryview, pysnmp objects exposing asOctets(),
+        or objects that can be converted via bytes(). Returns b"" on failure.
+        """
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
+
+        as_octets = getattr(value, "asOctets", None)
+        if callable(as_octets):
+            try:
+                return bytes(as_octets())
+            except Exception:
+                return b""
+
+        try:
+            return bytes(value)
+        except Exception:
+            return b""
+
+    @staticmethod
+    def snmp_get_result_last_idx_value(snmp_responses: list[ObjectType]) -> list[tuple[InterfaceIndex, str]]:
+        """
+        Extract the last index and value from each SNMP response.
+
+        Args:
+            snmp_responses (List[ObjectType]): List of SNMP ObjectType responses.
+
+        Returns:
+            List[Tuple[InterfaceIndex, str]]: List of (last InterfaceIndex, value) pairs.
+        """
+        result = []
+        for obj in snmp_responses:
+            oid = obj[0]
+            last_idx = InterfaceIndex(int(str(oid).split('.')[-1]))
+            value = str(obj[1])
+            result.append((last_idx, value))
+        return result
+
+    T = TypeVar("T", int, str)
+    @staticmethod
+    def snmp_get_result_last_idx_force_value_type(snmp_responses: list[ObjectType],
+                                                  value_type: type[T] = str) -> list[tuple[int, T]]:
+        """
+        Extract the last index and value from each SNMP response,
+        casting the value to the requested type (int or str).
+
+        Args:
+            snmp_responses: List of SNMP ObjectType responses.
+            value_type: Type to cast the SNMP value to (int or str). Defaults to str.
+
+        Returns:
+            List of (last index, value) pairs, where `value` is of type `value_type`.
+        """
+        logger = logging.getLogger(__name__)
+        result: list[tuple[int, T]] = []
+
+        for obj in snmp_responses:
+            # 1) extract index
+            try:
+                oid_str = str(obj[0])
+                last_idx = int(oid_str.rsplit(".", 1)[-1])
+            except Exception as e:
+                logger.warning(f"Could not parse index from OID {obj[0]!r}: {e}")
+                continue
+
+            # 2) cast value
+            raw_val = obj[1]
+            try:
+                if value_type is int:
+                    cast_val: int | str = int(raw_val)
+                else:
+                    cast_val = str(raw_val)
+            except Exception as e:
+                logger.warning(f"Failed to cast SNMP value {raw_val!r} to {value_type}: {e}")
+                # fallback: leave it in its raw form
+                cast_val = raw_val  # type: ignore
+
+            result.append((last_idx, cast_val))  # type: ignore
+
+        return result
+
+    @staticmethod
+    def snmp_set_result_value(snmp_set_response: str) -> list[str]:
+        """
+        Extracts value(s) from an SNMP SET response string.
+
+        This method parses the raw SNMP SET response string and extracts the
+        returned value(s), if any, from the output. Useful for validating
+        SNMP set operations.
+
+        Parameters:
+        - snmp_set_response (str): The raw SNMP SET response string, typically
+        returned by an SNMP set operation.
+
+        Returns:
+        - List[str]: A list containing the parsed value(s) from the response.
+                    If no value is found, returns an empty list.
+        """
+        if not snmp_set_response:
+            return []
+
+        logging.debug(f'snmp_set_result_value -> {snmp_set_response}')
+
+        return  [str(value[1]) for value in snmp_set_response]
+
+    @staticmethod
+    def get_oid_index(oid: str) -> SnmpIndex | None:
+        """
+        Extract the index (last sub-identifier) from an OID string.
+
+        Args:
+            oid (str): The OID in dot-separated format (e.g., '1.3.6.1.2.1.2.2.1.3.2').
+
+        Returns:
+            Optional[int]: The last part of the OID interpreted as an integer, or None if extraction fails.
+        """
+        if not isinstance(oid, str):
+            oid = str(oid)
+
+        try:
+            parts = oid.strip().split('.')
+            index = SnmpIndex(int(parts[-1]))
+            logging.debug(f"Extracted OID index: OID='{oid}', Parts={parts}, Index={index}")
+            return index
+        except (ValueError, IndexError) as e:
+            logging.error(f"Failed to extract index from OID '{oid}': {e}")
+            return None
+
+    @staticmethod
+    def get_inet_address_type(inet_address: InetAddressStr) -> InetAddressType:
+        """
+        Determine the InetAddressType of an IP address (IPv4 or IPv6).
+
+        Args:
+            inet_address (str): The IP address to check.
+
+        Returns:
+            InetAddressType: IPV4 (1) for IPv4 addresses, or IPV6 (2) for IPv6 addresses.
+
+        Raises:
+            ValueError: If the IP address is invalid.
+        """
+        binary = InetGenerate.inet_to_binary(inet_address)
+
+        if not binary:
+            raise ValueError(f"Invalid IP address: {inet_address}")
+
+        return InetAddressType.IPV6 if len(binary) > 4 else InetAddressType.IPV4
+
+    @staticmethod
+    def parse_snmp_datetime(data: bytes) -> str:
+        """
+        Parses SNMP DateAndTime byte array and returns an ISO 8601 datetime string.
+
+        Args:
+            data (bytes): SNMP DateAndTime value as a byte array.
+
+        Returns:
+            str: ISO 8601 formatted datetime string (e.g., "2025-05-02T13:15:00").
+        """
+        if len(data) < 8:
+            raise ValueError("Invalid SNMP DateAndTime data (too short)")
+
+        # Convert the raw bytes into integer values
+        year = data[0] << 8 | data[1]
+        month = data[2]
+        day = data[3]
+        hour = data[4]
+        minute = data[5]
+        second = data[6]
+
+        # Default: naive datetime (no timezone info)
+        dt = datetime(year, month, day, hour, minute, second)
+
+        if len(data) >= 11:
+            # Timezone info exists
+            direction = chr(data[8])
+            tz_hours = data[9]
+            tz_minutes = data[10]
+            offset_minutes = tz_hours * 60 + tz_minutes
+            if direction == '-':
+                offset_minutes = -offset_minutes
+            tz = timezone(timedelta(minutes=offset_minutes))
+            dt = dt.replace(tzinfo=tz)
+
+        return dt.isoformat()
+
+    @staticmethod
+    def truth_value(snmp_value: int | str) -> bool:
+        """
+        Converts SNMP TruthValue integer to a boolean.
+
+        TruthValue ::= INTEGER { true(1), false(2) }
+
+        Args:
+            snmp_value (int or str): The raw SNMP integer value or string representation.
+
+        Returns:
+            bool: True if value is 1 (true), False if 2 (false).
+
+        Raises:
+            ValueError: If the value is not 1 or 2.
+        """
+        # Attempt to convert the snmp_value to an integer
+        try:
+            snmp_value = int(snmp_value)
+        except ValueError:
+            raise ValueError(f"Invalid input for TruthValue: {snmp_value}") from None
+
+        if snmp_value == 1:
+            return True
+        elif snmp_value == 2:
+            return False
+        else:
+            raise ValueError(f"Invalid TruthValue: {snmp_value}")
+
+    @staticmethod
+    def ticks_to_duration(ticks: int) -> str:
+        """
+        Converts SNMP sysUpTime ticks to a human-readable duration string.
+
+        SNMP uptime ticks are measured in hundredths of a second.
+
+        Args:
+            ticks (int): The sysUpTime value in hundredths of a second.
+
+        Returns:
+            str: A formatted duration string like '3 days, 4:05:06.78'
+        """
+        if ticks < 0:
+            raise ValueError("Ticks must be a non-negative integer")
+
+        # Convert hundredths of a second to total seconds and microseconds
+        total_seconds = ticks // 100
+        remainder_hundredths = ticks % 100
+        duration = timedelta(seconds=total_seconds, milliseconds=remainder_hundredths * 10)
+
+        return str(duration)
+
+
+    ###################
+    # Private Methods #
+    ###################
+
+    def _to_object_identity(self, oid: str | tuple[str, str, int]) -> ObjectIdentity:
+        """
+        Internal helper to resolve an OID.
+
+        Args:
+            oid (Union[str, Tuple[str, str, int]]): OID to resolve.
+
+        Returns:
+            ObjectIdentity: pysnmp ObjectIdentity.
+        """
+        if isinstance(oid, tuple):
+            self.logger.debug(f"Resolving OID tuple: {oid}")
+            return ObjectIdentity(*oid)
+        else:
+            self.logger.debug(f"Resolving OID string: {oid}")
+            return ObjectIdentity(oid)
+
+    def _raise_on_snmp_error(self, errorIndication: Exception | str | None, errorStatus: object | None, errorIndex: Integer32 | int | None) -> None:
+        """
+        Raises RuntimeError if any SNMP error is detected.
+
+        Args:
+            errorIndication: General SNMP engine-level error (e.g., timeout, transport failure).
+                            Typically an Exception instance or an error string, or None.
+            errorStatus: SNMP protocol-level error (e.g., noSuchName, tooBig) or None.
+            errorIndex: Index of the variable that caused the error (if applicable).
+
+        Raises:
+            RuntimeError: If an SNMP error or indication is present.
+        """
+        if errorIndication:
+            raise RuntimeError(f"SNMP operation failed: {errorIndication}")
+        if errorStatus:
+            # errorStatus objects from pysnmp typically expose prettyPrint()
+            pretty = getattr(errorStatus, "prettyPrint", None)
+            status_text = pretty() if callable(pretty) else str(errorStatus)
+            raise RuntimeError(
+                f"SNMP error {status_text} at index {errorIndex}"
+            )
+
+    def _is_oid_in_subtree(self, oid_str: str, obj_str: str) -> bool:
+        """
+        Check if an OID is part of the requested subtree.
+
+        Args:
+            oid_str (str): The current OID string (e.g., '1.3.6.1.2.1.2.2.1.2.5').
+            obj_str (str): The requested root OID string (e.g., '1.3.6.1.2.1.2.2.1.2').
+
+        Returns:
+            bool: True if oid_str is within the subtree of obj_str.
+        """
+        oid_parts = oid_str.strip('.').split('.')
+        obj_parts = obj_str.strip('.').split('.')
+        return oid_parts[:len(obj_parts)] == obj_parts
+
+# FILE: src/pypnm/docsis/cm_snmp_operation.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
 
@@ -2444,3 +3345,870 @@ class CmSnmpOperation:
                 "Ensure Pre-Equalization is enabled on the upstream interface(s).")
 
         return ded
+
+# FILE: src/pypnm/lib/db/json_file_lock.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+import fcntl
+import logging
+import time
+from pathlib import Path
+from typing import TextIO
+
+
+class JsonFileLock:
+    """
+    Cross-process lock for JSON DB files using a sidecar lock file.
+    """
+    def __init__(self, target_path: Path, timeout: float = 5.0, poll_interval: float = 0.05) -> None:
+        self._lock_path = target_path.with_suffix(f"{target_path.suffix}.lock")
+        self._timeout = timeout
+        self._poll_interval = poll_interval
+        self._handle: TextIO | None = None
+        self._logger = logging.getLogger(self.__class__.__name__)
+
+    def __enter__(self) -> None:
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self._lock_path.open("a+", encoding="utf-8")
+        start = time.monotonic()
+
+        while True:
+            if self._try_lock():
+                return None
+            if time.monotonic() - start >= self._timeout:
+                raise TimeoutError(f"Timed out acquiring lock for {self._lock_path}") from None
+            time.sleep(self._poll_interval)
+
+    def _try_lock(self) -> bool:
+        if not self._handle:
+            return False
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    def __exit__(self, exc_type: object, exc: object, exc_tb: object) -> None:
+        if not self._handle:
+            return None
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        except Exception as err:
+            self._logger.debug("Failed to release lock %s: %s", self._lock_path, err)
+        finally:
+            self._handle.close()
+            self._handle = None
+        return None
+
+# FILE: src/pypnm/pnm/data_type/DocsEqualizerData.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+
+from __future__ import annotations
+
+import json
+import math
+from typing import Final, Literal
+
+from pydantic import BaseModel, Field
+
+
+class UsEqTapModel(BaseModel):
+    real: int = Field(..., description="Tap real coefficient decoded as 2's complement.")
+    imag: int = Field(..., description="Tap imag coefficient decoded as 2's complement.")
+    magnitude: float = Field(..., description="Magnitude computed from real/imag.")
+    magnitude_power_dB: float | None = Field(..., description="Magnitude power in dB (10*log10(mag^2)); None when magnitude is 0.")
+    real_hex: str = Field(..., description="Raw 2-byte real coefficient as received, shown as 4 hex chars.")
+    imag_hex: str = Field(..., description="Raw 2-byte imag coefficient as received, shown as 4 hex chars.")
+
+    model_config = {"frozen": True}
+
+
+class UsEqDataModel(BaseModel):
+    main_tap_location: int = Field(..., description="Main tap location (header byte 0; HEX value).")
+    taps_per_symbol: int = Field(..., description="Taps per symbol (header byte 1; HEX value).")
+    num_taps: int = Field(..., description="Number of taps (header byte 2; HEX value).")
+    reserved: int = Field(..., description="Reserved (header byte 3; HEX value).")
+    header_hex: str = Field(..., description="Header bytes as hex (4 bytes).")
+    payload_hex: str = Field(..., description="Full payload as hex (space-separated bytes).")
+    payload_preview_hex: str = Field(..., description="Header + first N taps as hex preview (space-separated bytes).")
+    taps: list[UsEqTapModel] = Field(..., description="Decoded taps in order (real/imag pairs).")
+
+    model_config = {"frozen": True}
+
+
+class DocsEqualizerData:
+    """
+    Parse DOCS-IF3 upstream pre-equalization tap data.
+
+    Notes:
+    - CM deployments have two common coefficient interpretations:
+      * four-nibble 2's complement (16-bit signed)
+      * three-nibble 2's complement (12-bit signed; upper nibble unused)
+    - Some deployments can be handled with a "universal" decoder: drop the first nibble and decode as 12-bit.
+
+    IMPORTANT:
+    - Pass raw SNMP OctetString bytes via add_from_bytes() whenever possible.
+    - If you pass a hex string, it must be real hex (e.g., 'FF FC 00 04 ...'), not a Unicode pretty string.
+    """
+
+    HEADER_SIZE: Final[int] = 4
+    COEFF_BYTES: Final[int] = 2
+    COMPLEX_TAP_SIZE: Final[int] = 4
+    MAX_TAPS: Final[int] = 64
+
+    U16_MASK: Final[int] = 0xFFFF
+    U12_MASK: Final[int] = 0x0FFF
+    U16_MSN_MASK: Final[int] = 0xF000
+
+    I16_SIGN: Final[int] = 0x8000
+    I12_SIGN: Final[int] = 0x0800
+    I16_RANGE: Final[int] = 0x10000
+    I12_RANGE: Final[int] = 0x1000
+
+    AUTO_ENDIAN_SAMPLE_MAX_TAPS: Final[int] = 16
+    AUTO_ENDIAN_BYTE_GOOD_0: Final[int] = 0x00
+    AUTO_ENDIAN_BYTE_GOOD_FF: Final[int] = 0xFF
+
+    def __init__(self) -> None:
+        self._coefficients_found: bool = False
+        self.equalizer_data: dict[int, UsEqDataModel] = {}
+
+    def add(
+        self,
+        us_idx: int,
+        payload_hex: str,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"] = "auto",
+        coeff_endianness: Literal["little", "big", "auto"] = "auto",
+        preview_taps: int = 8,
+    ) -> bool:
+        """
+        Parse/store from a hex string payload.
+
+        payload_hex MUST be actual hex bytes (e.g., 'FF FC 00 04 ...').
+        If payload_hex contains non-hex characters (like 'ÿ'), this will return False.
+
+        coeff_encoding:
+        - four-nibble: decode as signed 16-bit (2's complement)
+        - three-nibble: decode as signed 12-bit (2's complement) after masking to 0x0FFF
+        - auto: prefer 16-bit when the upper nibble is used; otherwise decode as 12-bit ("universal" behavior)
+
+        coeff_endianness:
+        - little: interpret each 2-byte coefficient as little-endian
+        - big: interpret each 2-byte coefficient as big-endian
+        - auto: heuristic selection based on common small-coefficient patterns
+        """
+        try:
+            payload = self._hex_to_bytes_strict(payload_hex)
+            return self._add_parsed(
+                us_idx,
+                payload,
+                coeff_encoding=coeff_encoding,
+                coeff_endianness=coeff_endianness,
+                preview_taps=preview_taps,
+            )
+        except Exception:
+            return False
+
+    def add_from_bytes(
+        self,
+        us_idx: int,
+        payload: bytes,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"] = "auto",
+        coeff_endianness: Literal["little", "big", "auto"] = "auto",
+        preview_taps: int = 8,
+    ) -> bool:
+        """
+        Parse/store from raw bytes (preferred for SNMP OctetString values).
+        """
+        try:
+            return self._add_parsed(
+                us_idx,
+                payload,
+                coeff_encoding=coeff_encoding,
+                coeff_endianness=coeff_endianness,
+                preview_taps=preview_taps,
+            )
+        except Exception:
+            return False
+
+    def coefficients_found(self) -> bool:
+        return self._coefficients_found
+
+    def get_record(self, us_idx: int) -> UsEqDataModel | None:
+        return self.equalizer_data.get(us_idx)
+
+    def to_dict(self) -> dict[int, dict]:
+        return {k: v.model_dump() for k, v in self.equalizer_data.items()}
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    def _add_parsed(
+        self,
+        us_idx: int,
+        payload: bytes,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"],
+        coeff_endianness: Literal["little", "big", "auto"],
+        preview_taps: int,
+    ) -> bool:
+        if len(payload) < self.HEADER_SIZE:
+            return False
+
+        main_tap_location = payload[0]
+        taps_per_symbol = payload[1]
+        num_taps = payload[2]
+        reserved = payload[3]
+
+        if num_taps == 0:
+            return False
+
+        if num_taps > self.MAX_TAPS:
+            return False
+
+        expected_len = self.HEADER_SIZE + (num_taps * self.COMPLEX_TAP_SIZE)
+        if len(payload) < expected_len:
+            return False
+
+        header_hex = payload[: self.HEADER_SIZE].hex(" ", 1).upper()
+        payload_hex = payload[:expected_len].hex(" ", 1).upper()
+
+        preview_taps_clamped = preview_taps
+        if preview_taps_clamped < 0:
+            preview_taps_clamped = 0
+        if preview_taps_clamped > num_taps:
+            preview_taps_clamped = num_taps
+
+        preview_len = self.HEADER_SIZE + (preview_taps_clamped * self.COMPLEX_TAP_SIZE)
+        payload_preview_hex = payload[:preview_len].hex(" ", 1).upper()
+
+        taps_blob = payload[self.HEADER_SIZE : expected_len]
+        taps = self._parse_taps(
+            taps_blob,
+            coeff_encoding=coeff_encoding,
+            coeff_endianness=coeff_endianness,
+        )
+
+        self.equalizer_data[us_idx] = UsEqDataModel(
+            main_tap_location=main_tap_location,
+            taps_per_symbol=taps_per_symbol,
+            num_taps=num_taps,
+            reserved=reserved,
+            header_hex=header_hex,
+            payload_hex=payload_hex,
+            payload_preview_hex=payload_preview_hex,
+            taps=taps,
+        )
+
+        self._coefficients_found = True
+        return True
+
+    def _parse_taps(
+        self,
+        data: bytes,
+        *,
+        coeff_encoding: Literal["four-nibble", "three-nibble", "auto"],
+        coeff_endianness: Literal["little", "big", "auto"],
+    ) -> list[UsEqTapModel]:
+        taps: list[UsEqTapModel] = []
+        step = self.COMPLEX_TAP_SIZE
+
+        endian = coeff_endianness
+        if endian == "auto":
+            endian = self._detect_coeff_endianness(data)
+
+        encoding = coeff_encoding
+        if encoding == "auto":
+            encoding = self._detect_coeff_encoding(data, coeff_endianness=endian)
+
+        tap_count = len(data) // step
+        for tap_idx in range(tap_count):
+            base = tap_idx * step
+            real_b = data[base : base + self.COEFF_BYTES]
+            imag_b = data[base + self.COEFF_BYTES : base + step]
+
+            real_u16 = int.from_bytes(real_b, byteorder=endian, signed=False)
+            imag_u16 = int.from_bytes(imag_b, byteorder=endian, signed=False)
+
+            real = self._decode_coeff(real_u16, coeff_encoding=encoding)
+            imag = self._decode_coeff(imag_u16, coeff_encoding=encoding)
+
+            magnitude = math.hypot(float(real), float(imag))
+            if magnitude > 0.0:
+                power_db = 10.0 * math.log10(magnitude * magnitude)
+            else:
+                power_db = None
+
+            taps.append(
+                UsEqTapModel(
+                    real=real,
+                    imag=imag,
+                    magnitude=round(magnitude, 2),
+                    magnitude_power_dB=(round(power_db, 2) if power_db is not None else None),
+                    real_hex=real_b.hex().upper(),
+                    imag_hex=imag_b.hex().upper(),
+                )
+            )
+
+        return taps
+
+    def _detect_coeff_endianness(self, data: bytes) -> Literal["little", "big"]:
+        """
+        Heuristic endianness detection.
+
+        Many deployed pre-EQ taps are small-magnitude, so the MSB of each 16-bit word is often 0x00 (positive)
+        or 0xFF (negative). We score both interpretations by counting how often the MSB matches {0x00, 0xFF}.
+        """
+        if len(data) < self.COMPLEX_TAP_SIZE:
+            return "little"
+
+        max_taps = self.AUTO_ENDIAN_SAMPLE_MAX_TAPS
+        tap_count = len(data) // self.COMPLEX_TAP_SIZE
+        if tap_count < max_taps:
+            max_taps = tap_count
+
+        good = (self.AUTO_ENDIAN_BYTE_GOOD_0, self.AUTO_ENDIAN_BYTE_GOOD_FF)
+
+        score_little = 0
+        score_big = 0
+
+        for tap_idx in range(max_taps):
+            base = tap_idx * self.COMPLEX_TAP_SIZE
+
+            r0 = data[base]
+            r1 = data[base + 1]
+            i0 = data[base + 2]
+            i1 = data[base + 3]
+
+            if r1 in good:
+                score_little += 1
+            if i1 in good:
+                score_little += 1
+
+            if r0 in good:
+                score_big += 1
+            if i0 in good:
+                score_big += 1
+
+        if score_big > score_little:
+            return "big"
+        return "little"
+
+    def _detect_coeff_encoding(
+        self,
+        data: bytes,
+        *,
+        coeff_endianness: Literal["little", "big"],
+    ) -> Literal["four-nibble", "three-nibble"]:
+        """
+        Auto-select coefficient decoding:
+
+        - If any coefficient uses the upper nibble (0xF000 mask != 0), assume 16-bit signed (four-nibble).
+        - Otherwise, default to 12-bit signed (three-nibble), which matches the "universal" decoding guidance.
+        """
+        step = self.COMPLEX_TAP_SIZE
+        tap_count = len(data) // step
+
+        for tap_idx in range(tap_count):
+            base = tap_idx * step
+            real_b = data[base : base + self.COEFF_BYTES]
+            imag_b = data[base + self.COEFF_BYTES : base + step]
+
+            real_u16 = int.from_bytes(real_b, byteorder=coeff_endianness, signed=False)
+            imag_u16 = int.from_bytes(imag_b, byteorder=coeff_endianness, signed=False)
+
+            if (real_u16 & self.U16_MSN_MASK) != 0:
+                return "four-nibble"
+            if (imag_u16 & self.U16_MSN_MASK) != 0:
+                return "four-nibble"
+
+        return "three-nibble"
+
+    def _decode_coeff(self, raw_u16: int, *, coeff_encoding: Literal["four-nibble", "three-nibble"]) -> int:
+        match coeff_encoding:
+            case "four-nibble":
+                return self._decode_int16(raw_u16)
+            case "three-nibble":
+                return self._decode_int12(raw_u16)
+            case _:
+                raise ValueError(f"Unsupported coeff_encoding: {coeff_encoding}")
+
+    def _decode_int16(self, raw_u16: int) -> int:
+        value = raw_u16 & self.U16_MASK
+        if value & self.I16_SIGN:
+            return value - self.I16_RANGE
+        return value
+
+    def _decode_int12(self, raw_u16: int) -> int:
+        value = raw_u16 & self.U12_MASK
+        if value & self.I12_SIGN:
+            return value - self.I12_RANGE
+        return value
+
+    def _hex_to_bytes_strict(self, payload_hex: str) -> bytes:
+        text = payload_hex.strip()
+        text = text.replace("Hex-STRING:", "")
+        text = text.replace("0x", "")
+        text = " ".join(text.split())
+
+        if text == "":
+            return b""
+
+        for ch in text:
+            if ch == " ":
+                continue
+            if "0" <= ch <= "9":
+                continue
+            if "a" <= ch <= "f":
+                continue
+            if "A" <= ch <= "F":
+                continue
+            return b""
+
+        return bytes.fromhex(text)
+
+# FILE: src/pypnm/api/routes/advance/common/operation_manager.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026 Maurice Garcia
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from pypnm.config.system_config_settings import SystemConfigSettings
+from pypnm.lib.constants import cast
+from pypnm.lib.db.json_file_lock import JsonFileLock
+from pypnm.lib.types import GroupId, OperationId
+
+
+class OperationManager:
+    """
+    Manager for mapping background capture operations to their capture group IDs.
+
+    Each operation is assigned a unique operation_id and linked to a
+    capture_group_id. Mappings are persisted in a JSON file so that
+    captures can be looked up later by operation ID.
+
+    JSON schema:
+    {
+        "<operation_id>": {
+            "capture_group_id": "<group_id>",
+            "created": <unix_epoch_seconds>
+        },
+        ...
+    }
+    """
+    def __init__(self, capture_group_id: GroupId, db_path: Path | None = None) -> None:
+        """
+        Initialize a new operation manager for a given capture group.
+
+        Args:
+            capture_group_id: The ID of the capture group to associate.
+            db_path: Optional path to the operations DB file; if None,
+                     retrieves from ConfigManager under
+                     [PnmFileRetrieval].operation_db.
+        """
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.capture_group_id: GroupId = capture_group_id
+        self.operation_id: OperationId = cast(OperationId, uuid.uuid4().hex[:16])
+
+        # Resolve DB file path
+        if db_path:
+            self.db_path = db_path
+        else:
+            db_str = SystemConfigSettings.operation_db()
+            self.db_path = Path(db_str)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Ensure DB exists
+        if not self.db_path.exists():
+            self._atomic_write({})
+
+    def _load(self) -> dict[str, Any]:
+        """
+        Load the operations DB from disk.
+
+        Returns:
+            Dict of operation mappings, or empty dict on parse error.
+        """
+        try:
+            if not self.db_path.exists():
+                self._atomic_write({})
+                return {}
+            with self.db_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load operation DB, resetting: {e}")
+            return {}
+
+    def _atomic_write(self, data: dict[str, Any]) -> None:
+        """
+        Atomically write the given data to the DB file.
+        """
+        temp = self.db_path.with_suffix('.tmp')
+        with temp.open('w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        temp.replace(self.db_path)
+
+    def _save(self, data: dict[str, Any]) -> None:
+        """
+        Persist the given operations dict to disk with atomic write.
+        """
+        try:
+            self._atomic_write(data)
+        except Exception as e:
+            self.logger.error(f"Failed to save operation DB: {e}")
+
+    def register(self) -> OperationId:
+        """
+        Register this operation with its capture group ID in the DB.
+
+        Verifies that the associated capture group exists before registration.
+
+        Returns:
+            The operation_id assigned.
+
+        Raises:
+            ValueError: If the capture_group_id is not present in the CaptureGroup database.
+        """
+        # Verify that the capture group exists, or fail hard
+        from pypnm.api.routes.common.classes.file_capture.capture_group import (
+            CaptureGroup,
+        )
+        cg = CaptureGroup(group_id=self.capture_group_id)
+        if self.capture_group_id not in cg.list_groups():
+            raise ValueError(
+                f"CaptureGroup '{self.capture_group_id}' does not exist"
+            )
+
+        with JsonFileLock(self.db_path):
+            db = self._load()
+            db[self.operation_id] = {
+                "capture_group_id": self.capture_group_id,
+                "created": int(time.time())
+            }
+            self._save(db)
+            self.logger.info(
+                f"Registered operation {self.operation_id} for group {self.capture_group_id}"
+            )
+        return self.operation_id
+
+    @classmethod
+    def get_capture_group(cls, operation_id: OperationId, db_path: Path | None = None) -> GroupId:
+        """
+        Retrieve the capture_group_id for a given operation_id.
+
+        Args:
+            operation_id: The operation ID to look up.
+            db_path: Optional override for the operations DB file.
+
+        Returns:
+            capture_group_id if found, otherwise None.
+            Exception thrown
+        """
+
+        if not db_path:
+            db_str = SystemConfigSettings.operation_db()
+            db_path = Path(db_str)
+        try:
+            with JsonFileLock(db_path), db_path.open("r", encoding="utf-8") as f:
+                db = json.load(f)
+            rec = db.get(operation_id)
+            return rec.get("capture_group_id") if isinstance(rec, dict) else None
+        except Exception as e:
+            cls.logger = logging.getLogger(cls.__name__)
+            cls.logger.error(f"Error retrieving capture group for {operation_id}: {e}")
+            return ""
+
+    @classmethod
+    def list_operations(cls, db_path: Path | None = None) -> list[str]:
+        """
+        List all registered operation IDs.
+
+        Args:
+            db_path: Optional override for the operations DB file.
+
+        Returns:
+            List of operation_id strings.
+        """
+        if not db_path:
+            db_str = SystemConfigSettings.operation_db()
+            db_path = Path(db_str)
+        try:
+            with JsonFileLock(db_path), db_path.open("r", encoding="utf-8") as f:
+                return list(json.load(f).keys())
+        except Exception as e:
+            logging.getLogger(cls.__name__).error(f"Error listing operations: {e}")
+            return []
+
+# FILE: tests/test_us_eq_octetstring_bytes.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Maurice Garcia
+
+from __future__ import annotations
+
+from pysnmp.proto.rfc1902 import OctetString
+
+from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
+from pypnm.snmp.snmp_v2c import Snmp_v2c
+
+
+def test_us_eq_payload_hex_preserves_raw_bytes() -> None:
+    payload = bytes([0x01, 0x02, 0x01, 0x00, 0xFF, 0xFC, 0xFF, 0xFE])
+    ded = DocsEqualizerData()
+
+    assert ded.add_from_bytes(1, payload)
+
+    record = ded.get_record(1)
+    assert record is not None
+    assert "FF FC FF FE" in record.payload_hex
+    assert "C3 BF" not in record.payload_hex
+
+
+def test_snmp_octets_to_bytes_rejects_utf8_text() -> None:
+    value = "ÿ"
+    raw = Snmp_v2c.snmp_octets_to_bytes(value)
+
+    assert raw == b""
+    assert value.encode("utf-8").hex() == "c3bf"
+
+
+def test_snmp_octets_to_bytes_handles_octetstring() -> None:
+    raw = Snmp_v2c.snmp_octets_to_bytes(OctetString(b"\xff\xfe\xfc"))
+    assert raw == b"\xff\xfe\xfc"
+
+# FILE: docs/api/fast-api/single/us/atdma/chan/stats.md
+# DOCSIS 3.0 Upstream ATDMA Channel Statistics
+
+Provides Access To DOCSIS 3.0 Upstream SC-QAM (ATDMA) Channel Statistics.
+
+## Endpoint
+
+**POST** `/docs/if30/us/atdma/chan/stats`
+
+## Request
+
+Use the SNMP-only format: [Common → Request](../../../../common/request.md)  
+TFTP parameters are not required.
+
+## Response
+
+This endpoint returns the standard envelope described in [Common → Response](../../../../common/response.md) (`mac_address`, `status`, `message`, `data`).
+
+`data` is an **array** of upstream channels. Each item contains the SNMP table `index`, the upstream `channel_id`, and an `entry` with configuration, status, and (where available) raw pre-EQ data (`docsIf3CmStatusUsEqData`).
+
+### Abbreviated Example
+
+```json
+{
+  "mac_address": "aa:bb:cc:dd:ee:ff",
+  "status": 0,
+  "message": null,
+  "data": [
+    {
+      "index": 80,
+      "channel_id": 1,
+      "entry": {
+        "docsIfUpChannelId": 1,
+        "docsIfUpChannelFrequency": 14600000,
+        "docsIfUpChannelWidth": 6400000,
+        "docsIfUpChannelModulationProfile": 0,
+        "docsIfUpChannelSlotSize": 2,
+        "docsIfUpChannelTxTimingOffset": 6436,
+        "docsIfUpChannelRangingBackoffStart": 3,
+        "docsIfUpChannelRangingBackoffEnd": 8,
+        "docsIfUpChannelTxBackoffStart": 2,
+        "docsIfUpChannelTxBackoffEnd": 6,
+        "docsIfUpChannelType": 2,
+        "docsIfUpChannelCloneFrom": 0,
+        "docsIfUpChannelUpdate": false,
+        "docsIfUpChannelStatus": 1,
+        "docsIfUpChannelPreEqEnable": true,
+        "docsIf3CmStatusUsTxPower": 49.0,
+        "docsIf3CmStatusUsT3Timeouts": 0,
+        "docsIf3CmStatusUsT4Timeouts": 0,
+        "docsIf3CmStatusUsRangingAborteds": 0,
+        "docsIf3CmStatusUsModulationType": 2,
+        "docsIf3CmStatusUsEqData": "0x08011800ffff0003...00020001",
+        "docsIf3CmStatusUsT3Exceededs": 0,
+        "docsIf3CmStatusUsIsMuted": false,
+        "docsIf3CmStatusUsRangingStatus": 4
+      }
+    },
+    {
+      "index": 81,
+      "channel_id": 2,
+      "entry": {
+        "docsIfUpChannelId": 2,
+        "docsIfUpChannelFrequency": 21000000,
+        "docsIfUpChannelWidth": 6400000,
+        "docsIfUpChannelModulationProfile": 0,
+        "docsIfUpChannelSlotSize": 2,
+        "docsIfUpChannelTxTimingOffset": 6436,
+        "docsIfUpChannelRangingBackoffStart": 3,
+        "docsIfUpChannelRangingBackoffEnd": 8,
+        "docsIfUpChannelTxBackoffStart": 2,
+        "docsIfUpChannelTxBackoffEnd": 6,
+        "docsIfUpChannelType": 2,
+        "docsIfUpChannelCloneFrom": 0,
+        "docsIfUpChannelUpdate": false,
+        "docsIfUpChannelStatus": 1,
+        "docsIfUpChannelPreEqEnable": true,
+        "docsIf3CmStatusUsTxPower": 48.5,
+        "docsIf3CmStatusUsT3Timeouts": 0,
+        "docsIf3CmStatusUsT4Timeouts": 0,
+        "docsIf3CmStatusUsRangingAborteds": 0,
+        "docsIf3CmStatusUsModulationType": 2,
+        "docsIf3CmStatusUsEqData": "0x08011800ffff0001...0002",
+        "docsIf3CmStatusUsT3Exceededs": 0,
+        "docsIf3CmStatusUsIsMuted": false,
+        "docsIf3CmStatusUsRangingStatus": 4
+      }
+    }
+  ]
+}
+```
+
+## Channel Fields
+
+| Field        | Type | Description                                                                 |
+| ------------ | ---- | --------------------------------------------------------------------------- |
+| `index`      | int  | **SNMP table index** (OID instance) for this channel’s row in the CM table. |
+| `channel_id` | int  | DOCSIS upstream SC-QAM (ATDMA) logical channel ID.                          |
+
+## Entry Fields
+
+| Field                                | Type   | Units | Description                                             |
+| ------------------------------------ | ------ | ----- | ------------------------------------------------------- |
+| `docsIfUpChannelId`                  | int    | —     | Upstream channel ID (mirrors logical ID).               |
+| `docsIfUpChannelFrequency`           | int    | Hz    | Center frequency.                                       |
+| `docsIfUpChannelWidth`               | int    | Hz    | Channel width.                                          |
+| `docsIfUpChannelModulationProfile`   | int    | —     | Modulation profile index.                               |
+| `docsIfUpChannelSlotSize`            | int    | —     | Slot size (minislot units).                             |
+| `docsIfUpChannelTxTimingOffset`      | int    | —     | Transmit timing offset (implementation-specific units). |
+| `docsIfUpChannelRangingBackoffStart` | int    | —     | Initial ranging backoff window start.                   |
+| `docsIfUpChannelRangingBackoffEnd`   | int    | —     | Initial ranging backoff window end.                     |
+| `docsIfUpChannelTxBackoffStart`      | int    | —     | Data/backoff start window.                              |
+| `docsIfUpChannelTxBackoffEnd`        | int    | —     | Data/backoff end window.                                |
+| `docsIfUpChannelType`                | int    | —     | Channel type enum (e.g., `2` = ATDMA).                  |
+| `docsIfUpChannelCloneFrom`           | int    | —     | Clone source channel (if used).                         |
+| `docsIfUpChannelUpdate`              | bool   | —     | Indicates a pending/active update.                      |
+| `docsIfUpChannelStatus`              | int    | —     | Operational status enum.                                |
+| `docsIfUpChannelPreEqEnable`         | bool   | —     | Whether pre-equalization is enabled.                    |
+| `docsIf3CmStatusUsTxPower`           | float  | dBmV  | Upstream transmit power.                                |
+| `docsIf3CmStatusUsT3Timeouts`        | int    | —     | T3 timeouts counter.                                    |
+| `docsIf3CmStatusUsT4Timeouts`        | int    | —     | T4 timeouts counter.                                    |
+| `docsIf3CmStatusUsRangingAborteds`   | int    | —     | Aborted ranging attempts.                               |
+| `docsIf3CmStatusUsModulationType`    | int    | —     | Modulation type enum.                                   |
+| `docsIf3CmStatusUsEqData`            | string | hex   | Raw pre-EQ coefficient payload (hex string; raw octets). |
+| `docsIf3CmStatusUsT3Exceededs`       | int    | —     | Exceeded T3 attempts.                                   |
+| `docsIf3CmStatusUsIsMuted`           | bool   | —     | Whether the upstream transmitter is muted.              |
+| `docsIf3CmStatusUsRangingStatus`     | int    | —     | Ranging state enum.                                     |
+
+## Notes
+
+* `docsIf3CmStatusUsEqData` contains the raw equalizer payload; decode to taps (location, magnitude, phase) in analysis workflows.
+* The hex string preserves original SNMP octets (for example `FF` stays `FF`, not UTF-8 encoded).
+* Use the combination of `TxPower`, timeout counters, and ranging status to corroborate upstream health with pre-EQ shape.
+* Channels are discovered automatically; no channel list is required in the request.
+# DOCSIS 3.0 Upstream ATDMA Pre-Equalization
+
+Provides Access To DOCSIS 3.0 Upstream SC-QAM (ATDMA) Pre-Equalization Tap Data For Plant Analysis (Reflections, Group Delay, Pre-Echo).
+
+## Endpoint
+
+**POST** `/docs/if30/us/scqam/chan/preEqualization`
+
+## Request
+
+Use the SNMP-only format: [Common → Request](../../../../common/request.md)  
+TFTP parameters are not required.
+
+## Response
+
+This endpoint returns the standard envelope described in [Common → Response](../../../../common/response.md) (`mac_address`, `status`, `message`, `data`).
+
+`data` is an **object** keyed by the **SNMP table index** of each upstream channel.  
+Each value contains decoded tap configuration and coefficient arrays.
+
+### Abbreviated Example
+
+```json
+{
+  "mac_address": "aa:bb:cc:dd:ee:ff",
+  "status": 0,
+  "message": null,
+  "data": {
+    "80": {
+      "main_tap_location": 8,
+      "forward_taps_per_symbol": 1,
+      "num_forward_taps": 24,
+      "num_reverse_taps": 0,
+      "forward_coefficients": [
+        { "real": 0, "imag": 4, "magnitude": 4.0, "magnitude_power_dB": 12.04 },
+        { "real": 2, "imag": -15425, "magnitude": 15425.0, "magnitude_power_dB": 83.76 },
+        { "real": -15426, "imag": 1, "magnitude": 15426.0, "magnitude_power_dB": 83.77 }
+        /* ... taps elided ... */
+      ],
+      "reverse_coefficients": []
+    },
+    "81": {
+      "main_tap_location": 8,
+      "forward_taps_per_symbol": 1,
+      "num_forward_taps": 24,
+      "num_reverse_taps": 0,
+      "forward_coefficients": [
+        { "real": -15425, "imag": -15425, "magnitude": 21814.24, "magnitude_power_dB": 86.77 },
+        { "real": 1, "imag": 3, "magnitude": 3.16, "magnitude_power_dB": 10.0 },
+        { "real": 1, "imag": -15425, "magnitude": 15425.0, "magnitude_power_dB": 83.76 }
+        /* ... taps elided ... */
+      ],
+      "reverse_coefficients": []
+    }
+    /* ... other upstream channel indices elided ... */
+  }
+}
+```
+
+## Container Keys
+
+| Key (top-level under `data`) | Type   | Description                                                       |
+| ---------------------------- | ------ | ----------------------------------------------------------------- |
+| `"80"`, `"81"`, …            | string | **SNMP table index** for the upstream channel row (OID instance). |
+
+## Channel-Level Fields
+
+| Field                     | Type    | Description                                                 |
+| ------------------------- | ------- | ----------------------------------------------------------- |
+| `main_tap_location`       | integer | Location of the main tap (typically near the filter center) |
+| `forward_taps_per_symbol` | integer | Number of forward taps per symbol                           |
+| `num_forward_taps`        | integer | Total forward equalizer taps                                |
+| `num_reverse_taps`        | integer | Total reverse equalizer taps (often `0` for ATDMA)          |
+| `forward_coefficients`    | array   | Complex tap coefficients applied in forward direction       |
+| `reverse_coefficients`    | array   | Complex tap coefficients applied in reverse direction       |
+
+## Coefficient Object Fields
+
+| Field                | Type  | Units | Description                          |
+| -------------------- | ----- | ----- | ------------------------------------ |
+| `real`               | int   | —     | Real part of the complex coefficient |
+| `imag`               | int   | —     | Imaginary part of the coefficient    |
+| `magnitude`          | float | —     | Magnitude of the complex tap         |
+| `magnitude_power_dB` | float | dB    | Power of the tap in dB               |
+
+## Notes
+
+* Each top-level key under `data` is the DOCSIS **SNMP index** for an upstream SC-QAM (ATDMA) channel.
+* Forward taps pre-compensate the channel (handling pre-echo/echo paths); reverse taps are uncommon in ATDMA.
+* Use tap shapes and main-tap offset to infer echo path delay and alignment health.
+* Tap coefficients are signed integers; convert to floating-point as needed for analysis.

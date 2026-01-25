@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from pypnm.config.system_config_settings import SystemConfigSettings
-from pypnm.lib.db.json_file_lock import JsonFileLock
 from pypnm.lib.constants import cast
+from pypnm.lib.db.json_file_lock import JsonFileLock
 from pypnm.lib.types import GroupId, OperationId
 
 
@@ -145,9 +145,8 @@ class OperationManager:
             db_str = SystemConfigSettings.operation_db()
             db_path = Path(db_str)
         try:
-            with JsonFileLock(db_path):
-                with db_path.open("r", encoding="utf-8") as f:
-                    db = json.load(f)
+            with JsonFileLock(db_path), db_path.open("r", encoding="utf-8") as f:
+                db = json.load(f)
             rec = db.get(operation_id)
             return rec.get("capture_group_id") if isinstance(rec, dict) else None
         except Exception as e:
@@ -170,9 +169,8 @@ class OperationManager:
             db_str = SystemConfigSettings.operation_db()
             db_path = Path(db_str)
         try:
-            with JsonFileLock(db_path):
-                with db_path.open("r", encoding="utf-8") as f:
-                    return list(json.load(f).keys())
+            with JsonFileLock(db_path), db_path.open("r", encoding="utf-8") as f:
+                return list(json.load(f).keys())
         except Exception as e:
             logging.getLogger(cls.__name__).error(f"Error listing operations: {e}")
             return []

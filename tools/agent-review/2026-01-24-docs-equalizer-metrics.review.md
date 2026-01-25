@@ -1,3 +1,11 @@
+## Agent Review Bundle Summary
+- Goal: Incorporate equalizer key metrics into DocsEqualizerData outputs.
+- Changes: Add optional metrics field and derive ATDMA metrics for 24-tap payloads.
+- Files: src/pypnm/pnm/data_type/DocsEqualizerData.py
+- Tests: python3 -m compileall src; ruff check src; ruff format --check . (fails: repo drift); pytest -q
+- Notes: Ruff format would reformat many existing files; no formatting applied.
+
+# FILE: src/pypnm/pnm/data_type/DocsEqualizerData.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
 

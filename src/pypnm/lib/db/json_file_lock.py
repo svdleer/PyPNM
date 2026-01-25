@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import time
 from pathlib import Path
 from typing import TextIO
-
-import fcntl
 
 
 class JsonFileLock:
@@ -28,13 +27,20 @@ class JsonFileLock:
         start = time.monotonic()
 
         while True:
-            try:
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if self._try_lock():
                 return None
-            except BlockingIOError:
-                if time.monotonic() - start >= self._timeout:
-                    raise TimeoutError(f"Timed out acquiring lock for {self._lock_path}")
-                time.sleep(self._poll_interval)
+            if time.monotonic() - start >= self._timeout:
+                raise TimeoutError(f"Timed out acquiring lock for {self._lock_path}") from None
+            time.sleep(self._poll_interval)
+
+    def _try_lock(self) -> bool:
+        if not self._handle:
+            return False
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
 
     def __exit__(self, exc_type: object, exc: object, exc_tb: object) -> None:
         if not self._handle:

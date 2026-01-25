@@ -584,15 +584,31 @@ class Snmp_v2c:
         result = []
         for varbind in snmp_responses:
             value = varbind[1]
-            # Attempt to get raw bytes directly if available
-            if hasattr(value, 'asOctets'):
-                result.append(value.asOctets())
-            elif isinstance(value, bytes):
-                result.append(value)
-            else:
-                # Fallback: try encoding string representation
-                result.append(str(value).encode())
+            result.append(Snmp_v2c.snmp_octets_to_bytes(value))
         return result
+
+    @staticmethod
+    def snmp_octets_to_bytes(value: object) -> bytes:
+        """
+        Normalize SNMP OctetString-like values into raw bytes.
+
+        Supports bytes/bytearray/memoryview, pysnmp objects exposing asOctets(),
+        or objects that can be converted via bytes(). Returns b"" on failure.
+        """
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
+
+        as_octets = getattr(value, "asOctets", None)
+        if callable(as_octets):
+            try:
+                return bytes(as_octets())
+            except Exception:
+                return b""
+
+        try:
+            return bytes(value)
+        except Exception:
+            return b""
 
     @staticmethod
     def snmp_get_result_last_idx_value(snmp_responses: list[ObjectType]) -> list[tuple[InterfaceIndex, str]]:
