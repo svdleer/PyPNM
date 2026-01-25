@@ -34,7 +34,7 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
     
     try:
         # Get TFTP IP from request or fall back to system config
-        tftp_ip = request.tftp.ipv4 if request.tftp.ipv4 else SystemConfigSettings.tftp_ipv4()
+        tftp_ip = request.tftp.ipv4 if request.tftp.ipv4 else SystemConfigSettings.bulk_tftp_ip_v4()
         if not tftp_ip:
             return UtscResponse(success=False, error="TFTP IPv4 address required but not provided in request or system config")
         
