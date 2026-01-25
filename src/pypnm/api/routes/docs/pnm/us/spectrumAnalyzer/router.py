@@ -14,7 +14,7 @@ from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.schemas import (
     UtscDiscoverRequest,
     UtscDiscoverResponse,
 )
-from pypnm.api.routes.docs/pnm/us/spectrumAnalyzer.service import CmtsUtscService, UtscRfPortDiscoveryService
+from pypnm.api.routes.docs.pnm.us.spectrumAnalyzer.service import CmtsUtscService, UtscRfPortDiscoveryService
 from pypnm.config.system_config_settings import SystemConfigSettings
 from pypnm.lib.inet import Inet
 
