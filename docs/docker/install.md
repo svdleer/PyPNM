@@ -1,5 +1,8 @@
 # PyPNM Docker Install & Usage
 
+Note: Docker workflows are supported on Linux hosts. macOS users should not use
+these Docker-specific instructions.
+
 PyPNM ships with Docker assets so you can run the API quickly on a workstation, lab host, or VM. This guide covers the common flows:
 
 - Install the published release image via the helper script.

@@ -1,5 +1,8 @@
 # Development Install (Docker + kind)
 
+Note: Docker and Kubernetes workflows are supported on Linux. macOS users should not use
+the Docker/kind paths in this guide.
+
 Use this when you want a local environment that can run the release smoke tests.
 
 This option installs:
