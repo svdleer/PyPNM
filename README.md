@@ -17,6 +17,7 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/pypnm-docsis.svg)](https://pypi.org/project/pypnm-docsis/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/pypnm-docsis.svg)](https://pypi.org/project/pypnm-docsis/)
 [![Daily Build](https://github.com/PyPNMApps/PyPNM/actions/workflows/daily-build.yml/badge.svg?branch=main)](https://github.com/PyPNMApps/PyPNM/actions/workflows/daily-build.yml)
+[![macOS CI](https://github.com/PyPNMApps/PyPNM/actions/workflows/macos-ci.yml/badge.svg?branch=main)](https://github.com/PyPNMApps/PyPNM/actions/workflows/macos-ci.yml)
 ![CodeQL](https://github.com/PyPNMApps/PyPNM/actions/workflows/codeql.yml/badge.svg)
 [![PyPI Install Check](https://github.com/PyPNMApps/PyPNM/actions/workflows/pypi-install-check.yml/badge.svg?branch=main)](https://github.com/PyPNMApps/PyPNM/actions/workflows/pypi-install-check.yml)
 [![Kubernetes (kind)](https://github.com/PyPNMApps/PyPNM/actions/workflows/kubernetes-kind.yml/badge.svg?branch=main)](https://github.com/PyPNMApps/PyPNM/actions/workflows/kubernetes-kind.yml)

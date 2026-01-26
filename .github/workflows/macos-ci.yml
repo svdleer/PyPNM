@@ -2,6 +2,14 @@ name: macOS CI (Test Only)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "main"
+      - "develop"
+  pull_request:
+    branches:
+      - "main"
+      - "develop"
 
 permissions:
   contents: read
@@ -39,3 +47,18 @@ jobs:
           PYTHONWARNINGS: default
         run: |
           python -m pytest -q
+
+      - name: Start PyPNM
+        run: |
+          python -m uvicorn pypnm.api.main:app --host 127.0.0.1 --port 8000 &
+          sleep 5
+          curl -fsS http://127.0.0.1:8000/health
+          pkill -f "uvicorn pypnm.api.main:app"
+
+      - name: Compile Python
+        run: |
+          python -m compileall src
+
+      - name: Build Docs (Strict)
+        run: |
+          mkdocs build --strict
