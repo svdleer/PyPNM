@@ -24,5 +24,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,docs]"
 
-      - name: Build docs (gated after Build)
-        run: mkdocs build --strict
+      - name: Compile Python
+        run: |
+          python -m compileall src
+
+      - name: Ruff Check
+        run: |
+          ruff check src
+
+      - name: Ruff Format Check
+        run: |
+          ruff format --check src
+
+      - name: Run Tests
+        env:
+          PYTHONWARNINGS: default
+        run: |
+          python -m pytest -q
+
+      - name: Start PyPNM
+        run: |
+          python -m uvicorn pypnm.api.main:app --host 127.0.0.1 --port 8000 &
+          sleep 5
+          curl -fsS http://127.0.0.1:8000/health
+          pkill -f "uvicorn pypnm.api.main:app"

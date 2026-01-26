@@ -1,11 +1,11 @@
-name: Build
+name: Daily Build
 
 on:
   push:
-    branches: [main]         # Run on every commit to main
+    branches: [main]                      # Run on every commit to main
   schedule:
-    - cron: "0 8 * * *"      # Every day at 08:00 UTC
-  workflow_dispatch:          # Allow manual triggering from GitHub UI
+    - cron: "0 8 * * *"   # Every day at 08:00 UTC
+  workflow_dispatch:                      # Allow manual triggering from GitHub UI
 
 jobs:
   daily-test:
