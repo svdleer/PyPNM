@@ -15,6 +15,8 @@ from pypnm.pnm.analysis.atdma_group_delay import GroupDelayCalculator, GroupDela
 from pypnm.pnm.analysis.atdma_preeq_key_metrics import (
     EqualizerMetrics,
     EqualizerMetricsModel,
+    EqualizerTapDelayAnnotator,
+    EqualizerTapDelaySummaryModel,
 )
 
 
@@ -30,16 +32,20 @@ class UsEqTapModel(BaseModel):
 
 
 class UsEqDataModel(BaseModel):
-    main_tap_location: int = Field(..., description="Main tap location (header byte 0; HEX value).")
-    taps_per_symbol: int = Field(..., description="Taps per symbol (header byte 1; HEX value).")
-    num_taps: int = Field(..., description="Number of taps (header byte 2; HEX value).")
-    reserved: int = Field(..., description="Reserved (header byte 3; HEX value).")
-    header_hex: str = Field(..., description="Header bytes as hex (4 bytes).")
-    payload_hex: str = Field(..., description="Full payload as hex (space-separated bytes).")
-    payload_preview_hex: str = Field(..., description="Header + first N taps as hex preview (space-separated bytes).")
-    taps: list[UsEqTapModel] = Field(..., description="Decoded taps in order (real/imag pairs).")
-    metrics: EqualizerMetricsModel | None = Field(None, description="ATDMA pre-equalization key metrics when available.")
+    main_tap_location: int      = Field(..., description="Main tap location (header byte 0; HEX value).")
+    taps_per_symbol: int        = Field(..., description="Taps per symbol (header byte 1; HEX value).")
+    num_taps: int               = Field(..., description="Number of taps (header byte 2; HEX value).")
+    reserved: int               = Field(..., description="Reserved (header byte 3; HEX value).")
+    header_hex: str             = Field(..., description="Header bytes as hex (4 bytes).")
+    payload_hex: str            = Field(..., description="Full payload as hex (space-separated bytes).")
+    payload_preview_hex: str    = Field(..., description="Header + first N taps as hex preview (space-separated bytes).")
+    taps: list[UsEqTapModel]    = Field(..., description="Decoded taps in order (real/imag pairs).")
+    metrics: EqualizerMetricsModel | None   = Field(None, description="ATDMA pre-equalization key metrics when available.")
     group_delay: GroupDelayModel | None = Field(None, description="ATDMA group delay derived from taps when channel_width_hz is provided.")
+    tap_delay_summary: EqualizerTapDelaySummaryModel | None = Field(
+        None,
+        description="Annotated tap delays and cable-length equivalents when channel_width_hz is provided.",
+    )
 
     model_config = {"frozen": True}
 
@@ -216,17 +222,24 @@ class DocsEqualizerData:
             taps_per_symbol=taps_per_symbol,
             rolloff=rolloff,
         )
-        self.equalizer_data[us_idx] = UsEqDataModel(
-            main_tap_location=main_tap_location,
+        tap_delay_summary = self._build_tap_delay_summary(
+            taps,
+            channel_width_hz=channel_width_hz,
             taps_per_symbol=taps_per_symbol,
-            num_taps=num_taps,
-            reserved=reserved,
-            header_hex=header_hex,
-            payload_hex=payload_hex,
-            payload_preview_hex=payload_preview_hex,
-            taps=taps,
-            metrics=metrics,
-            group_delay=group_delay,
+            rolloff=rolloff,
+        )
+        self.equalizer_data[us_idx] = UsEqDataModel(
+            main_tap_location      =   main_tap_location,
+            taps_per_symbol        =   taps_per_symbol,
+            num_taps               =   num_taps,
+            reserved               =   reserved,
+            header_hex             =   header_hex,
+            payload_hex            =   payload_hex,
+            payload_preview_hex    =   payload_preview_hex,
+            taps                   =   taps,
+            metrics                =   metrics,
+            group_delay            =   group_delay,
+            tap_delay_summary      =   tap_delay_summary,
         )
 
         self._coefficients_found = True
@@ -315,6 +328,36 @@ class DocsEqualizerData:
                 rolloff=rolloff,
             )
             return calculator.compute(coefficients)
+        except Exception:
+            return None
+
+    def _build_tap_delay_summary(
+        self,
+        taps: list[UsEqTapModel],
+        *,
+        channel_width_hz: BandwidthHz | None,
+        taps_per_symbol: int,
+        rolloff: float,
+    ) -> EqualizerTapDelaySummaryModel | None:
+        if channel_width_hz is None:
+            return None
+        if taps_per_symbol <= 0:
+            return None
+        if len(taps) != EqualizerTapDelayAnnotator.DEFAULT_TAP_COUNT:
+            return None
+        if rolloff < 0.0:
+            return None
+
+        coefficients: list[PreEqAtdmaCoefficients] = [
+            (RealInt(tap.real), ImginaryInt(tap.imag)) for tap in taps
+        ]
+        symbol_rate = float(int(channel_width_hz)) / (1.0 + float(rolloff))
+        try:
+            annotator = EqualizerTapDelayAnnotator(
+                symbol_rate=symbol_rate,
+                taps_per_symbol=taps_per_symbol,
+            )
+            return annotator.to_model(coefficients)
         except Exception:
             return None
 
