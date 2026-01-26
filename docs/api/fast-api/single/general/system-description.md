@@ -56,5 +56,3 @@ This endpoint returns the standard envelope described in [Common → Response](.
 * Data is derived from the SNMP `sysDescr` OID (`1.3.6.1.2.1.1.1.0`) and parsed using known vendor patterns.
 * Useful for populating device metadata dashboards or validation checks.
 * `is_empty = true` typically means the response could not be parsed into structured fields.
-
-> Noted: Using `aa:bb:cc:dd:ee:ff` as the MAC address in examples moving forward.
