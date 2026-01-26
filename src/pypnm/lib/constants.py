@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025
+# Copyright (c) 2025-2026
 
 from __future__ import annotations
 
@@ -45,13 +45,13 @@ DOCSIS_ROLL_OFF_FACTOR: Final[float] = 0.25
 
 # Velocity Factor (VF) by cable type (fraction of c0)
 CABLE_VF: Final[dict[CableTypes, float]] = {
-    "RG6":  0.87,
+    "RG6":  0.85,
     "RG59": 0.82,
     "RG11": 0.87,
 }
 
 class CableType(FloatEnum):
-    RG6  = 0.87
+    RG6  = 0.85
     RG59 = 0.82
     RG11 = 0.87
 
