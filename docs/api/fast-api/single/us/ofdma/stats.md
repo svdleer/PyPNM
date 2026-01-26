@@ -4,16 +4,16 @@ This API provides visibility into the configuration and runtime status of upstre
 
 Use this endpoint to support PNM workflows, particularly when analyzing power levels, ranging stability, and OFDMA symbol behavior under varying network conditions.
 
-## 🛰️ Endpoint
+## Endpoint
 
 **POST** `/docs/if31/us/ofdma/channel/stats`
 
 Retrieves statistics and configuration parameters for upstream OFDMA channels from a DOCSIS 3.1 cable modem. This includes subcarrier layout, transmit power, and upstream timing-related error counters.
 
 
-## 📥 Request Body (JSON)
+## Request Body (JSON)
 
-### 🔑 Request Fields
+### Request Fields
 
 | Field          | Type   | Description                       |
 | -------------- | ------ | --------------------------------- |
@@ -45,7 +45,7 @@ Retrieves statistics and configuration parameters for upstream OFDMA channels fr
 ```
 
 
-## 📤 Response Body (JSON)
+## Response Body (JSON)
 
 ```json
 [
@@ -77,7 +77,7 @@ Retrieves statistics and configuration parameters for upstream OFDMA channels fr
 ```
 
 
-## 📘 Response Field Highlights
+## Response Field Highlights
 
 | Field                                           | Type  | Description                                     |
 | ----------------------------------------------- | ----- | ----------------------------------------------- |
@@ -101,7 +101,7 @@ Retrieves statistics and configuration parameters for upstream OFDMA channels fr
 | `docsIf31CmStatusOfdmaUsRangingStatus`          | str   | Current ranging status (e.g., `4` = success)    |
 
 
-## 📝 Notes
+## Notes
 
 * Use this endpoint to monitor upstream channel state, power, and timeouts.
 * Useful for diagnosing access failures, ranging issues, or transmit mismatches.

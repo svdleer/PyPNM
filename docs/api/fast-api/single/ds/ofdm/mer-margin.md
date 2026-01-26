@@ -8,7 +8,7 @@ The CM also counts the number of MER per Subcarrier values that are below the th
 
 This table will have a row for each ifIndex for the modem.
 
-## 📚 Table of Contents
+## Table of Contents
 
 * [Get Measurement](#get-measurement)
 
@@ -16,13 +16,13 @@ This table will have a row for each ifIndex for the modem.
 
 ## Get Measurement
 
-### 🚀 Endpoint
+### Endpoint
 
 **POST** `/docs/pnm/ds/ofdm/merMargin/getMeasurement`
 
 Initiates a MER margin measurement on a DOCSIS 3.1 downstream OFDM profile.
 
-### 📒 Request Body (JSON)
+### Request Body (JSON)
 
 ```json
 {
