@@ -1,6 +1,6 @@
 ## Agent Review Bundle Summary
-- Goal: Validate macOS CI startup by hitting /health.
-- Changes: Add a curl health check after starting uvicorn.
+- Goal: Fix macOS CI pytest availability.
+- Changes: Ensure test extras install is not optional.
 - Files: .github/workflows/macos-ci.yml; README.md; src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/analysis/us_drw.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; docs/api/fast-api/single/us/atdma/chan/stats.md; docs/api/fast-api/single/us/ofdma/stats.md; docs/api/fast-api/single/ds/ofdm/mer-margin.md; docs/api/fast-api/single/general/system-description.md; tests/test_docs_equalizer_group_delay.py; tools/release/release.py
 - Tests: Not run (not requested).
 - Notes: None.
@@ -48,7 +48,7 @@ jobs:
       - name: Install Project
         run: |
           python -m pip install -e .
-          python -m pip install -e ".[test]" || true
+          python -m pip install -e ".[test]"
 
       - name: Run Tests
         env:
@@ -145,7 +145,7 @@ PyPNM is a DOCSIS 3.x/4.0 Proactive Network Maintenance toolkit for engineers wh
 Fast install (helper script; latest release auto-detected):
 
 ```bash
-TAG="v1.0.49.0-rc1"
+TAG="v1.0.50.0-rc1"
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \
