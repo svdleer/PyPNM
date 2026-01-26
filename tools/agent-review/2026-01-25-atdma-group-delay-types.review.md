@@ -1,10 +1,64 @@
 ## Agent Review Bundle Summary
-- Goal: Clarify macOS TFTP server availability.
-- Changes: Add a note that macOS ships a TFTP client but not a server.
-- Files: .github/workflows/macos-ci.yml; README.md; install.sh; src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/analysis/us_drw.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; docs/api/fast-api/single/us/atdma/chan/stats.md; docs/api/fast-api/single/us/ofdma/stats.md; docs/api/fast-api/single/ds/ofdm/mer-margin.md; docs/api/fast-api/single/general/system-description.md; docs/install/development.md; docs/docker/install.md; docs/kubernetes/pypnm-deploy.md; docs/system/pnm-file-retrieval/tftp.md; tests/test_docs_equalizer_group_delay.py; tools/release/release.py
+- Goal: Add a health check to post-build CI.
+- Changes: Start uvicorn and curl /health after pytest.
+- Files: .github/workflows/post-build.yml; .github/workflows/macos-ci.yml; README.md; install.sh; src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/analysis/us_drw.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; docs/api/fast-api/single/us/atdma/chan/stats.md; docs/api/fast-api/single/us/ofdma/stats.md; docs/api/fast-api/single/ds/ofdm/mer-margin.md; docs/api/fast-api/single/general/system-description.md; docs/install/development.md; docs/docker/install.md; docs/kubernetes/pypnm-deploy.md; docs/system/pnm-file-retrieval/tftp.md; tests/test_docs_equalizer_group_delay.py; tools/release/release.py
 - Tests: Not run (not requested).
 - Notes: None.
 
+# FILE: .github/workflows/post-build.yml
+name: Post Build
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+
+jobs:
+  downstream:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,docs]"
+
+      - name: Build docs (gated after Build)
+        run: mkdocs build --strict
+
+      - name: Compile Python
+        run: |
+          python -m compileall src
+
+      - name: Ruff Check
+        run: |
+          ruff check src
+
+      - name: Ruff Format Check
+        run: |
+          ruff format --check .
+
+      - name: Run Tests
+        env:
+          PYTHONWARNINGS: default
+        run: |
+          python -m pytest -q
+
+      - name: Start PyPNM
+        run: |
+          python -m uvicorn pypnm.api.main:app --host 127.0.0.1 --port 8000 &
+          sleep 5
+          curl -fsS http://127.0.0.1:8000/health
+          pkill -f "uvicorn pypnm.api.main:app"
 # FILE: .github/workflows/macos-ci.yml
 name: macOS CI
 
@@ -145,7 +199,7 @@ PyPNM is a DOCSIS 3.x/4.0 Proactive Network Maintenance toolkit for engineers wh
 Fast install (helper script; latest release auto-detected):
 
 ```bash
-TAG="v1.0.52.0-rc1"
+TAG="v1.0.53.0"
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \
@@ -5067,7 +5121,7 @@ PyPNM ships with Docker assets so you can run the API quickly on a workstation, 
 ## Fast path: PyPNM Docker container install
 
 ```bash
-TAG="v1.0.52.0-rc1"
+TAG="v1.0.53.0"
 PORT=8080
 
 curl -fsSLo install-pypnm-docker-container.sh \
@@ -5099,7 +5153,7 @@ curl -X GET http://127.0.0.1:${PORT}/pypnm/system/webService/reload -H 'accept: 
 ## Deploy bundle flow (tarball)
 
 ```bash
-TAG="v1.0.52.0-rc1"
+TAG="v1.0.53.0"
 WORKING_DIR="PyPNM-${TAG}"
 
 mkdir -p "${WORKING_DIR}"
@@ -5156,7 +5210,7 @@ This workflow pulls the manifests from GitHub and deploys the GHCR image directl
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PyPNMApps/PyPNM/main/tools/k8s/pypnm_k8s_remote_deploy.sh \\
   -o /tmp/pypnm_k8s_remote_deploy.sh
-TAG="v1.0.52.0-rc1"
+TAG="v1.0.53.0"
 NAMESPACE="pypnm-cmts-a"
 
 bash /tmp/pypnm_k8s_remote_deploy.sh --create --tag "${TAG}" --namespace "${NAMESPACE}" --replicas 1
