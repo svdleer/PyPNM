@@ -109,8 +109,15 @@ class DwrDynamicWindowRangeChecker:
     dwr_violation_db: PowerdB
 
     MIN_CHANNELS: ClassVar[Final[int]] = 2
+    DEFAULT_WARNING_DB: ClassVar[Final[PowerdB]] = PowerdB(6.0)
+    DEFAULT_VIOLATION_DB: ClassVar[Final[PowerdB]] = PowerdB(12.0)
 
-    def __init__(self, *, dwr_violation_db: PowerdB = PowerdB(12.0), dwr_warning_db: PowerdB = PowerdB(6.0)) -> None:
+    def __init__(
+        self,
+        *,
+        dwr_violation_db: PowerdB = DEFAULT_VIOLATION_DB,
+        dwr_warning_db: PowerdB = DEFAULT_WARNING_DB,
+    ) -> None:
         """
         Initialize a DWR checker with explicit thresholds.
 

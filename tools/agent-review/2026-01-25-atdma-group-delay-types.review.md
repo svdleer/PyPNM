@@ -1,6 +1,6 @@
 ## Agent Review Bundle Summary
-- Goal: Clarify DWR checker documentation and ATDMA stats docs.
-- Changes: Update DWR docstring and expand DWR window fields in stats docs.
+- Goal: Resolve ruff B008 defaults for DWR thresholds.
+- Changes: Move PowerdB defaults into class-level constants.
 - Files: src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/analysis/us_drw.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; docs/api/fast-api/single/us/atdma/chan/stats.md; tests/test_docs_equalizer_group_delay.py; tools/release/release.py
 - Tests: Not run (not requested).
 - Notes: None.
@@ -308,8 +308,15 @@ class DwrDynamicWindowRangeChecker:
     dwr_violation_db: PowerdB
 
     MIN_CHANNELS: ClassVar[Final[int]] = 2
+    DEFAULT_WARNING_DB: ClassVar[Final[PowerdB]] = PowerdB(6.0)
+    DEFAULT_VIOLATION_DB: ClassVar[Final[PowerdB]] = PowerdB(12.0)
 
-    def __init__(self, *, dwr_violation_db: PowerdB = PowerdB(12.0), dwr_warning_db: PowerdB = PowerdB(6.0)) -> None:
+    def __init__(
+        self,
+        *,
+        dwr_violation_db: PowerdB = DEFAULT_VIOLATION_DB,
+        dwr_warning_db: PowerdB = DEFAULT_WARNING_DB,
+    ) -> None:
         """
         Initialize a DWR checker with explicit thresholds.
 
@@ -3276,7 +3283,14 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_connect
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import BandwidthHz, ChannelId, InetAddressStr, MacAddressStr, PowerdB, PowerdBmV
+from pypnm.lib.types import (
+    BandwidthHz,
+    ChannelId,
+    InetAddressStr,
+    MacAddressStr,
+    PowerdB,
+    PowerdBmV,
+)
 from pypnm.pnm.analysis.us_drw import (
     DwrChannelPowerModel,
     DwrDynamicWindowRangeChecker,
@@ -3294,6 +3308,9 @@ class UsScQamChannelService:
         cm (CableModem): An instance of the CableModem class used to perform SNMP operations.
     """
 
+    DEFAULT_DWR_WARNING_DB: PowerdB = PowerdB(6.0)
+    DEFAULT_DWR_VIOLATION_DB: PowerdB = PowerdB(12.0)
+
     def __init__(self, mac_address: MacAddressStr,
                  ip_address: InetAddressStr,
                  snmp_config: SNMPConfig) -> None:
@@ -3310,8 +3327,8 @@ class UsScQamChannelService:
 
     async def get_upstream_entries(
         self,
-        dwr_warning_db: PowerdB = PowerdB(6.0),
-        dwr_violation_db: PowerdB = PowerdB(12.0),
+        dwr_warning_db: PowerdB = DEFAULT_DWR_WARNING_DB,
+        dwr_violation_db: PowerdB = DEFAULT_DWR_VIOLATION_DB,
     ) -> dict[str, object]:
         """
         Fetches DOCSIS Upstream SC-QAM channel entries.
