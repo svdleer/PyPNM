@@ -9,7 +9,12 @@ from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_connect
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.types import BandwidthHz, InetAddressStr, MacAddressStr
+from pypnm.lib.types import BandwidthHz, ChannelId, InetAddressStr, MacAddressStr, PowerdB, PowerdBmV
+from pypnm.pnm.analysis.us_drw import (
+    DwrChannelPowerModel,
+    DwrDynamicWindowRangeChecker,
+    DwrWindowCheckModel,
+)
 from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
 
 
@@ -36,15 +41,47 @@ class UsScQamChannelService:
                              inet=Inet(ip_address),
                              write_community=snmp_config.snmp_v2c.community)
 
-    async def get_upstream_entries(self) -> list[dict]:
+    async def get_upstream_entries(
+        self,
+        dwr_warning_db: PowerdB = PowerdB(6.0),
+        dwr_violation_db: PowerdB = PowerdB(12.0),
+    ) -> dict[str, object]:
         """
         Fetches DOCSIS Upstream SC-QAM channel entries.
 
         Returns:
-            List[dict]: A list of dictionaries representing upstream channel information.
+            Dict[str, object]: Upstream channel entries with optional DWR evaluation summary.
         """
         entries = await self.cm.getDocsIfUpstreamChannelEntry()
-        return [entry.model_dump() for entry in entries]
+        entry_dicts = [entry.model_dump() for entry in entries]
+
+        channel_powers: list[DwrChannelPowerModel] = []
+        for entry in entries:
+            tx_power = entry.entry.docsIf3CmStatusUsTxPower
+            if tx_power is None:
+                continue
+            channel_powers.append(
+                DwrChannelPowerModel(
+                    channel_id=ChannelId(entry.channel_id),
+                    tx_power_dbmv=PowerdBmV(tx_power),
+                )
+            )
+
+        dwr_check: DwrWindowCheckModel | None = None
+        if len(channel_powers) >= DwrDynamicWindowRangeChecker.MIN_CHANNELS:
+            try:
+                checker = DwrDynamicWindowRangeChecker(
+                    dwr_violation_db=dwr_violation_db,
+                    dwr_warning_db=dwr_warning_db,
+                )
+                dwr_check = checker.evaluate(channel_powers)
+            except Exception:
+                dwr_check = None
+
+        return {
+            "entries": entry_dicts,
+            "dwr_window_check": (dwr_check.model_dump() if dwr_check is not None else None),
+        }
 
     async def get_upstream_pre_equalizations(self) ->  dict[int, dict]:
         """
@@ -54,9 +91,9 @@ class UsScQamChannelService:
             List[dict]: A dictionary containing per-channel equalizer data with real, imag,
                         magnitude, and power (dB) for each tap.
         """
-        entries = await self.get_upstream_entries()
+        entries_payload = await self.get_upstream_entries()
         channel_widths: dict[int, BandwidthHz] = {}
-        for entry in entries:
+        for entry in entries_payload.get("entries", []):
             index = entry.get("index")
             entry_data = entry.get("entry") or {}
             channel_width = entry_data.get("docsIfUpChannelWidth")

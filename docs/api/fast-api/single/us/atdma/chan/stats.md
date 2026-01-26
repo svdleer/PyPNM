@@ -15,7 +15,7 @@ TFTP parameters are not required.
 
 This endpoint returns the standard envelope described in [Common → Response](../../../../common/response.md) (`mac_address`, `status`, `message`, `data`).
 
-`data` is an **array** of upstream channels. Each item contains the SNMP table `index`, the upstream `channel_id`, and an `entry` with configuration, status, and (where available) raw pre-EQ data (`docsIf3CmStatusUsEqData`).
+`data` is an **object** with the upstream channel entries plus an optional DWR window evaluation summary. Each entry contains the SNMP table `index`, the upstream `channel_id`, and an `entry` with configuration, status, and (where available) raw pre-EQ data (`docsIf3CmStatusUsEqData`).
 
 ### Abbreviated Example
 
@@ -24,70 +24,104 @@ This endpoint returns the standard envelope described in [Common → Response](.
   "mac_address": "aa:bb:cc:dd:ee:ff",
   "status": 0,
   "message": null,
-  "data": [
-    {
-      "index": 80,
-      "channel_id": 1,
-      "entry": {
-        "docsIfUpChannelId": 1,
-        "docsIfUpChannelFrequency": 14600000,
-        "docsIfUpChannelWidth": 6400000,
-        "docsIfUpChannelModulationProfile": 0,
-        "docsIfUpChannelSlotSize": 2,
-        "docsIfUpChannelTxTimingOffset": 6436,
-        "docsIfUpChannelRangingBackoffStart": 3,
-        "docsIfUpChannelRangingBackoffEnd": 8,
-        "docsIfUpChannelTxBackoffStart": 2,
-        "docsIfUpChannelTxBackoffEnd": 6,
-        "docsIfUpChannelType": 2,
-        "docsIfUpChannelCloneFrom": 0,
-        "docsIfUpChannelUpdate": false,
-        "docsIfUpChannelStatus": 1,
-        "docsIfUpChannelPreEqEnable": true,
-        "docsIf3CmStatusUsTxPower": 49.0,
-        "docsIf3CmStatusUsT3Timeouts": 0,
-        "docsIf3CmStatusUsT4Timeouts": 0,
-        "docsIf3CmStatusUsRangingAborteds": 0,
-        "docsIf3CmStatusUsModulationType": 2,
-        "docsIf3CmStatusUsEqData": "0x08011800ffff0003...00020001",
-        "docsIf3CmStatusUsT3Exceededs": 0,
-        "docsIf3CmStatusUsIsMuted": false,
-        "docsIf3CmStatusUsRangingStatus": 4
+  "data": {
+    "entries": [
+      {
+        "index": 80,
+        "channel_id": 1,
+        "entry": {
+          "docsIfUpChannelId": 1,
+          "docsIfUpChannelFrequency": 14600000,
+          "docsIfUpChannelWidth": 6400000,
+          "docsIfUpChannelModulationProfile": 0,
+          "docsIfUpChannelSlotSize": 2,
+          "docsIfUpChannelTxTimingOffset": 6436,
+          "docsIfUpChannelRangingBackoffStart": 3,
+          "docsIfUpChannelRangingBackoffEnd": 8,
+          "docsIfUpChannelTxBackoffStart": 2,
+          "docsIfUpChannelTxBackoffEnd": 6,
+          "docsIfUpChannelType": 2,
+          "docsIfUpChannelCloneFrom": 0,
+          "docsIfUpChannelUpdate": false,
+          "docsIfUpChannelStatus": 1,
+          "docsIfUpChannelPreEqEnable": true,
+          "docsIf3CmStatusUsTxPower": 49.0,
+          "docsIf3CmStatusUsT3Timeouts": 0,
+          "docsIf3CmStatusUsT4Timeouts": 0,
+          "docsIf3CmStatusUsRangingAborteds": 0,
+          "docsIf3CmStatusUsModulationType": 2,
+          "docsIf3CmStatusUsEqData": "0x08011800ffff0003...00020001",
+          "docsIf3CmStatusUsT3Exceededs": 0,
+          "docsIf3CmStatusUsIsMuted": false,
+          "docsIf3CmStatusUsRangingStatus": 4
+        }
+      },
+      {
+        "index": 81,
+        "channel_id": 2,
+        "entry": {
+          "docsIfUpChannelId": 2,
+          "docsIfUpChannelFrequency": 21000000,
+          "docsIfUpChannelWidth": 6400000,
+          "docsIfUpChannelModulationProfile": 0,
+          "docsIfUpChannelSlotSize": 2,
+          "docsIfUpChannelTxTimingOffset": 6436,
+          "docsIfUpChannelRangingBackoffStart": 3,
+          "docsIfUpChannelRangingBackoffEnd": 8,
+          "docsIfUpChannelTxBackoffStart": 2,
+          "docsIfUpChannelTxBackoffEnd": 6,
+          "docsIfUpChannelType": 2,
+          "docsIfUpChannelCloneFrom": 0,
+          "docsIfUpChannelUpdate": false,
+          "docsIfUpChannelStatus": 1,
+          "docsIfUpChannelPreEqEnable": true,
+          "docsIf3CmStatusUsTxPower": 48.5,
+          "docsIf3CmStatusUsT3Timeouts": 0,
+          "docsIf3CmStatusUsT4Timeouts": 0,
+          "docsIf3CmStatusUsRangingAborteds": 0,
+          "docsIf3CmStatusUsModulationType": 2,
+          "docsIf3CmStatusUsEqData": "0x08011800ffff0001...0002",
+          "docsIf3CmStatusUsT3Exceededs": 0,
+          "docsIf3CmStatusUsIsMuted": false,
+          "docsIf3CmStatusUsRangingStatus": 4
+        }
       }
-    },
-    {
-      "index": 81,
-      "channel_id": 2,
-      "entry": {
-        "docsIfUpChannelId": 2,
-        "docsIfUpChannelFrequency": 21000000,
-        "docsIfUpChannelWidth": 6400000,
-        "docsIfUpChannelModulationProfile": 0,
-        "docsIfUpChannelSlotSize": 2,
-        "docsIfUpChannelTxTimingOffset": 6436,
-        "docsIfUpChannelRangingBackoffStart": 3,
-        "docsIfUpChannelRangingBackoffEnd": 8,
-        "docsIfUpChannelTxBackoffStart": 2,
-        "docsIfUpChannelTxBackoffEnd": 6,
-        "docsIfUpChannelType": 2,
-        "docsIfUpChannelCloneFrom": 0,
-        "docsIfUpChannelUpdate": false,
-        "docsIfUpChannelStatus": 1,
-        "docsIfUpChannelPreEqEnable": true,
-        "docsIf3CmStatusUsTxPower": 48.5,
-        "docsIf3CmStatusUsT3Timeouts": 0,
-        "docsIf3CmStatusUsT4Timeouts": 0,
-        "docsIf3CmStatusUsRangingAborteds": 0,
-        "docsIf3CmStatusUsModulationType": 2,
-        "docsIf3CmStatusUsEqData": "0x08011800ffff0001...0002",
-        "docsIf3CmStatusUsT3Exceededs": 0,
-        "docsIf3CmStatusUsIsMuted": false,
-        "docsIf3CmStatusUsRangingStatus": 4
-      }
+    ],
+    "dwr_window_check": {
+      "dwr_warning_db": 6.0,
+      "dwr_violation_db": 12.0,
+      "channel_count": 2,
+      "min_power_dbmv": 48.5,
+      "max_power_dbmv": 49.0,
+      "spread_db": 0.5,
+      "is_warning": false,
+      "is_violation": false,
+      "extreme_channel_ids": [1, 2]
     }
-  ]
+  }
 }
 ```
+
+## Data Fields
+
+| Field              | Type   | Description                                      |
+| ------------------ | ------ | ------------------------------------------------ |
+| `entries`          | array  | Upstream channel entries (same as prior format). |
+| `dwr_window_check` | object | DWR evaluation summary, or null when unavailable. |
+
+## DWR Window Check Fields
+
+| Field              | Type  | Units | Description |
+| ------------------ | ----- | ----- | ----------- |
+| `dwr_warning_db`   | float | dB    | Warning threshold for the DWR spread. |
+| `dwr_violation_db` | float | dB    | Violation threshold for the DWR spread. |
+| `channel_count`    | int   | —     | Number of channels included in the evaluation. |
+| `min_power_dbmv`   | float | dBmV  | Minimum transmit power across channels. |
+| `max_power_dbmv`   | float | dBmV  | Maximum transmit power across channels. |
+| `spread_db`        | float | dB    | Power spread across channels (max-min). |
+| `is_warning`       | bool  | —     | True when warning_db < spread_db <= violation_db. |
+| `is_violation`     | bool  | —     | True when spread_db > violation_db. |
+| `extreme_channel_ids` | array | —  | Channel IDs that define the min/max spread. |
 
 ## Channel Fields
 
@@ -131,6 +165,7 @@ This endpoint returns the standard envelope described in [Common → Response](.
 * The hex string preserves original SNMP octets (for example `FF` stays `FF`, not UTF-8 encoded).
 * Use the combination of `TxPower`, timeout counters, and ranging status to corroborate upstream health with pre-EQ shape.
 * Channels are discovered automatically; no channel list is required in the request.
+* DWR warning and violation thresholds are evaluated against the min/max power spread for all channels returned.
 # DOCSIS 3.0 Upstream ATDMA Pre-Equalization
 
 Provides Access To DOCSIS 3.0 Upstream SC-QAM (ATDMA) Pre-Equalization Tap Data For Plant Analysis (Reflections, Group Delay, Pre-Echo).
