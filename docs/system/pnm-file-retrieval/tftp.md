@@ -68,6 +68,9 @@ If PNM file retrieval fails with TFTP errors (for example,
 `TFTP_PNM_FILE_FETCH_ERROR` in the logs), verify:
 
 1. The TFTP service is running on `localhost` and listening on UDP port 69.
+
+Note: macOS includes a TFTP client but does not ship a native TFTP server. Use a
+third-party daemon if you need a local TFTP server on macOS.
 2. The TFTP server is allowed to **serve** files (download) as well as accept
    uploads from the cable modem. Some configurations are upload-only.
 3. The TFTP root or `remote_dir` actually contains the PNM files that the CM

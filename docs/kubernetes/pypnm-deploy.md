@@ -1,5 +1,8 @@
 # PyPNM on Kubernetes (kind)
 
+Note: Kubernetes (kind) workflows are supported on Linux hosts. macOS users should not
+use this guide.
+
 This walkthrough uses the manifests in `deploy/kubernetes/`. Start by installing kind and creating a cluster using [Local Kubernetes (kind) install](kind-install.md).
 
 ## Repo toolkit usage (recommended)

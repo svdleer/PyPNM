@@ -462,6 +462,11 @@ esac
 
 if [[ "$DEVELOPMENT_MODE" == "1" ]]; then
   echo "🧰 Development setup: Docker + kind/kubectl + gitleaks..."
+  if [[ "$PM" == "brew" ]]; then
+    echo "⚠️  macOS does not support the Docker/kind bootstrap in this script."
+    echo "    Skipping Docker/kind install; running gitleaks setup only."
+    install_gitleaks
+  else
   if ! command -v curl >/dev/null 2>&1; then
     if [[ "$PM" == "none" ]]; then
       echo "❌ curl not found and no package manager available."
@@ -488,6 +493,7 @@ if [[ "$DEVELOPMENT_MODE" == "1" ]]; then
   install_gitleaks
   echo "ℹ️  Docker may require: sudo systemctl start docker"
   echo "ℹ️  For non-sudo Docker: sudo usermod -aG docker \"${USER}\" (then log out/in)"
+  fi
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
