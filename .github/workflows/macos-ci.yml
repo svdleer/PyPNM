@@ -1,4 +1,4 @@
-name: macOS CI (Test Only)
+name: macOS CI
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
       - name: Install Project
         run: |
           python -m pip install -e .
-          python -m pip install -e ".[test]"
+          python -m pip install -e ".[dev,docs]"
 
       - name: Run Tests
         env:
