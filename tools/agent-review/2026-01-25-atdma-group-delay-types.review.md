@@ -1,10 +1,52 @@
 ## Agent Review Bundle Summary
-- Goal: Remove redundant MAC note from system description docs.
-- Changes: Delete the MAC note line per docs guidance.
-- Files: src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/analysis/us_drw.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; docs/api/fast-api/single/us/atdma/chan/stats.md; docs/api/fast-api/single/us/ofdma/stats.md; docs/api/fast-api/single/ds/ofdm/mer-margin.md; docs/api/fast-api/single/general/system-description.md; tests/test_docs_equalizer_group_delay.py; tools/release/release.py
+- Goal: Add a manual macOS CI workflow for testing.
+- Changes: Add a workflow_dispatch-only macOS test matrix workflow.
+- Files: .github/workflows/macos-ci-test-only.yml; src/pypnm/pnm/analysis/atdma_group_delay.py; src/pypnm/pnm/analysis/us_drw.py; src/pypnm/pnm/data_type/DocsEqualizerData.py; src/pypnm/docsis/cm_snmp_operation.py; src/pypnm/api/routes/docs/if30/us/atdma/chan/stats/service.py; docs/api/fast-api/single/us/atdma/chan/pre-equalization.md; docs/api/fast-api/single/us/atdma/chan/stats.md; docs/api/fast-api/single/us/ofdma/stats.md; docs/api/fast-api/single/ds/ofdm/mer-margin.md; docs/api/fast-api/single/general/system-description.md; tests/test_docs_equalizer_group_delay.py; tools/release/release.py
 - Tests: Not run (not requested).
 - Notes: None.
 
+# FILE: .github/workflows/macos-ci-test-only.yml
+name: macOS CI (Test Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-macos:
+    name: macOS · Python ${{ matrix.python-version }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Upgrade Pip Tooling
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install Project
+        run: |
+          python -m pip install -e .
+          python -m pip install -e ".[test]" || true
+
+      - name: Run Tests
+        env:
+          PYTHONWARNINGS: default
+        run: |
+          python -m pytest -q
 # FILE: src/pypnm/pnm/analysis/atdma_group_delay.py
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
