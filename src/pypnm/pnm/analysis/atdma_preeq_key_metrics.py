@@ -10,7 +10,7 @@ from typing import ClassVar, Final
 import numpy as np
 from pydantic import BaseModel, Field
 
-from pypnm.lib.constants import CableType, FEET_PER_METER, SPEED_OF_LIGHT
+from pypnm.lib.constants import FEET_PER_METER, SPEED_OF_LIGHT, CableType
 from pypnm.lib.types import PreEqAtdmaCoefficients
 
 
