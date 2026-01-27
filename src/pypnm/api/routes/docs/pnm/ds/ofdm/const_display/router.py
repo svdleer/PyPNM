@@ -103,8 +103,10 @@ class ConstellationDisplayRouter:
             cm = CableModem(mac_address=MacAddress(mac), inet=Inet(ip), write_community=community)
 
             status, msg = await CableModemServicePreCheck(cable_modem=cm, validate_ofdm_exist=True).run_precheck()
+            print(f"=== Precheck status: {status}, msg: {msg} ===", flush=True)
             if status != ServiceStatusCode.SUCCESS:
                 self.logger.error(msg)
+                print("=== EARLY RETURN: Precheck failed ===", flush=True)
                 return SnmpResponse(mac_address=mac, status=status, message=msg)
 
             modulation_order_offset: int = request.capture_settings.modulation_order_offset
@@ -123,9 +125,11 @@ class ConstellationDisplayRouter:
                 interface_parameters = DownstreamOfdmParameters(channel_id=list(channel_ids))
 
             msg_rsp: MessageResponse = await service.set_and_go(interface_parameters=interface_parameters)
+            print(f"=== set_and_go status: {msg_rsp.status} ===", flush=True)
             if msg_rsp.status != ServiceStatusCode.SUCCESS:
                 err = "Unable to complete Constellation Display capture."
                 self.logger.error(err)
+                print("=== EARLY RETURN: set_and_go failed ===", flush=True)
                 return SnmpResponse(mac_address=mac, message=err, status=msg_rsp.status)
 
             measurement_stats:list[DocsPnmCmDsConstDispMeasEntry] = \
