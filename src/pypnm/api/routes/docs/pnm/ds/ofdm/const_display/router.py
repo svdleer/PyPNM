@@ -139,9 +139,26 @@ class ConstellationDisplayRouter:
                     self.logger.warning(f"set_and_go returned non-zero status {msg_rsp.status}, but continuing to check for uploaded file")
                     print(f"=== WARNING: set_and_go status {msg_rsp.status}, but continuing ===", flush=True)
 
-                measurement_stats:list[DocsPnmCmDsConstDispMeasEntry] = \
-                    cast(list[DocsPnmCmDsConstDispMeasEntry],
-                        await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
+                # BYPASS BROKEN SNMP QUERY: Scan TFTP for constellation files directly
+                import glob
+                import os
+                from pypnm.api.routes.common.classes.config_settings import SystemConfigSettings
+                
+                tftp_dir = SystemConfigSettings.pnm_dir()
+                mac_clean = mac.replace(":", "").lower()
+                pattern = os.path.join(tftp_dir, f"ds_constellation_disp_{mac_clean}_*.bin")
+                files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+                
+                print(f"=== TFTP FILE SCAN ===", flush=True)
+                print(f"TFTP dir: {tftp_dir}", flush=True)
+                print(f"Pattern: {pattern}", flush=True)
+                print(f"Found {len(files)} files: {files[:3]}", flush=True)
+                print(f"=== END FILE SCAN ===", flush=True)
+                
+                # Skip SNMP measurement stats query - it's broken and returns empty list
+                # measurement_stats:list[DocsPnmCmDsConstDispMeasEntry] = \
+                #     cast(list[DocsPnmCmDsConstDispMeasEntry],
+                #         await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
 
                 cps = CommonProcessService(msg_rsp)
                 msg_rsp = cps.process()
