@@ -148,18 +148,28 @@ class ConstellationDisplayRouter:
                 # Debug: Check payload structure to diagnose empty plots
                 print(f"\n=== CONSTELLATION DEBUG for {mac} ===", flush=True)
                 print(f"Payload type: {type(msg_rsp.payload)}", flush=True)
-                print(f"Payload keys: {msg_rsp.payload.keys() if hasattr(msg_rsp.payload, 'keys') else 'No keys'}", flush=True)
-                if hasattr(msg_rsp.payload, 'measurements'):
-                    print(f"Number of measurements: {len(msg_rsp.payload.measurements)}", flush=True)
-                    if msg_rsp.payload.measurements:
-                        first_meas = msg_rsp.payload.measurements[0]
-                        if hasattr(first_meas, 'keys'):
-                            print(f"First measurement keys: {first_meas.keys()}", flush=True)
-                            if 'samples' in first_meas:
-                                samples = first_meas.get('samples')
-                                print(f"Samples present: {samples is not None}, Type: {type(samples) if samples else 'None'}", flush=True)
-                                if samples and hasattr(samples, '__len__'):
-                                    print(f"Samples length: {len(samples)}", flush=True)
+                
+                # Check if payload is a list
+                if isinstance(msg_rsp.payload, list):
+                    print(f"Payload is a list with length: {len(msg_rsp.payload)}", flush=True)
+                    if len(msg_rsp.payload) > 0:
+                        print(f"First item type: {type(msg_rsp.payload[0])}", flush=True)
+                        print(f"First item: {msg_rsp.payload[0]}", flush=True)
+                    else:
+                        print("ERROR: Payload list is EMPTY - modem returned no constellation data", flush=True)
+                else:
+                    print(f"Payload keys: {msg_rsp.payload.keys() if hasattr(msg_rsp.payload, 'keys') else 'No keys'}", flush=True)
+                    if hasattr(msg_rsp.payload, 'measurements'):
+                        print(f"Number of measurements: {len(msg_rsp.payload.measurements)}", flush=True)
+                        if msg_rsp.payload.measurements:
+                            first_meas = msg_rsp.payload.measurements[0]
+                            if hasattr(first_meas, 'keys'):
+                                print(f"First measurement keys: {first_meas.keys()}", flush=True)
+                                if 'samples' in first_meas:
+                                    samples = first_meas.get('samples')
+                                    print(f"Samples present: {samples is not None}, Type: {type(samples) if samples else 'None'}", flush=True)
+                                    if samples and hasattr(samples, '__len__'):
+                                        print(f"Samples length: {len(samples)}", flush=True)
                 print("=== END DEBUG ===\n", flush=True)
 
                 # Verify that samples exist before attempting constellation analysis
