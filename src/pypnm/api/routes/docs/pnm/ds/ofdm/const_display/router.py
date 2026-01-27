@@ -110,10 +110,11 @@ class ConstellationDisplayRouter:
 
                 status, msg = await CableModemServicePreCheck(cable_modem=cm, validate_ofdm_exist=True).run_precheck()
                 print(f"=== Precheck status: {status}, msg: {msg} ===", flush=True)
+                # NOTE: Continue even if precheck fails - modem may still upload files to TFTP successfully
+                # Ping often fails from Docker container even with host networking
                 if status != ServiceStatusCode.SUCCESS:
-                    self.logger.error(msg)
-                    print("=== EARLY RETURN: Precheck failed ===", flush=True)
-                    return SnmpResponse(mac_address=mac, status=status, message=msg)
+                    self.logger.warning(f"Precheck failed ({status}): {msg}, but continuing anyway")
+                    print(f"=== WARNING: Precheck status {status}, but continuing ===", flush=True)
 
                 modulation_order_offset: int = request.capture_settings.modulation_order_offset
                 number_sample_symbol: int = request.capture_settings.number_sample_symbol
