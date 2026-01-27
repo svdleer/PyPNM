@@ -91,8 +91,10 @@ class ConstellationDisplayRouter:
             [API Guide](https://github.com/PyPNMApps/PyPNM/blob/main/docs/api/fast-api/single/ds/ofdm/constellation-display.md)
 
             """
+            print("=== ENTERED get_capture ===", flush=True)
             mac: MacAddressStr = request.cable_modem.mac_address
             ip: InetAddressStr = request.cable_modem.ip_address
+            print(f"=== Processing constellation for MAC: {mac} ===", flush=True)
             community = RequestDefaultsResolver.resolve_snmp_community(request.cable_modem.snmp)
             tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
 
