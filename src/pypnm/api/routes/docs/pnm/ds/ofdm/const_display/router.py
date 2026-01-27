@@ -91,10 +91,16 @@ class ConstellationDisplayRouter:
             [API Guide](https://github.com/PyPNMApps/PyPNM/blob/main/docs/api/fast-api/single/ds/ofdm/constellation-display.md)
 
             """
-            print("=== ENTERED get_capture ===", flush=True)
-            mac: MacAddressStr = request.cable_modem.mac_address
-            ip: InetAddressStr = request.cable_modem.ip_address
-            print(f"=== Processing constellation for MAC: {mac} ===", flush=True)
+            import sys
+            import traceback
+            try:
+                print("=== ENTERED get_capture ===", flush=True)
+                sys.stderr.write("=== STDERR: Entered get_capture ===\n")
+                sys.stderr.flush()
+                mac: MacAddressStr = request.cable_modem.mac_address
+                ip: InetAddressStr = request.cable_modem.ip_address
+                sys.stderr.write(f"=== Processing constellation for MAC: {mac} ===\n")
+                sys.stderr.flush()
             community = RequestDefaultsResolver.resolve_snmp_community(request.cable_modem.snmp)
             tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
 
@@ -196,6 +202,15 @@ class ConstellationDisplayRouter:
                     mac_address =   mac,
                     status      =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
                     data        =   {},)
+            except Exception as e:
+                import sys
+                import traceback
+                sys.stderr.write(f"\n=== EXCEPTION IN get_capture ===\n")
+                sys.stderr.write(f"Exception type: {type(e).__name__}\n")
+                sys.stderr.write(f"Exception message: {str(e)}\n")
+                sys.stderr.write(f"Traceback:\n{traceback.format_exc()}\n")
+                sys.stderr.flush()
+                raise
 
 # Required for dynamic auto-registration
 router = ConstellationDisplayRouter().router
