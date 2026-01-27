@@ -132,11 +132,11 @@ class ConstellationDisplayRouter:
 
                 msg_rsp: MessageResponse = await service.set_and_go(interface_parameters=interface_parameters)
                 print(f"=== set_and_go status: {msg_rsp.status} ===", flush=True)
+                # NOTE: Continue even if status != 0, modem may upload file despite non-zero status
+                # Status 111 often occurs but files are successfully uploaded to TFTP
                 if msg_rsp.status != ServiceStatusCode.SUCCESS:
-                    err = "Unable to complete Constellation Display capture."
-                    self.logger.error(err)
-                    print("=== EARLY RETURN: set_and_go failed ===", flush=True)
-                    return SnmpResponse(mac_address=mac, message=err, status=msg_rsp.status)
+                    self.logger.warning(f"set_and_go returned non-zero status {msg_rsp.status}, but continuing to check for uploaded file")
+                    print(f"=== WARNING: set_and_go status {msg_rsp.status}, but continuing ===", flush=True)
 
                 measurement_stats:list[DocsPnmCmDsConstDispMeasEntry] = \
                     cast(list[DocsPnmCmDsConstDispMeasEntry],
