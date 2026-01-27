@@ -133,7 +133,17 @@ class ConstellationDisplayRouter:
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()
 
-            analysis = Analysis(AnalysisType.BASIC, msg_rsp)
+            # Verify that samples exist before attempting constellation analysis
+            try:
+                analysis = Analysis(AnalysisType.BASIC, msg_rsp)
+            except (ValueError, KeyError) as e:
+                err = f"Constellation analysis failed: {str(e)}. The modem may not support constellation capture or returned empty data."
+                self.logger.error(err)
+                return SnmpResponse(
+                    mac_address=mac, 
+                    message=err, 
+                    status=ServiceStatusCode.DS_OFDM_RXMER_NOT_AVAILABLE
+                )
 
             if request.analysis.output.type == OutputType.JSON:
                 payload: dict[str, Any] = cast(dict[str, Any], analysis.get_results())
