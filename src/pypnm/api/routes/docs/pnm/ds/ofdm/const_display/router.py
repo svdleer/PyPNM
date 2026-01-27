@@ -133,6 +133,14 @@ class ConstellationDisplayRouter:
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()
 
+            # Debug: Log payload structure to diagnose empty plots
+            self.logger.info(f"DEBUG: msg_rsp payload keys: {msg_rsp.payload.keys() if hasattr(msg_rsp.payload, 'keys') else type(msg_rsp.payload)}")
+            if hasattr(msg_rsp.payload, 'measurements'):
+                self.logger.info(f"DEBUG: Number of measurements: {len(msg_rsp.payload.measurements)}")
+                if msg_rsp.payload.measurements:
+                    first_meas = msg_rsp.payload.measurements[0]
+                    self.logger.info(f"DEBUG: First measurement keys: {first_meas.keys() if hasattr(first_meas, 'keys') else dir(first_meas)}")
+
             # Verify that samples exist before attempting constellation analysis
             try:
                 analysis = Analysis(AnalysisType.BASIC, msg_rsp)
