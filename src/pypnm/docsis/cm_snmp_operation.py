@@ -1482,6 +1482,10 @@ class CmSnmpOperation:
 
         try:
             indices = await self.getDocsIf31CmDsOfdmChannelIdIndex()
+            
+            print(f"=== OFDM CHANNEL INDEX DEBUG ===", flush=True)
+            print(f"Found {len(indices)} OFDM channel indices: {indices}", flush=True)
+            print(f"=== END INDEX DEBUG ===", flush=True)
 
             if not indices:
                 self.logger.warning("No DocsIf31CmDsOfdmChanChannelIdIndex indices found.")
