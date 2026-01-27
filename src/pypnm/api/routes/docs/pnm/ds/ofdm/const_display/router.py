@@ -133,13 +133,22 @@ class ConstellationDisplayRouter:
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()
 
-            # Debug: Log payload structure to diagnose empty plots
-            self.logger.info(f"DEBUG: msg_rsp payload keys: {msg_rsp.payload.keys() if hasattr(msg_rsp.payload, 'keys') else type(msg_rsp.payload)}")
+            # Debug: Check payload structure to diagnose empty plots
+            print(f"\n=== CONSTELLATION DEBUG for {mac} ===", flush=True)
+            print(f"Payload type: {type(msg_rsp.payload)}", flush=True)
+            print(f"Payload keys: {msg_rsp.payload.keys() if hasattr(msg_rsp.payload, 'keys') else 'No keys'}", flush=True)
             if hasattr(msg_rsp.payload, 'measurements'):
-                self.logger.info(f"DEBUG: Number of measurements: {len(msg_rsp.payload.measurements)}")
+                print(f"Number of measurements: {len(msg_rsp.payload.measurements)}", flush=True)
                 if msg_rsp.payload.measurements:
                     first_meas = msg_rsp.payload.measurements[0]
-                    self.logger.info(f"DEBUG: First measurement keys: {first_meas.keys() if hasattr(first_meas, 'keys') else dir(first_meas)}")
+                    if hasattr(first_meas, 'keys'):
+                        print(f"First measurement keys: {first_meas.keys()}", flush=True)
+                        if 'samples' in first_meas:
+                            samples = first_meas.get('samples')
+                            print(f"Samples present: {samples is not None}, Type: {type(samples) if samples else 'None'}", flush=True)
+                            if samples and hasattr(samples, '__len__'):
+                                print(f"Samples length: {len(samples)}", flush=True)
+            print("=== END DEBUG ===\n", flush=True)
 
             # Verify that samples exist before attempting constellation analysis
             try:
