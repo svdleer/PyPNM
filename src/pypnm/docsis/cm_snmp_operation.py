@@ -2086,8 +2086,13 @@ class CmSnmpOperation:
         """
         try:
             oid_file_name = f'{"docsPnmCmDsOfdmRxMerFileName"}.{ofdm_idx}'
-            set_response = await self._snmp.set(oid_file_name, rxmer_file_name, OctetString)
             self.logger.debug(f'Setting RxMER file name [{oid_file_name}] = "{rxmer_file_name}"')
+            
+            # Wrap SNMP SET with timeout to prevent hanging
+            set_response = await asyncio.wait_for(
+                self._snmp.set(oid_file_name, rxmer_file_name, OctetString),
+                timeout=5.0
+            )
 
             result = Snmp_v2c.snmp_set_result_value(set_response)
             if not result or str(result[0]) != rxmer_file_name:
@@ -2096,8 +2101,13 @@ class CmSnmpOperation:
 
             if set_and_go:
                 oid_file_enable = f'{"docsPnmCmDsOfdmRxMerFileEnable"}.{ofdm_idx}'
-                set_response = await self._snmp.set(oid_file_enable, 1, Integer32)
                 self.logger.debug(f'Enabling RxMER capture [{oid_file_enable}] = 1')
+                
+                # Wrap SNMP SET with timeout to prevent hanging
+                set_response = await asyncio.wait_for(
+                    self._snmp.set(oid_file_enable, 1, Integer32),
+                    timeout=5.0
+                )
 
                 result = Snmp_v2c.snmp_set_result_value(set_response)
                 if not result or int(result[0]) != 1:
@@ -2106,6 +2116,9 @@ class CmSnmpOperation:
 
             return True
 
+        except asyncio.TimeoutError:
+            self.logger.error(f'SNMP SET timeout during RxMER configuration for index {ofdm_idx}')
+            return False
         except Exception as e:
             self.logger.exception(f'Exception during setDocsPnmCmDsOfdmRxMer for index {ofdm_idx}: {e}')
             return False
