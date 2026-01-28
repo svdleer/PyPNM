@@ -353,7 +353,7 @@ class CmtsUsOfdmaRxMerService:
             ofdma_ifindex: OFDMA channel ifIndex
             
         Returns:
-            Dict with measurement status
+            Dict with measurement status and filename
         """
         snmp = self._get_snmp()
         
@@ -366,7 +366,7 @@ class CmtsUsOfdmaRxMerService:
             status_value = int(result[0][1])
             status_name = MeasStatus(status_value).name if status_value in [e.value for e in MeasStatus] else "unknown"
             
-            return {
+            response = {
                 "success": True,
                 "ofdma_ifindex": ofdma_ifindex,
                 "meas_status": status_value,
@@ -375,6 +375,19 @@ class CmtsUsOfdmaRxMerService:
                 "is_busy": status_value == MeasStatus.BUSY,
                 "is_error": status_value == MeasStatus.ERROR
             }
+            
+            # Get filename if measurement is ready
+            if status_value == MeasStatus.SAMPLE_READY:
+                try:
+                    filename_result = await snmp.get(f"{self.OID_US_RXMER_FILENAME}.{ofdma_ifindex}")
+                    if filename_result and filename_result[0][1]:
+                        filename = str(filename_result[0][1])
+                        response["filename"] = filename
+                        self.logger.info(f"US RxMER ready, filename: {filename}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to get filename: {e}")
+            
+            return response
             
         except Exception as e:
             self.logger.error(f"Failed to get US RxMER status: {e}")
