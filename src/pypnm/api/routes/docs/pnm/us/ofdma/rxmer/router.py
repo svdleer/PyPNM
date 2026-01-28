@@ -233,22 +233,31 @@ class UsOfdmaRxMerRouter:
             import numpy as np
             
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
+            import glob
             
-            # Build file path
-            if request.tftp_server:
-                # TODO: Implement TFTP fetch if needed
-                filepath = Path(request.tftp_path) / request.filename
-            else:
-                filepath = Path(request.tftp_path) / request.filename
+            # Build file path - CMTS adds timestamp, so use glob to find latest
+            tftp_dir = Path(request.tftp_path)
+            
+            # First try exact filename
+            filepath = tftp_dir / request.filename
+            
+            if not filepath.exists():
+                # CMTS adds timestamp like: usrxmer_9c305bf81daf_2026-01-28_19.42.35.123
+                # Try to find the file with glob pattern
+                pattern = str(tftp_dir / f"{request.filename}_*")
+                matching_files = sorted(glob.glob(pattern), reverse=True)
+                
+                if matching_files:
+                    filepath = Path(matching_files[0])  # Use most recent
+                    self.logger.info(f"Found timestamped file: {filepath}")
+                else:
+                    self.logger.error(f"File not found: {filepath} (tried pattern: {pattern})")
+                    return UsOfdmaRxMerCaptureResponse(
+                        success=False,
+                        error=f"File not found: {filepath}"
+                    )
             
             self.logger.info(f"Loading US RxMER file: {filepath}")
-            
-            # Check file exists
-            if not filepath.exists():
-                return UsOfdmaRxMerCaptureResponse(
-                    success=False,
-                    error=f"File not found: {filepath}"
-                )
             
             try:
                 # Read and parse file
