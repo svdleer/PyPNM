@@ -1154,7 +1154,7 @@ class Analysis:
         return result_model
 
     @classmethod
-    def basic_analysis_ds_constellation_display(cls, measurement: dict[str, Any]) -> ConstellationDisplayAnalysisModel:
+    def basic_analysis_ds_constellation_display(cls, measurement: dict[str, Any]) -> ConstellationDisplayAnalysisModel | None:
         """
         Build a minimal constellation analysis payload from a downstream OFDM
         measurement dictionary.
@@ -1179,15 +1179,16 @@ class Analysis:
 
         Returns
         -------
-        ConstellationDisplayAnalysisModel
+        ConstellationDisplayAnalysisModel | None
             Typed model carrying device/header info, inferred QAM order,
             **hard** constellation points from the LUT, and the **unscaled soft**
             decision coordinates provided by the CM.
+            Returns None if samples are empty (modem doesn't support this channel).
 
         Raises
         ------
-        ValueError
-            If ``samples`` is missing or empty.
+        None
+            This method now returns None instead of raising for empty samples.
         """
         # DEBUG: Log incoming measurement structure
         print(f"=== CONSTELLATION DISPLAY DEBUG ===", flush=True)
@@ -1208,7 +1209,10 @@ class Analysis:
             samples = [(float(s[0]), float(s[1])) if isinstance(s, (list, tuple)) else s for s in raw_samples]
         
         if not samples:
-            raise ValueError("measurement['samples'] is required and must be a non-empty ComplexArray.")
+            # Return None for empty samples instead of raising - this allows other channels to succeed
+            channel_id = measurement.get("channel_id", "unknown")
+            print(f"WARNING: Channel {channel_id} has no constellation samples, skipping", flush=True)
+            return None
 
         # Map actual modulation order → QamModulation
         amo: int | str = measurement.get("actual_modulation_order", DsOfdmModulationType.UNKNOWN)
