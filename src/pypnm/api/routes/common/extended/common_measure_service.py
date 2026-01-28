@@ -519,6 +519,7 @@ class CommonMeasureService(CommonMessagingService):
         """
         method = SystemConfigSettings.retrieval_method()
         print(f"=== Retrieval method: {method} ===", flush=True)
+        print(f"=== Config path: {SystemConfigSettings._cfg.get_config_path()} ===", flush=True)
         self.logger.info(f"{self.log_prefix} - Retrieval method: {method}")
 
         try:
