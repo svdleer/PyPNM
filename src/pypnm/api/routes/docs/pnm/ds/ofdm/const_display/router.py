@@ -91,117 +91,57 @@ class ConstellationDisplayRouter:
             [API Guide](https://github.com/PyPNMApps/PyPNM/blob/main/docs/api/fast-api/single/ds/ofdm/constellation-display.md)
 
             """
-            import sys
-            import traceback
+            mac: MacAddressStr = request.cable_modem.mac_address
+            ip: InetAddressStr = request.cable_modem.ip_address
+            community = RequestDefaultsResolver.resolve_snmp_community(request.cable_modem.snmp)
+            tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
+
+            self.logger.info(f"Starting Constellation Display capture for MAC: {mac}, IP: {ip}")
+
+            cm = CableModem(mac_address=MacAddress(mac), inet=Inet(ip), write_community=community)
+
+            status, msg = await CableModemServicePreCheck(cable_modem=cm, validate_ofdm_exist=True).run_precheck()
+            # NOTE: Continue even if precheck fails - modem may still upload files to TFTP successfully
+            if status != ServiceStatusCode.SUCCESS:
+                self.logger.warning(f"Precheck failed ({status}): {msg}, but continuing anyway")
+
+            modulation_order_offset: int = request.capture_settings.modulation_order_offset
+            number_sample_symbol: int = request.capture_settings.number_sample_symbol
+
+            service: CmDsOfdmConstDisplayService = CmDsOfdmConstDisplayService(
+                cable_modem             =   cm,
+                tftp_servers            =   tftp_servers,
+                modulation_order_offset =   modulation_order_offset,
+                number_sample_symbol    =   number_sample_symbol,
+            )
+
+            channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
+            interface_parameters = None
+            if channel_ids:
+                interface_parameters = DownstreamOfdmParameters(channel_id=list(channel_ids))
+
+            msg_rsp: MessageResponse = await service.set_and_go(interface_parameters=interface_parameters)
+            # NOTE: Continue even if status != 0, modem may upload file despite non-zero status
+            if msg_rsp.status != ServiceStatusCode.SUCCESS:
+                self.logger.warning(f"set_and_go returned non-zero status {msg_rsp.status}, but continuing to check for uploaded file")
+
+            # Skip SNMP measurement stats query - it's broken and returns empty list
+            measurement_stats: list[DocsPnmCmDsConstDispMeasEntry] = []
+
+            cps = CommonProcessService(msg_rsp)
+            msg_rsp = cps.process()
+
+            # Verify that samples exist before attempting constellation analysis
             try:
-                print("=== ENTERED get_capture ===", flush=True)
-                sys.stderr.write("=== STDERR: Entered get_capture ===\n")
-                sys.stderr.flush()
-                mac: MacAddressStr = request.cable_modem.mac_address
-                ip: InetAddressStr = request.cable_modem.ip_address
-                sys.stderr.write(f"=== Processing constellation for MAC: {mac} ===\n")
-                sys.stderr.flush()
-                community = RequestDefaultsResolver.resolve_snmp_community(request.cable_modem.snmp)
-                tftp_servers = RequestDefaultsResolver.resolve_tftp_servers(request.cable_modem.pnm_parameters.tftp)
-
-                self.logger.info(f"Starting Constellation Display capture for MAC: {mac}, IP: {ip}")
-
-                cm = CableModem(mac_address=MacAddress(mac), inet=Inet(ip), write_community=community)
-
-                status, msg = await CableModemServicePreCheck(cable_modem=cm, validate_ofdm_exist=True).run_precheck()
-                print(f"=== Precheck status: {status}, msg: {msg} ===", flush=True)
-                # NOTE: Continue even if precheck fails - modem may still upload files to TFTP successfully
-                # Ping often fails from Docker container even with host networking
-                if status != ServiceStatusCode.SUCCESS:
-                    self.logger.warning(f"Precheck failed ({status}): {msg}, but continuing anyway")
-                    print(f"=== WARNING: Precheck status {status}, but continuing ===", flush=True)
-
-                modulation_order_offset: int = request.capture_settings.modulation_order_offset
-                number_sample_symbol: int = request.capture_settings.number_sample_symbol
-
-                service: CmDsOfdmConstDisplayService = CmDsOfdmConstDisplayService(
-                    cable_modem             =   cm,
-                    tftp_servers            =   tftp_servers,
-                    modulation_order_offset =   modulation_order_offset,
-                    number_sample_symbol    =   number_sample_symbol,
+                analysis = Analysis(AnalysisType.BASIC, msg_rsp)
+            except (ValueError, KeyError) as e:
+                err = f"Constellation analysis failed: {str(e)}. The modem may not support constellation capture or returned empty data."
+                self.logger.error(err)
+                return SnmpResponse(
+                    mac_address=mac, 
+                    message=err, 
+                    status=ServiceStatusCode.DS_OFDM_RXMER_NOT_AVAILABLE
                 )
-
-                channel_ids = request.cable_modem.pnm_parameters.capture.channel_ids
-                interface_parameters = None
-                if channel_ids:
-                    interface_parameters = DownstreamOfdmParameters(channel_id=list(channel_ids))
-
-                msg_rsp: MessageResponse = await service.set_and_go(interface_parameters=interface_parameters)
-                print(f"=== set_and_go status: {msg_rsp.status} ===", flush=True)
-                # NOTE: Continue even if status != 0, modem may upload file despite non-zero status
-                # Status 111 often occurs but files are successfully uploaded to TFTP
-                if msg_rsp.status != ServiceStatusCode.SUCCESS:
-                    self.logger.warning(f"set_and_go returned non-zero status {msg_rsp.status}, but continuing to check for uploaded file")
-                    print(f"=== WARNING: set_and_go status {msg_rsp.status}, but continuing ===", flush=True)
-
-                # BYPASS BROKEN SNMP QUERY: Scan TFTP for constellation files directly
-                import glob
-                import os
-                from pypnm.config.system_config_settings import SystemConfigSettings
-                
-                tftp_dir = SystemConfigSettings.pnm_dir()
-                mac_clean = mac.replace(":", "").lower()
-                pattern = os.path.join(tftp_dir, f"ds_constellation_disp_{mac_clean}_*.bin")
-                files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-                
-                print(f"=== TFTP FILE SCAN ===", flush=True)
-                print(f"TFTP dir: {tftp_dir}", flush=True)
-                print(f"Pattern: {pattern}", flush=True)
-                print(f"Found {len(files)} files: {files[:3]}", flush=True)
-                print(f"=== END FILE SCAN ===", flush=True)
-                
-                # Skip SNMP measurement stats query - it's broken and returns empty list
-                measurement_stats: list[DocsPnmCmDsConstDispMeasEntry] = []
-                # measurement_stats:list[DocsPnmCmDsConstDispMeasEntry] = \
-                #     cast(list[DocsPnmCmDsConstDispMeasEntry],
-                #         await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
-
-                cps = CommonProcessService(msg_rsp)
-                msg_rsp = cps.process()
-
-                # Debug: Check payload structure to diagnose empty plots
-                print(f"\n=== CONSTELLATION DEBUG for {mac} ===", flush=True)
-                print(f"Payload type: {type(msg_rsp.payload)}", flush=True)
-                
-                # Check if payload is a list
-                if isinstance(msg_rsp.payload, list):
-                    print(f"Payload is a list with length: {len(msg_rsp.payload)}", flush=True)
-                    if len(msg_rsp.payload) > 0:
-                        print(f"First item type: {type(msg_rsp.payload[0])}", flush=True)
-                        print(f"First item: {msg_rsp.payload[0]}", flush=True)
-                    else:
-                        print("ERROR: Payload list is EMPTY - modem returned no constellation data", flush=True)
-                else:
-                    print(f"Payload keys: {msg_rsp.payload.keys() if hasattr(msg_rsp.payload, 'keys') else 'No keys'}", flush=True)
-                    if hasattr(msg_rsp.payload, 'measurements'):
-                        print(f"Number of measurements: {len(msg_rsp.payload.measurements)}", flush=True)
-                        if msg_rsp.payload.measurements:
-                            first_meas = msg_rsp.payload.measurements[0]
-                            if hasattr(first_meas, 'keys'):
-                                print(f"First measurement keys: {first_meas.keys()}", flush=True)
-                                if 'samples' in first_meas:
-                                    samples = first_meas.get('samples')
-                                    print(f"Samples present: {samples is not None}, Type: {type(samples) if samples else 'None'}", flush=True)
-                                    if samples and hasattr(samples, '__len__'):
-                                        print(f"Samples length: {len(samples)}", flush=True)
-                print("=== END DEBUG ===\n", flush=True)
-
-                # Verify that samples exist before attempting constellation analysis
-                try:
-                    analysis = Analysis(AnalysisType.BASIC, msg_rsp)
-                except (ValueError, KeyError) as e:
-                    err = f"Constellation analysis failed: {str(e)}. The modem may not support constellation capture or returned empty data."
-                    self.logger.error(err)
-                    return SnmpResponse(
-                        mac_address=mac, 
-                        message=err, 
-                        status=ServiceStatusCode.DS_OFDM_RXMER_NOT_AVAILABLE
-                    )
 
                 if request.analysis.output.type == OutputType.JSON:
                     payload: dict[str, Any] = cast(dict[str, Any], analysis.get_results())
@@ -231,15 +171,6 @@ class ConstellationDisplayRouter:
                         mac_address =   mac,
                         status      =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
                         data        =   {},)
-            except Exception as e:
-                import sys
-                import traceback
-                sys.stderr.write(f"\n=== EXCEPTION IN get_capture ===\n")
-                sys.stderr.write(f"Exception type: {type(e).__name__}\n")
-                sys.stderr.write(f"Exception message: {str(e)}\n")
-                sys.stderr.write(f"Traceback:\n{traceback.format_exc()}\n")
-                sys.stderr.flush()
-                raise
 
 # Required for dynamic auto-registration
 router = ConstellationDisplayRouter().router

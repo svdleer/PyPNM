@@ -189,19 +189,6 @@ class Analysis:
         payload: dict[int | str, Any]           = msg_response.payload_to_dict() or {}
         _raw_data                               = payload.get("data", [])
 
-        # DEBUG: Log the payload structure
-        print(f"=== ANALYSIS INIT DEBUG ===", flush=True)
-        print(f"payload_to_dict keys: {payload.keys() if isinstance(payload, dict) else type(payload)}", flush=True)
-        print(f"_raw_data type: {type(_raw_data)}", flush=True)
-        if isinstance(_raw_data, list) and len(_raw_data) > 0:
-            print(f"_raw_data[0] keys: {_raw_data[0].keys() if isinstance(_raw_data[0], dict) else type(_raw_data[0])}", flush=True)
-            if isinstance(_raw_data[0], dict):
-                print(f"_raw_data[0] has 'samples': {'samples' in _raw_data[0]}", flush=True)
-                if 'samples' in _raw_data[0]:
-                    samples = _raw_data[0]['samples']
-                    print(f"samples type: {type(samples)}, length: {len(samples) if hasattr(samples, '__len__') else 'N/A'}", flush=True)
-        print(f"=== END ANALYSIS INIT DEBUG ===", flush=True)
-
         self._result_model:list[BaseAnalysisModel] = []
         self._processed_pnm_type:list[PnmFileType] = []
         self._skip_automatic_process = skip_automatic_process
