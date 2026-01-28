@@ -159,7 +159,7 @@ class RxMerAnalysisReport(AnalysisReport):
                     grid            =   True,
                     legend          =   True,
                     transparent     =   False,
-                    theme           =   self.getAnalysisRptMatplotConfig().theme,
+                    theme           =   False,  # Light theme to match US RxMER
                     line_colors     =   ["#36A2EB", "#FF6384"],  # Match US RxMER blue for main line, pink for regression
                 )
 
@@ -189,7 +189,7 @@ class RxMerAnalysisReport(AnalysisReport):
                         grid        =   True,
                         legend      =   False,
                         transparent =   False,
-                        theme       =   self.getAnalysisRptMatplotConfig().theme,
+                        theme       =   False,  # Light theme to match US RxMER
                         line_color  =   "#36A2EB",  # Match US RxMER blue
                     )
 
@@ -224,7 +224,7 @@ class RxMerAnalysisReport(AnalysisReport):
                     grid          = True,
                     legend        = True,
                     transparent   = False,
-                    theme         = self.getAnalysisRptMatplotConfig().theme,
+                    theme         = False,  # Light theme to match US RxMER
                     line_color    = "#36A2EB",  # Match US RxMER blue
                 )
 
