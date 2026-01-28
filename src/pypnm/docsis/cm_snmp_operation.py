@@ -1874,19 +1874,19 @@ class CmSnmpOperation:
                 return False
 
             oid = f"{base_oid}.0"
-            logging.debug(f'Field-OID: {field_name} -> OID: {oid} -> {obj_value} -> Type: {snmp_type}')
+            self.logger.info(f'SPECTRUM SET: {field_name} -> OID: {oid} -> Value: {obj_value}')
 
             set_response = await self._snmp.set(oid, obj_value, snmp_type)
-            logging.debug(f'Set {field_name} [{oid}] = {obj_value}: {set_response}')
+            self.logger.info(f'SPECTRUM SET Response: {field_name} = {set_response}')
 
             if not set_response:
-                logging.error(f'Failed to set {field_name} to ({obj_value})')
+                self.logger.error(f'SPECTRUM SET FAILED: {field_name} to ({obj_value}) - No response')
                 return False
 
             result = Snmp_v2c.snmp_set_result_value(set_response)[0]
 
             if not result:
-                logging.error(f'Failed to set {field_name} to ({obj_value})')
+                self.logger.error(f'SPECTRUM SET FAILED: {field_name} to ({obj_value}) - Result empty')
                 return False
 
             logging.debug(f"Result({result}): {type(result)} -> Value({obj_value}): {type(obj_value)}")
