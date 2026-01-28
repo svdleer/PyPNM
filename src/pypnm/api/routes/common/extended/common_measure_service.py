@@ -292,8 +292,10 @@ class CommonMeasureService(CommonMessagingService):
         ##############################################################################################
 
         status_index_channelId = await self._get_indexes_via_pnm_test_type(interface_parameters)
+        print(f'=== Index/ChannelID List: {status_index_channelId[1]} ===', flush=True)
         self.logger.info(f'{self.log_prefix} - Index/ChannelID List: {status_index_channelId[1]}')
         if status_index_channelId[0] != ServiceStatusCode.SUCCESS or status_index_channelId[1] is None:
+            print(f'=== ERROR: Unable to acquire index from ChannelID, reason: {status_index_channelId[0]} ===', flush=True)
             self.logger.error(f'{self.log_prefix} - Unable to aquire index from ChannelID, reason: {status_index_channelId[0]}')
             return self.build_send_msg(status_index_channelId[0])
 
@@ -301,7 +303,10 @@ class CommonMeasureService(CommonMessagingService):
         # This section runs through all the indexes, build PNM file, run measurement and check status
         ##############################################################################################
         index_channelId: list[tuple[InterfaceIndex, ChannelId]] = status_index_channelId[1]
-        return self.build_send_msg(await self._pnm_measure_status_and_pnm_file_transfer(index_channelId, max_wait_count))
+        print(f'=== Calling _pnm_measure_status_and_pnm_file_transfer with {len(index_channelId)} indexes ===', flush=True)
+        result = await self._pnm_measure_status_and_pnm_file_transfer(index_channelId, max_wait_count)
+        print(f'=== _pnm_measure_status_and_pnm_file_transfer result: {result} ===', flush=True)
+        return self.build_send_msg(result)
 
     def getInterfaceParameters(self,
         interface_type: DocsisIfType) -> DownstreamOfdmParameters | UpstreamOfdmaParameters:
@@ -642,6 +647,7 @@ class CommonMeasureService(CommonMessagingService):
                 or the measurement status did not become SAMPLE_READY).
         """
         for interface_index, channel_id in idx_channelId:
+            print(f'=== Processing interface_index={interface_index}, channel_id={channel_id} ===', flush=True)
 
             #######################################################################
             # This sets the Measurement Table/Row for the specific PNM Measurement
@@ -649,7 +655,9 @@ class CommonMeasureService(CommonMessagingService):
             ctl_measure_status:tuple[ServiceStatusCode, list[FileNameStr]] = \
                 await self._setDocsPnmCmMeasureTest(self.pnm_test_type, interface_index, channel_id)
             
+            print(f'=== _setDocsPnmCmMeasureTest result: status={ctl_measure_status[0]}, files={ctl_measure_status[1]} ===', flush=True)
             if ctl_measure_status[0] != ServiceStatusCode.SUCCESS:
+                print(f'=== ERROR: _setDocsPnmCmMeasureTest failed: {ctl_measure_status[0]} ===', flush=True)
                 return ctl_measure_status[0]
 
             pnm_filenames = ctl_measure_status[1]
@@ -658,6 +666,7 @@ class CommonMeasureService(CommonMessagingService):
             count=1
             while True:
                 cm_ctl_status:DocsPnmCmCtlStatus = await self.cm.getDocsPnmCmCtlStatus()
+                print(f"=== PNM status: {str(cm_ctl_status).upper()} - count: {count} ===", flush=True)
                 self.logger.info(f"{self.log_prefix} - PNM status: {str(cm_ctl_status).upper()} - count: {count}")
                 if cm_ctl_status == DocsPnmCmCtlStatus.TEST_IN_PROGRESS:
                     count += 1
@@ -681,6 +690,7 @@ class CommonMeasureService(CommonMessagingService):
 
             while wait_count < max_wait_count:
                 meas_status = await self.cm.getPnmMeasurementStatus(self.pnm_test_type, extract_idx(interface_index))
+                print(f"=== MeasureStatus: {meas_status.name} (wait_count={wait_count}) ===", flush=True)
                 self.logger.info(f"{self.log_prefix} - MeasureStatus: {meas_status.name}")
                 if meas_status == MeasStatusType.SAMPLE_READY:
                     break
