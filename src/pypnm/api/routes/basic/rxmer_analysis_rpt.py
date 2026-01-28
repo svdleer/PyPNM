@@ -160,6 +160,7 @@ class RxMerAnalysisReport(AnalysisReport):
                     legend          =   True,
                     transparent     =   False,
                     theme           =   self.getAnalysisRptMatplotConfig().theme,
+                    line_colors     =   ["#36A2EB", "#FF6384"],  # Match US RxMER blue for main line, pink for regression
                 )
 
                 multi = self.create_png_fname(tags=[str(channel_id), 'rxmer'])
@@ -223,6 +224,7 @@ class RxMerAnalysisReport(AnalysisReport):
                     legend        = True,
                     transparent   = False,
                     theme         = self.getAnalysisRptMatplotConfig().theme,
+                    line_color    = "#36A2EB",  # Match US RxMER blue
                 )
 
                 signal_aggregate_fname = self.create_png_fname(tags=['signal_aggregate'])
