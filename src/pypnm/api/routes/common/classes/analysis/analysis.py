@@ -1202,7 +1202,24 @@ class Analysis:
         ValueError
             If ``samples`` is missing or empty.
         """
-        samples: ComplexArray = measurement.get("samples") or []
+        # DEBUG: Log incoming measurement structure
+        print(f"=== CONSTELLATION DISPLAY DEBUG ===", flush=True)
+        print(f"measurement keys: {measurement.keys()}", flush=True)
+        print(f"measurement has 'samples': {'samples' in measurement}", flush=True)
+        raw_samples = measurement.get("samples")
+        print(f"raw_samples type: {type(raw_samples)}", flush=True)
+        print(f"raw_samples is None: {raw_samples is None}", flush=True)
+        if raw_samples is not None:
+            print(f"raw_samples length: {len(raw_samples) if hasattr(raw_samples, '__len__') else 'N/A'}", flush=True)
+            if len(raw_samples) > 0:
+                print(f"first sample type: {type(raw_samples[0])}, value: {raw_samples[0]}", flush=True)
+        print(f"=== END CONSTELLATION DISPLAY DEBUG ===", flush=True)
+        
+        # Convert samples from list of lists to list of tuples if needed
+        samples: ComplexArray = []
+        if raw_samples:
+            samples = [(float(s[0]), float(s[1])) if isinstance(s, (list, tuple)) else s for s in raw_samples]
+        
         if not samples:
             raise ValueError("measurement['samples'] is required and must be a non-empty ComplexArray.")
 
