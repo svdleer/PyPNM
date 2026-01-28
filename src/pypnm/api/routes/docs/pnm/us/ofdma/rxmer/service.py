@@ -287,18 +287,18 @@ class CmtsUsOfdmaRxMerService:
         self.logger.info(f"Starting US RxMER for OFDMA ifIndex {ofdma_ifindex}, CM MAC {cm_mac}, dest={destination_index}")
         
         try:
-            # 1. Set filename
-            await snmp.set(
-                f"{self.OID_US_RXMER_FILENAME}{idx}",
-                filename,
-                OctetString
-            )
-            
-            # 2. Set CM MAC address
+            # 1. Set CM MAC address FIRST (CMTS uses this to generate the filename)
             mac_octets = self.mac_to_hex_octets(cm_mac)
             await snmp.set(
                 f"{self.OID_US_RXMER_CM_MAC}{idx}",
                 mac_octets,
+                OctetString
+            )
+            
+            # 2. Set filename (now CMTS knows which modem)
+            await snmp.set(
+                f"{self.OID_US_RXMER_FILENAME}{idx}",
+                filename,
                 OctetString
             )
             
