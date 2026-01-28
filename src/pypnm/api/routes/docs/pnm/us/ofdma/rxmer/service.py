@@ -19,7 +19,7 @@ import logging
 from enum import IntEnum
 from typing import Any, Optional
 
-from pysnmp.proto.rfc1902 import Integer32, OctetString
+from pysnmp.proto.rfc1902 import Gauge32, Integer32, OctetString
 
 from pypnm.snmp.snmp_v2c import Snmp_v2c
 from pypnm.lib.inet import Inet
@@ -53,13 +53,26 @@ class CmtsUsOfdmaRxMerService:
     OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.5.1.1"  # docsIf31CmtsCmUsOfdmaChannelStatusTable
     
     # US OFDMA RxMER Table (docsPnmCmtsUsOfdmaRxMerTable)
-    OID_US_RXMER_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.8.1"
-    OID_US_RXMER_ENABLE = f"{OID_US_RXMER_TABLE}.1"
-    OID_US_RXMER_PRE_EQ = f"{OID_US_RXMER_TABLE}.2"
-    OID_US_RXMER_NUM_AVGS = f"{OID_US_RXMER_TABLE}.3"
-    OID_US_RXMER_MEAS_STATUS = f"{OID_US_RXMER_TABLE}.4"
-    OID_US_RXMER_FILENAME = f"{OID_US_RXMER_TABLE}.5"
-    OID_US_RXMER_CM_MAC = f"{OID_US_RXMER_TABLE}.6"
+    # Correct OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
+    OID_US_RXMER_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.7.1"
+    OID_US_RXMER_ENABLE = f"{OID_US_RXMER_TABLE}.1"      # docsPnmCmtsUsOfdmaRxMerEnable
+    OID_US_RXMER_CM_MAC = f"{OID_US_RXMER_TABLE}.2"      # docsPnmCmtsUsOfdmaRxMerCmMac
+    OID_US_RXMER_PRE_EQ = f"{OID_US_RXMER_TABLE}.3"      # docsPnmCmtsUsOfdmaRxMerPreEq
+    OID_US_RXMER_NUM_AVGS = f"{OID_US_RXMER_TABLE}.4"    # docsPnmCmtsUsOfdmaRxMerNumAvgs
+    OID_US_RXMER_MEAS_STATUS = f"{OID_US_RXMER_TABLE}.5" # docsPnmCmtsUsOfdmaRxMerMeasStatus
+    OID_US_RXMER_FILENAME = f"{OID_US_RXMER_TABLE}.6"    # docsPnmCmtsUsOfdmaRxMerFileName
+    OID_US_RXMER_DEST_INDEX = f"{OID_US_RXMER_TABLE}.7"  # docsPnmCmtsUsOfdmaRxMerDestinationIndex
+    
+    # Bulk Data Transfer Config Table (docsPnmBulkDataTransferCfgTable)
+    OID_BULK_CFG_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.1.3.1.1"
+    OID_BULK_CFG_HOSTNAME = f"{OID_BULK_CFG_TABLE}.2"    # DestHostname
+    OID_BULK_CFG_IP_TYPE = f"{OID_BULK_CFG_TABLE}.3"     # DestHostIpAddrType
+    OID_BULK_CFG_IP_ADDR = f"{OID_BULK_CFG_TABLE}.4"     # DestHostIpAddress
+    OID_BULK_CFG_PORT = f"{OID_BULK_CFG_TABLE}.5"        # DestPort
+    OID_BULK_CFG_BASE_URI = f"{OID_BULK_CFG_TABLE}.6"    # DestBaseUri
+    OID_BULK_CFG_PROTOCOL = f"{OID_BULK_CFG_TABLE}.7"    # Protocol (1=tftp)
+    OID_BULK_CFG_LOCAL_STORE = f"{OID_BULK_CFG_TABLE}.8" # LocalStore
+    OID_BULK_CFG_ROW_STATUS = f"{OID_BULK_CFG_TABLE}.9"  # RowStatus
     
     def __init__(
         self,
@@ -250,7 +263,8 @@ class CmtsUsOfdmaRxMerService:
         cm_mac: str,
         filename: str = "us_rxmer",
         pre_eq: bool = True,
-        num_averages: int = 1
+        num_averages: int = 1,
+        destination_index: int = 0
     ) -> dict[str, Any]:
         """
         Start Upstream OFDMA RxMER measurement.
@@ -261,6 +275,8 @@ class CmtsUsOfdmaRxMerService:
             filename: Output filename
             pre_eq: Enable pre-equalization
             num_averages: Number of averages
+            destination_index: Bulk transfer destination index (0=local only, 
+                             >0=use docsPnmBulkDataTransferCfgTable row)
             
         Returns:
             Dict with success status and details
@@ -268,7 +284,7 @@ class CmtsUsOfdmaRxMerService:
         snmp = self._get_snmp()
         idx = f".{ofdma_ifindex}"
         
-        self.logger.info(f"Starting US RxMER for OFDMA ifIndex {ofdma_ifindex}, CM MAC {cm_mac}")
+        self.logger.info(f"Starting US RxMER for OFDMA ifIndex {ofdma_ifindex}, CM MAC {cm_mac}, dest={destination_index}")
         
         try:
             # 1. Set filename
@@ -294,14 +310,22 @@ class CmtsUsOfdmaRxMerService:
                 Integer32
             )
             
-            # 4. Set number of averages
+            # 4. Set number of averages (Gauge32)
             await snmp.set(
                 f"{self.OID_US_RXMER_NUM_AVGS}{idx}",
                 num_averages,
-                Integer32
+                Gauge32
             )
             
-            # 5. Enable measurement (1=true)
+            # 5. Set destination index for bulk upload (0=local storage only, Gauge32)
+            if destination_index > 0:
+                await snmp.set(
+                    f"{self.OID_US_RXMER_DEST_INDEX}{idx}",
+                    destination_index,
+                    Gauge32
+                )
+            
+            # 6. Enable measurement (1=true)
             await snmp.set(
                 f"{self.OID_US_RXMER_ENABLE}{idx}",
                 1,
@@ -313,7 +337,8 @@ class CmtsUsOfdmaRxMerService:
                 "message": "US OFDMA RxMER measurement started",
                 "ofdma_ifindex": ofdma_ifindex,
                 "cm_mac_address": cm_mac,
-                "filename": filename
+                "filename": filename,
+                "destination_index": destination_index
             }
             
         except Exception as e:
@@ -354,3 +379,83 @@ class CmtsUsOfdmaRxMerService:
         except Exception as e:
             self.logger.error(f"Failed to get US RxMER status: {e}")
             return {"success": False, "error": str(e)}
+    
+    async def get_bulk_destinations(self) -> dict[str, Any]:
+        """
+        Get list of configured bulk data transfer destinations.
+        
+        These destinations can be used with destination_index parameter
+        in start_measurement() to upload results via TFTP.
+        
+        Returns:
+            Dict with list of configured destinations
+        """
+        snmp = self._get_snmp()
+        destinations = []
+        
+        try:
+            # Walk the row status to find configured destinations
+            results = await snmp.bulk_walk(self.OID_BULK_CFG_ROW_STATUS, max_repetitions=20)
+            
+            if not results:
+                return {"success": True, "destinations": []}
+            
+            for var_bind in results:
+                oid_str = str(var_bind[0])
+                row_status = int(var_bind[1])
+                
+                # Only include active rows (rowStatus=1)
+                if row_status != 1:
+                    continue
+                
+                # Extract index from OID
+                dest_index = int(oid_str.split(".")[-1])
+                
+                # Get destination details
+                dest_info = {
+                    "index": dest_index,
+                    "ip_address": None,
+                    "port": 69,
+                    "protocol": "tftp",
+                    "local_store": True
+                }
+                
+                # Get IP address
+                try:
+                    ip_result = await snmp.get(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}")
+                    if ip_result:
+                        ip_bytes = ip_result[0][1]
+                        if hasattr(ip_bytes, 'prettyPrint'):
+                            ip_hex = ip_bytes.prettyPrint()
+                            if ip_hex.startswith("0x"):
+                                ip_hex = ip_hex[2:]
+                            if len(ip_hex) == 8:
+                                dest_info["ip_address"] = ".".join([
+                                    str(int(ip_hex[i:i+2], 16)) for i in range(0, 8, 2)
+                                ])
+                except Exception:
+                    pass
+                
+                # Get port
+                try:
+                    port_result = await snmp.get(f"{self.OID_BULK_CFG_PORT}.{dest_index}")
+                    if port_result:
+                        dest_info["port"] = int(port_result[0][1])
+                except Exception:
+                    pass
+                
+                # Get local store setting
+                try:
+                    ls_result = await snmp.get(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}")
+                    if ls_result:
+                        dest_info["local_store"] = int(ls_result[0][1]) == 1
+                except Exception:
+                    pass
+                
+                destinations.append(dest_info)
+            
+            return {"success": True, "destinations": destinations}
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get bulk destinations: {e}")
+            return {"success": False, "error": str(e), "destinations": []}

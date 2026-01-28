@@ -28,6 +28,8 @@ from pypnm.api.routes.docs.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerStartResponse,
     UsOfdmaRxMerStatusRequest,
     UsOfdmaRxMerStatusResponse,
+    BulkDestinationsRequest,
+    BulkDestinationsResponse,
 )
 from pypnm.api.routes.docs.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 
@@ -121,7 +123,8 @@ class UsOfdmaRxMerRouter:
                     cm_mac=request.cm_mac_address,
                     filename=request.filename,
                     pre_eq=request.pre_eq,
-                    num_averages=request.num_averages
+                    num_averages=request.num_averages,
+                    destination_index=request.destination_index
                 )
                 return UsOfdmaRxMerStartResponse(**result)
             finally:
@@ -158,6 +161,40 @@ class UsOfdmaRxMerRouter:
             try:
                 result = await service.get_status(request.ofdma_ifindex)
                 return UsOfdmaRxMerStatusResponse(**result)
+            finally:
+                service.close()
+        
+        @self.router.post(
+            "/destinations",
+            summary="Get bulk transfer destinations",
+            response_model=BulkDestinationsResponse,
+        )
+        async def get_bulk_destinations(
+            request: BulkDestinationsRequest
+        ) -> BulkDestinationsResponse:
+            """
+            Get list of configured bulk data transfer destinations.
+            
+            Returns the available destination indexes that can be used with
+            the destination_index parameter in the /start endpoint to enable
+            automatic TFTP upload of measurement results.
+            
+            Destination index 0 means local storage only. Non-zero values
+            reference rows in the docsPnmBulkDataTransferCfgTable.
+            """
+            self.logger.info(
+                f"Getting bulk destinations on CMTS {request.cmts.cmts_ip}"
+            )
+            
+            service = CmtsUsOfdmaRxMerService(
+                cmts_ip=request.cmts.cmts_ip,
+                community=request.cmts.community,
+                write_community=request.cmts.write_community
+            )
+            
+            try:
+                result = await service.get_bulk_destinations()
+                return BulkDestinationsResponse(**result)
             finally:
                 service.close()
 
