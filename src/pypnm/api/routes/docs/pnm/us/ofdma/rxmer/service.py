@@ -366,7 +366,7 @@ class CmtsUsOfdmaRxMerService:
             status_value = int(result[0][1])
             status_name = MeasStatus(status_value).name if status_value in [e.value for e in MeasStatus] else "unknown"
             
-            return {
+            status = {
                 "success": True,
                 "ofdma_ifindex": ofdma_ifindex,
                 "meas_status": status_value,
@@ -375,6 +375,16 @@ class CmtsUsOfdmaRxMerService:
                 "is_busy": status_value == MeasStatus.BUSY,
                 "is_error": status_value == MeasStatus.ERROR
             }
+            
+            # Get filename from configuration table (with timestamp)
+            try:
+                filename_result = await snmp.get(f"{self.OID_US_RXMER_FILENAME}.{ofdma_ifindex}")
+                if filename_result:
+                    status["filename"] = str(filename_result[0][1])
+            except Exception:
+                pass
+            
+            return status
             
         except Exception as e:
             self.logger.error(f"Failed to get US RxMER status: {e}")
