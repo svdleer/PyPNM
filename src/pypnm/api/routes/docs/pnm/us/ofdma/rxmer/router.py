@@ -207,6 +207,7 @@ class UsOfdmaRxMerRouter:
         @self.router.post(
             "/getCapture",
             summary="Get and plot US OFDMA RxMER capture",
+            response_model=None,
             responses={
                 200: {"content": {"image/png": {}}, "description": "RxMER plot as PNG image"},
                 422: {"description": "Validation error or file not found"},
@@ -214,7 +215,7 @@ class UsOfdmaRxMerRouter:
         )
         async def get_capture(
             request: UsOfdmaRxMerCaptureRequest
-        ) -> Response | UsOfdmaRxMerCaptureResponse:
+        ):
             """
             Get and parse a US OFDMA RxMER capture file, return matplotlib plot.
             
