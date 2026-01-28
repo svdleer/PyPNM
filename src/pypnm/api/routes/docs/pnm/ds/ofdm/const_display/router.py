@@ -143,34 +143,34 @@ class ConstellationDisplayRouter:
                     status=ServiceStatusCode.DS_OFDM_RXMER_NOT_AVAILABLE
                 )
 
-                if request.analysis.output.type == OutputType.JSON:
-                    payload: dict[str, Any] = cast(dict[str, Any], analysis.get_results())
-                    payload.update({k: v for k, v in msg_rsp.payload_to_dict().items() if isinstance(k, str)})
+            if request.analysis.output.type == OutputType.JSON:
+                payload: dict[str, Any] = cast(dict[str, Any], analysis.get_results())
+                payload.update({k: v for k, v in msg_rsp.payload_to_dict().items() if isinstance(k, str)})
 
-                    DictGenerate.pop_keys_recursive(payload, ["pnm_header", "data"])
-                    primative = msg_rsp.payload_to_dict('primative')
-                    DictGenerate.pop_keys_recursive(primative, ["device_details"])
-                    payload.update({k: v for k, v in primative.items() if isinstance(k, str)})
-                    payload.update(DictGenerate.models_to_nested_dict(measurement_stats, 'measurement_stats',))
+                DictGenerate.pop_keys_recursive(payload, ["pnm_header", "data"])
+                primative = msg_rsp.payload_to_dict('primative')
+                DictGenerate.pop_keys_recursive(primative, ["device_details"])
+                payload.update({k: v for k, v in primative.items() if isinstance(k, str)})
+                payload.update(DictGenerate.models_to_nested_dict(measurement_stats, 'measurement_stats',))
 
-                    return PnmAnalysisResponse(
-                        mac_address =   mac,
-                        status      =   ServiceStatusCode.SUCCESS,
-                        data        =   payload,)
+                return PnmAnalysisResponse(
+                    mac_address =   mac,
+                    status      =   ServiceStatusCode.SUCCESS,
+                    data        =   payload,)
 
-                elif request.analysis.output.type == OutputType.ARCHIVE:
-                    theme = request.analysis.plot.ui.theme
-                    crosshair = request.analysis.plot.options.display_cross_hair
-                    plot_config = ConstDisplayAnalysisRptMatplotConfig(theme = theme, display_crosshair=crosshair)
-                    analysis_rpt = ConstellationDisplayReport(analysis, plot_config)
-                    rpt: Path = cast(Path, analysis_rpt.build_report())
-                    return PnmFileService().get_file(FileType.ARCHIVE, rpt.name)
+            elif request.analysis.output.type == OutputType.ARCHIVE:
+                theme = request.analysis.plot.ui.theme
+                crosshair = request.analysis.plot.options.display_cross_hair
+                plot_config = ConstDisplayAnalysisRptMatplotConfig(theme = theme, display_crosshair=crosshair)
+                analysis_rpt = ConstellationDisplayReport(analysis, plot_config)
+                rpt: Path = cast(Path, analysis_rpt.build_report())
+                return PnmFileService().get_file(FileType.ARCHIVE, rpt.name)
 
-                else:
-                    return PnmAnalysisResponse(
-                        mac_address =   mac,
-                        status      =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
-                        data        =   {},)
+            else:
+                return PnmAnalysisResponse(
+                    mac_address =   mac,
+                    status      =   ServiceStatusCode.INVALID_OUTPUT_TYPE,
+                    data        =   {},)
 
 # Required for dynamic auto-registration
 router = ConstellationDisplayRouter().router
