@@ -101,3 +101,30 @@ class BulkDestinationsResponse(BaseModel):
     success: bool
     destinations: list[BulkDestination] = Field(default_factory=list)
     error: Optional[str] = None
+
+
+class UsOfdmaRxMerCaptureRequest(BaseModel):
+    """Request to get and parse US OFDMA RxMER capture file."""
+    filename: str = Field(..., description="Filename of the RxMER capture (e.g., 'us_rxmer_2026-01-28_12.13.25.870')")
+    tftp_server: Optional[str] = Field(default=None, description="TFTP server IP. If None, uses local file path.")
+    tftp_path: str = Field(default="/var/lib/tftpboot", description="Local TFTP root path")
+
+
+class UsOfdmaRxMerCaptureResponse(BaseModel):
+    """Response with parsed US OFDMA RxMER data."""
+    success: bool
+    cm_mac_address: Optional[str] = None
+    ccap_id: Optional[str] = None
+    num_active_subcarriers: Optional[int] = None
+    first_active_subcarrier_index: Optional[int] = None
+    subcarrier_zero_frequency_hz: Optional[int] = None
+    subcarrier_spacing_hz: Optional[int] = None
+    occupied_bandwidth_mhz: Optional[float] = None
+    num_averages: Optional[int] = None
+    preeq_enabled: Optional[bool] = None
+    rxmer_min_db: Optional[float] = None
+    rxmer_avg_db: Optional[float] = None
+    rxmer_max_db: Optional[float] = None
+    rxmer_std_db: Optional[float] = None
+    values: Optional[list[float]] = None
+    error: Optional[str] = None

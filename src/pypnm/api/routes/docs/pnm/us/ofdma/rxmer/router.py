@@ -12,14 +12,18 @@ Endpoints:
 - POST /discover: Discover modem's OFDMA channel ifIndex on CMTS
 - POST /start: Start US OFDMA RxMER measurement
 - POST /status: Get measurement status
+- POST /getCapture: Get and parse RxMER capture, return plot
 """
 
 from __future__ import annotations
 
+import io
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter
+from fastapi.responses import Response
 
 from pypnm.api.routes.docs.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerDiscoverRequest,
@@ -30,6 +34,8 @@ from pypnm.api.routes.docs.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerStatusResponse,
     BulkDestinationsRequest,
     BulkDestinationsResponse,
+    UsOfdmaRxMerCaptureRequest,
+    UsOfdmaRxMerCaptureResponse,
 )
 from pypnm.api.routes.docs.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 
@@ -197,6 +203,138 @@ class UsOfdmaRxMerRouter:
                 return BulkDestinationsResponse(**result)
             finally:
                 service.close()
+
+        @self.router.post(
+            "/getCapture",
+            summary="Get and plot US OFDMA RxMER capture",
+            responses={
+                200: {"content": {"image/png": {}}, "description": "RxMER plot as PNG image"},
+                422: {"description": "Validation error or file not found"},
+            },
+        )
+        async def get_capture(
+            request: UsOfdmaRxMerCaptureRequest
+        ) -> Response | UsOfdmaRxMerCaptureResponse:
+            """
+            Get and parse a US OFDMA RxMER capture file, return matplotlib plot.
+            
+            This endpoint:
+            1. Loads the capture file from the specified path
+            2. Parses it using the CmtsUsOfdmaRxMer parser
+            3. Generates a matplotlib bar plot of RxMER per subcarrier
+            4. Returns the plot as a PNG image
+            
+            The file should be a PNN105 format file captured via the /start endpoint.
+            """
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import numpy as np
+            
+            from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
+            
+            # Build file path
+            if request.tftp_server:
+                # TODO: Implement TFTP fetch if needed
+                filepath = Path(request.tftp_path) / request.filename
+            else:
+                filepath = Path(request.tftp_path) / request.filename
+            
+            self.logger.info(f"Loading US RxMER file: {filepath}")
+            
+            # Check file exists
+            if not filepath.exists():
+                return UsOfdmaRxMerCaptureResponse(
+                    success=False,
+                    error=f"File not found: {filepath}"
+                )
+            
+            try:
+                # Read and parse file
+                data = filepath.read_bytes()
+                parser = CmtsUsOfdmaRxMer(data)
+                model = parser.to_model()
+                
+                # Get RxMER values
+                values = model.values
+                valid_values = [v for v in values if v < 63.5]  # Filter excluded subcarriers
+                
+                # Calculate frequencies for x-axis
+                spacing_khz = model.subcarrier_spacing / 1000
+                zero_freq_mhz = model.subcarrier_zero_frequency / 1e6
+                first_idx = model.first_active_subcarrier_index
+                
+                # Create frequency array in MHz
+                freqs_mhz = [
+                    zero_freq_mhz + (first_idx + i) * spacing_khz / 1000
+                    for i in range(len(values))
+                ]
+                
+                # Create matplotlib figure
+                fig, ax = plt.subplots(figsize=(14, 6))
+                
+                # Color bars based on RxMER thresholds
+                colors = []
+                for v in values:
+                    if v >= 63.5:  # Excluded
+                        colors.append('gray')
+                    elif v >= 35:  # Good
+                        colors.append('green')
+                    elif v >= 30:  # Marginal
+                        colors.append('orange')
+                    else:  # Poor
+                        colors.append('red')
+                
+                # Plot bars
+                ax.bar(freqs_mhz, values, width=spacing_khz/1000*0.8, color=colors, edgecolor='none')
+                
+                # Add threshold lines
+                ax.axhline(y=35, color='green', linestyle='--', alpha=0.5, label='Good (≥35 dB)')
+                ax.axhline(y=30, color='orange', linestyle='--', alpha=0.5, label='Marginal (≥30 dB)')
+                
+                # Labels and title
+                ax.set_xlabel('Frequency (MHz)', fontsize=12)
+                ax.set_ylabel('RxMER (dB)', fontsize=12)
+                ax.set_title(
+                    f'Upstream OFDMA RxMER - CM: {model.cm_mac_address}\n'
+                    f'CCAP: {model.ccap_id} | '
+                    f'Avg: {model.signal_statistics.mean:.1f} dB | '
+                    f'Min: {min(valid_values):.1f} dB | '
+                    f'Max: {max(valid_values):.1f} dB | '
+                    f'Subcarriers: {model.num_active_subcarriers}',
+                    fontsize=11
+                )
+                
+                # Set y-axis limits
+                ax.set_ylim(0, 55)
+                ax.set_xlim(min(freqs_mhz) - 0.5, max(freqs_mhz) + 0.5)
+                
+                # Grid and legend
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc='lower right')
+                
+                plt.tight_layout()
+                
+                # Save to bytes buffer
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                buf.seek(0)
+                
+                return Response(
+                    content=buf.getvalue(),
+                    media_type="image/png",
+                    headers={
+                        "Content-Disposition": f"inline; filename=us_rxmer_{model.cm_mac_address.replace(':', '')}.png"
+                    }
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Error parsing US RxMER file: {e}")
+                return UsOfdmaRxMerCaptureResponse(
+                    success=False,
+                    error=str(e)
+                )
 
 
 # Required for dynamic auto-registration
