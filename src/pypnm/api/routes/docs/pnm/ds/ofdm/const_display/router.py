@@ -156,6 +156,7 @@ class ConstellationDisplayRouter:
                 print(f"=== END FILE SCAN ===", flush=True)
                 
                 # Skip SNMP measurement stats query - it's broken and returns empty list
+                measurement_stats: list[DocsPnmCmDsConstDispMeasEntry] = []
                 # measurement_stats:list[DocsPnmCmDsConstDispMeasEntry] = \
                 #     cast(list[DocsPnmCmDsConstDispMeasEntry],
                 #         await service.getPnmMeasurementStatistics(channel_ids=channel_ids))
