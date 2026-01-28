@@ -322,6 +322,11 @@ class Analysis:
 
         elif pnm_file_type == PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY.value:
             self.logger.debug("Processing: DOWNSTREAM_CONSTELLATION_DISPLAY")
+            # Skip measurements with empty samples (some modems return multiple entries, not all valid)
+            samples = measurement.get("samples", [])
+            if not samples:
+                self.logger.debug("Skipping constellation display measurement with empty samples")
+                return
             model = self.basic_analysis_ds_constellation_display(measurement)
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
