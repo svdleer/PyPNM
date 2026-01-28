@@ -271,27 +271,20 @@ class UsOfdmaRxMerRouter:
                     for i in range(len(values))
                 ]
                 
-                # Create matplotlib figure
+                # Create matplotlib figure - match DS RxMER style
                 fig, ax = plt.subplots(figsize=(14, 6))
                 
-                # Color bars based on RxMER thresholds
-                colors = []
-                for v in values:
-                    if v >= 63.5:  # Excluded
-                        colors.append('gray')
-                    elif v >= 35:  # Good
-                        colors.append('green')
-                    elif v >= 30:  # Marginal
-                        colors.append('orange')
-                    else:  # Poor
-                        colors.append('red')
+                # Line plot with same blue color as DS RxMER
+                line_color = '#36A2EB'  # rgb(54, 162, 235)
+                fill_color = 'rgba(54, 162, 235, 0.2)'
                 
-                # Plot bars
-                ax.bar(freqs_mhz, values, width=spacing_khz/1000*0.8, color=colors, edgecolor='none')
+                # Plot line with fill
+                ax.plot(freqs_mhz, values, color=line_color, linewidth=1.5, label='RxMER')
+                ax.fill_between(freqs_mhz, values, alpha=0.2, color=line_color)
                 
-                # Add threshold lines
-                ax.axhline(y=35, color='green', linestyle='--', alpha=0.5, label='Good (≥35 dB)')
-                ax.axhline(y=30, color='orange', linestyle='--', alpha=0.5, label='Marginal (≥30 dB)')
+                # Add threshold lines matching DS RxMER style
+                ax.axhline(y=35, color='#4CAF50', linestyle='--', alpha=0.7, linewidth=1, label='Good (≥35 dB)')
+                ax.axhline(y=30, color='#FF9800', linestyle='--', alpha=0.7, linewidth=1, label='Marginal (≥30 dB)')
                 
                 # Labels and title
                 ax.set_xlabel('Frequency (MHz)', fontsize=12)
@@ -307,12 +300,12 @@ class UsOfdmaRxMerRouter:
                 )
                 
                 # Set y-axis limits
-                ax.set_ylim(0, 55)
-                ax.set_xlim(min(freqs_mhz) - 0.5, max(freqs_mhz) + 0.5)
+                ax.set_ylim(20, 55)
+                ax.set_xlim(min(freqs_mhz) - 0.2, max(freqs_mhz) + 0.2)
                 
                 # Grid and legend
-                ax.grid(True, alpha=0.3)
-                ax.legend(loc='lower right')
+                ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+                ax.legend(loc='lower right', fontsize=9)
                 
                 plt.tight_layout()
                 
