@@ -53,7 +53,9 @@ class CmtsUsOfdmaRxMerService:
     OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.5.1.1"  # docsIf31CmtsCmUsOfdmaChannelStatusTable
     
     # US OFDMA RxMER Table (docsPnmCmtsUsOfdmaRxMerTable)
-    # Correct OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
+    # OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
+    # Column order from DOCS-PNM-MIB-2024-07-05:
+    #   .1 = Enable, .2 = CmMac, .3 = PreEq, .4 = NumAvgs, .5 = MeasStatus, .6 = FileName, .7 = DestinationIndex
     OID_US_RXMER_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.7.1"
     OID_US_RXMER_ENABLE = f"{OID_US_RXMER_TABLE}.1"      # docsPnmCmtsUsOfdmaRxMerEnable
     OID_US_RXMER_CM_MAC = f"{OID_US_RXMER_TABLE}.2"      # docsPnmCmtsUsOfdmaRxMerCmMac
