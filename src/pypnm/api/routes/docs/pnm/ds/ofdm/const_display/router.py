@@ -142,7 +142,7 @@ class ConstellationDisplayRouter:
                 # BYPASS BROKEN SNMP QUERY: Scan TFTP for constellation files directly
                 import glob
                 import os
-                from pypnm.api.routes.common.classes.config_settings import SystemConfigSettings
+                from pypnm.config.system_config_settings import SystemConfigSettings
                 
                 tftp_dir = SystemConfigSettings.pnm_dir()
                 mac_clean = mac.replace(":", "").lower()
