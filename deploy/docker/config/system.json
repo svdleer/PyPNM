@@ -65,7 +65,7 @@
                 "local": {
                     "password": "",
                     "password_enc": "",
-                    "src_dir": "/srv/tftp"
+                    "src_dir": "/var/lib/tftpboot"
                 },
                 "sftp": {
                     "host": "172.19.8.28",
