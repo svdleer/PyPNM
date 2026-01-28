@@ -518,6 +518,7 @@ class CommonMeasureService(CommonMessagingService):
             bool: True if the file was successfully retrieved and moved; False otherwise.
         """
         method = SystemConfigSettings.retrieval_method()
+        print(f"=== Retrieval method: {method} ===", flush=True)
         self.logger.info(f"{self.log_prefix} - Retrieval method: {method}")
 
         try:
