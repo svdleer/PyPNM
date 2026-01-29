@@ -177,7 +177,7 @@ class CmUsOfdmaPreEqReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), fname, "magnitude"])
                 self.logger.debug("Creating OFDMA US Pre-EQ magnitude plot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_multi_line(filename=multi)
                 matplot_mgr.append(mgr)
 
@@ -204,7 +204,7 @@ class CmUsOfdmaPreEqReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), fname, "groupdelay"])
                 self.logger.debug("Creating OFDMA US Pre-EQ group-delay plot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=multi)
                 matplot_mgr.append(mgr)
 
@@ -232,7 +232,7 @@ class CmUsOfdmaPreEqReport(AnalysisReport):
                 scatter = self.create_png_fname(tags=[str(channel_id), fname, "scatter"])
                 self.logger.debug("Creating OFDMA US Pre-EQ scatter plot: %s for channel: %s", scatter, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_scatter(filename=scatter)
                 matplot_mgr.append(mgr)
 
@@ -281,7 +281,7 @@ class CmUsOfdmaPreEqReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), fname, "ifft"])
                 self.logger.debug("Creating OFDMA US Pre-EQ IFFT plot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=multi)
                 matplot_mgr.append(mgr)
 

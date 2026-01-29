@@ -295,7 +295,7 @@ class FecSummaryAnalysisReport(AnalysisReport):
                         xlabel_prefix   = "Time Range: ",        # optional prefix before start→end
                     )
 
-                    mgr = MatplotManager(default_cfg=cfg)
+                    mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                     png_path = self.create_png_fname(tags=[str(int(ch_id)), profile, self.FNAME_TAG])
                     self._log_preview(ch_id, profile, ts, tc, cc, uc)
                     self.logger.debug("Creating MatPlot: %s ch=%s prof=%s", png_path, int(ch_id), profile)
