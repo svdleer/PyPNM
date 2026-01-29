@@ -310,9 +310,14 @@ class Analysis:
         elif pnm_file_type == PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY.value:
             self.logger.debug("Processing: DOWNSTREAM_CONSTELLATION_DISPLAY")
             model = self.basic_analysis_ds_constellation_display(measurement)
-            self.__update_result_model(model)
-            self.__update_result_dict(model.model_dump())
-            self.__add_pnmType(PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY)
+            # model can be None if modem doesn't support this channel
+            if model is not None:
+                self.__update_result_model(model)
+                self.__update_result_dict(model.model_dump())
+                self.__add_pnmType(PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY)
+            else:
+                channel_id = measurement.get("channel_id", "unknown")
+                self.logger.warning(f"Skipping constellation display for channel {channel_id} - no samples returned")
 
         elif pnm_file_type == PnmFileType.RECEIVE_MODULATION_ERROR_RATIO.value:
             self.logger.debug("Processing: RECEIVE_MODULATION_ERROR_RATIO")

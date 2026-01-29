@@ -134,9 +134,20 @@ class ConstellationDisplayRouter:
             # Verify that samples exist before attempting constellation analysis
             try:
                 analysis = Analysis(AnalysisType.BASIC, msg_rsp)
-            except (ValueError, KeyError) as e:
+            except (ValueError, KeyError, AttributeError) as e:
                 err = f"Constellation analysis failed: {str(e)}. The modem may not support constellation capture or returned empty data."
                 self.logger.error(err)
+                return SnmpResponse(
+                    mac_address=mac, 
+                    message=err, 
+                    status=ServiceStatusCode.DS_OFDM_RXMER_NOT_AVAILABLE
+                )
+            
+            # Check if analysis has any valid results
+            results = analysis.get_results()
+            if not results or (isinstance(results, dict) and not results.get("analysis")):
+                err = "No constellation data available. The modem may not support constellation capture for the requested channels."
+                self.logger.warning(err)
                 return SnmpResponse(
                     mac_address=mac, 
                     message=err, 
