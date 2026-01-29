@@ -594,8 +594,8 @@ class MultiRxMerSignalAnalysis(MultiAnalysisRpt):
                     grid            =   True,
                     legend          =   True,
                     transparent     =   False,
-                    line_colors     =   ["#FF5733",  "#3357FF", "#33FF57",],
-                    theme           =   "dark",
+                    line_colors     =   ["#36A2EB", "#FF6384", "#4BC0C0"],
+                    theme           =   "light",
                 )
 
                 multi = self.create_png_fname(tags=[str(channel_id), "rxmer_min_avg_max"])
@@ -694,8 +694,8 @@ class MultiRxMerSignalAnalysis(MultiAnalysisRpt):
                         grid            =   True,
                         legend          =   True,
                         transparent     =   False,
-                        line_colors     =   ["#3357FF", "#33FF57"],
-                        theme           =   "dark",
+                        line_colors     =   ["#36A2EB", "#FF6384"],
+                        theme           =   "light",
                     )
 
                     fname   = self.create_png_fname(tags=[f"{ch_id}", f"profile_{pid}", "ofdm_profile_perf_1"])

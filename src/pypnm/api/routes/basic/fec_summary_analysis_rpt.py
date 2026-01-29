@@ -285,7 +285,7 @@ class FecSummaryAnalysisReport(AnalysisReport):
                         legend              = True,
                         transparent         = False,
                         theme               = self.getAnalysisRptMatplotConfig().theme,
-                        line_colors         = ["tab:blue", "tab:green", "tab:red"],
+                        line_colors         = ["#36A2EB", "#4BC0C0", "#FF6384"],  # Blue=Total, Teal=Corrected, Pink=Uncorrected
 
                         # ── X-axis time range label & tick suppression ──
                         x_ticks_visible = False,                 # hide all x ticks/labels
