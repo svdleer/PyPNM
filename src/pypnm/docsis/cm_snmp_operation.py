@@ -1857,7 +1857,8 @@ class CmSnmpOperation:
         Raises:
         - Exception: If any error occurs during the SNMP set operations.
         """
-
+        
+        self.logger.info('=== ENTERING setDocsIf3CmSpectrumAnalysisCtrlCmd ===')
         self.logger.debug(f'SpectrumAnalyzerPara: {spec_ana_cmd.to_dict()}')
 
         if spec_ana_cmd.precheck_spectrum_analyzer_settings():
@@ -1897,8 +1898,14 @@ class CmSnmpOperation:
             return True
 
         # Need to get Diplex Setting to make sure that the Spec Analyzer setting are within the band
-        cscs:DocsIf31CmSystemCfgDiplexState = await self.getDocsIf31CmSystemCfgDiplexState()
-        cscs.to_dict()[0]
+        self.logger.info('=== Reading diplexer configuration ===')
+        try:
+            cscs:DocsIf31CmSystemCfgDiplexState = await self.getDocsIf31CmSystemCfgDiplexState()
+            cscs.to_dict()[0]
+            self.logger.info('=== Diplexer configuration read successfully ===')
+        except Exception as e:
+            self.logger.error(f'Failed to read diplexer configuration: {e}')
+            return False
 
         """ TODO: Will need to validate the Spec Analyzer Settings against the Diplex Settings
         lower_edge = int(diplex_dict["docsIf31CmSystemCfgStateDiplexerCfgDsLowerBandEdge"]) * 1_000_000
