@@ -1905,25 +1905,37 @@ class CmSnmpOperation:
         upper_edge = diplex_dict["docsIf31CmSystemCfgStateDiplexerCfgDsUpperBandEdge"] * 1_000_000
         """
         
-        # Check docsPnmCmCtlStatus and disable any active measurement if needed
+        # Check docsPnmCmCtlStatus and clear any error/active state before starting new measurement
         try:
             status = await self.getDocsPnmCmCtlMeasStatus()
-            self.logger.info(f'Current PNM status: {status}')
+            self.logger.info(f'Current PNM measurement status: {status}')
             
-            # If a test is already in progress, disable it first
-            if status == DocsPnmCmCtlMeasStatus.TEST_IN_PROGRESS:
-                self.logger.info('PNM test already in progress, disabling first...')
-                # Disable spectrum analyzer by setting FileEnable to FALSE
+            # If a test is in progress or in error state, reset it by disabling
+            # According to MIB spec, docsPnmCmCtlStatus must be 'ready' to start new measurement
+            if status in [DocsPnmCmCtlMeasStatus.TEST_IN_PROGRESS, DocsPnmCmCtlMeasStatus.ERROR]:
+                self.logger.info(f'PNM measurement in state {status}, resetting before new measurement...')
+                
+                # Reset by setting both Enable and FileEnable to FALSE
+                # First disable SNMP amplitude data capture
+                disable_response = await self._snmp.set('docsIf3CmSpectrumAnalysisCtrlCmdEnable.0', Snmp_v2c.FALSE, Integer32)
+                if disable_response:
+                    self.logger.debug('Set CmdEnable to FALSE')
+                
+                # Then disable file-based capture
                 disable_response = await self._snmp.set('docsIf3CmSpectrumAnalysisCtrlCmdFileEnable.0', Snmp_v2c.FALSE, Integer32)
                 if disable_response:
-                    self.logger.info('Successfully disabled active spectrum analyzer measurement')
-                    # Wait a moment for the modem to process the disable
+                    self.logger.info(f'Successfully reset spectrum analyzer from {status} state')
+                    # Wait for the modem to process the reset
                     time.sleep(1)
                 else:
-                    self.logger.warning('Failed to disable active measurement, proceeding anyway')
+                    self.logger.warning(f'Failed to reset from {status} state, attempting to proceed anyway')
+            elif status == DocsPnmCmCtlMeasStatus.READY:
+                self.logger.debug('PNM status is READY, proceeding with new measurement')
+            else:
+                self.logger.warning(f'Unexpected PNM status: {status}, attempting to proceed')
         except Exception as e:
-            self.logger.warning(f'Failed to check/disable existing measurement: {e}')
-            # Continue anyway - the modem might not have had an active measurement
+            self.logger.warning(f'Failed to check/reset measurement status: {e}')
+            # Continue anyway - the modem might support spectrum analyzer despite the error
         
         try:
             field_type_map = {
