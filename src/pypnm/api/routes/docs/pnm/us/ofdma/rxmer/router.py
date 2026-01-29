@@ -34,6 +34,8 @@ from pypnm.api.routes.docs.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerStatusResponse,
     BulkDestinationsRequest,
     BulkDestinationsResponse,
+    CreateBulkDestinationRequest,
+    CreateBulkDestinationResponse,
     UsOfdmaRxMerCaptureRequest,
     UsOfdmaRxMerCaptureResponse,
 )
@@ -201,6 +203,48 @@ class UsOfdmaRxMerRouter:
             try:
                 result = await service.get_bulk_destinations()
                 return BulkDestinationsResponse(**result)
+            finally:
+                service.close()
+
+        @self.router.post(
+            "/destinations/create",
+            summary="Create or configure bulk transfer destination",
+            response_model=CreateBulkDestinationResponse,
+        )
+        async def create_bulk_destination(
+            request: CreateBulkDestinationRequest
+        ) -> CreateBulkDestinationResponse:
+            """
+            Create or configure a bulk data transfer destination for TFTP uploads.
+            
+            This endpoint configures the CMTS to upload PNM data files to a TFTP server.
+            The returned destination_index can then be used in the /start endpoint
+            to enable automatic file upload.
+            
+            If the TFTP server is already configured, returns the existing destination_index.
+            Otherwise creates a new entry in docsPnmBulkDataTransferCfgTable.
+            
+            This is required after CMTS reload since bulk destinations are not persisted.
+            """
+            self.logger.info(
+                f"Creating bulk destination for TFTP {request.tftp_ip}:{request.port} "
+                f"on CMTS {request.cmts.cmts_ip}"
+            )
+            
+            service = CmtsUsOfdmaRxMerService(
+                cmts_ip=request.cmts.cmts_ip,
+                community=request.cmts.community,
+                write_community=request.cmts.write_community
+            )
+            
+            try:
+                result = await service.create_bulk_destination(
+                    tftp_ip=request.tftp_ip,
+                    port=request.port,
+                    local_store=request.local_store,
+                    dest_index=request.dest_index
+                )
+                return CreateBulkDestinationResponse(**result)
             finally:
                 service.close()
 

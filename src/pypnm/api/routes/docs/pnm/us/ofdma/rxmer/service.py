@@ -474,3 +474,134 @@ class CmtsUsOfdmaRxMerService:
         except Exception as e:
             self.logger.error(f"Failed to get bulk destinations: {e}")
             return {"success": False, "error": str(e), "destinations": []}
+
+    async def create_bulk_destination(
+        self,
+        tftp_ip: str,
+        port: int = 69,
+        local_store: bool = True,
+        dest_index: Optional[int] = None
+    ) -> dict[str, Any]:
+        """
+        Create or update a bulk data transfer destination for TFTP uploads.
+        
+        Args:
+            tftp_ip: TFTP server IP address
+            port: TFTP port (default 69)
+            local_store: Also store locally on CMTS (default True)
+            dest_index: Destination index to use (1-10). If None, finds first available.
+            
+        Returns:
+            Dict with success status and destination_index
+        """
+        snmp = self._get_snmp()
+        
+        try:
+            # If no index specified, find first available (1-10)
+            if dest_index is None:
+                for idx in range(1, 11):
+                    try:
+                        result = await snmp.get(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}")
+                        if result:
+                            row_status = int(result[0][1])
+                            # Check if this destination already points to our TFTP server
+                            ip_result = await snmp.get(f"{self.OID_BULK_CFG_IP_ADDR}.{idx}")
+                            if ip_result and row_status == 1:
+                                ip_bytes = ip_result[0][1]
+                                if hasattr(ip_bytes, 'prettyPrint'):
+                                    ip_hex = ip_bytes.prettyPrint()
+                                    if ip_hex.startswith("0x"):
+                                        ip_hex = ip_hex[2:]
+                                    if len(ip_hex) == 8:
+                                        existing_ip = ".".join([
+                                            str(int(ip_hex[i:i+2], 16)) for i in range(0, 8, 2)
+                                        ])
+                                        if existing_ip == tftp_ip:
+                                            # Already configured for this TFTP server
+                                            self.logger.info(f"Found existing TFTP destination at index {idx}")
+                                            return {
+                                                "success": True,
+                                                "destination_index": idx,
+                                                "message": f"Using existing destination {idx} for {tftp_ip}",
+                                                "created": False
+                                            }
+                            # Row doesn't exist or is empty
+                            if row_status in (0, 2, 6):  # notInService, destroy, notReady
+                                dest_index = idx
+                                break
+                        else:
+                            dest_index = idx
+                            break
+                    except Exception:
+                        dest_index = idx
+                        break
+                
+                if dest_index is None:
+                    dest_index = 1  # Default to index 1
+            
+            self.logger.info(f"Creating bulk destination at index {dest_index} for TFTP {tftp_ip}:{port}")
+            
+            # Convert IP to bytes
+            ip_parts = tftp_ip.split(".")
+            ip_bytes = bytes([int(p) for p in ip_parts])
+            
+            # Set the destination configuration via SNMP
+            # First, set row to createAndWait (5) to allow configuration
+            await snmp.set(
+                f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}",
+                Integer32(5)  # createAndWait
+            )
+            
+            # Configure the destination
+            # IP address type (1=IPv4)
+            await snmp.set(
+                f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}",
+                Integer32(1)
+            )
+            
+            # IP address
+            await snmp.set(
+                f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}",
+                OctetString(ip_bytes)
+            )
+            
+            # Port
+            await snmp.set(
+                f"{self.OID_BULK_CFG_PORT}.{dest_index}",
+                Gauge32(port)
+            )
+            
+            # Protocol (1=tftp, 2=http, 3=https)
+            await snmp.set(
+                f"{self.OID_BULK_CFG_PROTOCOL}.{dest_index}",
+                Integer32(1)  # TFTP
+            )
+            
+            # Local store
+            await snmp.set(
+                f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}",
+                Integer32(1 if local_store else 2)  # 1=true, 2=false
+            )
+            
+            # Activate the row (set to active=1)
+            await snmp.set(
+                f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}",
+                Integer32(1)  # active
+            )
+            
+            self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
+            
+            return {
+                "success": True,
+                "destination_index": dest_index,
+                "tftp_ip": tftp_ip,
+                "port": port,
+                "local_store": local_store,
+                "message": f"Created destination {dest_index} for {tftp_ip}:{port}",
+                "created": True
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create bulk destination: {e}")
+            return {"success": False, "error": str(e)}
+

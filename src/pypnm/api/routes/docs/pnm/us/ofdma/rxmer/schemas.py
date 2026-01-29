@@ -103,6 +103,32 @@ class BulkDestinationsResponse(BaseModel):
     error: Optional[str] = None
 
 
+class CreateBulkDestinationRequest(BaseModel):
+    """Request to create or configure a bulk transfer destination."""
+    cmts: CmtsSnmpConfig
+    tftp_ip: str = Field(..., description="TFTP server IP address")
+    port: int = Field(default=69, description="TFTP port (default 69)")
+    local_store: bool = Field(default=True, description="Also store locally on CMTS")
+    dest_index: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="Destination index (1-10). If None, finds first available."
+    )
+
+
+class CreateBulkDestinationResponse(BaseModel):
+    """Response from creating a bulk transfer destination."""
+    success: bool
+    destination_index: Optional[int] = None
+    tftp_ip: Optional[str] = None
+    port: Optional[int] = None
+    local_store: Optional[bool] = None
+    message: Optional[str] = None
+    created: Optional[bool] = None
+    error: Optional[str] = None
+
+
 class UsOfdmaRxMerCaptureRequest(BaseModel):
     """Request to get and parse US OFDMA RxMER capture file."""
     filename: str = Field(..., description="Filename of the RxMER capture (e.g., 'us_rxmer_2026-01-28_12.13.25.870')")
