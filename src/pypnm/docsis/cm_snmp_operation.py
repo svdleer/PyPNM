@@ -1904,6 +1904,27 @@ class CmSnmpOperation:
         lower_edge = int(diplex_dict["docsIf31CmSystemCfgStateDiplexerCfgDsLowerBandEdge"]) * 1_000_000
         upper_edge = diplex_dict["docsIf31CmSystemCfgStateDiplexerCfgDsUpperBandEdge"] * 1_000_000
         """
+        
+        # Check docsPnmCmCtlStatus and disable any active measurement if needed
+        try:
+            status = await self.getDocsPnmCmCtlMeasStatus()
+            self.logger.info(f'Current PNM status: {status}')
+            
+            # If a test is already in progress, disable it first
+            if status == DocsPnmCmCtlMeasStatus.TEST_IN_PROGRESS:
+                self.logger.info('PNM test already in progress, disabling first...')
+                # Disable spectrum analyzer by setting FileEnable to FALSE
+                disable_response = await self._snmp.set('docsIf3CmSpectrumAnalysisCtrlCmdFileEnable.0', Snmp_v2c.FALSE, Integer32)
+                if disable_response:
+                    self.logger.info('Successfully disabled active spectrum analyzer measurement')
+                    # Wait a moment for the modem to process the disable
+                    time.sleep(1)
+                else:
+                    self.logger.warning('Failed to disable active measurement, proceeding anyway')
+        except Exception as e:
+            self.logger.warning(f'Failed to check/disable existing measurement: {e}')
+            # Continue anyway - the modem might not have had an active measurement
+        
         try:
             field_type_map = {
                 "docsIf3CmSpectrumAnalysisCtrlCmdInactivityTimeout": Integer32,
