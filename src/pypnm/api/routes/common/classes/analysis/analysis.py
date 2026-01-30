@@ -310,6 +310,9 @@ class Analysis:
         elif pnm_file_type == PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY.value:
             self.logger.debug("Processing: DOWNSTREAM_CONSTELLATION_DISPLAY")
             model = self.basic_analysis_ds_constellation_display(measurement)
+            if model is None:
+                self.logger.warning("Constellation analysis returned None (no samples?), skipping")
+                return
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
             self.__add_pnmType(PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY)
