@@ -194,7 +194,7 @@ class CmtsUsOfdmaRxMerService:
             results = await snmp.bulk_walk(self.OID_CM_OFDMA_STATUS, max_repetitions=50)
             
             if not results:
-                self.logger.warning("No OFDMA status entries found")
+                self.logger.warning("No OFDMA status entries found on CMTS")
                 return None
             
             for var_bind in results:
