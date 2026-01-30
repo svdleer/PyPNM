@@ -1256,11 +1256,24 @@ class CmSnmpOperation:
 
     async def getDocsIf31CmUsOfdmaChanChannelIdIndex(self) -> list[InterfaceIndex]:
         """
-        Get the Docsis 3.1 upstream OFDMA channels.
+        Get the Docsis 3.1 upstream OFDMA channel indices.
+
+        This method walks the docsIf31CmUsOfdmaChanChannelId MIB directly
+        to find OFDMA channel indices, rather than relying on ifType.
+        This is more reliable as some modems may not correctly report
+        ifType=278 for OFDMA interfaces.
 
         Returns:
             List[int]: A list of OFDMA channel indices present on the device.
         """
+        # First try walking the OFDMA channel table directly (more reliable)
+        idx_chan_stack = await self.getDocsIf31CmUsOfdmaChannelIdIndexStack()
+        if idx_chan_stack:
+            # Extract just the indices from the (index, channel_id) tuples
+            return [idx for idx, _ in idx_chan_stack]
+        
+        # Fallback to ifType-based discovery if MIB walk fails
+        self.logger.debug("OFDMA channel MIB walk returned empty, falling back to ifType discovery")
         return await self.getIfTypeIndex(DocsisIfType.docsOfdmaUpstream)
 
     async def getDocsIf31CmUsOfdmaChanEntry(self) -> list[DocsIf31CmUsOfdmaChanEntry]:
