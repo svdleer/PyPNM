@@ -403,7 +403,6 @@ class Snmp_v2c:
             raise ValueError("value_type must be explicitly specified")
 
         self.logger.debug(f'SNMP-SET-OID: {oid} -> {value_type} -> {value}')
-        print(f'=== SNMP-SET: host={self._host}, community={self._write_community}, oid={oid}, value={value} ===', flush=True)
 
         oid = Snmp_v2c.resolve_oid(oid)
 
@@ -413,7 +412,6 @@ class Snmp_v2c:
         try:
             snmp_value = value_type(value)
         except Exception as e:
-            print(f'=== SNMP-SET value type error: {e} ===', flush=True)
             raise ValueError(f"Failed to create SNMP value of type {value_type}: {e}") from e
 
         errorIndication, errorStatus, errorIndex, varBinds = await set_cmd(
@@ -424,7 +422,8 @@ class Snmp_v2c:
             ObjectType(ObjectIdentity(oid), snmp_value),
         )
         
-        print(f'=== SNMP-SET result: errorIndication={errorIndication}, errorStatus={errorStatus}, errorIndex={errorIndex} ===', flush=True)
+        if errorIndication:
+            self.logger.warning(f'SNMP-SET error: {errorIndication}')
         
         try:
             self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
