@@ -238,7 +238,8 @@ class CmSnmpOperation:
 
         if SystemConfigSettings.snmp_enable():
             self.logger.debug("Using SNMPv2c")
-            return Snmp_v2c(host=self._inet, community=self._community, port=self._port)
+            # Use a longer timeout (10s) for operations like Spectrum Analyzer that take time
+            return Snmp_v2c(host=self._inet, community=self._community, port=self._port, timeout=10, retries=3)
 
         # Neither protocol is usable
         msg = "No SNMP protocol enabled or properly configured (v3 disabled/invalid and v2c disabled)."
