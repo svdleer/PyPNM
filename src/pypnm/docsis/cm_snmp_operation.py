@@ -1858,6 +1858,9 @@ class CmSnmpOperation:
         - Exception: If any error occurs during the SNMP set operations.
         """
         
+        print('=== ENTERING setDocsIf3CmSpectrumAnalysisCtrlCmd ===', flush=True)
+        print(f'=== Community used: {self._community} ===', flush=True)
+        print(f'=== SNMP target: {self._inet} ===', flush=True)
         self.logger.info('=== ENTERING setDocsIf3CmSpectrumAnalysisCtrlCmd ===')
         self.logger.debug(f'SpectrumAnalyzerPara: {spec_ana_cmd.to_dict()}')
 
