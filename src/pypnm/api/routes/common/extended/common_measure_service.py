@@ -1245,13 +1245,48 @@ class CommonMeasureService(CommonMessagingService):
                 inactivity_timeout          = self.extra_options.get("inactivity_timeout", 100),
                 first_segment_center_freq   = self.extra_options.get("first_segment_center_freq", 300_000_000),
                 last_segment_center_freq    = self.extra_options.get("last_segment_center_freq", 993_000_000),
-                segment_freq_span           = self.extra_options.get("segment_freq_span", 1_000_000),
+                segment_freq_span           = self.extra_options.get("segment_freq_span", 1_000_000),  # Will be adjusted for vendor
                 num_bins_per_segment        = self.extra_options.get("num_bins_per_segment", 256),
                 noise_bw                    = self.extra_options.get("noise_bw", 110),
                 window_function             = self.extra_options.get("window_function", WindowFunction.HANN),
                 num_averages                = self.extra_options.get("num_averages", 1),
                 spectrum_retrieval_type     = self.extra_options.get("spectrum_retrieval_type",SpectrumRetrievalType.FILE),
             )
+
+        # Vendor-aware span adjustment: Some modems (e.g., Ubee) fail with 1 MHz span
+        # (919 segments) but work with 2 MHz span (460 segments).
+        # Use sysDescr SNMP call for reliable vendor detection.
+        try:
+            from pypnm.lib.vendor_capabilities import (
+                get_vendor_from_sysdescr,
+                _VENDOR_CAPABILITIES,
+            )
+            
+            sys_descr = await self.cm.getSysDescr()
+            vendor = get_vendor_from_sysdescr(sys_descr)
+            caps = _VENDOR_CAPABILITIES.get(vendor, _VENDOR_CAPABILITIES['Unknown'])
+            
+            # Calculate recommended span based on vendor capabilities
+            total_span = capture_parameter.last_segment_center_freq - capture_parameter.first_segment_center_freq
+            recommended_span = caps.min_spectrum_span_hz
+            
+            # Also ensure we don't exceed max segments
+            if total_span > 0 and caps.max_spectrum_segments > 0:
+                min_span_for_segments = total_span // caps.max_spectrum_segments
+                if min_span_for_segments > recommended_span:
+                    # Round up to nearest MHz
+                    recommended_span = ((min_span_for_segments + 999_999) // 1_000_000) * 1_000_000
+            
+            if recommended_span > capture_parameter.segment_freq_span:
+                self.logger.info(
+                    f"{self.log_prefix} - {vendor} modem detected (sysDescr), adjusting span from "
+                    f"{capture_parameter.segment_freq_span / 1_000_000:.1f} MHz to {recommended_span / 1_000_000:.1f} MHz"
+                )
+                capture_parameter = capture_parameter.model_copy(
+                    update={"segment_freq_span": recommended_span}
+                )
+        except Exception as e:
+            self.logger.warning(f"{self.log_prefix} - Could not apply vendor-specific settings: {e}")
 
         if capture_parameter.spectrum_retrieval_type == SpectrumRetrievalType.SNMP:
             self.logger.info(f"{self.log_prefix} - SPECTRUM-ANALYZER - SNMP-AMPLITUDE-DATA-RETURN")
