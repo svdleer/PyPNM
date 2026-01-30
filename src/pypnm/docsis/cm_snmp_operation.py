@@ -1901,12 +1901,15 @@ class CmSnmpOperation:
             return True
 
         # Need to get Diplex Setting to make sure that the Spec Analyzer setting are within the band
+        print('=== Reading diplexer configuration ===', flush=True)
         self.logger.info('=== Reading diplexer configuration ===')
         try:
             cscs:DocsIf31CmSystemCfgDiplexState = await self.getDocsIf31CmSystemCfgDiplexState()
             cscs.to_dict()[0]
+            print('=== Diplexer configuration read successfully ===', flush=True)
             self.logger.info('=== Diplexer configuration read successfully ===')
         except Exception as e:
+            print(f'=== FAILED to read diplexer configuration: {e} ===', flush=True)
             self.logger.error(f'Failed to read diplexer configuration: {e}')
             return False
 
