@@ -1874,30 +1874,37 @@ class CmSnmpOperation:
             """ Helper function to perform SNMP set and verify the result."""
             base_oid = COMPILED_OIDS.get(field_name)
             if not base_oid:
+                print(f'=== OID not found for field "{field_name}", skipping ===', flush=True)
                 self.logger.warning(f'OID not found for field "{field_name}", skipping.')
                 return False
 
             oid = f"{base_oid}.0"
+            print(f'=== SPECTRUM SET: {field_name} -> OID: {oid} -> Value: {obj_value} ===', flush=True)
             self.logger.info(f'SPECTRUM SET: {field_name} -> OID: {oid} -> Value: {obj_value}')
 
             set_response = await self._snmp.set(oid, obj_value, snmp_type)
+            print(f'=== SPECTRUM SET Response: {field_name} = {set_response} ===', flush=True)
             self.logger.info(f'SPECTRUM SET Response: {field_name} = {set_response}')
 
             if not set_response:
+                print(f'=== SPECTRUM SET FAILED: {field_name} to ({obj_value}) - No response ===', flush=True)
                 self.logger.error(f'SPECTRUM SET FAILED: {field_name} to ({obj_value}) - No response')
                 return False
 
             result = Snmp_v2c.snmp_set_result_value(set_response)[0]
 
             if not result:
+                print(f'=== SPECTRUM SET FAILED: {field_name} to ({obj_value}) - Result empty ===', flush=True)
                 self.logger.error(f'SPECTRUM SET FAILED: {field_name} to ({obj_value}) - Result empty')
                 return False
 
             logging.debug(f"Result({result}): {type(result)} -> Value({obj_value}): {type(obj_value)}")
 
             if str(result) != str(obj_value):
+                print(f'=== Failed to set {field_name}. Expected ({obj_value}), got ({result}) ===', flush=True)
                 logging.error(f'Failed to set {field_name}. Expected ({obj_value}), got ({result})')
                 return False
+            print(f'=== SPECTRUM SET SUCCESS: {field_name} = {result} ===', flush=True)
             return True
 
         # Need to get Diplex Setting to make sure that the Spec Analyzer setting are within the band
