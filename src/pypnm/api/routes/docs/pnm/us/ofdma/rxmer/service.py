@@ -50,7 +50,7 @@ class CmtsUsOfdmaRxMerService:
     # OID definitions
     OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
     OID_CM_REG_MAC = "1.3.6.1.4.1.4491.2.1.20.1.3.1.2"  # docsIf3CmtsCmRegStatusMacAddr
-    OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.5.1.1"  # docsIf31CmtsCmUsOfdmaChannelStatusTable
+    OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"  # docsIf31CmtsCmUsOfdmaChannelTimingOffset (has cm_index.ofdma_ifindex)
     
     # US OFDMA RxMER Table (docsPnmCmtsUsOfdmaRxMerTable)
     # OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
