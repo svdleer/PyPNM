@@ -53,16 +53,16 @@ class CmtsUsOfdmaRxMerService:
     OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"  # docsIf31CmtsCmUsOfdmaChannelTimingOffset (has cm_index.ofdma_ifindex)
     
     # US OFDMA RxMER Table (docsPnmCmtsUsOfdmaRxMerTable)
-    # OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
-    # Column order from DOCS-PNM-MIB-2024-07-05:
-    #   .1 = Enable, .2 = CmMac, .3 = PreEq, .4 = NumAvgs, .5 = MeasStatus, .6 = FileName, .7 = DestinationIndex
-    OID_US_RXMER_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.7.1"
+    # OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.8.1
+    # Column order from DOCS-PNM-MIB (verified working with Cisco cBR-8):
+    #   .1 = Enable, .2 = PreEq, .3 = NumAvgs, .4 = MeasStatus, .5 = FileName, .6 = CmMac, .7 = DestinationIndex
+    OID_US_RXMER_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.8.1"
     OID_US_RXMER_ENABLE = f"{OID_US_RXMER_TABLE}.1"      # docsPnmCmtsUsOfdmaRxMerEnable
-    OID_US_RXMER_CM_MAC = f"{OID_US_RXMER_TABLE}.2"      # docsPnmCmtsUsOfdmaRxMerCmMac
-    OID_US_RXMER_PRE_EQ = f"{OID_US_RXMER_TABLE}.3"      # docsPnmCmtsUsOfdmaRxMerPreEq
-    OID_US_RXMER_NUM_AVGS = f"{OID_US_RXMER_TABLE}.4"    # docsPnmCmtsUsOfdmaRxMerNumAvgs
-    OID_US_RXMER_MEAS_STATUS = f"{OID_US_RXMER_TABLE}.5" # docsPnmCmtsUsOfdmaRxMerMeasStatus
-    OID_US_RXMER_FILENAME = f"{OID_US_RXMER_TABLE}.6"    # docsPnmCmtsUsOfdmaRxMerFileName
+    OID_US_RXMER_PRE_EQ = f"{OID_US_RXMER_TABLE}.2"      # docsPnmCmtsUsOfdmaRxMerPreEq
+    OID_US_RXMER_NUM_AVGS = f"{OID_US_RXMER_TABLE}.3"    # docsPnmCmtsUsOfdmaRxMerNumAvgs
+    OID_US_RXMER_MEAS_STATUS = f"{OID_US_RXMER_TABLE}.4" # docsPnmCmtsUsOfdmaRxMerMeasStatus
+    OID_US_RXMER_FILENAME = f"{OID_US_RXMER_TABLE}.5"    # docsPnmCmtsUsOfdmaRxMerFileName
+    OID_US_RXMER_CM_MAC = f"{OID_US_RXMER_TABLE}.6"      # docsPnmCmtsUsOfdmaRxMerCmMac
     OID_US_RXMER_DEST_INDEX = f"{OID_US_RXMER_TABLE}.7"  # docsPnmCmtsUsOfdmaRxMerDestinationIndex
     
     # Bulk Data Transfer Config Table (docsPnmBulkDataTransferCfgTable)
@@ -289,18 +289,18 @@ class CmtsUsOfdmaRxMerService:
         self.logger.info(f"Starting US RxMER for OFDMA ifIndex {ofdma_ifindex}, CM MAC {cm_mac}, dest={destination_index}")
         
         try:
-            # 1. Set CM MAC address FIRST (CMTS uses this to generate the filename)
+            # 1. Set filename FIRST (agent order)
+            await snmp.set(
+                f"{self.OID_US_RXMER_FILENAME}{idx}",
+                filename,
+                OctetString
+            )
+            
+            # 2. Set CM MAC address (now CMTS knows which modem)
             mac_octets = self.mac_to_hex_octets(cm_mac)
             await snmp.set(
                 f"{self.OID_US_RXMER_CM_MAC}{idx}",
                 mac_octets,
-                OctetString
-            )
-            
-            # 2. Set filename (now CMTS knows which modem)
-            await snmp.set(
-                f"{self.OID_US_RXMER_FILENAME}{idx}",
-                filename,
                 OctetString
             )
             
