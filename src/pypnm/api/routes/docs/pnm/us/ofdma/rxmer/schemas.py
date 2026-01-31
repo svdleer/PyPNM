@@ -80,6 +80,7 @@ class UsOfdmaRxMerStatusResponse(BaseModel):
     is_busy: bool = False
     is_error: bool = False
     error: Optional[str] = None
+    filename: Optional[str] = Field(None, description="Filename of the captured data when is_ready=True")
 
 
 class BulkDestination(BaseModel):
