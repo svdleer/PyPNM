@@ -114,3 +114,38 @@ class UsAtdmaSpecAnaAnalysisRequest(ExtendSingleCaptureSpecAnaRequest):
 
 class UsAtdmaSpecAnaAnalysisResponse(PnmAnalysisResponse):
     pass
+
+
+# -------------- UTSC CMTS-BASED REQUEST/RESPONSE ------------------
+
+class CmtsUtscRequest(BaseModel):
+    cmts_ip: str = Field(description="CMTS IP address")
+    community: str = Field(default="private", description="SNMP community string")
+
+
+class UtscRequest(CmtsUtscRequest):
+    rf_port_ifindex: int = Field(description="RF port interface index for UTSC")
+    center_freq_hz: int = Field(default=30000000, description="Center frequency in Hz")
+    span_hz: int = Field(default=80000000, description="Frequency span in Hz")
+    num_bins: int = Field(default=800, description="Number of FFT bins")
+
+
+class UtscResponse(BaseModel):
+    success: bool
+    error: str | None = None
+    message: str | None = None
+
+
+class UtscDiscoverRequest(CmtsUtscRequest):
+    cm_mac_address: str = Field(description="Cable modem MAC address")
+
+
+class UtscDiscoverResponse(BaseModel):
+    success: bool
+    rf_port_ifindex: int | None = None
+    rf_port_description: str | None = None
+    cm_index: int | None = None
+    us_channels: list[int] = Field(default_factory=list)
+    logical_channel: int | None = None
+    error: str | None = None
+
