@@ -352,8 +352,12 @@ class UsOfdmaRxMerRouter:
                     fontsize=11
                 )
                 
-                # Set y-axis limits
-                ax.set_ylim(20, 55)
+                # Set y-axis limits with auto-scaling based on data
+                y_min = min(valid_values)
+                y_max = max(valid_values)
+                y_range = y_max - y_min
+                y_padding = max(2.0, y_range * 0.1)  # At least 2dB padding or 10% of range
+                ax.set_ylim(max(0, y_min - y_padding), y_max + y_padding)
                 ax.set_xlim(min(freqs_mhz) - 0.2, max(freqs_mhz) + 0.2)
                 
                 # Grid and legend
