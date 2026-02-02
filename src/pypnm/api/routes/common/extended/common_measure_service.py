@@ -1310,6 +1310,9 @@ class CommonMeasureService(CommonMessagingService):
             docsIf3CmSpectrumAnalysisCtrlCmdFileName                    =   filename,
             docsIf3CmSpectrumAnalysisCtrlCmdFileEnable                  =   ctl_cmd_filename,)
 
+        # Apply vendor-specific settings (Ubee needs 2 MHz minimum segment span)
+        spectrum_cmd.apply_vendor_settings(self.cm.cable_modem.mac_address)
+
         # Issue the SNMP SET for the control-command. The downstream logic
         # (not shown here) will branch to either:
         #   • SNMP:  set FileEnable = FALSE → wait for measurement → walk AmplitudeData
