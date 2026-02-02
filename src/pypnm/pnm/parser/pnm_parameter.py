@@ -224,9 +224,10 @@ class GetPnmParserAndParameters(PnmHeader):
         """Latency report parser (not implemented)."""
         raise NotImplementedError("Latency report parsing not implemented.")
 
-    def _process_spectrum_analysis(self) -> NoReturn:
-        """Spectrum analysis parser (not implemented)."""
-        raise NotImplementedError("Spectrum analysis parsing not implemented.")
+    def _process_spectrum_analysis(self):
+        """Spectrum analysis parser."""
+        from pypnm.pnm.parser.CmSpectrumAnalysis import CmSpectrumAnalysis
+        return CmSpectrumAnalysis(self.byte_stream)
 
     """This method may never be implemented by CableLabs, no real intrest from operators"""
     def _process_symbol_capture(self) -> NoReturn:
