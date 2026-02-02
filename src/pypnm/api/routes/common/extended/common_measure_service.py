@@ -1263,7 +1263,7 @@ class CommonMeasureService(CommonMessagingService):
             )
             
             sys_descr = await self.cm.getSysDescr()
-            vendor = get_vendor_from_sysdescr(sys_descr)
+            vendor = get_vendor_from_sysdescr(str(sys_descr))
             caps = _VENDOR_CAPABILITIES.get(vendor, _VENDOR_CAPABILITIES['Unknown'])
             
             # Calculate recommended span based on vendor capabilities
