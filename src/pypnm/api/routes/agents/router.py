@@ -5,6 +5,7 @@ from fastapi import APIRouter, WebSocket, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional
 import logging
+import os
 
 from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
 
@@ -12,14 +13,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
-
-@router.on_event("startup")
-async def startup_agent_manager():
-    """Initialize agent manager on startup."""
-    import os
-    auth_token = os.environ.get("PYPNM_AGENT_TOKEN", "dev-token-change-me")
-    init_agent_manager(auth_token)
-    logger.info(f"Agent manager initialized")
+# Initialize agent manager on module import
+_auth_token = os.environ.get("PYPNM_AGENT_TOKEN", "dev-token-change-me")
+init_agent_manager(_auth_token)
+logger.info(f"Agent manager initialized with token: {_auth_token[:8]}...")
 
 
 @router.websocket("/ws")
