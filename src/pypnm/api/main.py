@@ -69,4 +69,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register agent routes
+from pypnm.api.routes.agents import router as agent_router
+app.include_router(agent_router)
+
 RouterRegistrar().register(app)
