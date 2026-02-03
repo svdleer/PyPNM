@@ -197,10 +197,31 @@ class CmSnmpOperation:
         Select and instantiate the appropriate SNMP client.
 
         Precedence:
+        0) If agent is available -> return AgentSnmpTransport
         1) If SNMPv3 is explicitly enabled and parameters are valid -> return Snmp_v3
         2) Else if SNMPv2c is enabled -> return Snmp_v2c
         3) Else -> error
         """
+        
+        # Check if agent transport is available
+        import os
+        if os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true':
+            try:
+                from pypnm.snmp.agent_transport import AgentSnmpTransport
+                from pypnm.api.agent.manager import get_agent_manager
+                
+                agent_manager = get_agent_manager()
+                if agent_manager and agent_manager.get_agent_for_capability('snmp_get'):
+                    self.logger.info("Using agent SNMP transport")
+                    return AgentSnmpTransport(
+                        host=self._inet,
+                        community=self._community,
+                        port=self._port,
+                        timeout=10,
+                        retries=3
+                    )
+            except Exception as e:
+                self.logger.warning(f"Agent transport unavailable, falling back to direct SNMP: {e}")
 
         if SystemConfigSettings.snmp_v3_enable():
             '''
