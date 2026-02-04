@@ -56,7 +56,7 @@ async def get_cmts_modems(request: CMTSModemRequest):
     
     # Use first available agent
     agent = agents[0]
-    agent_id = agent.agent_id
+    agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
     
     logger.info(f"Routing CMTS modem discovery to agent {agent_id}: {request.cmts_ip}")
     
