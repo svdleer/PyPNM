@@ -5,12 +5,17 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import logging
+import os
 
-from pypnm.api.agent.manager import get_agent_manager
+from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/cmts", tags=["CMTS Discovery"])
+
+# Ensure agent manager is initialized (may already be done by agents router)
+_auth_token = os.environ.get("PYPNM_AGENT_TOKEN", "dev-token-change-me")
+init_agent_manager(_auth_token)
 
 
 class CMTSModemRequest(BaseModel):
