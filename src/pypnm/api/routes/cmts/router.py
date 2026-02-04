@@ -66,23 +66,23 @@ async def get_cmts_modems(request: CMTSModemRequest):
     logger.info(f"Routing CMTS modem discovery to agent {agent_id}: {request.cmts_ip}")
     
     try:
-        # Send SNMP bulk walk task to agent
-        # DOCSIS 3.0 Cable Modem MAC Table OID
+        # Send CMTS modem discovery task to agent
+        # Uses cmts_get_modems which does parallel walks for MAC, IP, Status
         task_id = await agent_manager.send_task(
             agent_id=agent_id,
-            command='snmp_bulk_walk',
+            command='cmts_get_modems',
             params={
-                'target_ip': request.cmts_ip,
-                'oid': '1.3.6.1.2.1.10.127.1.3.3.1.2',  # docsIfCmtsCmStatusMacAddress
+                'cmts_ip': request.cmts_ip,
                 'community': request.community,
-                'max_repetitions': 25,
-                'limit': request.limit
+                'limit': request.limit,
+                'use_bulk': True,
+                'use_cache': True
             },
-            timeout=60
+            timeout=120
         )
         
         # Wait for agent response (use async version!)
-        result = await agent_manager.wait_for_task_async(task_id, timeout=60)
+        result = await agent_manager.wait_for_task_async(task_id, timeout=120)
         
         if not result:
             return CMTSModemResponse(
