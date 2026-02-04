@@ -76,8 +76,8 @@ async def get_cmts_modems(request: CMTSModemRequest):
             timeout=60
         )
         
-        # Wait for agent response
-        result = await agent_manager.wait_for_task(task_id, timeout=60)
+        # Wait for agent response (use async version!)
+        result = await agent_manager.wait_for_task_async(task_id, timeout=60)
         
         if not result:
             return CMTSModemResponse(

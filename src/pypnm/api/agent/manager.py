@@ -3,6 +3,7 @@
 #
 # Manages WebSocket connections to remote agents
 
+import asyncio
 import json
 import logging
 import time
@@ -24,6 +25,7 @@ class AgentManager:
         self.pending_tasks: dict[str, PendingTask] = {}
         self.auth_token = auth_token
         self._task_queues: dict[str, Queue] = {}
+        self._async_task_queues: dict[str, asyncio.Queue] = {}
         self.logger = logging.getLogger(f'{__name__}.AgentManager')
     
     async def handle_websocket(self, websocket: WebSocket):
@@ -139,6 +141,13 @@ class AgentManager:
         if request_id in self._task_queues:
             self._task_queues[request_id].put(data)
         
+        # Put in async queue if waiting
+        if request_id in self._async_task_queues:
+            try:
+                self._async_task_queues[request_id].put_nowait(data)
+            except asyncio.QueueFull:
+                self.logger.error(f"Async queue full for task: {request_id}")
+        
         self.logger.info(f"Task completed: {request_id}")
     
     def _handle_pong(self, websocket: WebSocket):
@@ -207,6 +216,7 @@ class AgentManager:
         )
         self.pending_tasks[task_id] = task
         self._task_queues[task_id] = Queue()
+        self._async_task_queues[task_id] = asyncio.Queue(maxsize=1)
         
         # Send command to agent
         msg = json.dumps({
@@ -228,7 +238,7 @@ class AgentManager:
         return task_id
     
     def wait_for_task(self, task_id: str, timeout: float = 30.0) -> Optional[dict]:
-        """Wait for task result."""
+        """Wait for task result (blocking - for sync code only)."""
         if task_id not in self._task_queues:
             return None
         
@@ -240,6 +250,30 @@ class AgentManager:
         finally:
             if task_id in self._task_queues:
                 del self._task_queues[task_id]
+            if task_id in self._async_task_queues:
+                del self._async_task_queues[task_id]
+            if task_id in self.pending_tasks:
+                del self.pending_tasks[task_id]
+    
+    async def wait_for_task_async(self, task_id: str, timeout: float = 30.0) -> Optional[dict]:
+        """Wait for task result (async - for async code)."""
+        if task_id not in self._async_task_queues:
+            return None
+        
+        try:
+            result = await asyncio.wait_for(
+                self._async_task_queues[task_id].get(),
+                timeout=timeout
+            )
+            return result
+        except asyncio.TimeoutError:
+            self.logger.error(f"Timeout waiting for task: {task_id}")
+            return None
+        finally:
+            if task_id in self._task_queues:
+                del self._task_queues[task_id]
+            if task_id in self._async_task_queues:
+                del self._async_task_queues[task_id]
             if task_id in self.pending_tasks:
                 del self.pending_tasks[task_id]
 
