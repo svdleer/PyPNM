@@ -23,6 +23,8 @@ class CMTSModemRequest(BaseModel):
     cmts_ip: str
     community: str = "public"
     limit: int = 10000
+    enrich: bool = False  # Whether to enrich modems with firmware/model
+    modem_community: str = "private"  # SNMP community for modem enrichment
 
 
 class ModemInfo(BaseModel):
@@ -75,6 +77,8 @@ async def get_cmts_modems(request: CMTSModemRequest):
                 'cmts_ip': request.cmts_ip,
                 'community': request.community,
                 'limit': request.limit,
+                'enrich': request.enrich,
+                'modem_community': request.modem_community,
                 'use_bulk': True,
                 'use_cache': True
             },
