@@ -40,6 +40,9 @@ class CMTSModemResponse(BaseModel):
     count: int
     timestamp: Optional[str] = None
     error: Optional[str] = None
+    enriched: Optional[bool] = False
+    cached: Optional[bool] = False
+    enriching: Optional[bool] = False
 
 
 @router.post("/modems", response_model=CMTSModemResponse)
@@ -98,11 +101,15 @@ async def get_cmts_modems(request: CMTSModemRequest):
         
         if result.get('result', {}).get('success'):
             modems = result.get('result', {}).get('modems', [])
+            agent_result = result.get('result', {})
             return CMTSModemResponse(
                 success=True,
                 modems=modems,
                 count=len(modems),
-                timestamp=result.get('timestamp')
+                timestamp=result.get('timestamp'),
+                enriched=agent_result.get('enriched', False),
+                cached=agent_result.get('cached', False),
+                enriching=agent_result.get('enriching', False)
             )
         else:
             error_msg = result.get('result', {}).get('error', 'Unknown agent error')
