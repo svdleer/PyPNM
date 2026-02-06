@@ -16,6 +16,7 @@ import re
 from typing import Any, Optional
 
 from pysnmp.proto.rfc1902 import Integer32, OctetString
+from pysnmp.smi.rfc1902 import ObjectIdentity, ObjectType
 
 from pypnm.lib.inet import Inet
 from pypnm.lib.types import SnmpReadCommunity, SnmpWriteCommunity
@@ -164,6 +165,28 @@ def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
     return varbinds
 
 
+def _convert_to_object_types(varbinds: list[AgentVarBind]) -> list[ObjectType]:
+    """
+    Convert AgentVarBind objects to real pysnmp ObjectType objects.
+    
+    This ensures full compatibility with existing PyPNM code that expects
+    ObjectType objects from Snmp_v2c methods.
+    """
+    result = []
+    for vb in varbinds:
+        oid_str = vb[0]
+        value = vb[1]
+        
+        # Create ObjectIdentity from numeric OID string
+        oid_identity = ObjectIdentity(oid_str)
+        
+        # Create ObjectType with the OID and value
+        obj_type = ObjectType(oid_identity, value)
+        result.append(obj_type)
+    
+    return result
+
+
 class AgentSnmpTransport:
     """
     SNMP transport that routes operations through a connected agent.
@@ -249,12 +272,12 @@ class AgentSnmpTransport:
         oid: str,
         timeout: float | None = None,
         retries: int | None = None,
-    ) -> list[AgentVarBind] | None:
+    ) -> list[ObjectType] | None:
         """
         Perform SNMP GET via agent.
 
         Returns:
-            list[AgentVarBind] matching Snmp_v2c.get() contract, or None.
+            list[ObjectType] matching Snmp_v2c.get() contract, or None.
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
@@ -273,24 +296,26 @@ class AgentSnmpTransport:
             return None
 
         varbinds = _parse_output_to_varbinds(data.get('output', ''))
-        return varbinds if varbinds else None
+        if not varbinds:
+            return None
+        
+        # Convert AgentVarBind to real ObjectType for compatibility
+        return _convert_to_object_types(varbinds)
 
     async def walk(
         self,
         oid: str,
         timeout: float | None = None,
         retries: int | None = None,
-    ) -> list[AgentVarBind] | None:
+    ) -> list[ObjectType] | None:
         """
         Perform SNMP WALK via agent.
 
         Returns:
-            list[AgentVarBind] matching Snmp_v2c.walk() contract, or None.
+            list[ObjectType] matching Snmp_v2c.walk() contract, or None.
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
-        
-        print(f"DEBUG: AgentSnmpTransport.walk() called with oid='{oid}' -> resolved='{resolved}'")
 
         data = await self._send_and_wait(
             'snmp_walk', 'snmp_walk',
@@ -302,21 +327,16 @@ class AgentSnmpTransport:
             timeout=t,
         )
         
-        print(f"DEBUG: Agent walk response: success={data.get('success') if data else None}, data_keys={list(data.keys()) if data else None}")
-        
         if not data or not data.get('success'):
-            print(f"DEBUG: Agent WALK failed for {resolved}: {data}")
-            self.logger.warning(f"Agent WALK failed for {resolved}: {data}")
             return None
 
         output = data.get('output', '')
-        print(f"DEBUG: Agent walk output length: {len(output)} chars")
-        print(f"DEBUG: Agent walk output preview: {repr(output[:200])}")
-        
         varbinds = _parse_output_to_varbinds(output)
-        print(f"DEBUG: Parsed {len(varbinds)} varbinds")
+        if not varbinds:
+            return None
         
-        return varbinds if varbinds else None
+        # Convert AgentVarBind to real ObjectType for compatibility
+        return _convert_to_object_types(varbinds)
 
     async def bulk_walk(
         self,
