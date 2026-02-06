@@ -289,6 +289,8 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
+        
+        print(f"DEBUG: AgentSnmpTransport.walk() called with oid='{oid}' -> resolved='{resolved}'")
 
         data = await self._send_and_wait(
             'snmp_walk', 'snmp_walk',
@@ -299,11 +301,21 @@ class AgentSnmpTransport:
             },
             timeout=t,
         )
+        
+        print(f"DEBUG: Agent walk response: success={data.get('success') if data else None}, data_keys={list(data.keys()) if data else None}")
+        
         if not data or not data.get('success'):
+            print(f"DEBUG: Agent WALK failed for {resolved}: {data}")
             self.logger.warning(f"Agent WALK failed for {resolved}: {data}")
             return None
 
-        varbinds = _parse_output_to_varbinds(data.get('output', ''))
+        output = data.get('output', '')
+        print(f"DEBUG: Agent walk output length: {len(output)} chars")
+        print(f"DEBUG: Agent walk output preview: {repr(output[:200])}")
+        
+        varbinds = _parse_output_to_varbinds(output)
+        print(f"DEBUG: Parsed {len(varbinds)} varbinds")
+        
         return varbinds if varbinds else None
 
     async def bulk_walk(
