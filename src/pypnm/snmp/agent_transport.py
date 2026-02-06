@@ -196,6 +196,34 @@ def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
     return varbinds
 
 
+def _convert_to_object_types(varbinds: list[AgentVarBind]) -> list[ObjectType]:
+    """
+    Convert AgentVarBind objects to real pysnmp ObjectType objects with MIB resolution.
+    
+    This ensures full compatibility with existing PyPNM code that expects
+    ObjectType objects from Snmp_v2c methods. Uses the global MIB builder
+    configured with PyPNM's MIB directory.
+    """
+    result = []
+    for vb in varbinds:
+        oid_str = vb[0]
+        value = vb[1]
+        
+        try:
+            # Create ObjectIdentity with MIB builder
+            oid_identity = ObjectIdentity(oid_str).resolveWithMib(_MIB_VIEW)
+            
+            # Create ObjectType with the resolved OID and value
+            obj_type = ObjectType(oid_identity, value)
+            result.append(obj_type)
+        except Exception as e:
+            # If MIB resolution fails, fall back to returning the AgentVarBind
+            # which is already compatible with indexing [0] and [1]
+            result.append(vb)
+    
+    return result
+
+
 class AgentSnmpTransport:
     """
     SNMP transport that routes operations through a connected agent.
@@ -305,7 +333,11 @@ class AgentSnmpTransport:
             return None
 
         varbinds = _parse_output_to_varbinds(data.get('output', ''))
-        return varbinds if varbinds else None
+        if not varbinds:
+            return None
+        
+        # Convert to ObjectType for full compatibility
+        return _convert_to_object_types(varbinds)
 
     async def walk(
         self,
@@ -321,8 +353,6 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
-        
-        print(f"DEBUG: AgentSnmpTransport.walk() called with oid='{oid}' -> resolved='{resolved}'")
 
         data = await self._send_and_wait(
             'snmp_walk', 'snmp_walk',
@@ -334,21 +364,17 @@ class AgentSnmpTransport:
             timeout=t,
         )
         
-        print(f"DEBUG: Agent walk response: success={data.get('success') if data else None}, data_keys={list(data.keys()) if data else None}")
-        
         if not data or not data.get('success'):
-            print(f"DEBUG: Agent WALK failed for {resolved}: {data}")
             self.logger.warning(f"Agent WALK failed for {resolved}: {data}")
             return None
 
         output = data.get('output', '')
-        print(f"DEBUG: Agent walk output length: {len(output)} chars")
-        print(f"DEBUG: Agent walk output preview: {repr(output[:200])}")
-        
         varbinds = _parse_output_to_varbinds(output)
-        print(f"DEBUG: Parsed {len(varbinds)} varbinds")
+        if not varbinds:
+            return None
         
-        return varbinds if varbinds else None
+        # Convert to ObjectType for full compatibility
+        return _convert_to_object_types(varbinds)
 
     async def bulk_walk(
         self,
