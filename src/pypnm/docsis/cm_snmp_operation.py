@@ -779,7 +779,7 @@ class CmSnmpOperation:
         Returns:
             List[int]: A list of SNMP index integers.
         """
-        oid = "docsDevEvId"
+        oid = "docsDevEvFirstTime"
 
         results = await self._snmp.walk(oid)
 
