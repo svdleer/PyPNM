@@ -302,11 +302,15 @@ class DocsIfDownstreamChannelEntry(BaseModel):
             logger.warning("No downstream SC-QAM channel indices provided.")
             return results
 
-        for index in indices:
-            try:
-                result = await cls.from_snmp(index, snmp)
-                results.append(result)
-            except Exception as e:  # noqa: PERF203
-                logger.warning(f"Failed to retrieve downstream channel {index}: {e}")
+        # Parallelize from_snmp calls for all indices
+        import asyncio
+        tasks = [cls.from_snmp(index, snmp) for index in indices]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for index, response in zip(indices, responses):
+            if isinstance(response, Exception):
+                logger.warning(f"Failed to retrieve downstream channel {index}: {response}")
+            elif response is not None:
+                results.append(response)
 
         return results

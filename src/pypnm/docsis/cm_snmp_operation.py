@@ -747,8 +747,12 @@ class CmSnmpOperation:
             if not indices:
                 self.logger.warning("No downstream SC-QAM channel indices found.")
                 return []
+            
+            print(f"DEBUG: Found {len(indices)} SC-QAM channel indices: {indices}")
 
             entries = await DocsIfDownstreamChannelEntry.get(snmp=self._snmp, indices=indices)
+            
+            print(f"DEBUG: Got {len(entries)} SC-QAM channel entries")
 
             return entries
 
@@ -837,15 +841,16 @@ class CmSnmpOperation:
                 self.logger.warning("No DocsDevEventEntry indices found.")
                 return event_entries
 
-            for idx in indices:
-                try:
-                    entry = DocsDevEventEntry(index=idx, snmp=self._snmp)
-                    success = await entry.start()
-                    if success:
-                        event_entries.append(entry.to_dict() if to_dict else entry)
-                except Exception as e:
-                    self.logger.warning(f"Failed to process event entry {idx}: {e}")
-                    continue
+            # Parallelize entry.start() calls for all indices
+            import asyncio
+            entries = [DocsDevEventEntry(index=idx, snmp=self._snmp) for idx in indices]
+            start_results = await asyncio.gather(*[entry.start() for entry in entries], return_exceptions=True)
+            
+            for entry, success in zip(entries, start_results):
+                if isinstance(success, Exception):
+                    self.logger.warning(f"Failed to process event entry {entry.index}: {success}")
+                elif success:
+                    event_entries.append(entry.to_dict() if to_dict else entry)
 
         except Exception as e:
             self.logger.exception("Failed to retrieve DocsDevEventEntry entries, error: %s", e)

@@ -124,9 +124,15 @@ class DocsIfUpstreamChannelEntry(BaseModel):
             logger.warning("No upstream ATDMA indices found.")
             return results
 
-        for index in indices:
-            result = await cls.from_snmp(index, snmp)
-            if result is not None:
-                results.append(result)
+        # Parallelize from_snmp calls for all indices
+        import asyncio
+        tasks = [cls.from_snmp(index, snmp) for index in indices]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for index, response in zip(indices, responses):
+            if isinstance(response, Exception):
+                logger.warning(f"Failed to retrieve upstream channel {index}: {response}")
+            elif response is not None:
+                results.append(response)
 
         return results
