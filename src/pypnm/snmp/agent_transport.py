@@ -210,14 +210,15 @@ def _convert_to_object_types(varbinds: list[AgentVarBind]) -> list[ObjectType]:
         value = vb[1]
         
         try:
-            # Create ObjectIdentity with MIB builder
-            oid_identity = ObjectIdentity(oid_str).resolveWithMib(_MIB_VIEW)
+            # Create ObjectIdentity - MIB resolution happens automatically
+            # when the MIB sources are configured via the builder
+            oid_identity = ObjectIdentity(oid_str)
             
-            # Create ObjectType with the resolved OID and value
+            # Create ObjectType with the OID and value
             obj_type = ObjectType(oid_identity, value)
             result.append(obj_type)
-        except Exception as e:
-            # If MIB resolution fails, fall back to returning the AgentVarBind
+        except Exception:
+            # If ObjectType creation fails, fall back to returning the AgentVarBind
             # which is already compatible with indexing [0] and [1]
             result.append(vb)
     
