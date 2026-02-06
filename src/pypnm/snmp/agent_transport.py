@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any, Optional
 
 from pysnmp.proto.rfc1902 import Integer32, OctetString
@@ -291,6 +292,9 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
+        
+        start_time = time.time()
+        print(f"DEBUG: AgentSnmpTransport.get() called with oid='{oid}' -> resolved='{resolved}'")
 
         data = await self._send_and_wait(
             'snmp_get', 'snmp_get',
@@ -301,11 +305,20 @@ class AgentSnmpTransport:
             },
             timeout=t,
         )
+        
+        elapsed = time.time() - start_time
+        print(f"DEBUG: Agent get response: success={data.get('success') if data else None}, elapsed={elapsed:.3f}s")
+        
         if not data or not data.get('success'):
             self.logger.warning(f"Agent GET failed for {resolved}: {data}")
             return None
 
-        varbinds = _parse_output_to_varbinds(data.get('output', ''))
+        output = data.get('output', '')
+        print(f"DEBUG: Agent get output: {repr(output[:200])}")
+        
+        varbinds = _parse_output_to_varbinds(output)
+        print(f"DEBUG: Parsed {len(varbinds) if varbinds else 0} varbinds, total time={time.time()-start_time:.3f}s")
+        
         return varbinds if varbinds else None
 
     async def walk(
@@ -323,6 +336,7 @@ class AgentSnmpTransport:
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
         
+        start_time = time.time()
         print(f"DEBUG: AgentSnmpTransport.walk() called with oid='{oid}' -> resolved='{resolved}'")
 
         data = await self._send_and_wait(
@@ -335,7 +349,8 @@ class AgentSnmpTransport:
             timeout=t,
         )
         
-        print(f"DEBUG: Agent walk response: success={data.get('success') if data else None}, data_keys={list(data.keys()) if data else None}")
+        elapsed = time.time() - start_time
+        print(f"DEBUG: Agent walk response: success={data.get('success') if data else None}, elapsed={elapsed:.3f}s")
         
         if not data or not data.get('success'):
             print(f"DEBUG: Agent WALK failed for {resolved}: {data}")
@@ -347,7 +362,7 @@ class AgentSnmpTransport:
         print(f"DEBUG: Agent walk output preview: {repr(output[:200])}")
         
         varbinds = _parse_output_to_varbinds(output)
-        print(f"DEBUG: Parsed {len(varbinds)} varbinds")
+        print(f"DEBUG: Parsed {len(varbinds)} varbinds, total time={time.time()-start_time:.3f}s")
         
         return varbinds if varbinds else None
 

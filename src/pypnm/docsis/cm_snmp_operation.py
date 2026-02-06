@@ -1287,13 +1287,21 @@ class CmSnmpOperation:
         Returns:
             Dict[str, List[Dict]]: Mapping of interface type name to list of interface stats.
         """
+        import time
+        start_time = time.time()
         stats: dict[str, list[dict]] = {}
 
         for if_type in interface_types:
+            type_start = time.time()
+            print(f"DEBUG: getInterfaceStatistics processing {if_type.name}...")
             interfaces = await InterfaceStats.from_snmp(self._snmp, if_type)
+            type_elapsed = time.time() - type_start
+            print(f"DEBUG: {if_type.name} took {type_elapsed:.3f}s, got {len(interfaces) if interfaces else 0} interfaces")
             if interfaces:
                 stats[if_type.name] = [iface.model_dump() for iface in interfaces]
 
+        total_elapsed = time.time() - start_time
+        print(f"DEBUG: getInterfaceStatistics TOTAL time: {total_elapsed:.3f}s")
         return stats
 
     async def getDocsIf31CmUsOfdmaChanChannelIdIndex(self) -> list[InterfaceIndex]:
