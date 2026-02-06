@@ -44,25 +44,32 @@ class CmDocsDevService:
         Fetch DOCSIS event log entries and return a list of structured models.
         """
         raw_entries: list[dict] = await self._cm.getDocsDevEventEntry(to_dict=True)
+        
+        print(f"DEBUG: fetch_event_log received {len(raw_entries)} raw entries")
 
         log_entries = []
-        for raw in raw_entries:
+        for i, raw in enumerate(raw_entries):
             if not isinstance(raw, dict) or not raw:
+                print(f"DEBUG: skipping entry {i} - not dict or empty: {type(raw)}")
                 continue
 
             try:
                 _, event_data = next(iter(raw.items()))
-                log_entries.append(EventLogEntry(
+                log_entry = EventLogEntry(
                     docsDevEvFirstTime  =event_data.get("docsDevEvFirstTime", ""),
                     docsDevEvLastTime   =event_data.get("docsDevEvLastTime", ""),
                     docsDevEvCounts     =event_data.get("docsDevEvCounts", 0),
                     docsDevEvLevel      =event_data.get("docsDevEvLevel", 0),
                     docsDevEvId         =event_data.get("docsDevEvId", 0),
                     docsDevEvText       =event_data.get("docsDevEvText", ""),
-                ))
-            except Exception:
+                )
+                log_entries.append(log_entry)
+                print(f"DEBUG: successfully processed entry {i}")
+            except Exception as e:
+                print(f"DEBUG: failed to process entry {i}: {e}")
                 continue
 
+        print(f"DEBUG: returning {len(log_entries)} processed entries")
         return log_entries
 
     async def reset_cable_modem(self) -> PnmResponse:

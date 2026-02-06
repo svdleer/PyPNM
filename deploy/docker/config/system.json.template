@@ -9,8 +9,8 @@
             "2c": {
                 "enable": true,
                 "retries": 3,
-                "read_community": "public",
-                "write_community": "private"
+                "read_community": "z1gg0m0n1t0r1ng",
+                "write_community": "z1gg0m0n1t0r1ng"
             },
             "3": {
                 "enable": false,
