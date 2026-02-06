@@ -59,7 +59,7 @@ class AgentVarBind:
 # ---------------------------------------------------------------------------
 
 _NUMERIC_OID_RE = re.compile(r"\.?(\d+\.)+\d+")
-_SYMBOLIC_RE = re.compile(r"^([a-zA-Z0-9_:]+)(\..+)?$")
+_SYMBOLIC_RE = re.compile(r"^([a-zA-Z0-9_:-]+)(\..+)?$")
 _HEX_RE = re.compile(r"0x[0-9a-fA-F]+")
 
 
