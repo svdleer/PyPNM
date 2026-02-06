@@ -99,33 +99,86 @@ class InterfaceStats(BaseModel):
 
         # For each matching interface, fetch all required fields in batches
         for index in matching_indexes:
-            # Batch fetch all IfEntry fields (reduces ~20 individual GETs to parallel fetches)
-            tasks = {
-                "ifDescr": snmp.get(f"ifDescr.{index}"),
-                "ifMtu": snmp.get(f"ifMtu.{index}"),
-                "ifSpeed": snmp.get(f"ifSpeed.{index}"),
-                "ifPhysAddress": snmp.get(f"ifPhysAddress.{index}"),
-                "ifAdminStatus": snmp.get(f"ifAdminStatus.{index}"),
-                "ifOperStatus": snmp.get(f"ifOperStatus.{index}"),
-                "ifLastChange": snmp.get(f"ifLastChange.{index}"),
-                "ifInOctets": snmp.get(f"ifInOctets.{index}"),
-                "ifInUcastPkts": snmp.get(f"ifInUcastPkts.{index}"),
-                "ifInNUcastPkts": snmp.get(f"ifInNUcastPkts.{index}"),
-                "ifInDiscards": snmp.get(f"ifInDiscards.{index}"),
-                "ifInErrors": snmp.get(f"ifInErrors.{index}"),
-                "ifInUnknownProtos": snmp.get(f"ifInUnknownProtos.{index}"),
-                "ifOutOctets": snmp.get(f"ifOutOctets.{index}"),
-                "ifOutUcastPkts": snmp.get(f"ifOutUcastPkts.{index}"),
-                "ifOutNUcastPkts": snmp.get(f"ifOutNUcastPkts.{index}"),
-                "ifOutDiscards": snmp.get(f"ifOutDiscards.{index}"),
-                "ifOutErrors": snmp.get(f"ifOutErrors.{index}"),
-                "ifOutQLen": snmp.get(f"ifOutQLen.{index}"),
-                "ifSpecific": snmp.get(f"ifSpecific.{index}"),
-            }
-            
-            # Await all in parallel
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            field_values = dict(zip(tasks.keys(), results))
+            # Try bulk_get if available (agent transport optimization)
+            if hasattr(snmp, 'bulk_get'):
+                oid_list = [
+                    f"ifDescr.{index}",
+                    f"ifMtu.{index}",
+                    f"ifSpeed.{index}",
+                    f"ifPhysAddress.{index}",
+                    f"ifAdminStatus.{index}",
+                    f"ifOperStatus.{index}",
+                    f"ifLastChange.{index}",
+                    f"ifInOctets.{index}",
+                    f"ifInUcastPkts.{index}",
+                    f"ifInNUcastPkts.{index}",
+                    f"ifInDiscards.{index}",
+                    f"ifInErrors.{index}",
+                    f"ifInUnknownProtos.{index}",
+                    f"ifOutOctets.{index}",
+                    f"ifOutUcastPkts.{index}",
+                    f"ifOutNUcastPkts.{index}",
+                    f"ifOutDiscards.{index}",
+                    f"ifOutErrors.{index}",
+                    f"ifOutQLen.{index}",
+                    f"ifSpecific.{index}",
+                ]
+                
+                bulk_results = await snmp.bulk_get(oid_list)
+                if bulk_results:
+                    field_values = {
+                        "ifDescr": bulk_results.get(f"ifDescr.{index}"),
+                        "ifMtu": bulk_results.get(f"ifMtu.{index}"),
+                        "ifSpeed": bulk_results.get(f"ifSpeed.{index}"),
+                        "ifPhysAddress": bulk_results.get(f"ifPhysAddress.{index}"),
+                        "ifAdminStatus": bulk_results.get(f"ifAdminStatus.{index}"),
+                        "ifOperStatus": bulk_results.get(f"ifOperStatus.{index}"),
+                        "ifLastChange": bulk_results.get(f"ifLastChange.{index}"),
+                        "ifInOctets": bulk_results.get(f"ifInOctets.{index}"),
+                        "ifInUcastPkts": bulk_results.get(f"ifInUcastPkts.{index}"),
+                        "ifInNUcastPkts": bulk_results.get(f"ifInNUcastPkts.{index}"),
+                        "ifInDiscards": bulk_results.get(f"ifInDiscards.{index}"),
+                        "ifInErrors": bulk_results.get(f"ifInErrors.{index}"),
+                        "ifInUnknownProtos": bulk_results.get(f"ifInUnknownProtos.{index}"),
+                        "ifOutOctets": bulk_results.get(f"ifOutOctets.{index}"),
+                        "ifOutUcastPkts": bulk_results.get(f"ifOutUcastPkts.{index}"),
+                        "ifOutNUcastPkts": bulk_results.get(f"ifOutNUcastPkts.{index}"),
+                        "ifOutDiscards": bulk_results.get(f"ifOutDiscards.{index}"),
+                        "ifOutErrors": bulk_results.get(f"ifOutErrors.{index}"),
+                        "ifOutQLen": bulk_results.get(f"ifOutQLen.{index}"),
+                        "ifSpecific": bulk_results.get(f"ifSpecific.{index}"),
+                    }
+                else:
+                    # Fallback if bulk_get fails
+                    field_values = {}
+            else:
+                # Fallback: Batch fetch all IfEntry fields (reduces ~20 individual GETs to parallel fetches)
+                tasks = {
+                    "ifDescr": snmp.get(f"ifDescr.{index}"),
+                    "ifMtu": snmp.get(f"ifMtu.{index}"),
+                    "ifSpeed": snmp.get(f"ifSpeed.{index}"),
+                    "ifPhysAddress": snmp.get(f"ifPhysAddress.{index}"),
+                    "ifAdminStatus": snmp.get(f"ifAdminStatus.{index}"),
+                    "ifOperStatus": snmp.get(f"ifOperStatus.{index}"),
+                    "ifLastChange": snmp.get(f"ifLastChange.{index}"),
+                    "ifInOctets": snmp.get(f"ifInOctets.{index}"),
+                    "ifInUcastPkts": snmp.get(f"ifInUcastPkts.{index}"),
+                    "ifInNUcastPkts": snmp.get(f"ifInNUcastPkts.{index}"),
+                    "ifInDiscards": snmp.get(f"ifInDiscards.{index}"),
+                    "ifInErrors": snmp.get(f"ifInErrors.{index}"),
+                    "ifInUnknownProtos": snmp.get(f"ifInUnknownProtos.{index}"),
+                    "ifOutOctets": snmp.get(f"ifOutOctets.{index}"),
+                    "ifOutUcastPkts": snmp.get(f"ifOutUcastPkts.{index}"),
+                    "ifOutNUcastPkts": snmp.get(f"ifOutNUcastPkts.{index}"),
+                    "ifOutDiscards": snmp.get(f"ifOutDiscards.{index}"),
+                    "ifOutErrors": snmp.get(f"ifOutErrors.{index}"),
+                    "ifOutQLen": snmp.get(f"ifOutQLen.{index}"),
+                    "ifSpecific": snmp.get(f"ifSpecific.{index}"),
+                }
+                
+                # Await all in parallel
+                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                field_values = dict(zip(tasks.keys(), results))
             
             def get_val(field: str, cast=None):
                 result = field_values.get(field)

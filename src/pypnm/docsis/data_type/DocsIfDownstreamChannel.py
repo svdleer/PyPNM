@@ -178,22 +178,82 @@ class DocsIfDownstreamChannelEntry(BaseModel):
                 logger.warning(f"Failed to fetch {field}.{index}: {e}")
                 return None
 
-        entry = DocsIfDownstreamEntry(
-            docsIfDownChannelId         =   await fetch("docsIfDownChannelId", int),
-            docsIfDownChannelFrequency  =   await fetch("docsIfDownChannelFrequency", int),
-            docsIfDownChannelWidth      =   await fetch("docsIfDownChannelWidth", int),
-            docsIfDownChannelModulation =   await fetch("docsIfDownChannelModulation", int),
-            docsIfDownChannelInterleave =   await fetch("docsIfDownChannelInterleave", int),
-            docsIfDownChannelPower      =   await fetch("docsIfDownChannelPower", tenthdBmV_to_float),
-            docsIfSigQUnerroreds        =   await fetch("docsIfSigQUnerroreds", int),
-            docsIfSigQCorrecteds        =   await fetch("docsIfSigQCorrecteds", int),
-            docsIfSigQUncorrectables    =   await fetch("docsIfSigQUncorrectables", int),
-            docsIfSigQMicroreflections  =   await fetch("docsIfSigQMicroreflections", int),
-            docsIfSigQExtUnerroreds     =   await fetch("docsIfSigQExtUnerroreds", int),
-            docsIfSigQExtCorrecteds     =   await fetch("docsIfSigQExtCorrecteds", int),
-            docsIfSigQExtUncorrectables =   await fetch("docsIfSigQExtUncorrectables", int),
-            docsIf3SignalQualityExtRxMER =  await fetch("docsIf3SignalQualityExtRxMER", to_float)
-        )
+        # Try bulk_get if available (agent transport optimization)
+        if hasattr(snmp, 'bulk_get'):
+            fields_to_fetch = [
+                "docsIfDownChannelId",
+                "docsIfDownChannelFrequency",
+                "docsIfDownChannelWidth",
+                "docsIfDownChannelModulation",
+                "docsIfDownChannelInterleave",
+                "docsIfDownChannelPower",
+                "docsIfSigQUnerroreds",
+                "docsIfSigQCorrecteds",
+                "docsIfSigQUncorrectables",
+                "docsIfSigQMicroreflections",
+                "docsIfSigQExtUnerroreds",
+                "docsIfSigQExtCorrecteds",
+                "docsIfSigQExtUncorrectables",
+                "docsIf3SignalQualityExtRxMER",
+            ]
+            
+            oids = [f"{field}.{index}" for field in fields_to_fetch]
+            bulk_results = await snmp.bulk_get(oids)
+            
+            def get_bulk_val(field: str, cast: Callable | None = None):
+                try:
+                    raw = bulk_results.get(f"{field}.{index}") if bulk_results else None
+                    val = Snmp_v2c.get_result_value(raw) if raw else None
+                    if val is None or val == "":
+                        return None
+                    if cast:
+                        return safe_cast(val, cast)
+                    val = val.strip()
+                    if val.isdigit():
+                        return int(val)
+                    if val.lower() in ("true", "false"):
+                        return val.lower() == "true"
+                    try:
+                        return float(val)
+                    except ValueError:
+                        return val
+                except Exception:
+                    return None
+            
+            entry = DocsIfDownstreamEntry(
+                docsIfDownChannelId         =   get_bulk_val("docsIfDownChannelId", int),
+                docsIfDownChannelFrequency  =   get_bulk_val("docsIfDownChannelFrequency", int),
+                docsIfDownChannelWidth      =   get_bulk_val("docsIfDownChannelWidth", int),
+                docsIfDownChannelModulation =   get_bulk_val("docsIfDownChannelModulation", int),
+                docsIfDownChannelInterleave =   get_bulk_val("docsIfDownChannelInterleave", int),
+                docsIfDownChannelPower      =   get_bulk_val("docsIfDownChannelPower", tenthdBmV_to_float),
+                docsIfSigQUnerroreds        =   get_bulk_val("docsIfSigQUnerroreds", int),
+                docsIfSigQCorrecteds        =   get_bulk_val("docsIfSigQCorrecteds", int),
+                docsIfSigQUncorrectables    =   get_bulk_val("docsIfSigQUncorrectables", int),
+                docsIfSigQMicroreflections  =   get_bulk_val("docsIfSigQMicroreflections", int),
+                docsIfSigQExtUnerroreds     =   get_bulk_val("docsIfSigQExtUnerroreds", int),
+                docsIfSigQExtCorrecteds     =   get_bulk_val("docsIfSigQExtCorrecteds", int),
+                docsIfSigQExtUncorrectables =   get_bulk_val("docsIfSigQExtUncorrectables", int),
+                docsIf3SignalQualityExtRxMER =  get_bulk_val("docsIf3SignalQualityExtRxMER", to_float)
+            )
+        else:
+            # Fallback: use individual fetch calls
+            entry = DocsIfDownstreamEntry(
+                docsIfDownChannelId         =   await fetch("docsIfDownChannelId", int),
+                docsIfDownChannelFrequency  =   await fetch("docsIfDownChannelFrequency", int),
+                docsIfDownChannelWidth      =   await fetch("docsIfDownChannelWidth", int),
+                docsIfDownChannelModulation =   await fetch("docsIfDownChannelModulation", int),
+                docsIfDownChannelInterleave =   await fetch("docsIfDownChannelInterleave", int),
+                docsIfDownChannelPower      =   await fetch("docsIfDownChannelPower", tenthdBmV_to_float),
+                docsIfSigQUnerroreds        =   await fetch("docsIfSigQUnerroreds", int),
+                docsIfSigQCorrecteds        =   await fetch("docsIfSigQCorrecteds", int),
+                docsIfSigQUncorrectables    =   await fetch("docsIfSigQUncorrectables", int),
+                docsIfSigQMicroreflections  =   await fetch("docsIfSigQMicroreflections", int),
+                docsIfSigQExtUnerroreds     =   await fetch("docsIfSigQExtUnerroreds", int),
+                docsIfSigQExtCorrecteds     =   await fetch("docsIfSigQExtCorrecteds", int),
+                docsIfSigQExtUncorrectables =   await fetch("docsIfSigQExtUncorrectables", int),
+                docsIf3SignalQualityExtRxMER =  await fetch("docsIf3SignalQualityExtRxMER", to_float)
+            )
 
 
         return cls(
