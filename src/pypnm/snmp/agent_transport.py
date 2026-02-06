@@ -81,24 +81,19 @@ def _resolve_oid(oid: str) -> str:
 
 def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
     """
-    Parse the agent's ``'OID = value'`` text lines into AgentVarBind
-    objects that CmSnmpOperation / Snmp_v2c helpers understand.
+    Parse the agent's SNMP output into AgentVarBind objects.
 
-    The agent formats each varbind via pysnmp ``prettyPrint()``::
-
+    The agent can return different formats:
+    1. pysnmp prettyPrint() format::
         SNMPv2-MIB::sysDescr.0 = <<GEAR3>>...
         IF-MIB::ifType.1 = 127
         IF-MIB::ifPhysAddress.1 = 0xac22053ad5c0
+        
+    2. snmpwalk format::
+        iso.3.6.1.2.1.69.1.5.8.1.2.32 = Hex-STRING: 07 EA 02 05 05 1F 33 00
+        iso.3.6.1.2.1.1.1.0 = STRING: "<<GEAR3>>"
 
-    We split on the first `` = `` and wrap both sides in AgentVarBind.
-
-    Value mapping:
-    - ``0x…`` hex strings → ``OctetString`` with **raw bytes**
-      (the agent's ``prettyPrint()`` encodes binary OctetString values this
-      way; we must decode them back so callers like ``getIfPhysAddress``
-      that do ``bytes(value)`` get the original octets).
-    - Pure integer strings → ``Integer32``
-    - Everything else → ``OctetString`` (text)
+    We normalize both to AgentVarBind objects.
     """
     varbinds: list[AgentVarBind] = []
     if not output:
@@ -114,20 +109,50 @@ def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
             continue
         oid_str, val_str = parts
 
-        # Build a resolved numeric OID.  We strip any MIB module prefix
-        # the agent may have added (e.g. ``SNMPv2-MIB::sysDescr.0``).
-        if '::' in oid_str:
-            oid_str = oid_str.split('::', 1)[1]  # take the part after ::
-        oid_str = _resolve_oid(oid_str.strip())
+        # Normalize OID: handle both 'iso.' prefix and MIB module prefixes
+        if oid_str.startswith('iso.'):
+            # Convert iso.3.6.1... to 1.3.6.1...
+            oid_str = '1' + oid_str[3:]
+        elif '::' in oid_str:
+            # Handle SNMPv2-MIB::sysDescr.0 -> sysDescr.0, then resolve
+            oid_str = oid_str.split('::', 1)[1]
+            oid_str = _resolve_oid(oid_str.strip())
+        elif not _NUMERIC_OID_RE.match(oid_str):
+            # Symbolic OID without MIB prefix, resolve it
+            oid_str = _resolve_oid(oid_str.strip())
+        # else: already numeric, use as-is
 
-        # Determine value type
+        # Parse value based on format
         val_str_stripped = val_str.strip()
-
-        if _HEX_RE.fullmatch(val_str_stripped):
-            # Binary OctetString that prettyPrint() rendered as 0x…
+        
+        # Handle snmpwalk type prefixes: "Hex-STRING: ...", "STRING: ...", "INTEGER: ..."
+        if ':' in val_str_stripped and any(prefix in val_str_stripped for prefix in ['Hex-STRING:', 'STRING:', 'INTEGER:', 'Gauge32:']):
+            # snmpwalk format: "TYPE: value"
+            type_part, value_part = val_str_stripped.split(':', 1)
+            value_part = value_part.strip()
+            
+            if type_part.strip() == 'Hex-STRING':
+                # "Hex-STRING: 07 EA 02 05 05 1F 33 00" -> bytes
+                hex_bytes = value_part.replace(' ', '')
+                raw = bytes.fromhex(hex_bytes)
+                typed_val = OctetString(hexValue=raw.hex())
+            elif type_part.strip() in ['INTEGER', 'Gauge32']:
+                # "INTEGER: 127" -> Integer32
+                typed_val = Integer32(int(value_part))
+            elif type_part.strip() == 'STRING':
+                # "STRING: "text"" -> OctetString, strip quotes
+                if value_part.startswith('"') and value_part.endswith('"'):
+                    value_part = value_part[1:-1]
+                typed_val = OctetString(value_part)
+            else:
+                # Fallback to text
+                typed_val = OctetString(value_part)
+        elif _HEX_RE.fullmatch(val_str_stripped):
+            # pysnmp prettyPrint() hex format: "0xac22053ad5c0"
             raw = bytes.fromhex(val_str_stripped[2:])
             typed_val = OctetString(hexValue=raw.hex())
         else:
+            # Try integer, fallback to string
             try:
                 int_val = int(val_str_stripped)
                 typed_val = Integer32(int_val)
