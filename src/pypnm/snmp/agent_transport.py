@@ -365,13 +365,18 @@ class AgentSnmpTransport:
         # Parse results for each OID
         results = {}
         raw_results = data.get('results', {})
-        for oid, oid_data in raw_results.items():
+        
+        # Create mapping from resolved OID back to original OID
+        oid_mapping = dict(zip(resolved_oids, oids))
+        
+        for resolved_oid, oid_data in raw_results.items():
+            original_oid = oid_mapping.get(resolved_oid, resolved_oid)
             if oid_data.get('success'):
                 output = oid_data.get('output', '')
                 varbinds = _parse_output_to_varbinds(output)
-                results[oid] = varbinds if varbinds else []
+                results[original_oid] = varbinds if varbinds else []
             else:
-                results[oid] = []
+                results[original_oid] = []
         
         print(f"DEBUG: Parsed {len(results)} OID results, total time={time.time()-start_time:.3f}s")
         return results
