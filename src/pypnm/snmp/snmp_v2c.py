@@ -486,7 +486,7 @@ class Snmp_v2c:
     @staticmethod
     def get_result_value(pysnmp_get_result: ObjectType | tuple[ObjectType, ...] | list | None) -> str | None:
         """
-        Extract the value from a pysnmp GET result.
+        Extract the value from a pysnmp GET result or AgentVarBind.
 
         Args:
             pysnmp_get_result: SNMP response from get().
@@ -505,8 +505,8 @@ class Snmp_v2c:
                     return None
                 pysnmp_get_result = pysnmp_get_result[0]
 
-            # Extract value from ObjectType
-            if isinstance(pysnmp_get_result, ObjectType):
+            # Extract value from ObjectType or AgentVarBind (both support [1])
+            if hasattr(pysnmp_get_result, '__getitem__'):
                 value = pysnmp_get_result[1]
                 if isinstance(value, OctetString):
                     return value.prettyPrint()

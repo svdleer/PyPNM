@@ -16,6 +16,7 @@ import re
 from typing import Any, Optional
 
 from pysnmp.proto.rfc1902 import Integer32, OctetString
+from pysnmp.smi.rfc1902 import ObjectIdentity, ObjectType
 
 from pypnm.lib.inet import Inet
 from pypnm.lib.types import SnmpReadCommunity, SnmpWriteCommunity
@@ -28,30 +29,62 @@ from pypnm.snmp.compiled_oids import COMPILED_OIDS
 
 class AgentVarBind:
     """
-    Minimal varbind wrapper returned by ``AgentSnmpTransport``.
+    Varbind wrapper that mimics pysnmp ObjectType behavior.
 
     Behaves like pysnmp ``ObjectType`` for indexing:
-        varbind[0] -> OID string  (can be ``str(varbind[0])`` or ``.prettyPrint()``)
+        varbind[0] -> OID (ObjectIdentity-like object with prettyPrint())
         varbind[1] -> typed value (``OctetString`` / ``Integer32``)
 
-    This avoids the MIB-resolution requirement of real ``ObjectType`` objects.
+    This provides full compatibility with code expecting ObjectType without
+    requiring MIB resolution on every operation.
     """
 
-    __slots__ = ('_oid', '_value')
+    __slots__ = ('_oid', '_value', '_oid_identity')
 
     def __init__(self, oid: str, value: OctetString | Integer32) -> None:
         self._oid = oid
         self._value = value
+        # Create a minimal ObjectIdentity for [0] access
+        self._oid_identity = _MinimalObjectIdentity(oid)
 
     def __getitem__(self, idx: int):
         if idx == 0:
-            return self._oid
+            return self._oid_identity  # Return OID as ObjectIdentity-like
         if idx == 1:
             return self._value
         raise IndexError(idx)
 
+    def __len__(self) -> int:
+        return 2
+    
+    def __iter__(self):
+        return iter([self._oid_identity, self._value])
+
     def __repr__(self) -> str:
         return f"AgentVarBind({self._oid!r}, {self._value!r})"
+
+
+class _MinimalObjectIdentity:
+    """
+    Minimal ObjectIdentity-like class that provides OID string access.
+    
+    This allows AgentVarBind[0] to behave like a real ObjectIdentity
+    with .prettyPrint() and str() methods.
+    """
+    
+    __slots__ = ('_oid',)
+    
+    def __init__(self, oid: str):
+        self._oid = oid
+    
+    def __str__(self) -> str:
+        return self._oid
+    
+    def prettyPrint(self) -> str:
+        return self._oid
+    
+    def __repr__(self) -> str:
+        return f"OID({self._oid})"
 
 
 # ---------------------------------------------------------------------------
