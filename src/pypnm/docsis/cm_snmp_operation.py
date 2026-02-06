@@ -819,32 +819,24 @@ class CmSnmpOperation:
 
         try:
             indices = await self.getEventEntryIndex()
-            print(f"DEBUG: getDocsDevEventEntry found {len(indices)} indices: {indices[:5]}...")
 
             if not indices:
                 self.logger.warning("No DocsDevEventEntry indices found.")
                 return event_entries
 
-            for i, idx in enumerate(indices):
-                print(f"DEBUG: Processing event entry {i+1}/{len(indices)}, index={idx}")
+            for idx in indices:
                 try:
                     entry = DocsDevEventEntry(index=idx, snmp=self._snmp)
                     success = await entry.start()
-                    print(f"DEBUG: Entry {idx} start() returned: {success}")
                     if success:
-                        result = entry.to_dict() if to_dict else entry
-                        event_entries.append(result)
-                        print(f"DEBUG: Entry {idx} successfully added")
-                    else:
-                        print(f"DEBUG: Entry {idx} start() failed, skipping")
+                        event_entries.append(entry.to_dict() if to_dict else entry)
                 except Exception as e:
-                    print(f"DEBUG: Exception processing entry {idx}: {e}")
+                    self.logger.warning(f"Failed to process event entry {idx}: {e}")
                     continue
 
         except Exception as e:
             self.logger.exception("Failed to retrieve DocsDevEventEntry entries, error: %s", e)
 
-        print(f"DEBUG: getDocsDevEventEntry returning {len(event_entries)} entries")
         return event_entries
 
     async def getDocsIf31CmDsOfdmChanEntry(self) -> list[DocsIf31CmDsOfdmChanChannelEntry]:
