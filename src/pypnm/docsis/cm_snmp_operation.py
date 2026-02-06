@@ -365,6 +365,8 @@ class CmSnmpOperation:
         if not results:
             self.logger.warning("No results found during SNMP walk for ifType.")
             return indexes
+        
+        self.logger.debug(f"Found {len(results)} ifType results to process")
 
         # Iterate through results and filter by the specified DOCSIS interface type
         ifType_name = doc_if_type.name
@@ -372,8 +374,19 @@ class CmSnmpOperation:
 
         try:
             for result in results:
+                # Get the value properly - result[1] might be OctetString or Integer32
+                try:
+                    result_value = int(result[1])
+                except (ValueError, TypeError):
+                    # Try to convert via string first
+                    try:
+                        result_value = int(str(result[1]))
+                    except (ValueError, TypeError):
+                        self.logger.warning(f"Could not convert result[1] to int: {result[1]} (type: {type(result[1])})")
+                        continue
+                
                 # Compare ifType value with the result value
-                if ifType_value == int(result[1]):
+                if ifType_value == result_value:
                     self.logger.debug(f"ifType-Name: ({ifType_name}) -> ifType-Value: ({ifType_value}) -> Found: {result}")
 
                     # Extract index using a helper method (ensure it returns a valid index)
