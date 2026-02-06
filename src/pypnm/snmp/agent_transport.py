@@ -321,6 +321,61 @@ class AgentSnmpTransport:
         
         return varbinds if varbinds else None
 
+    async def bulk_get(
+        self,
+        oids: list[str],
+        timeout: float | None = None,
+    ) -> dict[str, list[AgentVarBind]] | None:
+        """
+        Perform multiple SNMP GET operations in one batch via agent.
+        
+        Args:
+            oids: List of OID strings to retrieve
+            timeout: Optional timeout override
+            
+        Returns:
+            dict mapping each OID to its result list, or None on failure
+        """
+        if not oids:
+            return {}
+            
+        resolved_oids = [_resolve_oid(oid) for oid in oids]
+        t = timeout if timeout is not None else self._timeout
+        
+        start_time = time.time()
+        print(f"DEBUG: AgentSnmpTransport.bulk_get() called with {len(oids)} OIDs")
+
+        data = await self._send_and_wait(
+            'snmp_bulk_get', 'snmp_bulk_get',
+            {
+                'target_ip': self._host,
+                'oids': resolved_oids,
+                'community': self._read_community,
+            },
+            timeout=t,
+        )
+        
+        elapsed = time.time() - start_time
+        print(f"DEBUG: Agent bulk_get response: success={data.get('success') if data else None}, elapsed={elapsed:.3f}s")
+        
+        if not data or not data.get('success'):
+            self.logger.warning(f"Agent BULK_GET failed: {data}")
+            return None
+
+        # Parse results for each OID
+        results = {}
+        raw_results = data.get('results', {})
+        for oid, oid_data in raw_results.items():
+            if oid_data.get('success'):
+                output = oid_data.get('output', '')
+                varbinds = _parse_output_to_varbinds(output)
+                results[oid] = varbinds if varbinds else []
+            else:
+                results[oid] = []
+        
+        print(f"DEBUG: Parsed {len(results)} OID results, total time={time.time()-start_time:.3f}s")
+        return results
+
     async def walk(
         self,
         oid: str,
