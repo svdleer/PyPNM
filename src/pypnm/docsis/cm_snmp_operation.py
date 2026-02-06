@@ -205,23 +205,39 @@ class CmSnmpOperation:
         
         # Check if agent transport is available
         import os
-        if os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true':
+        agent_enabled = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
+        print(f"DEBUG: PYPNM_USE_AGENT_SNMP={agent_enabled}")
+        
+        if agent_enabled:
             try:
                 from pypnm.snmp.agent_transport import AgentSnmpTransport
                 from pypnm.api.agent.manager import get_agent_manager
                 
                 agent_manager = get_agent_manager()
-                if agent_manager and agent_manager.get_agent_for_capability('snmp_get'):
-                    self.logger.info("Using agent SNMP transport")
-                    return AgentSnmpTransport(
-                        host=self._inet,
-                        community=self._community,
-                        port=self._port,
-                        timeout=10,
-                        retries=3
-                    )
+                print(f"DEBUG: Agent manager: {agent_manager}")
+                
+                if agent_manager:
+                    agent = agent_manager.get_agent_for_capability('snmp_get')
+                    print(f"DEBUG: Agent for snmp_get: {agent}")
+                    
+                    if agent:
+                        print("DEBUG: Using agent SNMP transport")
+                        return AgentSnmpTransport(
+                            host=self._inet,
+                            community=self._community,
+                            port=self._port,
+                            timeout=10,
+                            retries=3
+                        )
+                    else:
+                        print("DEBUG: No agent with snmp_get capability")
+                else:
+                    print("DEBUG: No agent manager available")
             except Exception as e:
+                print(f"DEBUG: Agent transport exception: {e}")
                 self.logger.warning(f"Agent transport unavailable, falling back to direct SNMP: {e}")
+
+        print("DEBUG: Using direct Snmp_v2c transport")
 
         if SystemConfigSettings.snmp_v3_enable():
             '''
