@@ -98,8 +98,8 @@ async def send_task(agent_id: str, command: str, params: dict, timeout: Optional
         task_id = await agent_manager.send_task(agent_id, command, params, timeout)
         
         if wait:
-            # Wait for task result
-            result = agent_manager.wait_for_task(task_id, timeout=timeout)
+            # Wait for task result (async)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
             if result:
                 return {"task_id": task_id, "status": "completed", "success": True, "result": result}
             else:
