@@ -1277,31 +1277,52 @@ class CmSnmpOperation:
             self.logger.exception(f"Exception during DOCSIS version retrieval: {e}")
             return None
 
-    async def getInterfaceStatistics(self, interface_types: type[Enum] = DocsisIfType) -> dict[str, list[dict]]:
+    async def getInterfaceStatistics(self, interface_types: list[DocsisIfType] | None = None) -> dict[str, list[dict]]:
         """
-        Retrieves interface statistics grouped by provided Enum of interface types.
+        Retrieves interface statistics grouped by provided list of interface types.
+        Optimized to process all interface types in parallel.
 
         Args:
-            interface_types (Type[Enum]): Enum class representing interface types.
+            interface_types: List of DocsisIfType to query. If None, queries common types:
+                            docsCableMaclayer, docsCableDownstream, docsCableUpstream
 
         Returns:
             Dict[str, List[Dict]]: Mapping of interface type name to list of interface stats.
         """
         import time
         start_time = time.time()
-        stats: dict[str, list[dict]] = {}
-
-        for if_type in interface_types:
+        
+        # Default to common interface types if not specified
+        if interface_types is None:
+            interface_types = [
+                DocsisIfType.docsCableMaclayer,      # 127 - MAC layer
+                DocsisIfType.docsCableDownstream,    # 128 - DS channels
+                DocsisIfType.docsCableUpstream,      # 129 - US channels
+            ]
+        
+        # Process all interface types in parallel
+        async def fetch_type(if_type):
             type_start = time.time()
             print(f"DEBUG: getInterfaceStatistics processing {if_type.name}...")
             interfaces = await InterfaceStats.from_snmp(self._snmp, if_type)
             type_elapsed = time.time() - type_start
             print(f"DEBUG: {if_type.name} took {type_elapsed:.3f}s, got {len(interfaces) if interfaces else 0} interfaces")
+            return (if_type.name, interfaces)
+        
+        # Gather all interface types in parallel
+        results = await asyncio.gather(*[fetch_type(if_type) for if_type in interface_types], return_exceptions=True)
+        
+        stats: dict[str, list[dict]] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"DEBUG: Interface type fetch failed: {result}")
+                continue
+            type_name, interfaces = result
             if interfaces:
-                stats[if_type.name] = [iface.model_dump() for iface in interfaces]
+                stats[type_name] = [iface.model_dump() for iface in interfaces]
 
         total_elapsed = time.time() - start_time
-        print(f"DEBUG: getInterfaceStatistics TOTAL time: {total_elapsed:.3f}s")
+        print(f"DEBUG: getInterfaceStatistics TOTAL time: {total_elapsed:.3f}s, found {len(stats)} interface types")
         return stats
 
     async def getDocsIf31CmUsOfdmaChanChannelIdIndex(self) -> list[InterfaceIndex]:
