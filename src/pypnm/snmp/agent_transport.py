@@ -12,14 +12,46 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 from pysnmp.proto.rfc1902 import Integer32, OctetString
+from pysnmp.smi.rfc1902 import ObjectIdentity, ObjectType
+from pysnmp.smi import builder, view
 
 from pypnm.lib.inet import Inet
 from pypnm.lib.types import SnmpReadCommunity, SnmpWriteCommunity
 from pypnm.snmp.compiled_oids import COMPILED_OIDS
+
+
+# ---------------------------------------------------------------------------
+#  MIB Configuration
+# ---------------------------------------------------------------------------
+
+def _get_mib_path():
+    """Get the path to the PyPNM MIBs directory."""
+    # MIBs are in the root of the PyPNM package
+    pypnm_root = Path(__file__).parent.parent.parent.parent
+    mib_path = pypnm_root / "mibs"
+    if mib_path.exists():
+        return str(mib_path)
+    return None
+
+
+def _create_mib_builder():
+    """Create a MIB builder with PyPNM's MIB path configured."""
+    mib_builder = builder.MibBuilder()
+    mib_path = _get_mib_path()
+    if mib_path:
+        mib_builder.addMibSources(builder.DirMibSource(mib_path))
+    return mib_builder
+
+
+# Global MIB builder for ObjectType creation
+_MIB_BUILDER = _create_mib_builder()
+_MIB_VIEW = view.MibViewController(_MIB_BUILDER)
 
 
 # ---------------------------------------------------------------------------
