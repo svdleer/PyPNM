@@ -29,6 +29,7 @@ from pypnm.snmp.compiled_oids import COMPILED_OIDS
 
 _NUMERIC_OID_RE = re.compile(r"\.?(\d+\.)+\d+")
 _SYMBOLIC_RE = re.compile(r"^([a-zA-Z0-9_:]+)(\..+)?$")
+_HEX_RE = re.compile(r"0x[0-9a-fA-F]+")
 
 
 def _resolve_oid(oid: str) -> str:
@@ -52,14 +53,21 @@ def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
     Parse the agent's ``'OID = value'`` text lines into pysnmp ObjectType
     varbinds that CmSnmpOperation / Snmp_v2c helpers understand.
 
-    The agent formats each varbind as::
+    The agent formats each varbind via pysnmp ``prettyPrint()``::
 
         SNMPv2-MIB::sysDescr.0 = <<GEAR3>>...
-        1.3.6.1.2.1.2.2.1.3.1 = 127
+        IF-MIB::ifType.1 = 127
+        IF-MIB::ifPhysAddress.1 = 0xac22053ad5c0
 
     We split on the first `` = `` and wrap both sides in ObjectType.
-    Numeric values are emitted as ``Integer32``; everything else as
-    ``OctetString``.
+
+    Value mapping:
+    - ``0x…`` hex strings → ``OctetString`` with **raw bytes**
+      (the agent's ``prettyPrint()`` encodes binary OctetString values this
+      way; we must decode them back so callers like ``getIfPhysAddress``
+      that do ``bytes(value)`` get the original octets).
+    - Pure integer strings → ``Integer32``
+    - Everything else → ``OctetString`` (text)
     """
     varbinds: list[ObjectType] = []
     if not output:
@@ -84,11 +92,18 @@ def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
         oid_str = _resolve_oid(oid_str.strip())
 
         # Determine value type
-        try:
-            int_val = int(val_str)
-            typed_val = Integer32(int_val)
-        except (ValueError, TypeError):
-            typed_val = OctetString(val_str)
+        val_str_stripped = val_str.strip()
+
+        if _HEX_RE.fullmatch(val_str_stripped):
+            # Binary OctetString that prettyPrint() rendered as 0x…
+            raw = bytes.fromhex(val_str_stripped[2:])
+            typed_val = OctetString(hexValue=raw.hex())
+        else:
+            try:
+                int_val = int(val_str_stripped)
+                typed_val = Integer32(int_val)
+            except (ValueError, TypeError):
+                typed_val = OctetString(val_str_stripped)
 
         varbinds.append(ObjectType(ObjectIdentity(oid_str), typed_val))
 
