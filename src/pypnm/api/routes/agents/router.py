@@ -75,7 +75,7 @@ async def get_agent(agent_id: str):
 
 
 @router.post("/{agent_id}/task")
-async def send_task(agent_id: str, command: str, params: dict, timeout: Optional[float] = 30.0):
+async def send_task(agent_id: str, command: str, params: dict, timeout: Optional[float] = 30.0, wait: Optional[bool] = True):
     """
     Send a task to a specific agent.
     
@@ -84,9 +84,11 @@ async def send_task(agent_id: str, command: str, params: dict, timeout: Optional
         command: The command to execute
         params: Command parameters
         timeout: Task timeout in seconds
+        wait: If True, wait for task result (default True)
     
     Returns:
         task_id: ID of the created task
+        result: Task result if wait=True
     """
     agent_manager = get_agent_manager()
     if not agent_manager:
@@ -94,6 +96,15 @@ async def send_task(agent_id: str, command: str, params: dict, timeout: Optional
     
     try:
         task_id = await agent_manager.send_task(agent_id, command, params, timeout)
+        
+        if wait:
+            # Wait for task result
+            result = agent_manager.wait_for_task(task_id, timeout=timeout)
+            if result:
+                return {"task_id": task_id, "status": "completed", "success": True, "result": result}
+            else:
+                return {"task_id": task_id, "status": "timeout", "success": False, "error": "Task timed out"}
+        
         return {"task_id": task_id, "status": "sent"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
