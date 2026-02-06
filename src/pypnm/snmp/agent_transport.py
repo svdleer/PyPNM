@@ -6,7 +6,7 @@
 # The remote pyPNMAgent executes the actual pysnmp calls and returns
 # results as ``{'success': True, 'output': 'OID = value\n...'}``.
 # This transport parses that textual output back into pysnmp
-# ``ObjectType`` varbinds so that the rest of PyPNM (CmSnmpOperation,
+# ``AgentVarBind`` objects so that the rest of PyPNM (CmSnmpOperation,
 # Snmp_v2c helpers, etc.) works without any changes.
 
 from __future__ import annotations
@@ -15,12 +15,43 @@ import logging
 import re
 from typing import Any, Optional
 
-from pysnmp.hlapi.v3arch.asyncio import ObjectIdentity, ObjectType
 from pysnmp.proto.rfc1902 import Integer32, OctetString
 
 from pypnm.lib.inet import Inet
 from pypnm.lib.types import SnmpReadCommunity, SnmpWriteCommunity
 from pypnm.snmp.compiled_oids import COMPILED_OIDS
+
+
+# ---------------------------------------------------------------------------
+#  Lightweight varbind that mimics pysnmp ObjectType[0] / ObjectType[1]
+# ---------------------------------------------------------------------------
+
+class AgentVarBind:
+    """
+    Minimal varbind wrapper returned by ``AgentSnmpTransport``.
+
+    Behaves like pysnmp ``ObjectType`` for indexing:
+        varbind[0] -> OID string  (can be ``str(varbind[0])`` or ``.prettyPrint()``)
+        varbind[1] -> typed value (``OctetString`` / ``Integer32``)
+
+    This avoids the MIB-resolution requirement of real ``ObjectType`` objects.
+    """
+
+    __slots__ = ('_oid', '_value')
+
+    def __init__(self, oid: str, value: OctetString | Integer32) -> None:
+        self._oid = oid
+        self._value = value
+
+    def __getitem__(self, idx: int):
+        if idx == 0:
+            return self._oid
+        if idx == 1:
+            return self._value
+        raise IndexError(idx)
+
+    def __repr__(self) -> str:
+        return f"AgentVarBind({self._oid!r}, {self._value!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -45,13 +76,13 @@ def _resolve_oid(oid: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Parsing the agent's textual output into ObjectType varbinds
+#  Parsing the agent's textual output into AgentVarBind objects
 # ---------------------------------------------------------------------------
 
-def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
+def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
     """
-    Parse the agent's ``'OID = value'`` text lines into pysnmp ObjectType
-    varbinds that CmSnmpOperation / Snmp_v2c helpers understand.
+    Parse the agent's ``'OID = value'`` text lines into AgentVarBind
+    objects that CmSnmpOperation / Snmp_v2c helpers understand.
 
     The agent formats each varbind via pysnmp ``prettyPrint()``::
 
@@ -59,7 +90,7 @@ def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
         IF-MIB::ifType.1 = 127
         IF-MIB::ifPhysAddress.1 = 0xac22053ad5c0
 
-    We split on the first `` = `` and wrap both sides in ObjectType.
+    We split on the first `` = `` and wrap both sides in AgentVarBind.
 
     Value mapping:
     - ``0x…`` hex strings → ``OctetString`` with **raw bytes**
@@ -69,7 +100,7 @@ def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
     - Pure integer strings → ``Integer32``
     - Everything else → ``OctetString`` (text)
     """
-    varbinds: list[ObjectType] = []
+    varbinds: list[AgentVarBind] = []
     if not output:
         return varbinds
 
@@ -83,10 +114,8 @@ def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
             continue
         oid_str, val_str = parts
 
-        # Build a simple ObjectType from raw strings.
-        # ObjectIdentity with a numeric OID is the safest approach (no MIB
-        # compilation required).  We strip any MIB module prefix the agent
-        # may have added (e.g. ``SNMPv2-MIB::sysDescr.0``).
+        # Build a resolved numeric OID.  We strip any MIB module prefix
+        # the agent may have added (e.g. ``SNMPv2-MIB::sysDescr.0``).
         if '::' in oid_str:
             oid_str = oid_str.split('::', 1)[1]  # take the part after ::
         oid_str = _resolve_oid(oid_str.strip())
@@ -105,7 +134,7 @@ def _parse_output_to_varbinds(output: str) -> list[ObjectType]:
             except (ValueError, TypeError):
                 typed_val = OctetString(val_str_stripped)
 
-        varbinds.append(ObjectType(ObjectIdentity(oid_str), typed_val))
+        varbinds.append(AgentVarBind(oid_str, typed_val))
 
     return varbinds
 
@@ -114,9 +143,10 @@ class AgentSnmpTransport:
     """
     SNMP transport that routes operations through a connected agent.
 
-    Returns ``list[ObjectType]`` — the same contract as ``Snmp_v2c`` — so
-    that all downstream consumers (``CmSnmpOperation``, static helpers on
-    ``Snmp_v2c``, etc.) work transparently.
+    Returns ``list[AgentVarBind]`` — indexable like pysnmp ObjectType
+    (``varbind[0]`` = OID, ``varbind[1]`` = typed value) so that all
+    downstream consumers (``CmSnmpOperation``, ``Snmp_v2c`` helpers, etc.)
+    work transparently.
     """
 
     SNMP_PORT = 161
@@ -194,12 +224,12 @@ class AgentSnmpTransport:
         oid: str,
         timeout: float | None = None,
         retries: int | None = None,
-    ) -> list[ObjectType] | None:
+    ) -> list[AgentVarBind] | None:
         """
         Perform SNMP GET via agent.
 
         Returns:
-            list[ObjectType] matching Snmp_v2c.get() contract, or None.
+            list[AgentVarBind] matching Snmp_v2c.get() contract, or None.
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
@@ -225,12 +255,12 @@ class AgentSnmpTransport:
         oid: str,
         timeout: float | None = None,
         retries: int | None = None,
-    ) -> list[ObjectType] | None:
+    ) -> list[AgentVarBind] | None:
         """
         Perform SNMP WALK via agent.
 
         Returns:
-            list[ObjectType] matching Snmp_v2c.walk() contract, or None.
+            list[AgentVarBind] matching Snmp_v2c.walk() contract, or None.
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
@@ -257,7 +287,7 @@ class AgentSnmpTransport:
         non_repeaters: int = 0,
         max_repetitions: int = 25,
         suppress_no_such_name: bool = True,
-    ) -> list[ObjectType] | None:
+    ) -> list[AgentVarBind] | None:
         """
         SNMP BULK WALK via agent (uses the agent's snmp_bulk_walk command).
 
