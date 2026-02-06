@@ -200,9 +200,17 @@ class DocsIfDownstreamChannelEntry(BaseModel):
             oids = [f"{field}.{index}" for field in fields_to_fetch]
             bulk_results = await snmp.bulk_get(oids)
             
+            logger.debug(f"bulk_get returned {len(bulk_results) if bulk_results else 0} results for index {index}")
+            if bulk_results:
+                logger.debug(f"bulk_results keys: {list(bulk_results.keys())[:3]}")
+            
             def get_bulk_val(field: str, cast: Callable | None = None):
                 try:
-                    raw = bulk_results.get(f"{field}.{index}") if bulk_results else None
+                    oid_key = f"{field}.{index}"
+                    raw = bulk_results.get(oid_key) if bulk_results else None
+                    if not raw:
+                        logger.warning(f"No bulk result for {oid_key}, available keys: {list(bulk_results.keys())[:3] if bulk_results else []}")
+                        return None
                     val = Snmp_v2c.get_result_value(raw) if raw else None
                     if val is None or val == "":
                         return None
