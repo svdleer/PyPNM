@@ -12,46 +12,14 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
-from pathlib import Path
 from typing import Any, Optional
 
 from pysnmp.proto.rfc1902 import Integer32, OctetString
-from pysnmp.smi.rfc1902 import ObjectIdentity, ObjectType
-from pysnmp.smi import builder, view
 
 from pypnm.lib.inet import Inet
 from pypnm.lib.types import SnmpReadCommunity, SnmpWriteCommunity
 from pypnm.snmp.compiled_oids import COMPILED_OIDS
-
-
-# ---------------------------------------------------------------------------
-#  MIB Configuration
-# ---------------------------------------------------------------------------
-
-def _get_mib_path():
-    """Get the path to the PyPNM MIBs directory."""
-    # MIBs are in the root of the PyPNM package
-    pypnm_root = Path(__file__).parent.parent.parent.parent
-    mib_path = pypnm_root / "mibs"
-    if mib_path.exists():
-        return str(mib_path)
-    return None
-
-
-def _create_mib_builder():
-    """Create a MIB builder with PyPNM's MIB path configured."""
-    mib_builder = builder.MibBuilder()
-    mib_path = _get_mib_path()
-    if mib_path:
-        mib_builder.addMibSources(builder.DirMibSource(mib_path))
-    return mib_builder
-
-
-# Global MIB builder for ObjectType creation
-_MIB_BUILDER = _create_mib_builder()
-_MIB_VIEW = view.MibViewController(_MIB_BUILDER)
 
 
 # ---------------------------------------------------------------------------
@@ -196,35 +164,6 @@ def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
     return varbinds
 
 
-def _convert_to_object_types(varbinds: list[AgentVarBind]) -> list[ObjectType]:
-    """
-    Convert AgentVarBind objects to real pysnmp ObjectType objects with MIB resolution.
-    
-    This ensures full compatibility with existing PyPNM code that expects
-    ObjectType objects from Snmp_v2c methods. Uses the global MIB builder
-    configured with PyPNM's MIB directory.
-    """
-    result = []
-    for vb in varbinds:
-        oid_str = vb[0]
-        value = vb[1]
-        
-        try:
-            # Create ObjectIdentity - MIB resolution happens automatically
-            # when the MIB sources are configured via the builder
-            oid_identity = ObjectIdentity(oid_str)
-            
-            # Create ObjectType with the OID and value
-            obj_type = ObjectType(oid_identity, value)
-            result.append(obj_type)
-        except Exception:
-            # If ObjectType creation fails, fall back to returning the AgentVarBind
-            # which is already compatible with indexing [0] and [1]
-            result.append(vb)
-    
-    return result
-
-
 class AgentSnmpTransport:
     """
     SNMP transport that routes operations through a connected agent.
@@ -334,11 +273,7 @@ class AgentSnmpTransport:
             return None
 
         varbinds = _parse_output_to_varbinds(data.get('output', ''))
-        if not varbinds:
-            return None
-        
-        # Convert to ObjectType for full compatibility
-        return _convert_to_object_types(varbinds)
+        return varbinds if varbinds else None
 
     async def walk(
         self,
@@ -354,6 +289,8 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
+        
+        print(f"DEBUG: AgentSnmpTransport.walk() called with oid='{oid}' -> resolved='{resolved}'")
 
         data = await self._send_and_wait(
             'snmp_walk', 'snmp_walk',
@@ -365,17 +302,21 @@ class AgentSnmpTransport:
             timeout=t,
         )
         
+        print(f"DEBUG: Agent walk response: success={data.get('success') if data else None}, data_keys={list(data.keys()) if data else None}")
+        
         if not data or not data.get('success'):
+            print(f"DEBUG: Agent WALK failed for {resolved}: {data}")
             self.logger.warning(f"Agent WALK failed for {resolved}: {data}")
             return None
 
         output = data.get('output', '')
-        varbinds = _parse_output_to_varbinds(output)
-        if not varbinds:
-            return None
+        print(f"DEBUG: Agent walk output length: {len(output)} chars")
+        print(f"DEBUG: Agent walk output preview: {repr(output[:200])}")
         
-        # Convert to ObjectType for full compatibility
-        return _convert_to_object_types(varbinds)
+        varbinds = _parse_output_to_varbinds(output)
+        print(f"DEBUG: Parsed {len(varbinds)} varbinds")
+        
+        return varbinds if varbinds else None
 
     async def bulk_walk(
         self,
