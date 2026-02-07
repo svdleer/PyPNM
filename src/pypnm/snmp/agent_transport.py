@@ -171,8 +171,16 @@ def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
                 raw = bytes.fromhex(hex_bytes)
                 typed_val = OctetString(hexValue=raw.hex())
             elif type_part.strip() in ['INTEGER', 'Gauge32']:
-                # "INTEGER: 127" -> Integer32
-                typed_val = Integer32(int(value_part))
+                # "INTEGER: 127" -> Use appropriate type based on value
+                from pysnmp.proto.rfc1902 import Unsigned32, Counter64
+                int_val = int(value_part)
+                # Use Unsigned32 for positive values that might exceed Integer32 range
+                if int_val >= 0 and int_val <= 4294967295:
+                    typed_val = Unsigned32(int_val)
+                elif int_val > 4294967295:
+                    typed_val = Counter64(int_val)
+                else:
+                    typed_val = Integer32(int_val)
             elif type_part.strip() == 'STRING':
                 # "STRING: "text"" -> OctetString, strip quotes
                 if value_part.startswith('"') and value_part.endswith('"'):
@@ -188,8 +196,15 @@ def _parse_output_to_varbinds(output: str) -> list[AgentVarBind]:
         else:
             # Try integer, fallback to string
             try:
+                from pysnmp.proto.rfc1902 import Unsigned32, Counter64
                 int_val = int(val_str_stripped)
-                typed_val = Integer32(int_val)
+                # Use Unsigned32 for positive values that might exceed Integer32 range
+                if int_val >= 0 and int_val <= 4294967295:
+                    typed_val = Unsigned32(int_val)
+                elif int_val > 4294967295:
+                    typed_val = Counter64(int_val)
+                else:
+                    typed_val = Integer32(int_val)
             except (ValueError, TypeError):
                 typed_val = OctetString(val_str_stripped)
 
