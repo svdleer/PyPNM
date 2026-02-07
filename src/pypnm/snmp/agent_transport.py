@@ -355,10 +355,14 @@ class AgentSnmpTransport:
             return {}
             
         resolved_oids = [_resolve_oid(oid) for oid in oids]
-        t = timeout if timeout is not None else self._timeout
+        
+        # For bulk operations, use longer timeout: ~0.1s per OID with overhead
+        # 336 OIDs (24 channels × 14 fields) needs ~40s
+        default_bulk_timeout = max(30.0, len(oids) * 0.15)
+        t = timeout if timeout is not None else default_bulk_timeout
         
         start_time = time.time()
-        print(f"DEBUG: AgentSnmpTransport.bulk_get() called with {len(oids)} OIDs")
+        print(f"DEBUG: AgentSnmpTransport.bulk_get() called with {len(oids)} OIDs, timeout={t:.1f}s")
 
         data = await self._send_and_wait(
             'snmp_bulk_get', 'snmp_bulk_get',

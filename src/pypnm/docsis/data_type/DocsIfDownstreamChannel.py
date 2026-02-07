@@ -302,7 +302,55 @@ class DocsIfDownstreamChannelEntry(BaseModel):
             logger.warning("No downstream SC-QAM channel indices provided.")
             return results
 
-        # Parallelize from_snmp calls for all indices
+        # Check if bulk_get is available (agent transport optimization)
+        if hasattr(snmp, 'bulk_get'):
+            # OPTIMIZATION: Use ONE bulk_get call for ALL channels at once
+            # instead of one bulk_get per channel (24 calls → 1 call)
+            fields_to_fetch = [
+                "docsIfDownChannelId",
+                "docsIfDownChannelFrequency",
+                "docsIfDownChannelWidth",
+                "docsIfDownChannelModulation",
+                "docsIfDownChannelInterleave",
+                "docsIfDownChannelPower",
+                "docsIfSigQUnerroreds",
+                "docsIfSigQCorrecteds",
+                "docsIfSigQUncorrectables",
+                "docsIfSigQMicroreflections",
+                "docsIfSigQExtUnerroreds",
+                "docsIfSigQExtCorrecteds",
+                "docsIfSigQExtUncorrectables",
+                "docsIf3SignalQualityExtRxMER",
+            ]
+            
+            # Build ALL OIDs for all indices in one list
+            all_oids = []
+            for index in indices:
+                for field in fields_to_fetch:
+                    all_oids.append(f"{field}.{index}")
+            
+            print(f"DEBUG: Calling bulk_get with {len(all_oids)} OIDs for {len(indices)} channels")
+            bulk_results = await snmp.bulk_get(all_oids)
+            print(f"DEBUG: bulk_get returned {len(bulk_results) if bulk_results else 0} results")
+            
+            # Parse results for each channel
+            for index in indices:
+                try:
+                    entry = cls._parse_bulk_results(index, bulk_results, fields_to_fetch)
+                    if entry:
+                        results.append(cls(
+                            index=index,
+                            channel_id=entry.docsIfDownChannelId or 0,
+                            entry=entry
+                        ))
+                except Exception as e:
+                    print(f"DEBUG: Channel {index} parse failed: {type(e).__name__}: {e}")
+                    logger.warning(f"Failed to parse channel {index}: {e}")
+            
+            print(f"DEBUG: Got {len(results)} SC-QAM channel entries")
+            return results
+
+        # Fallback: use individual from_snmp calls in parallel
         import asyncio
         tasks = [cls.from_snmp(index, snmp) for index in indices]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -320,3 +368,71 @@ class DocsIfDownstreamChannelEntry(BaseModel):
                 print(f"DEBUG: Response for index {index} is None")
 
         return results
+    
+    @classmethod
+    def _parse_bulk_results(cls, index: int, bulk_results: dict, fields: list[str]) -> DocsIfDownstreamEntry | None:
+        """Parse bulk_get results for a single channel index."""
+        from pypnm.snmp.snmp_v2c import Snmp_v2c
+        
+        def tenthdBmV_to_float(value: str) -> float | None:
+            try:
+                return float(value) / 10.0
+            except Exception:
+                return None
+
+        def to_float(value: str) -> float | None:
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        def safe_cast(value: str, cast) -> int | float | str | bool | None:
+            try:
+                return cast(value)
+            except Exception:
+                return None
+
+        def get_bulk_val(field: str, cast=None):
+            try:
+                oid_key = f"{field}.{index}"
+                raw = bulk_results.get(oid_key) if bulk_results else None
+                if not raw:
+                    return None
+                val = Snmp_v2c.get_result_value(raw) if raw else None
+                if val is None or val == "":
+                    return None
+                if cast:
+                    return safe_cast(val, cast)
+                val = str(val).strip()
+                if val.isdigit():
+                    return int(val)
+                if val.lower() in ("true", "false"):
+                    return val.lower() == "true"
+                try:
+                    return float(val)
+                except ValueError:
+                    return val
+            except Exception:
+                return None
+        
+        # Get channel ID - if this is None, skip this channel
+        channel_id = get_bulk_val("docsIfDownChannelId", int)
+        if channel_id is None:
+            return None
+        
+        return DocsIfDownstreamEntry(
+            docsIfDownChannelId         =   channel_id,
+            docsIfDownChannelFrequency  =   get_bulk_val("docsIfDownChannelFrequency", int),
+            docsIfDownChannelWidth      =   get_bulk_val("docsIfDownChannelWidth", int),
+            docsIfDownChannelModulation =   get_bulk_val("docsIfDownChannelModulation", int),
+            docsIfDownChannelInterleave =   get_bulk_val("docsIfDownChannelInterleave", int),
+            docsIfDownChannelPower      =   get_bulk_val("docsIfDownChannelPower", tenthdBmV_to_float),
+            docsIfSigQUnerroreds        =   get_bulk_val("docsIfSigQUnerroreds", int),
+            docsIfSigQCorrecteds        =   get_bulk_val("docsIfSigQCorrecteds", int),
+            docsIfSigQUncorrectables    =   get_bulk_val("docsIfSigQUncorrectables", int),
+            docsIfSigQMicroreflections  =   get_bulk_val("docsIfSigQMicroreflections", int),
+            docsIfSigQExtUnerroreds     =   get_bulk_val("docsIfSigQExtUnerroreds", int),
+            docsIfSigQExtCorrecteds     =   get_bulk_val("docsIfSigQExtCorrecteds", int),
+            docsIfSigQExtUncorrectables =   get_bulk_val("docsIfSigQExtUncorrectables", int),
+            docsIf3SignalQualityExtRxMER =  get_bulk_val("docsIf3SignalQualityExtRxMER", to_float)
+        )
