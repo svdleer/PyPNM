@@ -309,10 +309,10 @@ class DocsIfDownstreamChannelEntry(BaseModel):
         
         print(f"DEBUG: DocsIfDownstreamChannel.get() received {len(responses)} responses")
         print(f"DEBUG: Response types: {[type(r).__name__ for r in responses[:5]]}")
-        print(f"DEBUG: First response: {responses[0] if responses else None}")
         
         for index, response in zip(indices, responses):
             if isinstance(response, Exception):
+                print(f"DEBUG: Channel {index} failed: {type(response).__name__}: {response}")
                 logger.warning(f"Failed to retrieve downstream channel {index}: {response}")
             elif response is not None:
                 results.append(response)
