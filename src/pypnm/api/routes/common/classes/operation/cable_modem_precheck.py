@@ -203,12 +203,18 @@ class CableModemServicePreCheck:
         Perform an ICMP ping test.
         When PYPNM_USE_AGENT_SNMP is set, the ping is executed by the remote
         agent (which actually has L3 access to the modem network).
+        
+        Note: For agent-based SNMP, we skip the ping check and rely on SNMP
+        reachability instead, as ping can timeout when multiple parallel
+        requests queue at the agent.
 
         Returns:
             SUCCESS if reachable, else PING_FAILED.
         """
         if _USE_AGENT:
-            return await self._ping_via_agent()
+            # Skip ping for agent transport - SNMP check is more reliable
+            self.logger.debug("Skipping ping check for agent transport (will check SNMP instead)")
+            return ServiceStatusCode.SUCCESS
         return self._ping_local()
 
     def _ping_local(self) -> ServiceStatusCode:
