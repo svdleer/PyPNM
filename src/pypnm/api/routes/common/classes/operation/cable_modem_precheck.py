@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterable
+from typing import Dict, Tuple
 
 from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
     SNMPConfig,
@@ -24,6 +26,11 @@ PreCheckStatus = tuple[ServiceStatusCode, str]
 
 # Check once at import time
 _USE_AGENT = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
+
+# Simple in-memory cache for ping/SNMP reachability checks
+# Cache format: {ip_address: (timestamp, ping_status, snmp_status)}
+_REACHABILITY_CACHE: Dict[str, Tuple[float, ServiceStatusCode, ServiceStatusCode]] = {}
+_CACHE_TTL = 30.0  # Cache results for 30 seconds
 
 
 class CableModemServicePreCheck:
@@ -207,15 +214,32 @@ class CableModemServicePreCheck:
         Note: For agent-based SNMP, we skip the ping check and rely on SNMP
         reachability instead, as ping can timeout when multiple parallel
         requests queue at the agent.
+        
+        Results are cached for 30 seconds to avoid redundant checks when
+        multiple endpoints are called for the same modem.
 
         Returns:
             SUCCESS if reachable, else PING_FAILED.
         """
+        # Check cache first
+        cache_entry = _REACHABILITY_CACHE.get(self._ip_address)
+        if cache_entry:
+            timestamp, ping_status, _ = cache_entry
+            if time.time() - timestamp < _CACHE_TTL:
+                self.logger.debug(f"Ping check result from cache: {ping_status}")
+                return ping_status
+        
         if _USE_AGENT:
             # Skip ping for agent transport - SNMP check is more reliable
             self.logger.debug("Skipping ping check for agent transport (will check SNMP instead)")
-            return ServiceStatusCode.SUCCESS
-        return self._ping_local()
+            status = ServiceStatusCode.SUCCESS
+        else:
+            status = self._ping_local()
+        
+        # Update cache
+        snmp_status = cache_entry[2] if cache_entry else None
+        _REACHABILITY_CACHE[self._ip_address] = (time.time(), status, snmp_status)
+        return status
 
     def _ping_local(self) -> ServiceStatusCode:
         """Local ping (direct network access)."""
@@ -266,13 +290,30 @@ class CableModemServicePreCheck:
         Perform SNMP reachability check (sysDescr GET).
         When PYPNM_USE_AGENT_SNMP is set, the SNMP query is routed through
         the remote agent.
+        
+        Results are cached for 30 seconds to avoid redundant checks when
+        multiple endpoints are called for the same modem.
 
         Returns:
             SUCCESS if SNMP response received, else UNREACHABLE_SNMP.
         """
+        # Check cache first
+        cache_entry = _REACHABILITY_CACHE.get(self._ip_address)
+        if cache_entry:
+            timestamp, ping_status, snmp_status = cache_entry
+            if snmp_status and time.time() - timestamp < _CACHE_TTL:
+                self.logger.debug(f"SNMP check result from cache: {snmp_status}")
+                return snmp_status
+        
         if _USE_AGENT:
-            return await self._snmp_via_agent()
-        return await self._snmp_local()
+            status = await self._snmp_via_agent()
+        else:
+            status = await self._snmp_local()
+        
+        # Update cache (preserve ping_status if present)
+        ping_status = cache_entry[1] if cache_entry else None
+        _REACHABILITY_CACHE[self._ip_address] = (time.time(), ping_status, status)
+        return status
 
     async def _snmp_local(self) -> ServiceStatusCode:
         """Direct SNMP sysDescr check."""
@@ -296,6 +337,10 @@ class CableModemServicePreCheck:
 
             community = self._snmp_community or 'public'
 
+            # Use longer timeout to account for agent queue when multiple
+            # parallel requests are in flight (each SNMP operation ~1-3s)
+            timeout = 15.0  # Increased from 5.0 to handle 4+ parallel requests
+
             task_id = await mgr.send_task(
                 agent.agent_id,
                 'snmp_get',
@@ -304,9 +349,9 @@ class CableModemServicePreCheck:
                     'oid': '1.3.6.1.2.1.1.1.0',       # sysDescr.0
                     'community': community,
                 },
-                timeout=5.0,
+                timeout=timeout,
             )
-            result = await mgr.wait_for_task_async(task_id, timeout=5.0)
+            result = await mgr.wait_for_task_async(task_id, timeout=timeout)
 
             if result and result.get('type') == 'response':
                 data = result.get('result', {})
