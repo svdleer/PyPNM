@@ -131,23 +131,26 @@ class ChannelStatsRouter:
                         error="Agent task timed out"
                     )
                 
-                # Agent returns result directly
-                if result.get("success"):
+                # Result is wrapped: {request_id, result: {...}, error: ...}
+                # Extract the actual result from the agent
+                agent_result = result.get("result", {})
+                
+                if agent_result.get("success"):
                     return ChannelStatsResponse(
                         success=True,
                         status=0,
-                        mac_address=result.get("mac_address"),
-                        modem_ip=result.get("modem_ip"),
-                        timestamp=result.get("timestamp"),
-                        timing=result.get("timing"),
-                        downstream=result.get("downstream"),
-                        upstream=result.get("upstream"),
+                        mac_address=agent_result.get("mac_address"),
+                        modem_ip=agent_result.get("modem_ip"),
+                        timestamp=agent_result.get("timestamp"),
+                        timing=agent_result.get("timing"),
+                        downstream=agent_result.get("downstream"),
+                        upstream=agent_result.get("upstream"),
                     )
                 else:
                     return ChannelStatsResponse(
                         success=False,
                         status=-1,
-                        error=result.get("error", "Unknown error from agent")
+                        error=agent_result.get("error") or result.get("error") or "Unknown error from agent"
                     )
                     
             except ValueError as e:
