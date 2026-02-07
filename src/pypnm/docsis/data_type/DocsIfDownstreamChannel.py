@@ -307,10 +307,16 @@ class DocsIfDownstreamChannelEntry(BaseModel):
         tasks = [cls.from_snmp(index, snmp) for index in indices]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
+        print(f"DEBUG: DocsIfDownstreamChannel.get() received {len(responses)} responses")
+        print(f"DEBUG: Response types: {[type(r).__name__ for r in responses[:5]]}")
+        print(f"DEBUG: First response: {responses[0] if responses else None}")
+        
         for index, response in zip(indices, responses):
             if isinstance(response, Exception):
                 logger.warning(f"Failed to retrieve downstream channel {index}: {response}")
             elif response is not None:
                 results.append(response)
+            else:
+                print(f"DEBUG: Response for index {index} is None")
 
         return results
