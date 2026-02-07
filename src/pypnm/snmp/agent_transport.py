@@ -366,6 +366,10 @@ class AgentSnmpTransport:
         results = {}
         raw_results = data.get('results', {})
         
+        print(f"DEBUG: bulk_get raw_results keys: {list(raw_results.keys())[:3]}")
+        print(f"DEBUG: bulk_get resolved_oids: {resolved_oids[:3]}")
+        print(f"DEBUG: bulk_get original oids: {oids[:3]}")
+        
         # Create mapping from resolved OID back to original OID
         oid_mapping = dict(zip(resolved_oids, oids))
         
@@ -378,6 +382,7 @@ class AgentSnmpTransport:
             else:
                 results[original_oid] = []
         
+        print(f"DEBUG: bulk_get results keys: {list(results.keys())[:3]}")
         print(f"DEBUG: Parsed {len(results)} OID results, total time={time.time()-start_time:.3f}s")
         return results
 
