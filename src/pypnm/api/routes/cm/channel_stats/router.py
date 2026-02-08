@@ -264,13 +264,16 @@ class ChannelStatsRouter:
             # Find CM index by matching MAC address
             cm_index = None
             results = result.get("result", {}).get("results", [])
+            self.logger.info(f"CMTS returned {len(results)} CMs, looking for {mac_normalized}")
             for entry in results:
-                if entry.get("value", "").lower() == mac_normalized.lower():
+                cmts_mac = entry.get("value", "")
+                self.logger.info(f"Comparing: '{cmts_mac.lower()}' == '{mac_normalized.lower()}'")
+                if cmts_mac.lower() == mac_normalized.lower():
                     # Extract index from OID (last component)
                     oid_parts = entry.get("oid", "").split(".")
                     if oid_parts:
                         cm_index = oid_parts[-1]
-                        self.logger.debug(f"Found CM index {cm_index} for MAC {mac_address}")
+                        self.logger.info(f"Found CM index {cm_index} for MAC {mac_address}")
                         break
             
             if not cm_index:
