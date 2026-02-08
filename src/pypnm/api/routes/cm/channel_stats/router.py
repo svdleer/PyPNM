@@ -249,7 +249,7 @@ class ChannelStatsRouter:
                 # Convert to hex without leading zero: '05' -> '5', '0f' -> 'f'
                 mac_normalized_parts.append(f"{int(byte, 16):x}")
             mac_normalized = ':'.join(mac_normalized_parts)
-            self.logger.debug(f"Normalized MAC: {mac_address} -> {mac_normalized}")
+            self.logger.info(f"Normalized MAC: {mac_address} -> {mac_normalized}")
             
             # Walk docsIfCmtsCmStatusMacAddress table to find CM index
             oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
