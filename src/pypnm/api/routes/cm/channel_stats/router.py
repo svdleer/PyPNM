@@ -133,7 +133,7 @@ class ChannelStatsRouter:
                     # Quick SNMP check
                     check_task_id = await agent_manager.send_task(
                         agent_id, "snmp_get",
-                        {"ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", "community": request.community},
+                        {"target_ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", "community": request.community},
                         timeout=5.0
                     )
                     check_result = await agent_manager.wait_for_task_async(check_task_id, timeout=5.0)
