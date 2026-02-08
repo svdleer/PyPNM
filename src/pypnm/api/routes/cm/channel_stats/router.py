@@ -304,7 +304,8 @@ class ChannelStatsRouter:
             
             self.logger.info(f"Found CM Service Group ID: {cm_sg_id}")
             
-            # Get DS ifIndex using CM index
+            # Get DS and US ifIndex using CM index
+            # Need BOTH for the US-to-DS mapping table
             oid = '1.3.6.1.2.1.10.127.1.3.3.1.6'  # docsIfCmtsCmStatusDownChannelIfIndex base
             self.logger.info(f"Walking DS ifIndex table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
@@ -314,7 +315,6 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 for entry in results:
-                    # OID format: ...1.6.{cm_index}
                     if entry.get("oid", "").endswith(f".{cm_index}"):
                         ds_ifindex = entry.get("value")
                         break
@@ -325,9 +325,29 @@ class ChannelStatsRouter:
             
             self.logger.info(f"Found DS ifIndex: {ds_ifindex}")
             
-            # Walk US-to-DS channel mapping to get MD ifIndex
-            # OID: docsIf3MdUsToDsChMappingMdIfIndex
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.14.1.3'
+            # Get US ifIndex
+            oid = '1.3.6.1.2.1.10.127.1.3.3.1.5'  # docsIfCmtsCmStatusUpChannelIfIndex base
+            self.logger.info(f"Walking US ifIndex table: {oid}")
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            
+            us_ifindex = None
+            if result and result.get("result", {}).get("success"):
+                results = result.get("result", {}).get("results", [])
+                for entry in results:
+                    if entry.get("oid", "").endswith(f".{cm_index}"):
+                        us_ifindex = entry.get("value")
+                        break
+            
+            if not us_ifindex:
+                self.logger.warning(f"No US ifIndex returned for CM index {cm_index}")
+                return None
+            
+            self.logger.info(f"Found US ifIndex: {us_ifindex}")
+            
+            # Walk US-to-DS channel mapping to get MD ifIndex using BOTH indexes
+            # OID: docsIf3MdUsToDsChMappingMdIfIndex.{usIfIndex}.{dsIfIndex}
+            oid = f'1.3.6.1.4.1.4491.2.1.20.1.14.1.3.{us_ifindex}.{ds_ifindex}'
             self.logger.info(f"Walking US-to-DS mapping table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
@@ -336,18 +356,11 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 self.logger.info(f"Got {len(results)} mapping entries")
-                # OID format: ...14.1.3.{usIfIndex}.{dsIfIndex}.{mdIfIndex}
-                # We're looking for entries with our dsIfIndex
-                for entry in results:
-                    oid_str = entry.get("oid", "")
-                    parts = oid_str.split('.')
-                    # The dsIfIndex should be at index -2, mdIfIndex at -1
-                    if len(parts) >= 3:
-                        entry_ds_ifindex = parts[-2]
-                        if entry_ds_ifindex == str(ds_ifindex):
-                            md_ifindex = entry.get("value")
-                            self.logger.info(f"Found MD ifIndex: {md_ifindex}")
-                            break
+                # Since we queried with specific US and DS ifIndex, 
+                # the result should contain the MD ifIndex directly
+                if results and len(results) > 0:
+                    md_ifindex = results[0].get("value")
+                    self.logger.info(f"Found MD ifIndex: {md_ifindex}")
             
             if not md_ifindex:
                 self.logger.warning(f"No MD ifIndex found for DS ifIndex {ds_ifindex}")
