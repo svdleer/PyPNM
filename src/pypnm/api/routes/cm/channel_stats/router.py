@@ -359,9 +359,9 @@ class ChannelStatsRouter:
             self.logger.info(f"Found US ifIndex: {us_ifindex}")
             
             # Walk US-to-DS channel mapping table to get MD ifIndex
-            # Need to walk parent OID and filter for our US+DS combination
-            # OID: docsIf3MdUsToDsChMappingMdIfIndex base table
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.14.1.3'
+            # Need to walk with US and DS ifIndex in OID path
+            # OID: docsIf3MdUsToDsChMappingMdIfIndex.{usIfIndex}.{dsIfIndex}
+            oid = f'1.3.6.1.4.1.4491.2.1.20.1.15.1.3.{us_ifindex}.{ds_ifindex}'
             self.logger.info(f"Walking US-to-DS mapping table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
@@ -370,15 +370,11 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 self.logger.info(f"Got {len(results)} mapping entries")
-                # OID format: ...14.1.3.{usIfIndex}.{dsIfIndex}.{mdIfIndex}
-                # Filter for entries matching our US and DS ifIndex
-                for entry in results:
-                    oid_str = entry.get("oid", "")
-                    # Check if OID contains both our US and DS ifIndex
-                    if f".{us_ifindex}.{ds_ifindex}." in oid_str:
-                        md_ifindex = entry.get("value")
-                        self.logger.info(f"Found MD ifIndex: {md_ifindex} from OID: {oid_str}")
-                        break
+                # OID format: ...15.1.3.{usIfIndex}.{dsIfIndex}.{mdIfIndex}
+                # Value should be the MD ifIndex
+                if results and len(results) > 0:
+                    md_ifindex = results[0].get("value")
+                    self.logger.info(f"Found MD ifIndex: {md_ifindex}")
             
             if not md_ifindex:
                 self.logger.warning(f"No MD ifIndex found for DS ifIndex {ds_ifindex}")
