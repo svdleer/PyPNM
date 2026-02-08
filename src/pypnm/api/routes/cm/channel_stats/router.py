@@ -381,8 +381,9 @@ class ChannelStatsRouter:
                 return None
             
             # Now get fiber node name from docsIf3MdNodeStatusMdDsSgId using MD ifIndex
-            # OID format: ...1.12.1.{mdIfIndex}."FiberNodeName".{sgId}
-            oid = f'1.3.6.1.4.1.4491.2.1.20.1.12.1.{md_ifindex}'
+            # OID format: ...1.12.1.3.{mdIfIndex}.{length}.{ASCII bytes of FN name}.{sgId} = Gauge32: {sgId}
+            # Example: .1.12.1.3.536871021.4.70.78.49.55.1 = "FN17" with SG ID 1
+            oid = f'1.3.6.1.4.1.4491.2.1.20.1.12.1.3.{md_ifindex}'
             self.logger.info(f"Walking fiber node table for MD ifIndex {md_ifindex}: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
@@ -390,18 +391,36 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 # Match fiber node by Service Group ID
-                # OID format: ...1.12.1.{mdIfIndex}."FiberNodeName".{sgId}
+                # OID format: ...1.12.1.3.{mdIfIndex}.{length}.{ASCII bytes of FN name}.{sgId}
+                # Example: .1.12.1.3.536871021.4.70.78.49.55.1 where 4.70.78.49.55 = "FN17" (length 4, ASCII bytes)
                 for entry in results:
                     oid_str = entry.get("oid", "")
-                    parts = oid_str.split('.')
-                    # sgId is last part, fiber node name is second to last
-                    if len(parts) >= 2:
-                        oid_sg_id = parts[-1]
-                        if oid_sg_id == str(cm_sg_id):
-                            fn_part = parts[-2]
-                            fiber_node = fn_part.strip('"')
-                            self.logger.info(f"Found fiber node for {mac_address}: {fiber_node} (SG ID: {cm_sg_id})")
-                            return fiber_node
+                    sg_id_value = entry.get("value")  # The Gauge32 value should match CM's SG ID
+                    
+                    # Check if the value matches CM's SG ID
+                    if sg_id_value == cm_sg_id:
+                        # Parse fiber node name from OID
+                        # After the MD ifIndex, next part is the length, then ASCII bytes
+                        parts = oid_str.split('.')
+                        # Find MD ifIndex position
+                        try:
+                            md_idx_pos = -1
+                            for i, part in enumerate(parts):
+                                if part == str(md_ifindex):
+                                    md_idx_pos = i
+                                    break
+                            
+                            if md_idx_pos > 0 and md_idx_pos + 1 < len(parts):
+                                fn_length = int(parts[md_idx_pos + 1])
+                                # Next fn_length parts are ASCII bytes of fiber node name
+                                ascii_bytes = parts[md_idx_pos + 2:md_idx_pos + 2 + fn_length]
+                                fiber_node = ''.join(chr(int(b)) for b in ascii_bytes)
+                                self.logger.info(f"Found fiber node for {mac_address}: {fiber_node} (SG ID: {cm_sg_id})")
+                                return fiber_node
+                        except (ValueError, IndexError) as e:
+                            self.logger.warning(f"Failed to parse fiber node from OID {oid_str}: {e}")
+                            continue
+                
                 self.logger.warning(f"No fiber node matching SG ID {cm_sg_id} for MD ifIndex {md_ifindex}")
             else:
                 self.logger.warning(f"Fiber node walk failed for MD ifIndex {md_ifindex}")
