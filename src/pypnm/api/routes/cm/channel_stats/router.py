@@ -241,11 +241,12 @@ class ChannelStatsRouter:
             self.logger.info(f"Looking up fiber node for {mac_address} on CMTS {cmts_ip}")
             
             # Normalize MAC address to match CMTS format (shortened, colons)
-            # CMTS stores MACs like 44:5:3f:d4:19:15 (no leading zeros)
-            mac_normalized = ':'.join([str(int(b, 16)) for b in mac_address.replace(':', '').replace('-', '').replace('.', '')])
+            # CMTS stores MACs like 44:5:3f:d4:19:15 (no leading zeros in bytes)
             mac_normalized_parts = []
-            for i in range(0, len(mac_address.replace(':', '').replace('-', '').replace('.', '')), 2):
-                byte = mac_address.replace(':', '').replace('-', '').replace('.', '')[i:i+2]
+            mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '').lower()
+            for i in range(0, len(mac_clean), 2):
+                byte = mac_clean[i:i+2]
+                # Convert to hex without leading zero: '05' -> '5', '0f' -> 'f'
                 mac_normalized_parts.append(f"{int(byte, 16):x}")
             mac_normalized = ':'.join(mac_normalized_parts)
             self.logger.debug(f"Normalized MAC: {mac_address} -> {mac_normalized}")
