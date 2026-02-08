@@ -285,7 +285,7 @@ class ChannelStatsRouter:
                 return None
             
             # Get CM's Service Group ID - needed to match fiber node
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.4'  # docsIf3CmtsCmRegStatusMdCmSgId base
+            oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.8'  # docsIf3CmtsCmRegStatusMdCmSgId base
             self.logger.info(f"Walking CM Service Group ID table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
