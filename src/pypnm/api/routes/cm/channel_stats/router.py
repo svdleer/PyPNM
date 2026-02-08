@@ -286,9 +286,10 @@ class ChannelStatsRouter:
             
             # Get DS ifIndex using CM index
             oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{cm_index}'  # docsIfCmtsCmStatusDownChannelIfIndex
-            self.logger.debug(f"Querying DS ifIndex: {oid}")
+            self.logger.info(f"Querying DS ifIndex: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            self.logger.info(f"DS ifIndex query result: {result}")
             if not result or not result.get("result", {}).get("success"):
                 self.logger.warning(f"Failed to get DS ifIndex for CM index {cm_index}")
                 return None
