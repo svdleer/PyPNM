@@ -268,8 +268,11 @@ class ChannelStatsRouter:
             self.logger.info(f"CMTS returned {len(results)} CMs, looking for {mac_normalized}")
             for entry in results:
                 cmts_mac = entry.get("value", "")
-                self.logger.info(f"Comparing: '{cmts_mac.lower()}' == '{mac_normalized.lower()}'")
-                if cmts_mac.lower() == mac_normalized.lower():
+                # Normalize CMTS MAC to match format (strip leading zeros from bytes)
+                cmts_mac_parts = cmts_mac.split(':')
+                cmts_mac_normalized = ':'.join([f"{int(b, 16):x}" if b else '0' for b in cmts_mac_parts])
+                self.logger.info(f"Comparing: '{cmts_mac}' (normalized: '{cmts_mac_normalized}') == '{mac_normalized}'")
+                if cmts_mac_normalized.lower() == mac_normalized.lower():
                     # Extract index from OID (last component)
                     oid_parts = entry.get("oid", "").split(".")
                     if oid_parts:
