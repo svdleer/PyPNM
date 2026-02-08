@@ -230,7 +230,7 @@ class ChannelStatsRouter:
             
             # Get DS ifIndex
             oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{mac_decimal}'
-            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             if not result or not result.get("result", {}).get("success"):
                 return None
@@ -241,7 +241,7 @@ class ChannelStatsRouter:
             
             # Walk fiber node table
             oid = f'1.3.6.1.4.1.4491.2.1.20.1.12.1.1.{ds_ifindex}'
-            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
