@@ -309,7 +309,7 @@ class ChannelStatsRouter:
             
             # Get DS and US ifIndex using CM index
             # Need BOTH for the US-to-DS mapping table
-            oid = '1.3.6.1.2.1.10.127.1.3.3.1.6'  # docsIfCmtsCmStatusDownChannelIfIndex base
+            oid = '1.3.6.1.2.1.10.127.1.3.3.1.4'  # docsIfCmtsCmStatusDownChannelIfIndex base (column 4, not 6!)
             self.logger.info(f"Walking DS ifIndex table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
