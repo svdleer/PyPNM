@@ -317,12 +317,15 @@ class ChannelStatsRouter:
             ds_ifindex = None
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
+                self.logger.info(f"Got {len(results)} DS ifIndex entries")
                 for entry in results:
                     oid_str = entry.get("oid", "")
+                    value = entry.get("value")
                     # OID format: ...1.3.3.1.6.{cm_index}
                     parts = oid_str.split('.')
                     if parts and parts[-1] == str(cm_index):
-                        ds_ifindex = entry.get("value")
+                        self.logger.info(f"Match found: OID={oid_str}, value={value}")
+                        ds_ifindex = value
                         break
             
             if not ds_ifindex:
