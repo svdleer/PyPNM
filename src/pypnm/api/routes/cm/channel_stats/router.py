@@ -152,13 +152,13 @@ class ChannelStatsRouter:
                         "ip": request.modem_ip,
                         "oids": table_oids,
                         "community": request.community,
-                        "timeout": 15
+                        "timeout": 20
                     },
-                    timeout=20.0
+                    timeout=40.0
                 )
                 
                 # Wait for result
-                result = await agent_manager.wait_for_task_async(task_id, timeout=20.0)
+                result = await agent_manager.wait_for_task_async(task_id, timeout=40.0)
                 
                 if not result:
                     return ChannelStatsResponse(
