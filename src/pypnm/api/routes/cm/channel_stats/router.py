@@ -185,12 +185,15 @@ class ChannelStatsRouter:
                 )
                 
                 # Lookup fiber node from CMTS if provided
+                self.logger.info(f"Checking fiber node lookup: cmts_ip={request.cmts_ip}, mac={request.mac_address}")
                 fiber_node = None
                 if request.cmts_ip and request.mac_address:
                     fiber_node = await self._get_fiber_node_from_cmts(
                         agent_manager, agent_id, request.cmts_ip, 
                         request.mac_address, request.cmts_community or "public"
                     )
+                else:
+                    self.logger.warning(f"Skipping fiber node lookup: cmts_ip={request.cmts_ip}, mac={request.mac_address}")
                 
                 if parsed.get("success"):
                     return ChannelStatsResponse(
