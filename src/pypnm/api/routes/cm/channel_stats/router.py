@@ -68,6 +68,14 @@ class ChannelStatsRouter:
             tags = ["Cable Modem Channel Stats"]
         self.router = APIRouter(prefix=prefix, tags=tags)
         self.logger = logging.getLogger(__name__)
+        # Ensure logger level is set to INFO
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
         self._register_routes()
     
     def _register_routes(self) -> None:
@@ -185,13 +193,16 @@ class ChannelStatsRouter:
                 )
                 
                 # Lookup fiber node from CMTS if provided
-                self.logger.info(f"Checking fiber node lookup: cmts_ip={request.cmts_ip}, mac={request.mac_address}")
+                import sys
+                print(f"[FIBER_NODE_DEBUG] Checking fiber node lookup: cmts_ip={request.cmts_ip}, mac={request.mac_address}", file=sys.stderr, flush=True)
                 fiber_node = None
                 if request.cmts_ip and request.mac_address:
+                    print(f"[FIBER_NODE_DEBUG] Calling fiber node lookup", file=sys.stderr, flush=True)
                     fiber_node = await self._get_fiber_node_from_cmts(
                         agent_manager, agent_id, request.cmts_ip, 
                         request.mac_address, request.cmts_community or "public"
                     )
+                    print(f"[FIBER_NODE_DEBUG] Fiber node result: {fiber_node}", file=sys.stderr, flush=True)
                 else:
                     self.logger.warning(f"Skipping fiber node lookup: cmts_ip={request.cmts_ip}, mac={request.mac_address}")
                 
