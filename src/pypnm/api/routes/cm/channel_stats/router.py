@@ -33,6 +33,8 @@ class ChannelStatsRequest(BaseModel):
     mac_address: str = Field(..., description="Cable modem MAC address")
     modem_ip: str = Field(..., description="Cable modem IP address")
     community: str = Field(default="public", description="SNMP community string")
+    cmts_ip: Optional[str] = Field(default=None, description="CMTS IP address for fiber node lookup")
+    cmts_community: Optional[str] = Field(default=None, description="CMTS SNMP community string")
     skip_connectivity_check: bool = Field(default=False, description="Skip ping/SNMP check")
 
 
@@ -116,6 +118,8 @@ class ChannelStatsRouter:
                         "modem_ip": request.modem_ip,
                         "mac_address": request.mac_address,
                         "community": request.community,
+                        "cmts_ip": request.cmts_ip,
+                        "cmts_community": request.cmts_community,
                         "skip_connectivity_check": request.skip_connectivity_check,
                     },
                     timeout=30.0
