@@ -294,7 +294,10 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 for entry in results:
-                    if entry.get("oid", "").endswith(f".{cm_index}"):
+                    oid_str = entry.get("oid", "")
+                    # OID format: ...1.3.1.4.{cm_index}
+                    parts = oid_str.split('.')
+                    if parts and parts[-1] == str(cm_index):
                         cm_sg_id = entry.get("value")
                         break
             
@@ -315,7 +318,10 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 for entry in results:
-                    if entry.get("oid", "").endswith(f".{cm_index}"):
+                    oid_str = entry.get("oid", "")
+                    # OID format: ...1.3.3.1.6.{cm_index}
+                    parts = oid_str.split('.')
+                    if parts and parts[-1] == str(cm_index):
                         ds_ifindex = entry.get("value")
                         break
             
@@ -335,7 +341,10 @@ class ChannelStatsRouter:
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 for entry in results:
-                    if entry.get("oid", "").endswith(f".{cm_index}"):
+                    oid_str = entry.get("oid", "")
+                    # OID format: ...1.3.3.1.5.{cm_index}
+                    parts = oid_str.split('.')
+                    if parts and parts[-1] == str(cm_index):
                         us_ifindex = entry.get("value")
                         break
             
