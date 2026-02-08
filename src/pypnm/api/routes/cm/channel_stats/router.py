@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from pypnm.api.agent.manager import get_agent_manager
+from .parser import parse_channel_stats_raw
 
 logger = logging.getLogger(__name__)
 
@@ -110,21 +111,54 @@ class ChannelStatsRouter:
             self.logger.info(f"Getting channel stats for {request.modem_ip} via agent {agent_id}")
             
             try:
-                # Send task to agent
+                # Define table OIDs - agent will walk these in parallel
+                table_oids = [
+                    '1.3.6.1.2.1.10.127.1.1.1',     # docsIfDownChannelTable
+                    '1.3.6.1.2.1.10.127.1.1.4',     # docsIfSigQTable
+                    '1.3.6.1.4.1.4491.2.1.20.1.24', # docsIf3SignalQualityExtTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.9',  # docsIf31CmDsOfdmChanTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.11', # docsIf31CmDsOfdmChannelPowerTable
+                    '1.3.6.1.2.1.10.127.1.1.2',     # docsIfUpChannelTable
+                    '1.3.6.1.4.1.4491.2.1.20.1.2',  # docsIf3CmStatusUsTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.13', # docsIf31CmUsOfdmaChanTable
+                    '1.3.6.1.4.1.4491.2.1.28.1.12', # docsIf31CmStatusOfdmaUsTable
+                ]
+                
+                # Send parallel walk task to agent
+                import time
+                start_time = time.time()
+                
+                # Do connectivity check first if not skipped
+                if not request.skip_connectivity_check:
+                    # Quick SNMP check
+                    check_task_id = await agent_manager.send_task(
+                        agent_id, "snmp_get",
+                        {"ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", "community": request.community},
+                        timeout=5.0
+                    )
+                    check_result = await agent_manager.wait_for_task_async(check_task_id, timeout=5.0)
+                    if not check_result or not check_result.get("result", {}).get("success"):
+                        return ChannelStatsResponse(
+                            success=False,
+                            status=-1,
+                            error="SNMP not responding on modem"
+                        )
+                
+                # Walk all tables in parallel (agent has snmp_parallel_walk)
                 task_id = await agent_manager.send_task(
                     agent_id,
-                    "pnm_channel_stats",
+                    "snmp_parallel_walk",
                     {
-                        "modem_ip": request.modem_ip,
-                        "mac_address": request.mac_address,
+                        "ip": request.modem_ip,
+                        "oids": table_oids,
                         "community": request.community,
-                        "skip_connectivity_check": request.skip_connectivity_check,
+                        "timeout": 15
                     },
-                    timeout=30.0
+                    timeout=20.0
                 )
                 
                 # Wait for result
-                result = await agent_manager.wait_for_task_async(task_id, timeout=30.0)
+                result = await agent_manager.wait_for_task_async(task_id, timeout=20.0)
                 
                 if not result:
                     return ChannelStatsResponse(
@@ -133,11 +167,24 @@ class ChannelStatsRouter:
                         error="Agent task timed out"
                     )
                 
-                # Result is wrapped: {request_id, result: {...}, error: ...}
-                # Extract the actual result from the agent
+                # Extract raw SNMP walk results
                 agent_result = result.get("result", {})
+                if not agent_result.get("success"):
+                    return ChannelStatsResponse(
+                        success=False,
+                        status=-1,
+                        error=agent_result.get("error") or "SNMP walk failed"
+                    )
                 
-                # Lookup fiber node from CMTS if CMTS IP provided
+                raw_results = agent_result.get("results", {})
+                walk_time = time.time() - start_time
+                
+                # Parse results in API (NOT in agent)
+                parsed = parse_channel_stats_raw(
+                    raw_results, walk_time, request.mac_address, request.modem_ip
+                )
+                
+                # Lookup fiber node from CMTS if provided
                 fiber_node = None
                 if request.cmts_ip and request.mac_address:
                     fiber_node = await self._get_fiber_node_from_cmts(
@@ -145,23 +192,23 @@ class ChannelStatsRouter:
                         request.mac_address, request.cmts_community or "public"
                     )
                 
-                if agent_result.get("success"):
+                if parsed.get("success"):
                     return ChannelStatsResponse(
                         success=True,
                         status=0,
-                        mac_address=agent_result.get("mac_address"),
-                        modem_ip=agent_result.get("modem_ip"),
+                        mac_address=parsed.get("mac_address"),
+                        modem_ip=parsed.get("modem_ip"),
                         fiber_node=fiber_node,
-                        timestamp=agent_result.get("timestamp"),
-                        timing=agent_result.get("timing"),
-                        downstream=agent_result.get("downstream"),
-                        upstream=agent_result.get("upstream"),
+                        timestamp=parsed.get("timestamp"),
+                        timing=parsed.get("timing"),
+                        downstream=parsed.get("downstream"),
+                        upstream=parsed.get("upstream"),
                     )
                 else:
                     return ChannelStatsResponse(
                         success=False,
                         status=-1,
-                        error=agent_result.get("error") or result.get("error") or "Unknown error from agent"
+                        error=parsed.get("error") or "Parsing failed"
                     )
                     
             except ValueError as e:
