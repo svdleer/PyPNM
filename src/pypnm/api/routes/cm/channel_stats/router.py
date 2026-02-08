@@ -294,8 +294,13 @@ class ChannelStatsRouter:
                 self.logger.warning(f"Failed to get DS ifIndex for CM index {cm_index}")
                 return None
             
-            ds_ifindex = result.get("result", {}).get("value")
-            if not ds_ifindex:
+            # Parse DS ifIndex from output (format: "OID = value")
+            output = result.get("result", {}).get("output", "")
+            ds_ifindex = None
+            if " = " in output:
+                ds_ifindex = output.split(" = ")[-1].strip()
+            
+            if not ds_ifindex or ds_ifindex == "0":
                 self.logger.warning(f"No DS ifIndex returned for CM index {cm_index}")
                 return None
             
