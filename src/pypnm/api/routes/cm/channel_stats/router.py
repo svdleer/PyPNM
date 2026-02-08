@@ -118,8 +118,6 @@ class ChannelStatsRouter:
                         "modem_ip": request.modem_ip,
                         "mac_address": request.mac_address,
                         "community": request.community,
-                        "cmts_ip": request.cmts_ip,
-                        "cmts_community": request.cmts_community,
                         "skip_connectivity_check": request.skip_connectivity_check,
                     },
                     timeout=30.0
@@ -139,12 +137,21 @@ class ChannelStatsRouter:
                 # Extract the actual result from the agent
                 agent_result = result.get("result", {})
                 
+                # Lookup fiber node from CMTS if CMTS IP provided
+                fiber_node = None
+                if request.cmts_ip and request.mac_address:
+                    fiber_node = await self._get_fiber_node_from_cmts(
+                        agent_manager, agent_id, request.cmts_ip, 
+                        request.mac_address, request.cmts_community or "public"
+                    )
+                
                 if agent_result.get("success"):
                     return ChannelStatsResponse(
                         success=True,
                         status=0,
                         mac_address=agent_result.get("mac_address"),
                         modem_ip=agent_result.get("modem_ip"),
+                        fiber_node=fiber_node,
                         timestamp=agent_result.get("timestamp"),
                         timing=agent_result.get("timing"),
                         downstream=agent_result.get("downstream"),
@@ -163,6 +170,40 @@ class ChannelStatsRouter:
             except Exception as e:
                 self.logger.error(f"Channel stats failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to get channel stats: {str(e)}")
+    
+    async def _get_fiber_node_from_cmts(
+        self, agent_manager, agent_id: str, cmts_ip: str, 
+        mac_address: str, community: str
+    ) -> str:
+        """Lookup fiber node from CMTS using agent SNMP commands."""
+        try:
+            # Convert MAC to decimal format
+            mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '')
+            mac_decimal = '.'.join(str(int(mac_clean[i:i+2], 16)) for i in range(0, len(mac_clean), 2))
+            
+            # Get DS ifIndex
+            oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{mac_decimal}'
+            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            if not result or not result.get("result", {}).get("success"):
+                return None
+            
+            ds_ifindex = result.get("result", {}).get("value")
+            if not ds_ifindex:
+                return None
+            
+            # Walk fiber node table
+            oid = f'1.3.6.1.4.1.4491.2.1.20.1.12.1.1.{ds_ifindex}'
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            if result and result.get("result", {}).get("success"):
+                results = result.get("result", {}).get("results", [])
+                if results:
+                    return str(results[0].get("value", ""))
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get fiber node: {e}")
+            return None
 
 
 # Router instance for auto-discovery
