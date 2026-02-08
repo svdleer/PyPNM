@@ -300,37 +300,57 @@ class ChannelStatsRouter:
             
             self.logger.info(f"Found DS ifIndex: {ds_ifindex}")
             
-            # Walk fiber node table - docsIf3MdNodeStatusMdDsSgId
-            # Index format: ifIndex."FiberNodeName".something
-            # We need to walk the base table and find entries matching our ifIndex
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.12.1'  # docsIf3MdNodeStatusMdDsSgId base
-            self.logger.info(f"Walking fiber node table: {oid}")
+            # Walk US-to-DS channel mapping to get MD ifIndex
+            # OID: docsIf3MdUsToDsChMappingMdIfIndex
+            oid = '1.3.6.1.4.1.4491.2.1.20.1.14.1.3'
+            self.logger.info(f"Walking US-to-DS mapping table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            
+            md_ifindex = None
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
-                self.logger.info(f"Got {len(results)} fiber node entries")
-                # Parse OIDs to find matching ifIndex and extract fiber node name
-                # OID format: 1.3.6.1.4.1.4491.2.1.20.1.12.1.{ifIndex}."FiberNodeName".{something}
+                self.logger.info(f"Got {len(results)} mapping entries")
+                # OID format: ...14.1.3.{usIfIndex}.{dsIfIndex}.{mdIfIndex}
+                # We're looking for entries with our dsIfIndex
                 for entry in results:
                     oid_str = entry.get("oid", "")
-                    # Extract ifIndex from OID (should be after .12.1.)
-                    # Example: ...12.1.536871013."FN1".1
                     parts = oid_str.split('.')
-                    if len(parts) > 12:  # Ensure we have enough parts
-                        entry_ifindex = parts[12]  # The part after .12.1
-                        if entry_ifindex == str(ds_ifindex):
-                            # Found matching ifIndex, extract fiber node name
-                            # It's typically in quotes in the next part
-                            if len(parts) > 13:
-                                fn_part = parts[13]
-                                # Remove quotes if present
-                                fiber_node = fn_part.strip('"')
-                                self.logger.info(f"Found fiber node for {mac_address}: {fiber_node}")
-                                return fiber_node
-                self.logger.warning(f"No fiber node found for ifIndex {ds_ifindex}")
+                    # The dsIfIndex should be at index -2, mdIfIndex at -1
+                    if len(parts) >= 3:
+                        entry_ds_ifindex = parts[-2]
+                        if entry_ds_ifindex == str(ds_ifindex):
+                            md_ifindex = entry.get("value")
+                            self.logger.info(f"Found MD ifIndex: {md_ifindex}")
+                            break
+            
+            if not md_ifindex:
+                self.logger.warning(f"No MD ifIndex found for DS ifIndex {ds_ifindex}")
+                return None
+            
+            # Now get fiber node name from docsIf3MdNodeStatusMdDsSgId using MD ifIndex
+            # OID format: ...1.12.1.{mdIfIndex}."FiberNodeName".{sgId}
+            oid = f'1.3.6.1.4.1.4491.2.1.20.1.12.1.{md_ifindex}'
+            self.logger.info(f"Walking fiber node table for MD ifIndex {md_ifindex}: {oid}")
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            
+            if result and result.get("result", {}).get("success"):
+                results = result.get("result", {}).get("results", [])
+                if results:
+                    # Extract fiber node name from first entry's OID
+                    # OID format: ...1.12.1.{mdIfIndex}."FiberNodeName".{sgId}
+                    oid_str = results[0].get("oid", "")
+                    parts = oid_str.split('.')
+                    # Fiber node name is typically the second-to-last part (before sgId)
+                    if len(parts) >= 2:
+                        fn_part = parts[-2]
+                        fiber_node = fn_part.strip('"')
+                        self.logger.info(f"Found fiber node for {mac_address}: {fiber_node}")
+                        return fiber_node
+                self.logger.warning(f"No fiber node data in mapping for MD ifIndex {md_ifindex}")
             else:
-                self.logger.warning(f"Fiber node walk failed for {mac_address}")
+                self.logger.warning(f"Fiber node walk failed for MD ifIndex {md_ifindex}")
             return None
         except Exception as e:
             self.logger.warning(f"Failed to get fiber node: {e}")
