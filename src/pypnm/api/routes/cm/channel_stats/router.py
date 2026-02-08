@@ -224,29 +224,42 @@ class ChannelStatsRouter:
     ) -> str:
         """Lookup fiber node from CMTS using agent SNMP commands."""
         try:
+            self.logger.info(f"Looking up fiber node for {mac_address} on CMTS {cmts_ip}")
             # Convert MAC to decimal format
             mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '')
             mac_decimal = '.'.join(str(int(mac_clean[i:i+2], 16)) for i in range(0, len(mac_clean), 2))
             
             # Get DS ifIndex
             oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{mac_decimal}'
+            self.logger.debug(f"Querying DS ifIndex: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             if not result or not result.get("result", {}).get("success"):
+                self.logger.warning(f"Failed to get DS ifIndex for {mac_address}")
                 return None
             
             ds_ifindex = result.get("result", {}).get("value")
             if not ds_ifindex:
+                self.logger.warning(f"No DS ifIndex returned for {mac_address}")
                 return None
+            
+            self.logger.debug(f"Found DS ifIndex: {ds_ifindex}")
             
             # Walk fiber node table
             oid = f'1.3.6.1.4.1.4491.2.1.20.1.12.1.1.{ds_ifindex}'
+            self.logger.debug(f"Walking fiber node table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 if results:
-                    return str(results[0].get("value", ""))
+                    fiber_node = str(results[0].get("value", ""))
+                    self.logger.info(f"Found fiber node for {mac_address}: {fiber_node}")
+                    return fiber_node
+                else:
+                    self.logger.warning(f"No fiber node data returned for {mac_address}")
+            else:
+                self.logger.warning(f"Fiber node walk failed for {mac_address}")
             return None
         except Exception as e:
             self.logger.warning(f"Failed to get fiber node: {e}")
