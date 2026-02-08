@@ -321,10 +321,11 @@ class ChannelStatsRouter:
                 for entry in results:
                     oid_str = entry.get("oid", "")
                     value = entry.get("value")
+                    entry_type = entry.get("type")
                     # OID format: ...1.3.3.1.6.{cm_index}
                     parts = oid_str.split('.')
                     if parts and parts[-1] == str(cm_index):
-                        self.logger.info(f"Match found: OID={oid_str}, value={value}")
+                        self.logger.info(f"Match found: OID={oid_str}, value={value}, type={entry_type}")
                         ds_ifindex = value
                         break
             
