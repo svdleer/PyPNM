@@ -228,22 +228,55 @@ class ChannelStatsRouter:
         """Lookup fiber node from CMTS using agent SNMP commands."""
         try:
             self.logger.info(f"Looking up fiber node for {mac_address} on CMTS {cmts_ip}")
-            # Convert MAC to decimal format
-            mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '')
-            mac_decimal = '.'.join(str(int(mac_clean[i:i+2], 16)) for i in range(0, len(mac_clean), 2))
             
-            # Get DS ifIndex
-            oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{mac_decimal}'
+            # Normalize MAC address to match CMTS format (shortened, colons)
+            # CMTS stores MACs like 44:5:3f:d4:19:15 (no leading zeros)
+            mac_normalized = ':'.join([str(int(b, 16)) for b in mac_address.replace(':', '').replace('-', '').replace('.', '')])
+            mac_normalized_parts = []
+            for i in range(0, len(mac_address.replace(':', '').replace('-', '').replace('.', '')), 2):
+                byte = mac_address.replace(':', '').replace('-', '').replace('.', '')[i:i+2]
+                mac_normalized_parts.append(f"{int(byte, 16):x}")
+            mac_normalized = ':'.join(mac_normalized_parts)
+            self.logger.debug(f"Normalized MAC: {mac_address} -> {mac_normalized}")
+            
+            # Walk docsIfCmtsCmStatusMacAddress table to find CM index
+            oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
+            self.logger.debug(f"Walking CMTS CM table: {oid}")
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
+            
+            if not result or not result.get("result", {}).get("success"):
+                self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
+                return None
+            
+            # Find CM index by matching MAC address
+            cm_index = None
+            results = result.get("result", {}).get("results", [])
+            for entry in results:
+                if entry.get("value", "").lower() == mac_normalized.lower():
+                    # Extract index from OID (last component)
+                    oid_parts = entry.get("oid", "").split(".")
+                    if oid_parts:
+                        cm_index = oid_parts[-1]
+                        self.logger.debug(f"Found CM index {cm_index} for MAC {mac_address}")
+                        break
+            
+            if not cm_index:
+                self.logger.warning(f"MAC {mac_address} not found in CMTS table")
+                return None
+            
+            # Get DS ifIndex using CM index
+            oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{cm_index}'  # docsIfCmtsCmStatusDownChannelIfIndex
             self.logger.debug(f"Querying DS ifIndex: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             if not result or not result.get("result", {}).get("success"):
-                self.logger.warning(f"Failed to get DS ifIndex for {mac_address}")
+                self.logger.warning(f"Failed to get DS ifIndex for CM index {cm_index}")
                 return None
             
             ds_ifindex = result.get("result", {}).get("value")
             if not ds_ifindex:
-                self.logger.warning(f"No DS ifIndex returned for {mac_address}")
+                self.logger.warning(f"No DS ifIndex returned for CM index {cm_index}")
                 return None
             
             self.logger.debug(f"Found DS ifIndex: {ds_ifindex}")
