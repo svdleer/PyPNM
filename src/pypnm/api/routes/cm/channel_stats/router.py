@@ -45,6 +45,7 @@ class ChannelStatsResponse(BaseModel):
     status: int = 0
     mac_address: Optional[str] = None
     modem_ip: Optional[str] = None
+    fiber_node: Optional[str] = None
     timestamp: Optional[str] = None
     timing: Optional[dict] = None
     downstream: Optional[dict] = None
