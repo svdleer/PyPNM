@@ -294,17 +294,20 @@ class ChannelStatsRouter:
                 self.logger.warning(f"Failed to get DS ifIndex for CM index {cm_index}")
                 return None
             
-            # Get DS ifIndex using CM index - use walk since snmp_get is unreliable
-            oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{cm_index}'  # docsIfCmtsCmStatusDownChannelIfIndex
-            self.logger.info(f"Walking DS ifIndex: {oid}")
+            # Get DS ifIndex using CM index - walk parent OID and find our index
+            oid = '1.3.6.1.2.1.10.127.1.3.3.1.6'  # docsIfCmtsCmStatusDownChannelIfIndex base
+            self.logger.info(f"Walking DS ifIndex table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             
             ds_ifindex = None
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
-                if results and len(results) > 0:
-                    ds_ifindex = results[0].get("value")
+                for entry in results:
+                    # OID format: ...1.6.{cm_index}
+                    if entry.get("oid", "").endswith(f".{cm_index}"):
+                        ds_ifindex = entry.get("value")
+                        break
             
             if not ds_ifindex:
                 self.logger.warning(f"No DS ifIndex returned for CM index {cm_index}")
