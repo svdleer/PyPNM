@@ -152,7 +152,7 @@ class ChannelStatsRouter:
                         "ip": request.modem_ip,
                         "oids": table_oids,
                         "community": request.community,
-                        "timeout": 20
+                        "timeout": 30
                     },
                     timeout=40.0
                 )
