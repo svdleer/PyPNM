@@ -253,9 +253,10 @@ class ChannelStatsRouter:
             
             # Walk docsIfCmtsCmStatusMacAddress table to find CM index
             oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
-            self.logger.debug(f"Walking CMTS CM table: {oid}")
+            self.logger.info(f"Walking CMTS CM table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
+            self.logger.info(f"SNMP walk result: success={result.get('result',{}).get('success') if result else None}, results_count={len(result.get('result',{}).get('results',[])) if result else 0}")
             
             if not result or not result.get("result", {}).get("success"):
                 self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
