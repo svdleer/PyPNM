@@ -284,17 +284,27 @@ class ChannelStatsRouter:
                 self.logger.warning(f"MAC {mac_address} not found in CMTS table")
                 return None
             
-            # Get DS ifIndex using CM index
-            oid = f'1.3.6.1.2.1.10.127.1.3.3.1.6.{cm_index}'  # docsIfCmtsCmStatusDownChannelIfIndex
-            self.logger.info(f"Querying DS ifIndex: {oid}")
-            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            # Get CM's Service Group ID - needed to match fiber node
+            oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.4'  # docsIf3CmtsCmRegStatusMdCmSgId base
+            self.logger.info(f"Walking CM Service Group ID table: {oid}")
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
-            self.logger.info(f"DS ifIndex query result: {result}")
-            if not result or not result.get("result", {}).get("success"):
-                self.logger.warning(f"Failed to get DS ifIndex for CM index {cm_index}")
+            
+            cm_sg_id = None
+            if result and result.get("result", {}).get("success"):
+                results = result.get("result", {}).get("results", [])
+                for entry in results:
+                    if entry.get("oid", "").endswith(f".{cm_index}"):
+                        cm_sg_id = entry.get("value")
+                        break
+            
+            if not cm_sg_id:
+                self.logger.warning(f"No Service Group ID found for CM index {cm_index}")
                 return None
             
-            # Get DS ifIndex using CM index - walk parent OID and find our index
+            self.logger.info(f"Found CM Service Group ID: {cm_sg_id}")
+            
+            # Get DS ifIndex using CM index
             oid = '1.3.6.1.2.1.10.127.1.3.3.1.6'  # docsIfCmtsCmStatusDownChannelIfIndex base
             self.logger.info(f"Walking DS ifIndex table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
@@ -352,18 +362,20 @@ class ChannelStatsRouter:
             
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
-                if results:
-                    # Extract fiber node name from first entry's OID
-                    # OID format: ...1.12.1.{mdIfIndex}."FiberNodeName".{sgId}
-                    oid_str = results[0].get("oid", "")
+                # Match fiber node by Service Group ID
+                # OID format: ...1.12.1.{mdIfIndex}."FiberNodeName".{sgId}
+                for entry in results:
+                    oid_str = entry.get("oid", "")
                     parts = oid_str.split('.')
-                    # Fiber node name is typically the second-to-last part (before sgId)
+                    # sgId is last part, fiber node name is second to last
                     if len(parts) >= 2:
-                        fn_part = parts[-2]
-                        fiber_node = fn_part.strip('"')
-                        self.logger.info(f"Found fiber node for {mac_address}: {fiber_node}")
-                        return fiber_node
-                self.logger.warning(f"No fiber node data in mapping for MD ifIndex {md_ifindex}")
+                        oid_sg_id = parts[-1]
+                        if oid_sg_id == str(cm_sg_id):
+                            fn_part = parts[-2]
+                            fiber_node = fn_part.strip('"')
+                            self.logger.info(f"Found fiber node for {mac_address}: {fiber_node} (SG ID: {cm_sg_id})")
+                            return fiber_node
+                self.logger.warning(f"No fiber node matching SG ID {cm_sg_id} for MD ifIndex {md_ifindex}")
             else:
                 self.logger.warning(f"Fiber node walk failed for MD ifIndex {md_ifindex}")
             return None
