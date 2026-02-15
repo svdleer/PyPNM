@@ -584,10 +584,13 @@ class CmtsUtscService:
             
             # 8. Auto-calculate FreeRunDuration if not explicitly set
             if freerun_duration_ms <= 0:
-                # Default: use RepeatPeriod raw value for E6000 compat, or
-                # a sensible default (5000ms = 5 seconds) for Cisco
-                freerun_duration_ms = max(repeat_period_us, 5000)
-                self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms}")
+                # Cisco cBR-8: FreeRunDuration must be large enough for captures.
+                # Use max(repeat_period * trigger_count * 2, 60000ms) to be safe.
+                # E6000: compares raw values, so FreeRunDuration >= RepeatPeriod.
+                calc_ms = repeat_period_us * trigger_count * 2
+                freerun_duration_ms = max(calc_ms, repeat_period_us, 60000)
+                self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms}ms "
+                                f"(repeat={repeat_period_us}us * count={trigger_count} * 2)")
             
             # Cisco constraint: RepeatPeriod must not exceed FreeRunDuration
             # E6000 constraint: FreeRunDuration raw >= RepeatPeriod raw
