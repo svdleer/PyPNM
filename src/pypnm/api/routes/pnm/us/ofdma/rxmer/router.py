@@ -340,11 +340,12 @@ class UsOfdmaRxMerRouter:
                 ax.axhline(y=30, color='#FF9800', linestyle='--', alpha=0.7, linewidth=1, label='Marginal (≥30 dB)')
                 
                 # Labels and title
+                preeq_label = "Pre-EQ: ON" if model.preeq_enabled else "Pre-EQ: OFF"
                 ax.set_xlabel('Frequency (MHz)', fontsize=12)
                 ax.set_ylabel('RxMER (dB)', fontsize=12)
                 ax.set_title(
                     f'Upstream OFDMA RxMER - CM: {model.cm_mac_address}\n'
-                    f'CCAP: {model.ccap_id} | '
+                    f'CCAP: {model.ccap_id} | {preeq_label} | '
                     f'Avg: {model.signal_statistics.mean:.1f} dB | '
                     f'Min: {min(valid_values):.1f} dB | '
                     f'Max: {max(valid_values):.1f} dB | '
