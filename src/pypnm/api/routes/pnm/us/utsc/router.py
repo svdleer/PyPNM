@@ -30,6 +30,8 @@ from pypnm.api.routes.pnm.us.utsc.schemas import (
     UtscGetConfigResponse,
     UtscConfigureRequest,
     UtscConfigureResponse,
+    UtscBdtConfigureRequest,
+    UtscBdtConfigureResponse,
     UtscStartRequest,
     UtscStartResponse,
     UtscStopRequest,
@@ -170,6 +172,47 @@ class UtscRouter:
                     destination_index=request.destination_index
                 )
                 return UtscConfigureResponse(**result)
+            finally:
+                service.close()
+        
+        @self.router.post(
+            "/configure-bdt",
+            summary="Configure Bulk Data Transfer (TFTP) for PNM file transfer",
+            response_model=UtscBdtConfigureResponse,
+        )
+        async def configure_bdt(
+            request: UtscBdtConfigureRequest
+        ) -> UtscBdtConfigureResponse:
+            """
+            Configure Bulk Data Transfer (BDT) for PNM capture file transfer.
+            
+            **Required by Cisco cBR-8** before UTSC captures will work.
+            The Cisco guestshell IOX container uses BDT to TFTP capture files
+            to a destination server.
+            
+            **Must be called BEFORE /configure and /start.**
+            
+            Sets:
+            - docsPnmBulkDestIpAddr: TFTP server IP (hex-encoded)
+            - docsPnmBulkDestPath: Destination directory path
+            """
+            self.logger.info(
+                f"Configuring BDT on CMTS {request.cmts.cmts_ip}: "
+                f"TFTP={request.tftp_server_ip}/{request.tftp_path}"
+            )
+            
+            service = CmtsUtscService(
+                cmts_ip=request.cmts.cmts_ip,
+                community=request.cmts.community,
+                write_community=request.cmts.write_community
+            )
+            
+            try:
+                result = await service.configure_bdt(
+                    tftp_server_ip=request.tftp_server_ip,
+                    tftp_path=request.tftp_path
+                )
+                return UtscBdtConfigureResponse(**result)
             finally:
                 service.close()
         

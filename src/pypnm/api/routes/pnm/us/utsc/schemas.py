@@ -17,23 +17,33 @@ from pydantic import BaseModel, Field
 
 
 class TriggerMode(IntEnum):
-    """UTSC Trigger Mode (docsPnmCmtsUtscCfgTriggerMode)"""
+    """UTSC Trigger Mode (docsPnmCmtsUtscCfgTriggerMode)
+    
+    Cisco cBR-8 supports: OTHER(1), FREE_RUNNING(2), CM_MAC(7)
+    CommScope E6000 supports: FREE_RUNNING(2), CM_MAC(6)
+    """
     OTHER = 1
     FREE_RUNNING = 2
     MINI_SLOT_COUNT = 3
     SID = 4
-    IUC = 5
-    CM_MAC = 6
+    IDLE_SID = 5
+    MINISLOT_NUMBER = 6
+    CM_MAC = 7
+    QUIET_PROBE_SYMBOL = 8
 
 
 class OutputFormat(IntEnum):
-    """UTSC Output Format (docsPnmCmtsUtscCfgOutputFormat)"""
+    """UTSC Output Format (docsPnmCmtsUtscCfgOutputFormat)
+    
+    Cisco cBR-8 supports: TIME_IQ(1), FFT_POWER(2) only
+    CommScope E6000 supports: all formats including FFT_AMPLITUDE(5)
+    """
     TIME_IQ = 1
     FFT_POWER = 2
-    FFT_IQ = 3
-    FFT_AMPLITUDE = 4
-    FFT_POWER_AND_PHASE = 5
-    RAW_ADC = 6
+    RAW_ADC = 3
+    FFT_IQ = 4
+    FFT_AMPLITUDE = 5
+    FFT_DB = 6
 
 
 class WindowFunction(IntEnum):
@@ -92,8 +102,8 @@ class UtscConfigureRequest(BaseModel):
     cfg_index: int = Field(default=1, description="Config table index (usually 1)")
     
     # Trigger settings
-    trigger_mode: int = Field(default=2, ge=1, le=6, description="Trigger mode: 1=other, 2=freeRunning, 3=minislotCount, 4=sid, 5=iuc, 6=cmMac")
-    cm_mac_address: Optional[str] = Field(None, description="CM MAC address (required for trigger_mode=6)")
+    trigger_mode: int = Field(default=2, ge=1, le=8, description="Trigger mode: 1=other, 2=freeRunning, 3=minislotCount, 4=sid, 5=idleSid, 6=minislotNumber, 7=cmMac, 8=quietProbeSymbol")
+    cm_mac_address: Optional[str] = Field(None, description="CM MAC address (required for trigger_mode=7 cmMac)")
     logical_ch_ifindex: Optional[int] = Field(None, description="Logical channel ifIndex for CM MAC trigger")
     
     # Spectrum settings
@@ -102,8 +112,8 @@ class UtscConfigureRequest(BaseModel):
     num_bins: int = Field(default=800, description="Number of FFT bins")
     
     # Output settings
-    output_format: int = Field(default=2, ge=1, le=6, description="Output format: 1=timeIq, 2=fftPower, 3=fftIq, 4=fftAmplitude, 5=fftPowerAndPhase, 6=rawAdc")
-    window_function: int = Field(default=2, ge=1, le=8, description="Window function: 1=other, 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming, 6=flatTop, 7=gaussian, 8=chebyshev")
+    output_format: int = Field(default=2, ge=1, le=6, description="Output format: 1=timeIq, 2=fftPower (Cisco+E6000), 3=rawAdc, 4=fftIq, 5=fftAmplitude (E6000), 6=fftDb")
+    window_function: int = Field(default=2, ge=1, le=8, description="Window: 1=other, 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming (Cisco supports 2-5 only)")
     
     # Timing settings
     repeat_period_us: int = Field(default=1000000, description="Repeat period in microseconds")
@@ -122,6 +132,28 @@ class UtscConfigureResponse(BaseModel):
     cfg_index: Optional[int] = None
     trigger_mode: Optional[int] = None
     filename: Optional[str] = None
+    row_status: Optional[str] = Field(None, description="RowStatus after configure: active, notReady, etc.")
+    verify: Optional[dict] = Field(None, description="Parameter verification results")
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscBdtConfigureRequest(BaseModel):
+    """Request to configure Bulk Data Transfer (BDT) for PNM file transfer.
+    
+    Required by Cisco cBR-8 before UTSC captures. The guestshell IOX
+    container uses BDT to TFTP capture files to a destination server.
+    """
+    cmts: CmtsSnmpConfig
+    tftp_server_ip: str = Field(..., description="TFTP server IPv4 address")
+    tftp_path: str = Field(default="pnm", description="Destination path on TFTP server")
+
+
+class UtscBdtConfigureResponse(BaseModel):
+    """Response from configuring BDT."""
+    success: bool
+    tftp_server: Optional[str] = None
+    tftp_path: Optional[str] = None
     message: Optional[str] = None
     error: Optional[str] = None
 

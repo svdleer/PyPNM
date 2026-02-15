@@ -36,13 +36,17 @@ class TriggerMode(IntEnum):
 
 
 class OutputFormat(IntEnum):
-    """UTSC Output Format"""
+    """UTSC Output Format
+    
+    Cisco cBR-8 supports only: TIME_IQ (1) and FFT_POWER (2)
+    CommScope E6000 supports: all formats including FFT_AMPLITUDE (5)
+    """
     TIME_IQ = 1
     FFT_POWER = 2
-    FFT_IQ = 3
-    FFT_AMPLITUDE = 4
-    FFT_POWER_AND_PHASE = 5
-    RAW_ADC = 6
+    RAW_ADC = 3
+    FFT_IQ = 4
+    FFT_AMPLITUDE = 5
+    FFT_DB = 6
 
 
 class MeasStatus(IntEnum):
@@ -97,6 +101,19 @@ class CmtsUtscService:
     OID_UTSC_CFG_IUC = f"{OID_UTSC_CFG_TABLE}.22"             # Iuc
     OID_UTSC_CFG_DEST_INDEX = f"{OID_UTSC_CFG_TABLE}.24"      # DestinationIndex
     OID_UTSC_CFG_NUM_AVGS = f"{OID_UTSC_CFG_TABLE}.25"        # NumAvgs
+    
+    # Bulk Data Transfer (BDT) Control - required by Cisco cBR-8
+    OID_BDT_CONTROL = "1.3.6.1.4.1.4491.2.1.27.1.1.1"
+    OID_BDT_IP_ADDR_TYPE = f"{OID_BDT_CONTROL}.1.0"            # InetAddressType (1=IPv4, 2=IPv6)
+    OID_BDT_IP_ADDR = f"{OID_BDT_CONTROL}.2.0"                 # InetAddress (hex IP)
+    OID_BDT_PATH = f"{OID_BDT_CONTROL}.3.0"                    # Destination path
+    
+    # UTSC Capability Table - 1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1
+    OID_UTSC_CAPAB_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1"
+    OID_UTSC_CAPAB_TRIGGER_MODE = f"{OID_UTSC_CAPAB_TABLE}.1"  # Supported trigger modes
+    OID_UTSC_CAPAB_OUTPUT_FORMAT = f"{OID_UTSC_CAPAB_TABLE}.2" # Supported output formats
+    OID_UTSC_CAPAB_WINDOW = f"{OID_UTSC_CAPAB_TABLE}.3"        # Supported windows
+    OID_UTSC_CAPAB_DESCRIPTION = f"{OID_UTSC_CAPAB_TABLE}.4"   # Description
     
     # UTSC Control Table (docsPnmCmtsUtscCtrlTable) - 1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1
     OID_UTSC_CTRL_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1"
@@ -413,7 +430,7 @@ class CmtsUtscService:
                 try:
                     result = await self._snmp_get(f"{oid_base}{idx}")
                     value = self._parse_get_value(result)
-                    if value is not None:
+                    if value is not None and 'No Such' not in str(value):
                         if converter == str:
                             config[key] = value
                         else:
@@ -424,18 +441,68 @@ class CmtsUtscService:
             # Add human-readable names
             if "trigger_mode" in config:
                 trigger_names = {1: "other", 2: "freeRunning", 3: "minislotCount", 
-                                4: "sid", 5: "iuc", 6: "cmMac"}
+                                4: "sid", 5: "idleSid", 6: "minislotNumber",
+                                7: "cmMac", 8: "quietProbeSymbol"}
                 config["trigger_mode_name"] = trigger_names.get(config["trigger_mode"], "unknown")
             
             if "output_format" in config:
-                output_names = {1: "timeIq", 2: "fftPower", 3: "fftIq", 
-                               4: "fftAmplitude", 5: "fftPowerAndPhase", 6: "rawAdc"}
+                output_names = {1: "timeIq", 2: "fftPower", 3: "rawAdc", 
+                               4: "fftIq", 5: "fftAmplitude", 6: "fftDb"}
                 config["output_format_name"] = output_names.get(config["output_format"], "unknown")
             
             return config
             
         except Exception as e:
             self.logger.error(f"Failed to get UTSC config: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def configure_bdt(
+        self,
+        tftp_server_ip: str,
+        tftp_path: str = "pnm"
+    ) -> dict[str, Any]:
+        """
+        Configure Bulk Data Transfer (BDT) for PNM file transfer.
+        
+        Required by Cisco cBR-8 before UTSC captures — the guestshell IOX
+        container uses BDT to TFTP capture files to a destination server.
+        CommScope E6000 also uses BDT for remote file transfer.
+        
+        Args:
+            tftp_server_ip: TFTP server IPv4 address (e.g. "10.1.2.3")
+            tftp_path: Destination path on TFTP server (e.g. "pnm")
+            
+        Returns:
+            Dict with success status
+        """
+        self.logger.info(f"Configuring BDT: TFTP server={tftp_server_ip}, path={tftp_path}")
+        
+        try:
+            # Convert IP address to hex bytes: "10.1.2.3" -> "0A010203"
+            import ipaddress
+            ip_bytes = ipaddress.IPv4Address(tftp_server_ip).packed
+            ip_hex = ip_bytes.hex()
+            
+            # Set IP address (hex OctetString)
+            result = await self._snmp_set(self.OID_BDT_IP_ADDR, ip_hex, 'x')
+            if not result.get('success'):
+                return {"success": False, "error": f"Failed to set BDT IP: {result.get('error')}"}
+            
+            # Set destination path (string)
+            result = await self._snmp_set(self.OID_BDT_PATH, tftp_path, 's')
+            if not result.get('success'):
+                self.logger.warning(f"BDT path set failed (may not be required): {result.get('error')}")
+            
+            self.logger.info(f"BDT configured: {tftp_server_ip} -> {tftp_path}")
+            return {
+                "success": True,
+                "message": f"BDT configured: TFTP {tftp_server_ip}/{tftp_path}",
+                "tftp_server": tftp_server_ip,
+                "tftp_path": tftp_path
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to configure BDT: {e}")
             return {"success": False, "error": str(e)}
     
     async def configure(
@@ -448,10 +515,10 @@ class CmtsUtscService:
         center_freq_hz: int = 30000000,
         span_hz: int = 80000000,
         num_bins: int = 800,
-        output_format: int = 5,
+        output_format: int = 2,
         window_function: int = 2,
-        repeat_period_us: int = 50001,
-        freerun_duration_ms: int = 0,  # 0 = auto-calculate from repeat_period * trigger_count
+        repeat_period_us: int = 50000,
+        freerun_duration_ms: int = 0,  # 0 = auto-calculate
         trigger_count: int = 10,
         filename: str = "utsc_capture",
         destination_index: int = 1,
@@ -460,147 +527,218 @@ class CmtsUtscService:
         """
         Configure UTSC test parameters.
         
-        Automatically clears stale configuration before setting new parameters
-        to ensure OutputFormat=5, RepeatPeriod=50ms, and other fixes take effect.
+        Supports both CommScope E6000 and Cisco cBR-8 CMTS:
+        
+        **Cisco cBR-8 workflow** (per Cisco PNM documentation):
+        1. Configure BDT (TFTP server) — call configure_bdt() first
+        2. createAndGo(4) to create config entry
+        3. Set CenterFreq, Span, NumBins (Gauge32 type)
+        4. Set FreeRunDuration (must be set for config to become Active)
+        5. Verify RowStatus = active(1)
+        6. InitiateTest to start capture
+        
+        **Cisco quirks:**
+        - CenterFreq, Span, NumBins, RepeatPeriod, FreeRunDuration, TriggerCount
+          use Gauge32 (SNMP type 'u'), NOT Integer32
+        - OutputFormat: only fftPower(2) and timeIQ(1) supported
+        - Window: rectangular(2), hann(3), blackmanHarris(4), hamming(5) only
+        - Filename OID NOT supported
+        - RepeatPeriod must not exceed FreeRunDuration
+        - Max 8 captures per line card, 20 per router
         
         Args:
             rf_port_ifindex: RF port ifIndex
-            cfg_index: Config table index
-            trigger_mode: 1=other, 2=freeRunning, 3=minislotCount, 4=sid, 5=iuc, 6=cmMac
-            cm_mac_address: CM MAC address (required for trigger_mode=6)
+            cfg_index: Config table index (always 1 on Cisco)
+            trigger_mode: 1=other, 2=freeRunning, 3=minislotCount, 4=sid,
+                         5=idleSid, 6=minislotNumber, 7=cmMac, 8=quietProbeSymbol
+            cm_mac_address: CM MAC address (required for trigger_mode=7 cmMac)
             logical_ch_ifindex: Logical channel ifIndex for CM MAC trigger
             center_freq_hz: Center frequency in Hz (default 30MHz)
             span_hz: Frequency span in Hz
             num_bins: Number of FFT bins (800)
-            output_format: 5=fftAmplitude (E6000 requirement)
-            window_function: 2=rectangular
-            repeat_period_us: Repeat period in microseconds (50000=50ms)
-            freerun_duration_ms: Free run duration in ms (180000=3min)
-            trigger_count: Number of captures per trigger (10 max on E6000)
-            filename: Output filename
+            output_format: 2=fftPower (Cisco), 5=fftAmplitude (E6000)
+            window_function: 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming
+            repeat_period_us: Repeat period in microseconds (default 50000=50ms)
+            freerun_duration_ms: Free run duration in ms (0=auto-calculate)
+            trigger_count: Number of captures per trigger (max 10 on E6000)
+            filename: Output filename (ignored on Cisco)
             destination_index: Bulk transfer destination (0=local only)
-            auto_clear: Automatically clear stale config before setting new params (default: True)
+            auto_clear: Automatically clear stale config before setting new params
             
         Returns:
             Dict with success status
         """
         idx = f".{rf_port_ifindex}.{cfg_index}"
         
-        self.logger.info(f"Configuring UTSC for RF port {rf_port_ifindex}, trigger_mode={trigger_mode}, auto_clear={auto_clear}")
+        self.logger.info(f"Configuring UTSC for RF port {rf_port_ifindex}, "
+                         f"trigger_mode={trigger_mode}, auto_clear={auto_clear}")
         
         try:
             import asyncio
             
             # Check if UTSC config row exists by reading trigger mode
             check_result = await self._snmp_get(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}")
-            row_exists = check_result.get('success', False) and self._parse_get_value(check_result) is not None
+            check_value = self._parse_get_value(check_result)
+            row_exists = (check_result.get('success', False) 
+                         and check_value is not None
+                         and 'No Such' not in str(check_value))
             
             if row_exists:
-                # Row exists (CommScope E6000 pre-creates rows).
-                # Stop any running test so parameters can be modified.
-                self.logger.info("UTSC row exists — stopping any running test before reconfiguring...")
+                # Row exists (CommScope E6000 pre-creates rows, or Cisco with
+                # existing config). Stop any running test before reconfiguring.
+                self.logger.info("UTSC row exists — stopping any running test...")
                 stop_result = await self.stop(rf_port_ifindex, cfg_index)
                 self.logger.info(f"Stop result: {stop_result}")
-                await asyncio.sleep(1)
-            else:
-                # Row does not exist (Cisco cBR-8, Casa, etc.)
-                # Create it with RowStatus = createAndGo(4)
-                self.logger.info(f"UTSC config row not found — creating with RowStatus=createAndGo(4)")
+                
+                if auto_clear:
+                    # Cisco: destroy + recreate to ensure clean state
+                    self.logger.info("Auto-clear: destroying existing config entry...")
+                    await self._snmp_set(
+                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i'  # 6 = destroy
+                    )
+                    await asyncio.sleep(1)
+                    row_exists = False  # Will be recreated below
+            
+            if not row_exists:
+                # Create config entry with RowStatus = createAndGo(4)
+                # Per Cisco doc: "All capture entries must first be created
+                # by a client on a port before attempting to initiate any tests"
+                self.logger.info("Creating UTSC config entry with createAndGo(4)...")
                 create_result = await self._snmp_set(
                     f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 4, 'i'  # 4 = createAndGo
                 )
                 if not create_result.get('success'):
-                    # Some CMTS need createAndWait(5) + active(1)
-                    self.logger.warning(f"createAndGo failed, trying createAndWait(5): {create_result.get('error')}")
+                    # Fallback: createAndWait(5)
+                    self.logger.warning(f"createAndGo failed: {create_result.get('error')}, "
+                                       f"trying createAndWait(5)")
                     create_result = await self._snmp_set(
-                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'  # 5 = createAndWait
+                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
                     )
-                    if create_result.get('success'):
-                        await self._snmp_set(
-                            f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'  # 1 = active
-                        )
-                    else:
-                        return {"success": False, "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
+                    if not create_result.get('success'):
+                        return {"success": False, 
+                                "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
                 await asyncio.sleep(0.5)
-                self.logger.info("UTSC config row created successfully")
+                self.logger.info("UTSC config entry created")
             
-            # Set all parameters on the row
-            # 1. Set trigger mode
+            # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
+            
+            # 1. Trigger mode (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}", trigger_mode, 'i')
-            # 2. Set center frequency
+            
+            # 2. Center frequency (Gauge32)
             await self._snmp_set(f"{self.OID_UTSC_CFG_CENTER_FREQ}{idx}", center_freq_hz, 'u')
-            # 3. Set span
+            
+            # 3. Span (Gauge32)
             await self._snmp_set(f"{self.OID_UTSC_CFG_SPAN}{idx}", span_hz, 'u')
-            # 4. Set number of bins
+            
+            # 4. Number of bins (Gauge32)
             await self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
-            # 5. Set output format
+            
+            # 5. Output format (INTEGER) — Cisco: only 1 or 2
             await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
-            # 6. Set window function
+            
+            # 6. Window function (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_WINDOW}{idx}", window_function, 'i')
             
-            # 7. Clamp trigger_count to E6000 range (1-10)
-            trigger_count = min(max(trigger_count, 1), 10)
+            # 7. Clamp trigger_count (1-10 on E6000, no limit on Cisco)
+            trigger_count = max(trigger_count, 1)
             
-            # 8. Auto-calculate FreeRunDuration if not explicitly set.
-            # E6000 BUG: compares raw values of RepeatPeriod and FreeRunDuration
-            # without unit conversion (ignores µs vs ms). So FreeRunDuration
-            # raw value must be >= RepeatPeriod raw value.
+            # 8. Auto-calculate FreeRunDuration if not explicitly set
             if freerun_duration_ms <= 0:
-                # Use same raw value as repeat_period — E6000 ignores the
-                # interval anyway and just captures 10 spectra as fast as it can.
-                freerun_duration_ms = repeat_period_us
-                self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms} "
-                                 f"(= RepeatPeriod raw value, E6000 compares raw)")
+                # Default: use RepeatPeriod raw value for E6000 compat, or
+                # a sensible default (5000ms = 5 seconds) for Cisco
+                freerun_duration_ms = max(repeat_period_us, 5000)
+                self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms}")
             
-            # E6000 constraint: FreeRunDuration raw value must be >= RepeatPeriod raw value
+            # Cisco constraint: RepeatPeriod must not exceed FreeRunDuration
+            # E6000 constraint: FreeRunDuration raw >= RepeatPeriod raw
             if freerun_duration_ms < repeat_period_us:
                 freerun_duration_ms = repeat_period_us
-                self.logger.warning(f"FreeRunDuration clamped to {freerun_duration_ms} (>= RepeatPeriod raw)")
+                self.logger.warning(f"FreeRunDuration clamped to {freerun_duration_ms} "
+                                   f"(>= RepeatPeriod)")
             
-            # Set FreeRunDuration FIRST (must be >= RepeatPeriod for the set to succeed)
-            result = await self._snmp_set(f"{self.OID_UTSC_CFG_FREERUN_DUR}{idx}", freerun_duration_ms, 'u')
-            self.logger.info(f"FreeRunDuration SET result for {freerun_duration_ms}: {result}")
-            # Then set RepeatPeriod
-            result = await self._snmp_set(f"{self.OID_UTSC_CFG_REPEAT_PERIOD}{idx}", repeat_period_us, 'u')
-            self.logger.info(f"RepeatPeriod SET result for {repeat_period_us}: {result}")
-            # Set TriggerCount
-            await self._snmp_set(f"{self.OID_UTSC_CFG_TRIGGER_COUNT}{idx}", trigger_count, 'u')
-            self.logger.info(f"TriggerCount={trigger_count} set (E6000 max=10)")
-            # 10. Set filename
-            await self._snmp_set(f"{self.OID_UTSC_CFG_FILENAME}{idx}", filename, 's')
-            # 11. Set destination index if > 0 - Unsigned32
+            # 9. Set FreeRunDuration FIRST (Gauge32) — must be >= RepeatPeriod
+            fr_result = await self._snmp_set(
+                f"{self.OID_UTSC_CFG_FREERUN_DUR}{idx}", freerun_duration_ms, 'u'
+            )
+            self.logger.info(f"FreeRunDuration={freerun_duration_ms}: {fr_result}")
+            
+            # 10. Set RepeatPeriod (Gauge32)
+            rp_result = await self._snmp_set(
+                f"{self.OID_UTSC_CFG_REPEAT_PERIOD}{idx}", repeat_period_us, 'u'
+            )
+            self.logger.info(f"RepeatPeriod={repeat_period_us}: {rp_result}")
+            
+            # 11. Set TriggerCount (Gauge32)
+            await self._snmp_set(
+                f"{self.OID_UTSC_CFG_TRIGGER_COUNT}{idx}", trigger_count, 'u'
+            )
+            self.logger.info(f"TriggerCount={trigger_count}")
+            
+            # 12. Set filename (OctetString) — NOT supported on Cisco cBR-8
+            fn_result = await self._snmp_set(
+                f"{self.OID_UTSC_CFG_FILENAME}{idx}", filename, 's'
+            )
+            if not fn_result.get('success'):
+                self.logger.info(f"Filename SET skipped (unsupported on Cisco): {fn_result.get('error', '')}")
+            
+            # 13. Set destination index if > 0 (Unsigned32)
             if destination_index > 0:
-                await self._snmp_set(f"{self.OID_UTSC_CFG_DEST_INDEX}{idx}", destination_index, 'u')
-            # 12. For CM MAC trigger mode
-            if trigger_mode == 6 and cm_mac_address:
-                mac_hex = self.mac_to_hex_string(cm_mac_address)
-                await self._snmp_set(f"{self.OID_UTSC_CFG_CM_MAC}{idx}", mac_hex, 'x')
-                
-                if logical_ch_ifindex:
-                    await self._snmp_set(f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex, 'i')
+                await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_DEST_INDEX}{idx}", destination_index, 'u'
+                )
             
-            # VERIFY critical parameters were actually accepted by CMTS
-            import asyncio
+            # 14. For CM MAC trigger mode (mode 7 per Cisco doc, mode 6 per E6000)
+            if trigger_mode in (6, 7) and cm_mac_address:
+                mac_hex = self.mac_to_hex_string(cm_mac_address)
+                await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_CM_MAC}{idx}", mac_hex, 'x'
+                )
+                if logical_ch_ifindex:
+                    await self._snmp_set(
+                        f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex, 'i'
+                    )
+            
+            # ===== Verify RowStatus is Active =====
             await asyncio.sleep(0.5)
+            status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
+            row_status = self._parse_get_value(status_result)
+            row_status_names = {1: "active", 2: "notInService", 3: "notReady",
+                               4: "createAndGo", 5: "createAndWait", 6: "destroy"}
+            if row_status is not None and 'No Such' not in str(row_status):
+                row_status_int = int(row_status)
+                self.logger.info(f"RowStatus after configure: {row_status_int} "
+                                f"({row_status_names.get(row_status_int, 'unknown')})")
+                if row_status_int == 3:  # notReady
+                    self.logger.warning("RowStatus=notReady — config parameters may be "
+                                       "invalid. Check center_freq and span are in valid range.")
+            else:
+                self.logger.info("RowStatus not readable (normal on some CMTS with SNMP view restrictions)")
+            
+            # VERIFY critical parameters were accepted
             verify_checks = {
-                "repeat_period_us": (self.OID_UTSC_CFG_REPEAT_PERIOD, repeat_period_us),
-                "freerun_duration_ms": (self.OID_UTSC_CFG_FREERUN_DUR, freerun_duration_ms),
-                "output_format": (self.OID_UTSC_CFG_OUTPUT_FORMAT, output_format),
-                "window_function": (self.OID_UTSC_CFG_WINDOW, window_function),
+                "trigger_mode": (self.OID_UTSC_CFG_TRIGGER_MODE, trigger_mode),
+                "center_freq_hz": (self.OID_UTSC_CFG_CENTER_FREQ, center_freq_hz),
+                "span_hz": (self.OID_UTSC_CFG_SPAN, span_hz),
             }
             verify_results = {}
             for param_name, (oid_base, expected) in verify_checks.items():
                 try:
                     read_result = await self._snmp_get(f"{oid_base}{idx}")
                     actual = self._parse_get_value(read_result)
-                    if actual is not None:
+                    if actual is not None and 'No Such' not in str(actual):
                         actual_int = int(actual)
                         match = actual_int == expected
-                        verify_results[param_name] = {"expected": expected, "actual": actual_int, "match": match}
+                        verify_results[param_name] = {
+                            "expected": expected, "actual": actual_int, "match": match
+                        }
                         if not match:
-                            self.logger.warning(f"VERIFY MISMATCH: {param_name} expected={expected} actual={actual_int}")
+                            self.logger.warning(f"VERIFY MISMATCH: {param_name} "
+                                              f"expected={expected} actual={actual_int}")
                         else:
                             self.logger.info(f"VERIFY OK: {param_name}={actual_int}")
+                    else:
+                        self.logger.info(f"VERIFY skip {param_name}: not readable")
                 except Exception as ve:
                     self.logger.warning(f"VERIFY failed for {param_name}: {ve}")
             
@@ -611,7 +749,9 @@ class CmtsUtscService:
                 "cfg_index": cfg_index,
                 "trigger_mode": trigger_mode,
                 "filename": filename,
-                "verify": verify_results
+                "row_status": row_status_names.get(int(row_status), 'unknown') if row_status and 'No Such' not in str(row_status) else None,
+                "verify": verify_results,
+                "error": None
             }
             
         except Exception as e:
@@ -669,8 +809,12 @@ class CmtsUtscService:
         self.logger.info(f"Stopping UTSC for RF port {rf_port_ifindex}")
         
         try:
-            # Set InitiateTest to false (2)
-            result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 2, 'i')
+            # Set InitiateTest to false
+            # Cisco uses 0 to stop, standard MIB uses 2 (TruthValue false)
+            # Try 0 first (Cisco), fallback to 2
+            result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 0, 'i')
+            if not result.get('success'):
+                result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 2, 'i')
             
             if not result.get('success'):
                 return {"success": False, "error": result.get('error', 'Failed to stop UTSC')}
@@ -745,7 +889,7 @@ class CmtsUtscService:
             # Get measurement status
             result = await self._snmp_get(f"{self.OID_UTSC_STATUS_MEAS}{idx}")
             value = self._parse_get_value(result)
-            if value is not None:
+            if value is not None and 'No Such' not in str(value):
                 status_value = int(value)
                 status_names = {
                     1: "OTHER", 2: "INACTIVE", 3: "BUSY", 4: "SAMPLE_READY",
