@@ -309,11 +309,28 @@ class CMTSModemService:
         self.logger.info(f"Resolved {len(if_name_map)} interface names")
 
         # ---- partial service state ----
+        # docsIf31CmtsCmRegStatusPartialSvcState is BITS { dsPartialSvc(0), usPartialSvc(1) }
+        # BITS are encoded as OctetString.  The agent may return:
+        #   - an int (0 = no partial, non-zero = partial)
+        #   - a hex string like '80' (0x80 = dsPartialSvc bit set)
+        #   - a raw UTF-8 decoded string (e.g. '\x00' for no partial, '@' for 0x40)
         partial_svc_map: dict[str, bool] = {}
         for item in raw.get(OID_PARTIAL_SVC, []):
             try:
                 idx = self._extract_index(item['oid'], OID_PARTIAL_SVC)
-                partial_svc_map[idx] = int(item['value']) > 1
+                val = item['value']
+                if isinstance(val, int):
+                    # INTEGER encoding: 0 = no partial service
+                    partial_svc_map[idx] = val != 0
+                elif isinstance(val, str) and val:
+                    # BITS encoded as string — check if any byte is non-zero
+                    try:
+                        partial_svc_map[idx] = int(val, 16) != 0
+                    except ValueError:
+                        # Raw bytes that decoded as UTF-8 (e.g. '\x00', '@')
+                        partial_svc_map[idx] = any(ord(c) != 0 for c in val)
+                else:
+                    partial_svc_map[idx] = False
             except (ValueError, TypeError):
                 pass
 

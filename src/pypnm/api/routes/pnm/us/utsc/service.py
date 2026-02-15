@@ -271,7 +271,9 @@ class CmtsUtscService:
         """
         List available RF ports for UTSC.
         
-        Scans the UTSC config table to find available RF port indexes.
+        First scans the UTSC config table for pre-existing rows.
+        If empty (e.g. Cisco cBR-8), falls back to walking ifDescr to
+        discover upstream RF channels (Cable*/Upstream*, Integrated-Cable*/US*).
         
         Returns:
             Dict with list of RF ports and their configurations
@@ -279,39 +281,92 @@ class CmtsUtscService:
         rf_ports = []
         
         try:
-            # Walk the trigger mode to find configured RF ports
+            # 1. Try UTSC config table first (works on CommScope E6000 where rows are pre-created)
             result = await self._snmp_walk(self.OID_UTSC_CFG_TRIGGER_MODE)
             
-            if not result.get('success') or not result.get('results'):
+            if result.get('success') and result.get('results'):
+                for entry in result['results']:
+                    oid_str = str(entry.get('oid', ''))
+                    
+                    # Extract RF port ifIndex and cfg index from OID suffix
+                    # Format: ...3.{rfPortIfIndex}.{cfgIndex}
+                    suffix = oid_str.split(self.OID_UTSC_CFG_TRIGGER_MODE + ".")[-1]
+                    parts = suffix.split(".")
+                    if len(parts) >= 2:
+                        rf_port_ifindex = int(parts[0])
+                        cfg_index = int(parts[1])
+                        
+                        # Get port description
+                        description = None
+                        try:
+                            desc_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{rf_port_ifindex}")
+                            desc_value = self._parse_get_value(desc_result)
+                            if desc_value:
+                                description = desc_value
+                        except Exception:
+                            pass
+                        
+                        rf_ports.append({
+                            "rf_port_ifindex": rf_port_ifindex,
+                            "cfg_index": cfg_index,
+                            "description": description
+                        })
+            
+            if rf_ports:
+                return {"success": True, "rf_ports": rf_ports}
+            
+            # 2. Fallback: discover upstream RF channels from ifDescr
+            #    Cisco cBR-8 uses "Cable<slot>/<subslot>/US<port>" or
+            #    "Integrated-Cable<slot>/<subslot>/US<port>" or
+            #    "Upstream-Cable<slot>/<subslot>" descriptions.
+            self.logger.info("UTSC config table empty — falling back to ifDescr scan for upstream RF ports")
+            import re
+            
+            descr_result = await self._snmp_walk(self.OID_IF_DESCR)
+            if not descr_result.get('success') or not descr_result.get('results'):
                 return {"success": True, "rf_ports": []}
             
-            for entry in result['results']:
-                oid_str = str(entry.get('oid', ''))
-                
-                # Extract RF port ifIndex and cfg index from OID suffix
-                # Format: ...3.{rfPortIfIndex}.{cfgIndex}
-                suffix = oid_str.split(self.OID_UTSC_CFG_TRIGGER_MODE + ".")[-1]
-                parts = suffix.split(".")
-                if len(parts) >= 2:
-                    rf_port_ifindex = int(parts[0])
-                    cfg_index = int(parts[1])
-                    
-                    # Get port description
-                    description = None
-                    try:
-                        desc_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{rf_port_ifindex}")
-                        desc_value = self._parse_get_value(desc_result)
-                        if desc_value:
-                            description = desc_value
-                    except Exception:
-                        pass
-                    
-                    rf_ports.append({
-                        "rf_port_ifindex": rf_port_ifindex,
-                        "cfg_index": cfg_index,
-                        "description": description
-                    })
+            # Patterns for upstream interfaces on various vendors
+            us_patterns = [
+                re.compile(r'Cable\d+/\d+/US\d+', re.I),                    # Cisco cBR-8
+                re.compile(r'Integrated-Cable\d+/\d+/US\d+', re.I),         # Cisco cBR-8 integrated
+                re.compile(r'Upstream-Cable\d+', re.I),                      # Cisco legacy
+                re.compile(r'us-conn\s+\d+/\d+', re.I),                      # CommScope E6000
+                re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),         # Casa / Generic
+                re.compile(r'upstream\d+', re.I),                            # Generic
+            ]
             
+            for entry in descr_result['results']:
+                oid_str = str(entry.get('oid', ''))
+                descr = str(entry.get('value', ''))
+                
+                if not descr or 'No Such' in descr:
+                    continue
+                
+                # Check if this is an upstream RF interface
+                is_upstream = any(p.search(descr) for p in us_patterns)
+                if not is_upstream:
+                    continue
+                
+                # Extract ifIndex from OID
+                try:
+                    ifindex = int(oid_str.split('.')[-1])
+                except (ValueError, IndexError):
+                    continue
+                
+                # Skip logical/virtual channels — only want physical RF ports
+                # Cisco logical channels have very high ifIndexes (>840M)
+                # and descriptions like "Cable8/0/0-upstream3"
+                if ifindex >= 840000000:
+                    continue
+                
+                rf_ports.append({
+                    "rf_port_ifindex": ifindex,
+                    "cfg_index": 1,  # Default — row will be created on configure
+                    "description": descr
+                })
+            
+            self.logger.info(f"Discovered {len(rf_ports)} upstream RF ports via ifDescr")
             return {"success": True, "rf_ports": rf_ports}
             
         except Exception as e:
@@ -434,16 +489,42 @@ class CmtsUtscService:
         self.logger.info(f"Configuring UTSC for RF port {rf_port_ifindex}, trigger_mode={trigger_mode}, auto_clear={auto_clear}")
         
         try:
-            # E6000 rows are pre-created by firmware — no need for 
-            # createAndGo or destroy. Just set parameters directly.
-            # First stop any running test so parameters can be modified
-            self.logger.info("Stopping any running UTSC test before reconfiguring...")
-            stop_result = await self.stop(rf_port_ifindex, cfg_index)
-            self.logger.info(f"Stop result: {stop_result}")
             import asyncio
-            await asyncio.sleep(1)
             
-            # Set all parameters on the existing active row
+            # Check if UTSC config row exists by reading trigger mode
+            check_result = await self._snmp_get(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}")
+            row_exists = check_result.get('success', False) and self._parse_get_value(check_result) is not None
+            
+            if row_exists:
+                # Row exists (CommScope E6000 pre-creates rows).
+                # Stop any running test so parameters can be modified.
+                self.logger.info("UTSC row exists — stopping any running test before reconfiguring...")
+                stop_result = await self.stop(rf_port_ifindex, cfg_index)
+                self.logger.info(f"Stop result: {stop_result}")
+                await asyncio.sleep(1)
+            else:
+                # Row does not exist (Cisco cBR-8, Casa, etc.)
+                # Create it with RowStatus = createAndGo(4)
+                self.logger.info(f"UTSC config row not found — creating with RowStatus=createAndGo(4)")
+                create_result = await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 4, 'i'  # 4 = createAndGo
+                )
+                if not create_result.get('success'):
+                    # Some CMTS need createAndWait(5) + active(1)
+                    self.logger.warning(f"createAndGo failed, trying createAndWait(5): {create_result.get('error')}")
+                    create_result = await self._snmp_set(
+                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'  # 5 = createAndWait
+                    )
+                    if create_result.get('success'):
+                        await self._snmp_set(
+                            f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'  # 1 = active
+                        )
+                    else:
+                        return {"success": False, "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
+                await asyncio.sleep(0.5)
+                self.logger.info("UTSC config row created successfully")
+            
+            # Set all parameters on the row
             # 1. Set trigger mode
             await self._snmp_set(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}", trigger_mode, 'i')
             # 2. Set center frequency

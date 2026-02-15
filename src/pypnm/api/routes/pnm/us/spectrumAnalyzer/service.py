@@ -474,7 +474,7 @@ class UtscRfPortDiscoveryService:
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id, command='snmp_parallel_walk',
-                params={'target_ip': self.cmts_ip, 'oids': oids, 'community': self.community, 'timeout': 30},
+                params={'ip': self.cmts_ip, 'oids': oids, 'community': self.community, 'timeout': 30},
                 timeout=timeout
             )
             result = await self.agent_manager.wait_for_task_async(task_id, timeout=timeout)
