@@ -73,7 +73,7 @@ class CableModem(CmSnmpOperation):
         Returns:
             bool: True if SNMP communication is successful, False otherwise.
         """
-        system_description = await self.getSysDescr(timeout=1, retries=1)
+        system_description = await self.getSysDescr(timeout=10, retries=2)
 
         self.logger.debug(f"SNMP.is_snmp_reachable: System Description for {system_description}, is_empty: {system_description.is_empty()}")
 
