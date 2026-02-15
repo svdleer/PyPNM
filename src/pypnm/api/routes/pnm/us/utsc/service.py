@@ -102,12 +102,6 @@ class CmtsUtscService:
     OID_UTSC_CFG_DEST_INDEX = f"{OID_UTSC_CFG_TABLE}.24"      # DestinationIndex
     OID_UTSC_CFG_NUM_AVGS = f"{OID_UTSC_CFG_TABLE}.25"        # NumAvgs
     
-    # Bulk Data Transfer (BDT) Control - required by Cisco cBR-8
-    OID_BDT_CONTROL = "1.3.6.1.4.1.4491.2.1.27.1.1.1"
-    OID_BDT_IP_ADDR_TYPE = f"{OID_BDT_CONTROL}.1.0"            # InetAddressType (1=IPv4, 2=IPv6)
-    OID_BDT_IP_ADDR = f"{OID_BDT_CONTROL}.2.0"                 # InetAddress (hex IP)
-    OID_BDT_PATH = f"{OID_BDT_CONTROL}.3.0"                    # Destination path
-    
     # UTSC Capability Table - 1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1
     OID_UTSC_CAPAB_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1"
     OID_UTSC_CAPAB_TRIGGER_MODE = f"{OID_UTSC_CAPAB_TABLE}.1"  # Supported trigger modes
@@ -456,55 +450,6 @@ class CmtsUtscService:
             self.logger.error(f"Failed to get UTSC config: {e}")
             return {"success": False, "error": str(e)}
     
-    async def configure_bdt(
-        self,
-        tftp_server_ip: str,
-        tftp_path: str = "pnm"
-    ) -> dict[str, Any]:
-        """
-        Configure Bulk Data Transfer (BDT) for PNM file transfer.
-        
-        Required by Cisco cBR-8 before UTSC captures — the guestshell IOX
-        container uses BDT to TFTP capture files to a destination server.
-        CommScope E6000 also uses BDT for remote file transfer.
-        
-        Args:
-            tftp_server_ip: TFTP server IPv4 address (e.g. "10.1.2.3")
-            tftp_path: Destination path on TFTP server (e.g. "pnm")
-            
-        Returns:
-            Dict with success status
-        """
-        self.logger.info(f"Configuring BDT: TFTP server={tftp_server_ip}, path={tftp_path}")
-        
-        try:
-            # Convert IP address to hex bytes: "10.1.2.3" -> "0A010203"
-            import ipaddress
-            ip_bytes = ipaddress.IPv4Address(tftp_server_ip).packed
-            ip_hex = ip_bytes.hex()
-            
-            # Set IP address (hex OctetString)
-            result = await self._snmp_set(self.OID_BDT_IP_ADDR, ip_hex, 'x')
-            if not result.get('success'):
-                return {"success": False, "error": f"Failed to set BDT IP: {result.get('error')}"}
-            
-            # Set destination path (string)
-            result = await self._snmp_set(self.OID_BDT_PATH, tftp_path, 's')
-            if not result.get('success'):
-                self.logger.warning(f"BDT path set failed (may not be required): {result.get('error')}")
-            
-            self.logger.info(f"BDT configured: {tftp_server_ip} -> {tftp_path}")
-            return {
-                "success": True,
-                "message": f"BDT configured: TFTP {tftp_server_ip}/{tftp_path}",
-                "tftp_server": tftp_server_ip,
-                "tftp_path": tftp_path
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Failed to configure BDT: {e}")
-            return {"success": False, "error": str(e)}
-    
     async def configure(
         self,
         rf_port_ifindex: int,
@@ -530,8 +475,7 @@ class CmtsUtscService:
         Supports both CommScope E6000 and Cisco cBR-8 CMTS:
         
         **Cisco cBR-8 workflow** (per Cisco PNM documentation):
-        1. Configure BDT (TFTP server) — call configure_bdt() first
-        2. createAndGo(4) to create config entry
+        1. createAndGo(4) to create config entry
         3. Set CenterFreq, Span, NumBins (Gauge32 type)
         4. Set FreeRunDuration (must be set for config to become Active)
         5. Verify RowStatus = active(1)

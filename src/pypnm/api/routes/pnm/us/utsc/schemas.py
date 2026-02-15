@@ -138,26 +138,6 @@ class UtscConfigureResponse(BaseModel):
     error: Optional[str] = None
 
 
-class UtscBdtConfigureRequest(BaseModel):
-    """Request to configure Bulk Data Transfer (BDT) for PNM file transfer.
-    
-    Required by Cisco cBR-8 before UTSC captures. The guestshell IOX
-    container uses BDT to TFTP capture files to a destination server.
-    """
-    cmts: CmtsSnmpConfig
-    tftp_server_ip: str = Field(..., description="TFTP server IPv4 address")
-    tftp_path: str = Field(default="pnm", description="Destination path on TFTP server")
-
-
-class UtscBdtConfigureResponse(BaseModel):
-    """Response from configuring BDT."""
-    success: bool
-    tftp_server: Optional[str] = None
-    tftp_path: Optional[str] = None
-    message: Optional[str] = None
-    error: Optional[str] = None
-
-
 class UtscStartRequest(BaseModel):
     """Request to start UTSC test."""
     cmts: CmtsSnmpConfig
