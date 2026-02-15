@@ -292,8 +292,10 @@ class CommonMeasureService(CommonMessagingService):
         ##############################################################################################
 
         status_index_channelId = await self._get_indexes_via_pnm_test_type(interface_parameters)
+        print(f'=== Index/ChannelID List: {status_index_channelId[1]} ===', flush=True)
         self.logger.info(f'{self.log_prefix} - Index/ChannelID List: {status_index_channelId[1]}')
         if status_index_channelId[0] != ServiceStatusCode.SUCCESS or status_index_channelId[1] is None:
+            print(f'=== ERROR: Unable to acquire index from ChannelID, reason: {status_index_channelId[0]} ===', flush=True)
             self.logger.error(f'{self.log_prefix} - Unable to aquire index from ChannelID, reason: {status_index_channelId[0]}')
             return self.build_send_msg(status_index_channelId[0])
 
@@ -301,7 +303,10 @@ class CommonMeasureService(CommonMessagingService):
         # This section runs through all the indexes, build PNM file, run measurement and check status
         ##############################################################################################
         index_channelId: list[tuple[InterfaceIndex, ChannelId]] = status_index_channelId[1]
-        return self.build_send_msg(await self._pnm_measure_status_and_pnm_file_transfer(index_channelId, max_wait_count))
+        print(f'=== Calling _pnm_measure_status_and_pnm_file_transfer with {len(index_channelId)} indexes ===', flush=True)
+        result = await self._pnm_measure_status_and_pnm_file_transfer(index_channelId, max_wait_count)
+        print(f'=== _pnm_measure_status_and_pnm_file_transfer result: {result} ===', flush=True)
+        return self.build_send_msg(result)
 
     def getInterfaceParameters(self,
         interface_type: DocsisIfType) -> DownstreamOfdmParameters | UpstreamOfdmaParameters:
@@ -334,10 +339,17 @@ class CommonMeasureService(CommonMessagingService):
     def is_ping_reachable(self) -> bool:
         """
         Check if the cable modem is reachable via ICMP ping.
+        When agent SNMP transport is active, skip the ping check since
+        the Docker container lacks L3 access to the modem network.
+        SNMP reachability (checked next) is a more reliable indicator.
 
         Returns:
             bool: True if the modem responds to ping, False otherwise.
         """
+        import os
+        if os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true':
+            self.logger.debug(f"{self.log_prefix} - Skipping ping check (agent transport)")
+            return True
         return self.cm.is_ping_reachable()
 
     async def is_snmp_ready(self) -> bool:
@@ -513,6 +525,8 @@ class CommonMeasureService(CommonMessagingService):
             bool: True if the file was successfully retrieved and moved; False otherwise.
         """
         method = SystemConfigSettings.retrieval_method()
+        print(f"=== Retrieval method: {method} ===", flush=True)
+        print(f"=== Config path: {SystemConfigSettings._cfg.get_config_path()} ===", flush=True)
         self.logger.info(f"{self.log_prefix} - Retrieval method: {method}")
 
         try:
@@ -642,6 +656,7 @@ class CommonMeasureService(CommonMessagingService):
                 or the measurement status did not become SAMPLE_READY).
         """
         for interface_index, channel_id in idx_channelId:
+            print(f'=== Processing interface_index={interface_index}, channel_id={channel_id} ===', flush=True)
 
             #######################################################################
             # This sets the Measurement Table/Row for the specific PNM Measurement
@@ -649,7 +664,9 @@ class CommonMeasureService(CommonMessagingService):
             ctl_measure_status:tuple[ServiceStatusCode, list[FileNameStr]] = \
                 await self._setDocsPnmCmMeasureTest(self.pnm_test_type, interface_index, channel_id)
             
+            print(f'=== _setDocsPnmCmMeasureTest result: status={ctl_measure_status[0]}, files={ctl_measure_status[1]} ===', flush=True)
             if ctl_measure_status[0] != ServiceStatusCode.SUCCESS:
+                print(f'=== ERROR: _setDocsPnmCmMeasureTest failed: {ctl_measure_status[0]} ===', flush=True)
                 return ctl_measure_status[0]
 
             pnm_filenames = ctl_measure_status[1]
@@ -658,6 +675,7 @@ class CommonMeasureService(CommonMessagingService):
             count=1
             while True:
                 cm_ctl_status:DocsPnmCmCtlStatus = await self.cm.getDocsPnmCmCtlStatus()
+                print(f"=== PNM status: {str(cm_ctl_status).upper()} - count: {count} ===", flush=True)
                 self.logger.info(f"{self.log_prefix} - PNM status: {str(cm_ctl_status).upper()} - count: {count}")
                 if cm_ctl_status == DocsPnmCmCtlStatus.TEST_IN_PROGRESS:
                     count += 1
@@ -681,6 +699,7 @@ class CommonMeasureService(CommonMessagingService):
 
             while wait_count < max_wait_count:
                 meas_status = await self.cm.getPnmMeasurementStatus(self.pnm_test_type, extract_idx(interface_index))
+                print(f"=== MeasureStatus: {meas_status.name} (wait_count={wait_count}) ===", flush=True)
                 self.logger.info(f"{self.log_prefix} - MeasureStatus: {meas_status.name}")
                 if meas_status == MeasStatusType.SAMPLE_READY:
                     break
@@ -1233,13 +1252,48 @@ class CommonMeasureService(CommonMessagingService):
                 inactivity_timeout          = self.extra_options.get("inactivity_timeout", 100),
                 first_segment_center_freq   = self.extra_options.get("first_segment_center_freq", 300_000_000),
                 last_segment_center_freq    = self.extra_options.get("last_segment_center_freq", 993_000_000),
-                segment_freq_span           = self.extra_options.get("segment_freq_span", 1_000_000),
+                segment_freq_span           = self.extra_options.get("segment_freq_span", 1_000_000),  # Will be adjusted for vendor
                 num_bins_per_segment        = self.extra_options.get("num_bins_per_segment", 256),
                 noise_bw                    = self.extra_options.get("noise_bw", 110),
                 window_function             = self.extra_options.get("window_function", WindowFunction.HANN),
                 num_averages                = self.extra_options.get("num_averages", 1),
                 spectrum_retrieval_type     = self.extra_options.get("spectrum_retrieval_type",SpectrumRetrievalType.FILE),
             )
+
+        # Vendor-aware span adjustment: Some modems (e.g., Ubee) fail with 1 MHz span
+        # (919 segments) but work with 2 MHz span (460 segments).
+        # Use sysDescr SNMP call for reliable vendor detection.
+        try:
+            from pypnm.lib.vendor_capabilities import (
+                get_vendor_from_sysdescr,
+                _VENDOR_CAPABILITIES,
+            )
+            
+            sys_descr = await self.cm.getSysDescr()
+            vendor = get_vendor_from_sysdescr(str(sys_descr))
+            caps = _VENDOR_CAPABILITIES.get(vendor, _VENDOR_CAPABILITIES['Unknown'])
+            
+            # Calculate recommended span based on vendor capabilities
+            total_span = capture_parameter.last_segment_center_freq - capture_parameter.first_segment_center_freq
+            recommended_span = caps.min_spectrum_span_hz
+            
+            # Also ensure we don't exceed max segments
+            if total_span > 0 and caps.max_spectrum_segments > 0:
+                min_span_for_segments = total_span // caps.max_spectrum_segments
+                if min_span_for_segments > recommended_span:
+                    # Round up to nearest MHz
+                    recommended_span = ((min_span_for_segments + 999_999) // 1_000_000) * 1_000_000
+            
+            if recommended_span > capture_parameter.segment_freq_span:
+                self.logger.info(
+                    f"{self.log_prefix} - {vendor} modem detected (sysDescr), adjusting span from "
+                    f"{capture_parameter.segment_freq_span / 1_000_000:.1f} MHz to {recommended_span / 1_000_000:.1f} MHz"
+                )
+                capture_parameter = capture_parameter.model_copy(
+                    update={"segment_freq_span": recommended_span}
+                )
+        except Exception as e:
+            self.logger.warning(f"{self.log_prefix} - Could not apply vendor-specific settings: {e}")
 
         if capture_parameter.spectrum_retrieval_type == SpectrumRetrievalType.SNMP:
             self.logger.info(f"{self.log_prefix} - SPECTRUM-ANALYZER - SNMP-AMPLITUDE-DATA-RETURN")
@@ -1262,6 +1316,9 @@ class CommonMeasureService(CommonMessagingService):
             docsIf3CmSpectrumAnalysisCtrlCmdEnable                      =   Snmp_v2c.TRUE,
             docsIf3CmSpectrumAnalysisCtrlCmdFileName                    =   filename,
             docsIf3CmSpectrumAnalysisCtrlCmdFileEnable                  =   ctl_cmd_filename,)
+
+        # Apply vendor-specific settings (Ubee needs 2 MHz minimum segment span)
+        spectrum_cmd.apply_vendor_settings(str(self.cm.get_mac_address))
 
         # Issue the SNMP SET for the control-command. The downstream logic
         # (not shown here) will branch to either:

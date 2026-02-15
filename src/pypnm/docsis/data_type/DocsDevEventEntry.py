@@ -46,6 +46,28 @@ class DocsDevEventEntry:
         }
 
         try:
+            # Try bulk_get if available (agent transport)
+            if hasattr(self.snmp, 'bulk_get'):
+                oids = [f"{COMPILED_OIDS[oid_key]}.{self.index}" for oid_key, _ in fields.values()]
+                bulk_results = await self.snmp.bulk_get(oids)
+                
+                if bulk_results:
+                    for attr, (oid_key, transform) in fields.items():
+                        oid = f"{COMPILED_OIDS[oid_key]}.{self.index}"
+                        result = bulk_results.get(oid)
+                        if result:
+                            value_result = Snmp_v2c.get_result_value(result)
+                            if isinstance(value_result, str) and value_result.startswith("0x"):
+                                value_result = unhexlify(value_result[2:])
+                            if value_result:
+                                setattr(self, attr, transform(value_result))
+                            else:
+                                setattr(self, attr, None)
+                        else:
+                            setattr(self, attr, None)
+                    return True
+            
+            # Fallback to individual GET requests
             for attr, (oid_key, transform) in fields.items():
                 try:
                     result = await self.snmp.get(f"{COMPILED_OIDS[oid_key]}.{self.index}")

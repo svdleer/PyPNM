@@ -40,6 +40,11 @@ class InterfaceStatsRouter:
             """
             Retrieve DOCSIS interface statistics grouped by interface type.
 
+            **Note**: This endpoint queries multiple interface types and may be slow
+            over agent transport. For faster results, use specific channel endpoints:
+            - `/docs/if30/ds/scqam/chan/stats` - SC-QAM downstream channels
+            - `/docs/if30/us/atdma/chan/stats` - ATDMA upstream channels
+
             [API Guide - Retrieve DOCSIS Interface Statistics](https://github.com/PyPNMApps/PyPNM/blob/main/docs/api/fast-api/single/pnm/interface/stats.md)
             """
             mac: MacAddressStr = request.cable_modem.mac_address
@@ -55,13 +60,27 @@ class InterfaceStatsRouter:
                 self.logger.error(msg)
                 return SnmpResponse( mac_address=mac, status=status, message=msg)
 
-            service = InterfaceStatsService(mac_address=mac, ip_address=ip, write_community=community)
-            data: dict[str, list[dict]] = await service.get_interface_stat_entries()
+            try:
+                # Set a reasonable timeout for the operation
+                import asyncio
+                service = InterfaceStatsService(mac_address=mac, ip_address=ip, write_community=community)
+                data: dict[str, list[dict]] = await asyncio.wait_for(
+                    service.get_interface_stat_entries(), 
+                    timeout=25.0  # 25 second timeout
+                )
 
-            return SnmpResponse(mac_address=mac,
-                                status=ServiceStatusCode.SUCCESS,
-                                message="Interface statistics retrieved successfully",
-                                results=data)
+                return SnmpResponse(mac_address=mac,
+                                    status=ServiceStatusCode.SUCCESS,
+                                    message="Interface statistics retrieved successfully",
+                                    results=data)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout retrieving interface stats for {mac}")
+                return SnmpResponse(
+                    mac_address=mac,
+                    status=ServiceStatusCode.ERROR,
+                    message="Request timed out. Consider using specific channel endpoints for faster results.",
+                    results={}
+                )
 
 # Required for dynamic auto-registration
 router = InterfaceStatsRouter().router

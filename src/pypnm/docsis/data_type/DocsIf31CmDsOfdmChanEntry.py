@@ -124,9 +124,15 @@ class DocsIf31CmDsOfdmChanChannelEntry(BaseModel):
             logger.warning("No OFDM channel indices provided.")
             return results
 
-        for i in indices:
-            entry = await cls.from_snmp(i, snmp)
-            if entry.entry.docsIf31CmDsOfdmChanChannelId != INVALID_CHANNEL_ID:
+        # Parallelize from_snmp calls for all indices
+        import asyncio
+        tasks = [cls.from_snmp(i, snmp) for i in indices]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for i, entry in zip(indices, responses):
+            if isinstance(entry, Exception):
+                logger.warning(f"Failed to retrieve OFDM channel {i}: {entry}")
+            elif entry.entry.docsIf31CmDsOfdmChanChannelId != INVALID_CHANNEL_ID:
                 results.append(entry)
             else:
                 logger.warning(f"Failed to retrieve OFDM channel {i}: invalid channel ID")

@@ -31,7 +31,7 @@ from pypnm.api.routes.common.extended.common_messaging_service import MessageRes
 from pypnm.api.routes.common.extended.common_process_service import CommonProcessService
 from pypnm.api.routes.common.service.status_codes import ServiceStatusCode
 from pypnm.api.routes.docs.pnm.files.service import PnmFileService
-from pypnm.api.routes.docs.pnm.us.ofdma.pre_equalization.service import (
+from pypnm.api.routes.pnm.us.ofdma.pre_equalization.service import (
     CmUsOfdmaPreEqService,
 )
 from pypnm.docsis.cable_modem import CableModem
@@ -45,7 +45,7 @@ from pypnm.lib.types import InetAddressStr, MacAddressStr, Path
 
 class UsOfdmaPreEqualizationRouter:
     def __init__(self) -> None:
-        prefix = "/docs/pnm/us/ofdma"
+        prefix = "/pnm/us/ofdma"
         self.base_endpoint = "/preEqualization"
         self.router = APIRouter(
             prefix=prefix, tags=["PNM Operations - Upstream OFDMA Pre-Equalization"])

@@ -58,7 +58,7 @@ class AnalysisRptMatplotConfig(BaseModel):
 
     Extend this model in subclasses to add specific plot configuration options.
     """
-    theme: ThemeType = Field(default="dark", description="")
+    theme: ThemeType = Field(default="light", description="Plot theme: 'light' or 'dark'")
 
 class AnalysisReport(ABC):
     '''

@@ -15,8 +15,10 @@ class ConfigManager:
     """
     Manages application configuration stored in JSON format.
 
-    Loads configuration two levels above this file:
-    Example: src/pypnm/system.json
+    Config path resolution order:
+    1. Explicit config_path argument
+    2. PYPNM_CONFIG_PATH environment variable
+    3. Default: src/pypnm/settings/system.json
     """
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -27,6 +29,8 @@ class ConfigManager:
 
         if config_path:
             self._config_path = config_path
+        elif os.environ.get("PYPNM_CONFIG_PATH"):
+            self._config_path = os.environ["PYPNM_CONFIG_PATH"]
         else:
             # Two folders up from this file
             current_dir = os.path.dirname(os.path.abspath(__file__))

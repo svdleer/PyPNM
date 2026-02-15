@@ -8,6 +8,9 @@ from __future__ import annotations
 # Do not modify manually. Generated on: 2025-07-09T22:12:14.350659
 
 COMPILED_OIDS = {
+    # Standard SNMP identifiers
+    "mib-2": "1.3.6.1.2.1",
+    
     "ACSPolicyIndex": "1.3.6.1.4.1.4526.3.1.2.9",
     "CPULoadingOverThresholdTrap": "1.3.6.1.4.1.4526.3.1.6.43.1",
     "CPULoadingTrap": "1.3.6.1.4.1.4526.3.1.6.43",

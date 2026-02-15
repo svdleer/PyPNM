@@ -190,7 +190,7 @@ class DsHistrogramReport(AnalysisReport):
                 theme       =   self.getAnalysisRptMatplotConfig().theme,
             )
 
-            mgr = MatplotManager(default_cfg=cfg)
+            mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
             mgr.plot_histogram(
                 data        =   cast(ArrayLike, bin_indices),
                 filename    =   png,

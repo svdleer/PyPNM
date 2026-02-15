@@ -159,13 +159,14 @@ class RxMerAnalysisReport(AnalysisReport):
                     grid            =   True,
                     legend          =   True,
                     transparent     =   False,
-                    theme           =   self.getAnalysisRptMatplotConfig().theme,
+                    theme           =   False,  # Light theme to match US RxMER
+                    line_colors     =   ["#36A2EB", "#FF6384"],  # Match US RxMER blue for main line, pink for regression
                 )
 
                 multi = self.create_png_fname(tags=[str(channel_id), 'rxmer'])
                 self.logger.debug("Creating MatPlot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_multi_line(filename=multi)
 
                 out.append(mgr)
@@ -188,13 +189,14 @@ class RxMerAnalysisReport(AnalysisReport):
                         grid        =   True,
                         legend      =   False,
                         transparent =   False,
-                        theme       =   self.getAnalysisRptMatplotConfig().theme,
+                        theme       =   False,  # Light theme to match US RxMER
+                        line_color  =   "#36A2EB",  # Match US RxMER blue
                     )
 
                 mod_count_fname = self.create_png_fname(tags=[str(channel_id), 'modulation_count'])
                 self.logger.debug("Creating MatPlot: %s for channel: %s", mod_count_fname, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=mod_count_fname)
 
                 out.append(mgr)
@@ -222,13 +224,14 @@ class RxMerAnalysisReport(AnalysisReport):
                     grid          = True,
                     legend        = True,
                     transparent   = False,
-                    theme         = self.getAnalysisRptMatplotConfig().theme,
+                    theme         = False,  # Light theme to match US RxMER
+                    line_color    = "#36A2EB",  # Match US RxMER blue
                 )
 
                 signal_aggregate_fname = self.create_png_fname(tags=['signal_aggregate'])
                 self.logger.debug(f"Creating MatPlot: {signal_aggregate_fname} for aggregated RxMER capture")
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(
                     filename    =   signal_aggregate_fname,
                     label       =   "Aggregated RxMER"
