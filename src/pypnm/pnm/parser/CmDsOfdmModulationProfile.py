@@ -15,6 +15,8 @@ from pypnm.lib.types import FrequencySeriesHz, ProfileId
 from pypnm.pnm.parser.pnm_file_type import PnmFileType
 from pypnm.pnm.parser.pnm_header import PnmHeader
 
+logger = logging.getLogger(__name__)
+
 # TODO: Need to fix circular import
 if TYPE_CHECKING:
     from pypnm.pnm.parser.model.parser_rtn_models import CmDsOfdmModulationProfileModel
@@ -162,15 +164,23 @@ class CmDsOfdmModulationProfile(PnmHeader):
             try:
                 hdr_fmt = ">BH"
                 hdr_sz = calcsize(hdr_fmt)
+                if offset + hdr_sz > len(blob):
+                    break  # Not enough data for header - stop parsing
                 profile_id, length = unpack(hdr_fmt, blob[offset:offset + hdr_sz])
                 start = offset + hdr_sz
                 end = start + length
                 if end > len(blob):
-                    raise ValueError(f"Profile payload overruns buffer (offset={offset}, length={length})")
+                    logger.warning(
+                        f"Profile {profile_id} payload overruns buffer "
+                        f"(offset={offset}, length={length}, remaining={len(blob) - start}). "
+                        f"Skipping remaining profiles."
+                    )
+                    break  # Truncated data - return what we have
                 payload = blob[start:end]
                 offset = end
             except Exception as e:
-                raise ValueError(f"Failed to read profile header at offset {offset}: {e}") from e
+                logger.warning(f"Failed to read profile header at offset {offset}: {e}")
+                break  # Stop parsing on error, return what we have
 
             # Decode payload
             pos = 0
