@@ -584,20 +584,15 @@ class CmtsUtscService:
                          and 'No Such' not in str(check_value))
             
             if row_exists:
-                # Row exists (CommScope E6000 pre-creates rows, or Cisco with
-                # existing config). Stop any running test before reconfiguring.
+                # Row exists (CommScope E6000 pre-creates rows, Cisco cBR-8
+                # also pre-creates rows for each us-conn port).
+                # Stop any running test so parameters can be modified in-place.
                 self.logger.info("UTSC row exists — stopping any running test...")
                 stop_result = await self.stop(rf_port_ifindex, cfg_index)
                 self.logger.info(f"Stop result: {stop_result}")
-                
-                if auto_clear:
-                    # Cisco: destroy + recreate to ensure clean state
-                    self.logger.info("Auto-clear: destroying existing config entry...")
-                    await self._snmp_set(
-                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i'  # 6 = destroy
-                    )
-                    await asyncio.sleep(1)
-                    row_exists = False  # Will be recreated below
+                await asyncio.sleep(0.5)
+                # Note: Do NOT destroy+recreate — Cisco cBR-8 pre-creates rows
+                # and will reject createAndGo after destroy. Just modify in-place.
             
             if not row_exists:
                 # Create config entry with RowStatus = createAndGo(4)
