@@ -460,7 +460,7 @@ class CmtsUtscService:
         center_freq_hz: int = 30000000,
         span_hz: int = 80000000,
         num_bins: int = 800,
-        output_format: int = 2,
+        output_format: Optional[int] = None,  # None = auto-detect
         window_function: int = 2,
         repeat_period_us: int = 50000,
         freerun_duration_ms: int = 0,  # 0 = auto-calculate
@@ -500,7 +500,8 @@ class CmtsUtscService:
             center_freq_hz: Center frequency in Hz (default 30MHz)
             span_hz: Frequency span in Hz
             num_bins: Number of FFT bins (800)
-            output_format: 2=fftPower (Cisco), 5=fftAmplitude (E6000)
+            output_format: Output format (None=auto-detect, 1=timeIq, 2=fftPower, 
+                          5=fftAmplitude). Auto-detection queries CMTS capabilities.
             window_function: 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming
             repeat_period_us: Repeat period in microseconds (default 50000=50ms)
             freerun_duration_ms: Free run duration in ms (0=auto-calculate)
@@ -519,6 +520,23 @@ class CmtsUtscService:
         
         try:
             import asyncio
+            
+            # Auto-detect output format if not specified
+            if output_format is None or output_format == 0:
+                self.logger.info("Auto-detecting supported output format...")
+                caps = await self.get_capabilities(rf_port_ifindex)
+                
+                # Try to parse capabilities to determine best format
+                # Prefer FFT_AMPLITUDE(5) if available, else FFT_POWER(2)
+                if caps.get('success') and 'output_formats_bits' in caps:
+                    # For now, use FFT_AMPLITUDE(5) if E6000, else FFT_POWER(2)
+                    # TODO: Parse BITS field properly
+                    self.logger.info(f"Capabilities: {caps}")
+                    output_format = 5  # Try FFT_AMPLITUDE first
+                else:
+                    # Fallback: use FFT_POWER(2) - works on both vendors
+                    self.logger.info("Capability query failed, using FFT_POWER(2) as fallback")
+                    output_format = 2
             
             # Check if UTSC config row exists by reading trigger mode
             check_result = await self._snmp_get(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}")
@@ -573,8 +591,13 @@ class CmtsUtscService:
             # 4. Number of bins (Gauge32)
             await self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
             
-            # 5. Output format (INTEGER) — Cisco: only 1 or 2
-            await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
+            # 5. Output format (INTEGER) — Cisco: only 1 or 2, E6000: all formats
+            format_result = await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
+            if not format_result.get('success') and output_format == 5:
+                # FFT_AMPLITUDE not supported (Cisco), fallback to FFT_POWER
+                self.logger.warning(f"Output format {output_format} not supported, falling back to FFT_POWER(2)")
+                output_format = 2
+                await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
             
             # 6. Window function (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_WINDOW}{idx}", window_function, 'i')
