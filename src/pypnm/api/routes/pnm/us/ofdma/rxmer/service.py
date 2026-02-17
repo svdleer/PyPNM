@@ -310,17 +310,23 @@ class CmtsUsOfdmaRxMerService:
             
             for entry in result['results']:
                 oid_str = str(entry.get('oid', ''))
+                value = str(entry.get('value', ''))
                 
                 # OID format: ...1.2.<cmIndex>.<ofdmaIfIndex>
+                # Value is timing offset (0 means no OFDMA or not yet synchronized)
                 if f".{cm_index}." in oid_str:
                     parts = oid_str.split(".")
                     for i, part in enumerate(parts):
                         if part == str(cm_index) and i + 1 < len(parts):
                             ofdma_ifindex = int(parts[i + 1])
-                            # OFDMA ifindexes are typically in the 843087xxx range
-                            if ofdma_ifindex >= 843087000:
-                                self.logger.info(f"Found OFDMA ifIndex: {ofdma_ifindex}")
-                                return ofdma_ifindex
+                            # Check if value is non-zero (indicates active OFDMA channel)
+                            try:
+                                timing_offset = int(value)
+                                if timing_offset > 0:
+                                    self.logger.info(f"Found OFDMA ifIndex: {ofdma_ifindex} (timing offset: {timing_offset})")
+                                    return ofdma_ifindex
+                            except (ValueError, TypeError):
+                                pass
             
             self.logger.warning(f"No OFDMA channel found for CM index {cm_index}")
             return None
