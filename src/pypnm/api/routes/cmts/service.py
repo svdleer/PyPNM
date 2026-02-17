@@ -487,9 +487,15 @@ class CMTSModemService:
                 if len(parts) >= 2:
                     cm_idx = parts[0]
                     ofdma_ifidx = int(parts[1])
-                    if cm_idx in modem_indexes and ofdma_ifidx >= 840000000:
-                        ofdma_if_map[cm_idx] = ofdma_ifidx
-                        ofdma_ifindexes.add(ofdma_ifidx)
+                    # Check if timing offset > 0 (indicates active OFDMA channel)
+                    # Cisco uses ifIndexes like 488334, CommScope uses 843087xxx
+                    try:
+                        timing_offset = int(value)
+                        if cm_idx in modem_indexes and timing_offset > 0:
+                            ofdma_if_map[cm_idx] = ofdma_ifidx
+                            ofdma_ifindexes.add(ofdma_ifidx)
+                    except (ValueError, TypeError):
+                        pass
             except:
                 pass
         
