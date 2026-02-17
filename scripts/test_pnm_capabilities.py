@@ -73,7 +73,7 @@ SNMP_WRITE = CONFIG['snmp_write']
 
 # SNMP remote execution via agent container
 SNMP_PREFIX = (
-    'ssh access-engineering.nl '
+    'ssh labthingy '
     '"docker exec pypnm-agent-lab {cmd}"'
 )
 

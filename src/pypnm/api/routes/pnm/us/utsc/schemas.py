@@ -112,7 +112,7 @@ class UtscConfigureRequest(BaseModel):
     num_bins: int = Field(default=800, description="Number of FFT bins")
     
     # Output settings
-    output_format: int = Field(default=2, ge=1, le=6, description="Output format: 1=timeIq, 2=fftPower (Cisco+E6000), 3=rawAdc, 4=fftIq, 5=fftAmplitude (E6000), 6=fftDb")
+    output_format: Optional[int] = Field(None, ge=0, le=6, description="Output format: 0=auto-detect (tries 5 then 2), 1=timeIq, 2=fftPower (Cisco+E6000), 3=rawAdc, 4=fftIq, 5=fftAmplitude (E6000), 6=fftDb")
     window_function: int = Field(default=2, ge=1, le=8, description="Window: 1=other, 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming (Cisco supports 2-5 only)")
     
     # Timing settings

@@ -131,7 +131,7 @@ POLL_TIMEOUT = 120
 
 # SNMP remote execution
 SNMP_PREFIX = (
-    'ssh access-engineering.nl '
+    'ssh labthingy'
     '"docker exec pypnm-agent-lab {cmd}"'
 )
 
