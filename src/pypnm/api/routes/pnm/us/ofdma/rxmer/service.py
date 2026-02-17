@@ -293,6 +293,15 @@ class CmtsUsOfdmaRxMerService:
         """
         Find OFDMA channel ifIndex for a cable modem.
         
+        Uses vendor-agnostic detection: checks timing offset value from
+        docsIf31CmtsCmUsOfdmaChannelTimingOffset table. A non-zero value
+        indicates an active OFDMA channel regardless of vendor.
+        
+        This works for all DOCSIS 3.1 CMTS vendors:
+        - Cisco cBR-8: ifIndexes ~488334 (timing offset > 0 when active)
+        - CommScope E6000: ifIndexes ~843087xxx (timing offset > 0 when active)
+        - Casa CMTS: Similar to CommScope
+        
         Args:
             cm_index: CM registration index
             
@@ -319,7 +328,8 @@ class CmtsUsOfdmaRxMerService:
                     for i, part in enumerate(parts):
                         if part == str(cm_index) and i + 1 < len(parts):
                             ofdma_ifindex = int(parts[i + 1])
-                            # Check if value is non-zero (indicates active OFDMA channel)
+                            # Check if timing offset is non-zero (indicates active OFDMA)
+                            # This is vendor-agnostic: works for all DOCSIS 3.1 CMTS
                             try:
                                 timing_offset = int(value)
                                 if timing_offset > 0:

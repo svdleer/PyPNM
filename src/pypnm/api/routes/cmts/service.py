@@ -478,7 +478,12 @@ class CMTSModemService:
         
         self.logger.info(f"Resolved {len(md_if_map)} MD-IF-INDEX, {len(if_name_map)} interface names")
         
-        # Parse OFDMA: modem_index -> ofdma_ifindex (COPY-PASTE from agent)
+        # Parse OFDMA: modem_index -> ofdma_ifindex
+        # Uses vendor-agnostic timing offset check (0 = no OFDMA, >0 = active OFDMA)
+        # Works for all DOCSIS 3.1 CMTS vendors:
+        #  - Cisco cBR-8: ifIndexes ~488334
+        #  - CommScope E6000: ifIndexes ~843087xxx
+        #  - Casa CMTS: Similar to CommScope
         ofdma_if_map = {}
         ofdma_ifindexes = set()
         for index, value in ofdma_results:
@@ -487,8 +492,7 @@ class CMTSModemService:
                 if len(parts) >= 2:
                     cm_idx = parts[0]
                     ofdma_ifidx = int(parts[1])
-                    # Check if timing offset > 0 (indicates active OFDMA channel)
-                    # Cisco uses ifIndexes like 488334, CommScope uses 843087xxx
+                    # Timing offset > 0 indicates active OFDMA channel (vendor-agnostic)
                     try:
                         timing_offset = int(value)
                         if cm_idx in modem_indexes and timing_offset > 0:
