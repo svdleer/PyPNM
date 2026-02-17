@@ -579,7 +579,7 @@ class CmtsUtscService:
             await self._snmp_set(f"{self.OID_UTSC_CFG_SPAN}{idx}", span_hz, 'u')
             
             # 4. Number of bins (Gauge32)
-            await> self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
+            await self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
             
             # 5. Output format (INTEGER) — Cisco: only 1 or 2, E6000: all formats
             format_result = await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
