@@ -523,20 +523,10 @@ class CmtsUtscService:
             
             # Auto-detect output format if not specified
             if output_format is None or output_format == 0:
-                self.logger.info("Auto-detecting supported output format...")
-                caps = await self.get_capabilities(rf_port_ifindex)
-                
-                # Try to parse capabilities to determine best format
-                # Prefer FFT_AMPLITUDE(5) if available, else FFT_POWER(2)
-                if caps.get('success') and 'output_formats_bits' in caps:
-                    # For now, use FFT_AMPLITUDE(5) if E6000, else FFT_POWER(2)
-                    # TODO: Parse BITS field properly
-                    self.logger.info(f"Capabilities: {caps}")
-                    output_format = 5  # Try FFT_AMPLITUDE first
-                else:
-                    # Fallback: use FFT_POWER(2) - works on both vendors
-                    self.logger.info("Capability query failed, using FFT_POWER(2) as fallback")
-                    output_format = 2
+                self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
+                # Try FFT_AMPLITUDE(5) first (E6000 supports it)
+                # If SET fails, will fallback to FFT_POWER(2) below
+                output_format = 5
             
             # Check if UTSC config row exists by reading trigger mode
             check_result = await self._snmp_get(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}")
