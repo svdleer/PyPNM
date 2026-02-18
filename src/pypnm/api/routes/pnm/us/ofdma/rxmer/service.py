@@ -213,19 +213,37 @@ class CmtsUsOfdmaRxMerService:
         Agent returns either:
         - {'success': True, 'output': 'OID = value'}
         - {'success': True, 'results': [{'oid': ..., 'value': ...}]}
+        
+        Returns None for SNMP error strings such as 'No Such Instance',
+        'No Such Object', or 'No more variables' so callers always receive
+        either a real value or None.
         """
+        _SNMP_ERROR_STRINGS = (
+            'no such instance',
+            'no such object',
+            'no more variables',
+            'end of mib view',
+        )
+
         if not result.get('success'):
             return None
-        
+
         # Try results array first (walk-style response)
         if result.get('results'):
-            return str(result['results'][0].get('value', ''))
-        
+            value = str(result['results'][0].get('value', ''))
+            if value.lower().startswith(_SNMP_ERROR_STRINGS):
+                return None
+            return value
+
         # Parse output string (get-style response)
         output = result.get('output', '')
         if ' = ' in output:
-            return output.split(' = ', 1)[1].strip()
-        return output.strip() if output else None
+            value = output.split(' = ', 1)[1].strip()
+        else:
+            value = output.strip()
+        if not value or value.lower().startswith(_SNMP_ERROR_STRINGS):
+            return None
+        return value
     
     @staticmethod
     def normalize_mac(mac_address: str) -> str:
@@ -469,8 +487,26 @@ class CmtsUsOfdmaRxMerService:
             
             if value is None:
                 return {"success": False, "error": result.get('error', 'No response from CMTS')}
-            
-            status_value = int(value)
+
+            # Guard against SNMP "No Such Instance" strings (e.g. Cisco cBR-8
+            # returns a text error string instead of None when the row does not
+            # exist yet — treat it as INACTIVE so the caller can retry)
+            try:
+                status_value = int(value)
+            except (ValueError, TypeError):
+                self.logger.warning(
+                    f"US RxMER status OID returned non-integer: {value!r} "
+                    f"(treating as INACTIVE)"
+                )
+                return {
+                    "success": True,
+                    "ofdma_ifindex": ofdma_ifindex,
+                    "meas_status": MeasStatus.INACTIVE,
+                    "meas_status_name": "INACTIVE",
+                    "is_ready": False,
+                    "is_busy": False,
+                    "is_error": False,
+                }
             status_name = MeasStatus(status_value).name if status_value in [e.value for e in MeasStatus] else "unknown"
             
             response = {
