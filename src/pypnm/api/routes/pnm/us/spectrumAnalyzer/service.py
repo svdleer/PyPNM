@@ -20,11 +20,21 @@ class CmtsUtscService:
     All SNMP operations are routed through the agent.
     """
     
+    # docsPnmBulkDataTransferCfgTable (E6000 CER I-CCAP User Guide Release 13.0)
+    # Index: DestIndex (Unsigned32, key)
+    # .3 = DestHostIpAddrType (InetAddressType: 1=IPv4)
+    # .4 = DestHostIpAddress  (InetAddress: 4-byte hex for IPv4)
+    # .5 = DestPort           (Unsigned32, default 69)
+    # .7 = Protocol           (INTEGER: 1=tftp)
+    # .8 = LocalStore         (TruthValue: 1=true, 2=false)
+    # .9 = RowStatus          (RowStatus: 4=createAndGo, 1=active)
+    BULK_DEST_CFG_BASE = "1.3.6.1.4.1.4491.2.1.27.1.2.1"
+
     # Bulk Data Transfer Configuration
     BULK_UPLOAD_CONTROL = "1.3.6.1.4.1.4491.2.1.27.1.1.1.4"
     BULK_DEST_PATH = "1.3.6.1.4.1.4491.2.1.27.1.1.1.3"
     BULK_CFG_BASE = "1.3.6.1.4.1.4491.2.1.27.1.1.3.1.1"
-    
+
     # UTSC Configuration (correct OIDs from DOCS-PNM-MIB)
     UTSC_CFG_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1"
     UTSC_CTRL_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1"
@@ -154,6 +164,52 @@ class CmtsUtscService:
         oid = f"{self.UTSC_CFG_BASE}.21{idx}"  # docsPnmCmtsUtscCfgStatus (RowStatus is field .21)
         result = await self._safe_snmp_get(oid, f"Check row exists for {idx}")
         return self._parse_get_value(result) is not None
+
+    async def _setup_bulk_destination(self, dest_index: int, tftp_ip: str, port: int = 69) -> None:
+        """Set TFTP destination IP in docsPnmBulkDataTransferCfgTable.
+
+        Per E6000 CER I-CCAP User Guide Release 13.0:
+        - .3 = DestHostIpAddrType (1 = IPv4)
+        - .4 = DestHostIpAddress  (4-byte hex string, e.g. 0xAC104B12)
+        - .5 = DestPort           (default 69)
+        - .7 = Protocol           (1 = tftp)
+        - .8 = LocalStore         (2 = false — upload only, preferred)
+        - .9 = RowStatus          (createAndGo=4 or active=1)
+        """
+        idx = f".{dest_index}"
+        base = self.BULK_DEST_CFG_BASE
+
+        # Convert IP to 4-byte hex string for InetAddress (e.g. "172.22.147.18" → 0xAC169312)
+        try:
+            ip_parts = [int(x) for x in tftp_ip.split('.')]
+            ip_hex = ''.join(f'{b:02x}' for b in ip_parts)
+        except Exception as e:
+            self.logger.error(f"Invalid TFTP IP {tftp_ip}: {e}")
+            return
+
+        self.logger.info(f"Setting bulk destination {dest_index} → {tftp_ip}:{port} (hex: {ip_hex})")
+
+        # Check current RowStatus to decide createAndGo vs active
+        row_oid = f"{base}.9{idx}"
+        row_result = await self._safe_snmp_get(row_oid, f"BulkDest RowStatus check")
+        row_status = self._parse_get_int(row_result)
+
+        if row_status in (1,):  # active — update address directly
+            await self._safe_snmp_set(f"{base}.3{idx}", 1, 'i', f"BulkDest AddrType=IPv4")
+            await self._safe_snmp_set(f"{base}.4{idx}", f"0x{ip_hex}", 'x', f"BulkDest IP={tftp_ip}")
+            await self._safe_snmp_set(f"{base}.5{idx}", port, 'u', f"BulkDest Port={port}")
+            self.logger.info(f"Updated existing bulk destination {dest_index} → {tftp_ip}")
+        else:
+            # Row does not exist — createAndWait first, then set values, then activate
+            await self._safe_snmp_set(f"{base}.9{idx}", 5, 'i', "BulkDest RowStatus=createAndWait")
+            await self._safe_snmp_set(f"{base}.3{idx}", 1, 'i', f"BulkDest AddrType=IPv4")
+            await self._safe_snmp_set(f"{base}.4{idx}", f"0x{ip_hex}", 'x', f"BulkDest IP={tftp_ip}")
+            await self._safe_snmp_set(f"{base}.5{idx}", port, 'u', f"BulkDest Port={port}")
+            await self._safe_snmp_set(f"{base}.7{idx}", 1, 'i', "BulkDest Protocol=tftp")
+            await self._safe_snmp_set(f"{base}.8{idx}", 2, 'i', "BulkDest LocalStore=false")
+            await self._safe_snmp_set(f"{base}.9{idx}", 1, 'i', "BulkDest RowStatus=active")
+            self.logger.info(f"Created bulk destination {dest_index} → {tftp_ip}")
+
     
     async def reset_port_state(self) -> dict:
         """Reset UTSC port to a clean state before configuring.
@@ -306,7 +362,11 @@ class CmtsUtscService:
             elif trigger_mode == 2:
                 self.logger.info("Skipping TriggerCount for FreeRunning mode (parameter ignored by CMTS)")
             
-            # 7. Set DestinationIndex = 1 (use pre-configured TFTP destination)
+            # 7. Set TFTP destination IP in bulk data transfer table, then set DestinationIndex
+            # Per E6000 CER guide: DestHostIpAddrType/DestHostIpAddress must be configured
+            # before DestinationIndex can be used (default is '00000000'h = not set)
+            self.logger.info(f"Configuring bulk destination 1 → {tftp_ip}:69")
+            await self._setup_bulk_destination(dest_index=1, tftp_ip=tftp_ip, port=69)
             self.logger.info("Setting DestinationIndex=1 (pre-configured TFTP)")
             await self._safe_snmp_set(f"{self.UTSC_CFG_BASE}.24{idx}", 1, 'g', "Destination Index (1)")
             
