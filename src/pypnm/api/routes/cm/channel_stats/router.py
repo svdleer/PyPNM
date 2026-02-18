@@ -177,6 +177,7 @@ class ChannelStatsRouter:
                 cmts_rxmer_task_id = None
                 cmts_cmindex_task_id = None
                 cmts_chanid_task_id = None
+                cmts_profile_task_id = None
                 if request.cmts_ip:
                     try:
                         cmts_ofdma_task_id = await agent_manager.send_task(
@@ -208,12 +209,12 @@ class ChannelStatsRouter:
                             },
                             timeout=15.0,
                         )
-                        # Walk docsIf31CmtsUsOfdmaChanChannelId to map ofdma_ifindex -> channel_id
-                        cmts_chanid_task_id = await agent_manager.send_task(
+                        # Walk docsIf31CmtsCmUsOfdmaProfileStatusTable col 1 (codewords per IUC)
+                        cmts_profile_task_id = await agent_manager.send_task(
                             agent_id, "snmp_walk",
                             {
                                 "target_ip": request.cmts_ip,
-                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.3.1.2',  # docsIf31CmtsUsOfdmaChanChannelId
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',  # docsIf31CmtsCmUsOfdmaProfileCorrectedCodewords
                                 "community": request.cmts_community or "public",
                             },
                             timeout=15.0,
@@ -295,21 +296,9 @@ class ChannelStatsRouter:
                             rxmer_entries = rxmer_result.get('result', {}).get('results', [])
                             base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
 
-                            # Build ofdma_ifindex -> channel_id map from CMTS chan table
-                            ifindex_to_chanid = {}
-                            if cmts_chanid_task_id:
-                                chanid_result = await agent_manager.wait_for_task_async(cmts_chanid_task_id, timeout=15.0)
-                                if chanid_result and chanid_result.get('result', {}).get('success'):
-                                    for entry in chanid_result.get('result', {}).get('results', []):
-                                        oid = entry.get('oid', '')
-                                        suffix = oid.replace('1.3.6.1.4.1.4491.2.1.28.1.3.1.2.', '').lstrip('.')
-                                        try:
-                                            ifindex_to_chanid[int(suffix)] = int(entry.get('value', 0))
-                                        except (ValueError, TypeError):
-                                            pass
-
-                            # Build channel_id -> mean_rx_mer map, filtered by cm_index
-                            chanid_to_rxmer = {}
+                            # Build positional list of (ofdma_ifindex, rx_mer) filtered by cm_index
+                            # Cisco CCAP: no channel_id in this table, match by sorted ifindex order
+                            cm_rxmer_list = []
                             for entry in rxmer_entries:
                                 oid = entry.get('oid', '')
                                 suffix = oid.replace(base_oid + '.', '').lstrip('.')
@@ -321,19 +310,72 @@ class ChannelStatsRouter:
                                         if cm_index is None or entry_cm_index == cm_index:
                                             val = entry.get('value')
                                             if val is not None:
-                                                chan_id = ifindex_to_chanid.get(ofdma_ifindex)
-                                                if chan_id:
-                                                    chanid_to_rxmer[chan_id] = round(int(val) / 100, 2)
+                                                cm_rxmer_list.append((ofdma_ifindex, round(int(val) / 100, 2)))
+                                    except (ValueError, TypeError):
+                                        pass
+                            cm_rxmer_list.sort(key=lambda x: x[0])
+
+                            # Inject positionally into OFDMA channels (sorted by index)
+                            ofdma_channels = sorted(
+                                parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
+                                key=lambda c: c.get('index', 0)
+                            )
+                            for i, ch in enumerate(ofdma_channels):
+                                if i < len(cm_rxmer_list):
+                                    ch['rx_mer'] = cm_rxmer_list[i][1]
+                            if cm_rxmer_list:
+                                self.logger.info(f'Injected CMTS MeanRxMer for {len(cm_rxmer_list)} OFDMA channels (positional)')
+                    except Exception as rxmer_err:
+                        self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
+
+                # Collect CMTS OFDMA profile stats (IUC codewords) and inject active_iucs
+                if cmts_profile_task_id and parsed.get('success'):
+                    try:
+                        prof_result = await agent_manager.wait_for_task_async(cmts_profile_task_id, timeout=15.0)
+                        if prof_result and prof_result.get('result', {}).get('success'):
+                            prof_entries = prof_result.get('result', {}).get('results', [])
+                            base_oid = '1.3.6.1.4.1.4491.2.1.28.1.5.1.1'
+                            # Build: ofdma_ifindex -> {iuc_id -> codewords}
+                            ifindex_iuc_map = {}
+                            for entry in prof_entries:
+                                oid = entry.get('oid', '')
+                                suffix = oid.replace(base_oid + '.', '').lstrip('.')
+                                parts = suffix.split('.')
+                                # OID suffix: cm_index.ofdma_ifindex.iuc_id
+                                if len(parts) == 3:
+                                    try:
+                                        entry_cm_index = int(parts[0])
+                                        ofdma_ifindex = int(parts[1])
+                                        iuc_id = int(parts[2])
+                                        if cm_index is None or entry_cm_index == cm_index:
+                                            val = int(entry.get('value') or 0)
+                                            if ofdma_ifindex not in ifindex_iuc_map:
+                                                ifindex_iuc_map[ofdma_ifindex] = {}
+                                            ifindex_iuc_map[ofdma_ifindex][iuc_id] = val
                                     except (ValueError, TypeError):
                                         pass
 
-                            # Inject into OFDMA channels by channel_id
-                            for ch in parsed.get('upstream', {}).get('ofdma', {}).get('channels', []):
-                                cid = ch.get('channel_id')
-                                if cid in chanid_to_rxmer:
-                                    ch['rx_mer'] = chanid_to_rxmer[cid]
-                            if chanid_to_rxmer:
-                                self.logger.info(f'Injected CMTS MeanRxMer for {len(chanid_to_rxmer)} OFDMA channels via channel_id')
+                            # Match positionally (sorted ifindex order = sorted channel index order)
+                            sorted_ifindices = sorted(ifindex_iuc_map.keys())
+                            ofdma_channels = sorted(
+                                parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
+                                key=lambda c: c.get('index', 0)
+                            )
+                            for i, ch in enumerate(ofdma_channels):
+                                if i < len(sorted_ifindices):
+                                    iuc_data = ifindex_iuc_map[sorted_ifindices[i]]
+                                    iuc_stats = [
+                                        {'iuc': iuc_id, 'codewords': cw}
+                                        for iuc_id, cw in sorted(iuc_data.items())
+                                        if cw > 0
+                                    ]
+                                    if iuc_stats:
+                                        ch['iuc_stats'] = iuc_stats
+                                        ch['active_iucs'] = [s['iuc'] for s in iuc_stats]
+                                        ch['current_iuc'] = iuc_stats[-1]['iuc']  # highest active IUC
+                            self.logger.info(f'Injected CMTS IUC stats for {len(sorted_ifindices)} OFDMA channels')
+                    except Exception as prof_err:
+                        self.logger.warning(f'CMTS profile stats collection failed: {prof_err}')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
