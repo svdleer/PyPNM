@@ -132,7 +132,8 @@ class UsOfdmaRxMerRouter:
                     filename=request.filename,
                     pre_eq=request.pre_eq,
                     num_averages=request.num_averages,
-                    destination_index=request.destination_index
+                    destination_index=request.destination_index,
+                    tftp_server=request.tftp_server
                 )
                 return UsOfdmaRxMerStartResponse(**result)
             finally:

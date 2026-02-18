@@ -48,8 +48,11 @@ class UsOfdmaRxMerStartRequest(BaseModel):
     destination_index: int = Field(
         default=0,
         ge=0,
-        description="Bulk transfer destination index. 0=local storage only, "
-                    ">0=use docsPnmBulkDataTransferCfgTable row for TFTP upload"
+        description="Bulk transfer destination index. 0=auto-create row 1 when tftp_server given"
+    )
+    tftp_server: Optional[str] = Field(
+        default=None,
+        description="TFTP server IP for bulk upload. Required on Cisco cBR-8 to trigger measurement."
     )
 
 

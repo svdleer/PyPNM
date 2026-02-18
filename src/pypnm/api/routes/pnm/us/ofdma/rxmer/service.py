@@ -415,49 +415,70 @@ class CmtsUsOfdmaRxMerService:
         filename: str = "us_rxmer",
         pre_eq: bool = True,
         num_averages: int = 1,
-        destination_index: int = 0
+        destination_index: int = 0,
+        tftp_server: Optional[str] = None
     ) -> dict[str, Any]:
         """
         Start Upstream OFDMA RxMER measurement.
-        
+
+        Follows the exact Cisco cBR-8 flow:
+          1. createAndGo bulk destination row (with BaseUri)
+          2. Set CmMac, FileName
+          3. Set DestinationIndex (Unsigned32, index of bulk dest row)
+          4. Set Enable=true
+
         Args:
             ofdma_ifindex: OFDMA channel ifIndex
             cm_mac: Cable modem MAC address
             filename: Output filename
             pre_eq: Enable pre-equalization
             num_averages: Number of averages
-            destination_index: Bulk transfer destination index (0=local only, 
-                             >0=use docsPnmBulkDataTransferCfgTable row)
-            
+            destination_index: Bulk transfer destination index (0=auto-create row 1)
+            tftp_server: TFTP server IP for bulk upload
+
         Returns:
             Dict with success status and details
         """
         idx = f".{ofdma_ifindex}"
-        
-        self.logger.info(f"Starting US RxMER for OFDMA ifIndex {ofdma_ifindex}, CM MAC {cm_mac}, dest={destination_index}")
-        
+
+        self.logger.info(
+            f"Starting US RxMER for OFDMA ifIndex {ofdma_ifindex}, CM MAC {cm_mac}, "
+            f"dest={destination_index}, tftp={tftp_server}"
+        )
+
         try:
-            # 1. Set CM MAC address FIRST (CMTS uses this to identify the modem)
+            # 1. Set up bulk destination row — Cisco requires DestinationIndex to
+            #    point at an active row; without it the Enable SET is silently ignored.
+            if tftp_server and destination_index == 0:
+                try:
+                    dest_result = await self.create_bulk_destination(
+                        tftp_ip=tftp_server, dest_index=1
+                    )
+                    destination_index = dest_result.get("destination_index", 1)
+                except Exception as e:
+                    self.logger.warning(f"Bulk dest setup failed (continuing): {e}")
+                    destination_index = 1
+
+            # 2. Set CM MAC address (CMTS uses this to identify the modem)
             mac_hex = self.mac_to_hex_string(cm_mac)
             await self._snmp_set(f"{self.OID_US_RXMER_CM_MAC}{idx}", mac_hex, 'x')
-            
-            # 2. Set filename
+
+            # 3. Set filename
             await self._snmp_set(f"{self.OID_US_RXMER_FILENAME}{idx}", filename, 's')
-            
-            # 3. Set pre-equalization (1=true, 2=false)
+
+            # 4. Set pre-equalization (1=true, 2=false)
             pre_eq_val = 1 if pre_eq else 2
             await self._snmp_set(f"{self.OID_US_RXMER_PRE_EQ}{idx}", pre_eq_val, 'i')
-            
-            # 4. Set number of averages (Gauge32)
-            await self._snmp_set(f"{self.OID_US_RXMER_NUM_AVGS}{idx}", num_averages, 'g')
-            
-            # 5. Set destination index (always SET — Cisco ignores enable when this
-            #    is left at its default 0xFFFFFFFF "not configured" value)
-            await self._snmp_set(f"{self.OID_US_RXMER_DEST_INDEX}{idx}", destination_index, 'g')
 
-            # 6. Enable measurement (1=true)
+            # 5. Set number of averages (Gauge32)
+            await self._snmp_set(f"{self.OID_US_RXMER_NUM_AVGS}{idx}", num_averages, 'g')
+
+            # 6. Set DestinationIndex — Unsigned32 ('u') required by Cisco cBR-8
+            await self._snmp_set(f"{self.OID_US_RXMER_DEST_INDEX}{idx}", destination_index, 'u')
+
+            # 7. Enable measurement (triggers capture)
             await self._snmp_set(f"{self.OID_US_RXMER_ENABLE}{idx}", 1, 'i')
-            
+
             return {
                 "success": True,
                 "message": "US OFDMA RxMER measurement started",
@@ -690,30 +711,18 @@ class CmtsUsOfdmaRxMerService:
             ip_parts = tftp_ip.split(".")
             ip_hex = "".join([f"{int(p):02x}" for p in ip_parts])
             
-            # Set row to createAndWait (5) to allow configuration
-            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 5, 'i')
-            
+            # Cisco cBR-8 flow: createAndGo(4) activates the row immediately
+            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 4, 'i')
+
             # IP address type (1=IPv4)
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
-            
-            # IP address (4-byte OctetString)
+
+            # IP address (4-byte OctetString, e.g. "ac100884")
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
-            
-            # Port
-            await self._snmp_set(f"{self.OID_BULK_CFG_PORT}.{dest_index}", port, 'g')
-            
-            # Protocol (1=tftp, 2=http, 3=https)
-            await self._snmp_set(f"{self.OID_BULK_CFG_PROTOCOL}.{dest_index}", 1, 'i')
-            
-            # Local store
-            await self._snmp_set(
-                f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}",
-                1 if local_store else 2,
-                'i'
-            )
-            
-            # Activate the row (set to active=1)
-            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')
+
+            # BaseUri — required by Cisco for TFTP upload path
+            base_uri = f"tftp://{tftp_ip}/"
+            await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", base_uri, 's')
             
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             
