@@ -175,6 +175,7 @@ class ChannelStatsRouter:
                 # parallel so it adds zero extra wall-clock time)
                 cmts_ofdma_task_id = None
                 cmts_rxmer_task_id = None
+                cmts_cmindex_task_id = None
                 if request.cmts_ip:
                     try:
                         cmts_ofdma_task_id = await agent_manager.send_task(
@@ -186,12 +187,22 @@ class ChannelStatsRouter:
                             },
                             timeout=15.0,
                         )
-                        # Also walk CMTS-side OFDMA MeanRxMer (docsIf31CmtsCmUsOfdmaChannelMeanRxMer)
+                        # Walk CMTS-side OFDMA MeanRxMer (docsIf31CmtsCmUsOfdmaChannelMeanRxMer)
                         cmts_rxmer_task_id = await agent_manager.send_task(
                             agent_id, "snmp_walk",
                             {
                                 "target_ip": request.cmts_ip,
-                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',  # docsIf31CmtsCmUsOfdmaChannelMeanRxMer
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=15.0,
+                        )
+                        # Walk docsIf3CmtsCmRegStatusMacAddr to resolve mac -> cm_index
+                        cmts_cmindex_task_id = await agent_manager.send_task(
+                            agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
                                 "community": request.cmts_community or "public",
                             },
                             timeout=15.0,
@@ -246,30 +257,56 @@ class ChannelStatsRouter:
                 # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
                 if cmts_rxmer_task_id and parsed.get('success'):
                     try:
+                        # Resolve mac -> cm_index from CMTS reg status table
+                        cm_index = None
+                        if cmts_cmindex_task_id and request.mac_address:
+                            cmidx_result = await agent_manager.wait_for_task_async(cmts_cmindex_task_id, timeout=15.0)
+                            if cmidx_result and cmidx_result.get('result', {}).get('success'):
+                                mac_clean = request.mac_address.replace(':', '').lower()
+                                for entry in cmidx_result.get('result', {}).get('results', []):
+                                    val = entry.get('value', '')
+                                    # value is hex bytes like '90 32 4B C8 19 0B' or already a string
+                                    if isinstance(val, str):
+                                        entry_mac = val.replace(' ', '').replace(':', '').lower()
+                                        if entry_mac == mac_clean:
+                                            # OID suffix is the cm_index
+                                            oid = entry.get('oid', '')
+                                            suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
+                                            try:
+                                                cm_index = int(suffix.strip('.'))
+                                            except ValueError:
+                                                pass
+                                            break
+                            self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
+
                         rxmer_result = await agent_manager.wait_for_task_async(cmts_rxmer_task_id, timeout=15.0)
                         if rxmer_result and rxmer_result.get('result', {}).get('success'):
                             rxmer_entries = rxmer_result.get('result', {}).get('results', [])
-                            # Build lookup: cm_index -> {ofdma_ifindex -> mean_rx_mer}
-                            # OID suffix is .cm_index.ofdma_ifindex, value is INTEGER in 1/100 dB
-                            rxmer_map = {}
+                            base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
+                            # Build map: ofdma_ifindex -> mean_rx_mer (value in 1/100 dB)
+                            rxmer_map = {}  # ofdma_ifindex -> dB value
                             for entry in rxmer_entries:
-                                oid_suffix = entry.get('oid_suffix', '')
-                                parts = oid_suffix.strip('.').split('.')
-                                if len(parts) >= 2:
+                                oid = entry.get('oid', '')
+                                suffix = oid.replace(base_oid + '.', '').lstrip('.')
+                                parts = suffix.split('.')
+                                if len(parts) == 2:
                                     try:
-                                        ofdma_ifindex = int(parts[-1])
-                                        val = entry.get('value')
-                                        if val is not None:
-                                            rxmer_map[ofdma_ifindex] = round(int(val) / 100, 2)
+                                        entry_cm_index = int(parts[0])
+                                        ofdma_ifindex = int(parts[1])
+                                        # Filter to our modem's cm_index if known
+                                        if cm_index is None or entry_cm_index == cm_index:
+                                            val = entry.get('value')
+                                            if val is not None:
+                                                rxmer_map[ofdma_ifindex] = round(int(val) / 100, 2)
                                     except (ValueError, TypeError):
                                         pass
-                            # Inject into OFDMA channels by channel ifIndex
+                            # Inject into OFDMA channels matching ofdma_ifindex to channel index
                             for ch in parsed.get('upstream', {}).get('ofdma', {}).get('channels', []):
                                 ifidx = ch.get('index')
                                 if ifidx in rxmer_map:
                                     ch['rx_mer'] = rxmer_map[ifidx]
                             if rxmer_map:
-                                self.logger.info(f'Injected CMTS MeanRxMer for {len(rxmer_map)} OFDMA channels')
+                                self.logger.info(f'CMTS MeanRxMer map has {len(rxmer_map)} entries, cm_index={cm_index}')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 

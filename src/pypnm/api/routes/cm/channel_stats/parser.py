@@ -83,7 +83,8 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
     }
     
     # Fields that need /10 conversion
-    TENTH_FIELDS = {'power', 'snr', 'rxmer', 'mer', 'rxPower', 'rxMer', 'txPower'}
+    TENTH_FIELDS = {'power', 'snr', 'rxmer', 'rxPower', 'txPower'}
+    HUNDREDTH_FIELDS = {'rxMerMean', 'rxMerStdDev'}  # docsPnmCmDsOfdmRxMerTable values in 1/100 dB
     QUARTER_FIELDS_BY_TABLE = {
         'docsIf31CmUsOfdmaChanTable': {'txPower'}
     }
@@ -118,11 +119,14 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
                     
                     quarter_fields = QUARTER_FIELDS_BY_TABLE.get(table_name, set())
                     is_quarter = field_name in quarter_fields
-                    is_tenth = field_name in TENTH_FIELDS and not is_quarter
-                    
+                    is_hundredth = field_name in HUNDREDTH_FIELDS
+                    is_tenth = field_name in TENTH_FIELDS and not is_quarter and not is_hundredth
+
                     if isinstance(value, (int, float)):
                         if is_quarter:
                             value = value / 4.0
+                        elif is_hundredth:
+                            value = round(value / 100.0, 2)
                         elif is_tenth:
                             value = value / 10.0
                     elif isinstance(value, str):
