@@ -201,15 +201,18 @@ class ChannelStatsRouter:
                         # Check cm_index cache — avoids full MAC table walk on repeat calls
                         cached_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
 
-                        cmts_ofdma_task_id = await agent_manager.send_task(
-                            agent_id, "snmp_walk",
-                            {
-                                "target_ip": request.cmts_ip,
-                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',  # docsIf31CmtsUsOfdmaChanTable
-                                "community": request.cmts_community or "public",
-                            },
-                            timeout=15.0,
-                        )
+                        # Only fetch CMTS OFDMA channel table as fallback if modem doesn't report it
+                        # We check after modem walk; send speculatively only on first call
+                        if cached_cm_index is None:
+                            cmts_ofdma_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',  # docsIf31CmtsUsOfdmaChanTable
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
 
                         if cached_cm_index is not None:
                             # Scoped walks — tiny, fast
