@@ -17,11 +17,29 @@ Performance: ~8-10 seconds via parallel bulk walks (vs ~60+ seconds sequential)
 from __future__ import annotations
 
 import logging
+import time
 from enum import Enum
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+# In-process cache: (cmts_ip, mac) -> (cm_index, expires_at)
+_CM_INDEX_CACHE: dict = {}
+_CM_INDEX_TTL = 3600  # 1 hour
+
+
+def _get_cached_cm_index(cmts_ip: str, mac: str):
+    key = (cmts_ip, mac.lower())
+    entry = _CM_INDEX_CACHE.get(key)
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    return None
+
+
+def _set_cached_cm_index(cmts_ip: str, mac: str, cm_index: int):
+    key = (cmts_ip, mac.lower())
+    _CM_INDEX_CACHE[key] = (cm_index, time.time() + _CM_INDEX_TTL)
 
 from pypnm.api.agent.manager import get_agent_manager
 from .parser import parse_channel_stats_raw
@@ -180,6 +198,9 @@ class ChannelStatsRouter:
                 cmts_profile_task_id = None
                 if request.cmts_ip:
                     try:
+                        # Check cm_index cache — avoids full MAC table walk on repeat calls
+                        cached_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
+
                         cmts_ofdma_task_id = await agent_manager.send_task(
                             agent_id, "snmp_walk",
                             {
@@ -189,36 +210,56 @@ class ChannelStatsRouter:
                             },
                             timeout=15.0,
                         )
-                        # Walk CMTS-side OFDMA MeanRxMer (docsIf31CmtsCmUsOfdmaChannelMeanRxMer)
-                        cmts_rxmer_task_id = await agent_manager.send_task(
-                            agent_id, "snmp_walk",
-                            {
-                                "target_ip": request.cmts_ip,
-                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
-                                "community": request.cmts_community or "public",
-                            },
-                            timeout=15.0,
-                        )
-                        # Walk docsIf3CmtsCmRegStatusMacAddr to resolve mac -> cm_index
-                        cmts_cmindex_task_id = await agent_manager.send_task(
-                            agent_id, "snmp_walk",
-                            {
-                                "target_ip": request.cmts_ip,
-                                "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
-                                "community": request.cmts_community or "public",
-                            },
-                            timeout=15.0,
-                        )
-                        # Walk docsIf31CmtsCmUsOfdmaProfileStatusTable col 1 (codewords per IUC)
-                        cmts_profile_task_id = await agent_manager.send_task(
-                            agent_id, "snmp_walk",
-                            {
-                                "target_ip": request.cmts_ip,
-                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',  # docsIf31CmtsCmUsOfdmaProfileCorrectedCodewords
-                                "community": request.cmts_community or "public",
-                            },
-                            timeout=15.0,
-                        )
+
+                        if cached_cm_index is not None:
+                            # Scoped walks — tiny, fast
+                            cmts_rxmer_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                            cmts_profile_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.5.1.1.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                        else:
+                            # Full walks + MAC walk to resolve cm_index
+                            cmts_rxmer_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                            cmts_cmindex_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                            cmts_profile_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
                     except Exception as e:
                         self.logger.warning(f"Failed to send CMTS OFDMA task: {e}")
 
@@ -290,6 +331,8 @@ class ChannelStatsRouter:
                                                 pass
                                             break
                             self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
+                            if cm_index is not None:
+                                _set_cached_cm_index(request.cmts_ip, mac_address, cm_index)
 
                         rxmer_result = await agent_manager.wait_for_task_async(cmts_rxmer_task_id, timeout=15.0)
                         if rxmer_result and rxmer_result.get('result', {}).get('success'):
