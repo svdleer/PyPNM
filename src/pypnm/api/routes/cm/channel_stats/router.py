@@ -55,6 +55,7 @@ class ChannelStatsRequest(BaseModel):
     cmts_ip: Optional[str] = Field(default=None, description="CMTS IP address for fiber node lookup")
     cmts_community: Optional[str] = Field(default=None, description="CMTS SNMP community string")
     skip_connectivity_check: bool = Field(default=False, description="Skip ping/SNMP check")
+    cmts_stats: bool = Field(default=False, description="Fetch CMTS-side OFDMA MeanRxMer and IUC profile stats (slower)")
 
 
 class ChannelStatsResponse(BaseModel):
@@ -196,7 +197,7 @@ class ChannelStatsRouter:
                 cmts_cmindex_task_id = None
                 cmts_chanid_task_id = None
                 cmts_profile_task_id = None
-                if request.cmts_ip:
+                if request.cmts_ip and request.cmts_stats:
                     try:
                         # Check cm_index cache — avoids full MAC table walk on repeat calls
                         cached_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
