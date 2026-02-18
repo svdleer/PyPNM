@@ -405,6 +405,12 @@ class CMTSModemService:
             if index in us_ch_map:
                 modem['upstream_channel_id'] = us_ch_map[index]
 
+            # Skip modems that are offline: status=other(1) with no IP assigned.
+            # Casa CCAP and some other vendors report status=1 for all unreachable
+            # modems and never populate their IP — these are not worth showing.
+            if modem.get('status_code') == 1 and modem.get('ip_address', '0.0.0.0') in ('0.0.0.0', '', None):
+                continue
+
             modems.append(modem)
             if limit and len(modems) >= limit:
                 break
