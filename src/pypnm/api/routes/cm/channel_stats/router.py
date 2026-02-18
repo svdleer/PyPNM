@@ -176,6 +176,7 @@ class ChannelStatsRouter:
                 cmts_ofdma_task_id = None
                 cmts_rxmer_task_id = None
                 cmts_cmindex_task_id = None
+                cmts_chanid_task_id = None
                 if request.cmts_ip:
                     try:
                         cmts_ofdma_task_id = await agent_manager.send_task(
@@ -203,6 +204,16 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=15.0,
+                        )
+                        # Walk docsIf31CmtsUsOfdmaChanChannelId to map ofdma_ifindex -> channel_id
+                        cmts_chanid_task_id = await agent_manager.send_task(
+                            agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.3.1.2',  # docsIf31CmtsUsOfdmaChanChannelId
                                 "community": request.cmts_community or "public",
                             },
                             timeout=15.0,
@@ -283,8 +294,22 @@ class ChannelStatsRouter:
                         if rxmer_result and rxmer_result.get('result', {}).get('success'):
                             rxmer_entries = rxmer_result.get('result', {}).get('results', [])
                             base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
-                            # Build map: ofdma_ifindex -> mean_rx_mer (value in 1/100 dB)
-                            rxmer_map = {}  # ofdma_ifindex -> dB value
+
+                            # Build ofdma_ifindex -> channel_id map from CMTS chan table
+                            ifindex_to_chanid = {}
+                            if cmts_chanid_task_id:
+                                chanid_result = await agent_manager.wait_for_task_async(cmts_chanid_task_id, timeout=15.0)
+                                if chanid_result and chanid_result.get('result', {}).get('success'):
+                                    for entry in chanid_result.get('result', {}).get('results', []):
+                                        oid = entry.get('oid', '')
+                                        suffix = oid.replace('1.3.6.1.4.1.4491.2.1.28.1.3.1.2.', '').lstrip('.')
+                                        try:
+                                            ifindex_to_chanid[int(suffix)] = int(entry.get('value', 0))
+                                        except (ValueError, TypeError):
+                                            pass
+
+                            # Build channel_id -> mean_rx_mer map, filtered by cm_index
+                            chanid_to_rxmer = {}
                             for entry in rxmer_entries:
                                 oid = entry.get('oid', '')
                                 suffix = oid.replace(base_oid + '.', '').lstrip('.')
@@ -293,20 +318,22 @@ class ChannelStatsRouter:
                                     try:
                                         entry_cm_index = int(parts[0])
                                         ofdma_ifindex = int(parts[1])
-                                        # Filter to our modem's cm_index if known
                                         if cm_index is None or entry_cm_index == cm_index:
                                             val = entry.get('value')
                                             if val is not None:
-                                                rxmer_map[ofdma_ifindex] = round(int(val) / 100, 2)
+                                                chan_id = ifindex_to_chanid.get(ofdma_ifindex)
+                                                if chan_id:
+                                                    chanid_to_rxmer[chan_id] = round(int(val) / 100, 2)
                                     except (ValueError, TypeError):
                                         pass
-                            # Inject into OFDMA channels matching ofdma_ifindex to channel index
+
+                            # Inject into OFDMA channels by channel_id
                             for ch in parsed.get('upstream', {}).get('ofdma', {}).get('channels', []):
-                                ifidx = ch.get('index')
-                                if ifidx in rxmer_map:
-                                    ch['rx_mer'] = rxmer_map[ifidx]
-                            if rxmer_map:
-                                self.logger.info(f'CMTS MeanRxMer map has {len(rxmer_map)} entries, cm_index={cm_index}')
+                                cid = ch.get('channel_id')
+                                if cid in chanid_to_rxmer:
+                                    ch['rx_mer'] = chanid_to_rxmer[cid]
+                            if chanid_to_rxmer:
+                                self.logger.info(f'Injected CMTS MeanRxMer for {len(chanid_to_rxmer)} OFDMA channels via channel_id')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
