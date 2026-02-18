@@ -25,6 +25,7 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
         'docsIf31CmUsOfdmaChanTable': '1.3.6.1.4.1.4491.2.1.28.1.13',
         'docsIf31CmStatusOfdmaUsTable': '1.3.6.1.4.1.4491.2.1.28.1.12',
         'docsIf31CmUsOfdmaProfileStatsTable': '1.3.6.1.4.1.4491.2.1.28.1.14',
+        'docsPnmCmDsOfdmRxMerTable': '1.3.6.1.4.1.4491.2.1.27.1.2.5',
     }
     
     # Column mappings (from agent)
@@ -74,6 +75,10 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
         },
         'docsIf31CmUsOfdmaProfileStatsTable': {
             1: 'outOctets'
+        },
+        'docsPnmCmDsOfdmRxMerTable': {
+            # col 3: rxMerMean (in 1/10 dB), col 4: rxMerStdDev
+            3: 'rxMerMean', 4: 'rxMerStdDev'
         },
     }
     
@@ -195,6 +200,7 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
     ds_ofdm_power = tables_data.get('docsIf31CmDsOfdmChannelPowerTable', {})
     ds_rx_status = tables_data.get('docsIf31RxChStatusTable', {})
     ds_ofdm_profile_stats = tables_data.get('docsIf31CmDsOfdmProfileStatsTable', {})
+    ds_ofdm_rxmer = tables_data.get('docsPnmCmDsOfdmRxMerTable', {})
     us_up = tables_data.get('docsIfUpChannelTable', {})
     us_status = tables_data.get('docsIf3CmStatusUsTable', {})
     us_ofdma = tables_data.get('docsIf31CmUsOfdmaChanTable', {})
@@ -243,6 +249,10 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
         
         power_data = ds_ofdm_power.get(idx, {})
         rx_status = ds_rx_status.get(idx, {})
+        rxmer_data = ds_ofdm_rxmer.get(idx, {})
+        # mer: docsPnmCmDsOfdmRxMerTable col 3 = rxMerMean (already /10 by TENTH_FIELDS)
+        # fallback to docsIf31CmDsOfdmChannelPowerRxMer if present
+        ofdm_mer = rxmer_data.get('rxMerMean') or power_data.get('rxMer')
         
         # Parse OFDM profiles from BITS value
         profiles = []
@@ -282,7 +292,7 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
             'plc_freq': plc_freq,
             'plc_freq_mhz': plc_freq / 1_000_000 if plc_freq else None,
             'power': power_data.get('rxPower'),
-            'mer': power_data.get('rxMer'),
+            'mer': ofdm_mer,
             'num_subcarriers': num_sc,
             'subcarrier_spacing_khz': sc_hz / 1000,
             'bandwidth_mhz': bandwidth / 1_000_000 if bandwidth else None,

@@ -134,6 +134,7 @@ class ChannelStatsRouter:
                     '1.3.6.1.4.1.4491.2.1.28.1.13', # docsIf31CmUsOfdmaChanTable
                     '1.3.6.1.4.1.4491.2.1.28.1.12', # docsIf31CmStatusOfdmaUsTable
                     '1.3.6.1.4.1.4491.2.1.28.1.14', # docsIf31CmUsOfdmaProfileStatsTable (OFDMA IUC stats)
+                    '1.3.6.1.4.1.4491.2.1.27.1.2.5', # docsPnmCmDsOfdmRxMerTable (OFDM DS MER mean)
                 ]
                 
                 # Send parallel walk task to agent
@@ -173,6 +174,7 @@ class ChannelStatsRouter:
                 # (Cisco modems return empty modem-side OFDMA; CMTS walk runs in
                 # parallel so it adds zero extra wall-clock time)
                 cmts_ofdma_task_id = None
+                cmts_rxmer_task_id = None
                 if request.cmts_ip:
                     try:
                         cmts_ofdma_task_id = await agent_manager.send_task(
@@ -180,6 +182,16 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',  # docsIf31CmtsUsOfdmaChanTable
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=15.0,
+                        )
+                        # Also walk CMTS-side OFDMA MeanRxMer (docsIf31CmtsCmUsOfdmaChannelMeanRxMer)
+                        cmts_rxmer_task_id = await agent_manager.send_task(
+                            agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',  # docsIf31CmtsCmUsOfdmaChannelMeanRxMer
                                 "community": request.cmts_community or "public",
                             },
                             timeout=15.0,
@@ -230,6 +242,36 @@ class ChannelStatsRouter:
                 parsed = parse_channel_stats_raw(
                     raw_results, walk_time, request.mac_address, request.modem_ip
                 )
+
+                # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
+                if cmts_rxmer_task_id and parsed.get('success'):
+                    try:
+                        rxmer_result = await agent_manager.wait_for_task_async(cmts_rxmer_task_id, timeout=15.0)
+                        if rxmer_result and rxmer_result.get('result', {}).get('success'):
+                            rxmer_entries = rxmer_result.get('result', {}).get('results', [])
+                            # Build lookup: cm_index -> {ofdma_ifindex -> mean_rx_mer}
+                            # OID suffix is .cm_index.ofdma_ifindex, value is INTEGER in 1/100 dB
+                            rxmer_map = {}
+                            for entry in rxmer_entries:
+                                oid_suffix = entry.get('oid_suffix', '')
+                                parts = oid_suffix.strip('.').split('.')
+                                if len(parts) >= 2:
+                                    try:
+                                        ofdma_ifindex = int(parts[-1])
+                                        val = entry.get('value')
+                                        if val is not None:
+                                            rxmer_map[ofdma_ifindex] = round(int(val) / 100, 2)
+                                    except (ValueError, TypeError):
+                                        pass
+                            # Inject into OFDMA channels by channel ifIndex
+                            for ch in parsed.get('upstream', {}).get('ofdma', {}).get('channels', []):
+                                ifidx = ch.get('index')
+                                if ifidx in rxmer_map:
+                                    ch['rx_mer'] = rxmer_map[ifidx]
+                            if rxmer_map:
+                                self.logger.info(f'Injected CMTS MeanRxMer for {len(rxmer_map)} OFDMA channels')
+                    except Exception as rxmer_err:
+                        self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
                 # Fiber node lookup (also runs concurrently via asyncio.gather)
                 fiber_node = None
