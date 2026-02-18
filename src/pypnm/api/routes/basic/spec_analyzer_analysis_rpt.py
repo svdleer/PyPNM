@@ -109,7 +109,7 @@ class SpectrumAnalyzerReport(AnalysisReport):
                     transparent     =   False,
                     theme           =   self.getAnalysisRptMatplotConfig().theme,)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=fname)
                 out.append(mgr)
 
@@ -136,7 +136,7 @@ class SpectrumAnalyzerReport(AnalysisReport):
                     transparent     =   False,
                     theme           =   self.getAnalysisRptMatplotConfig().theme,)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=fname)
                 out.append(mgr)
 

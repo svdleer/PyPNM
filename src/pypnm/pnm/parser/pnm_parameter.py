@@ -16,11 +16,12 @@ from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
 from pypnm.pnm.parser.CmDsOfdmFecSummary import CmDsOfdmFecSummary
 from pypnm.pnm.parser.CmDsOfdmModulationProfile import CmDsOfdmModulationProfile
 from pypnm.pnm.parser.CmDsOfdmRxMer import CmDsOfdmRxMer
+from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
 from pypnm.pnm.parser.CmUsOfdmaPreEq import CmUsOfdmaPreEq
 from pypnm.pnm.parser.pnm_file_type import PnmFileType
 from pypnm.pnm.parser.pnm_header import PnmHeader
 
-PnmParsers = CmDsConstDispMeas | CmDsOfdmChanEstimateCoef | CmDsOfdmFecSummary | CmDsOfdmRxMer | CmUsOfdmaPreEq | CmDsHist
+PnmParsers = CmDsConstDispMeas | CmDsOfdmChanEstimateCoef | CmDsOfdmFecSummary | CmDsOfdmRxMer | CmUsOfdmaPreEq | CmDsHist | CmtsUsOfdmaRxMer
 
 class PnmParserParametersModel(BaseModel):
     file_type: PnmFileType     = Field(..., description="PNM file type enum (e.g., PNN2, PNN3, ...).")
@@ -174,6 +175,7 @@ class GetPnmParserAndParameters(PnmHeader):
             PnmFileType.SPECTRUM_ANALYSIS:                   self._process_spectrum_analysis,
             PnmFileType.OFDM_MODULATION_PROFILE:             self._process_modulation_profile,
             PnmFileType.LATENCY_REPORT:                      self._process_latency_report,
+            PnmFileType.CMTS_US_OFDMA_RXMER:                 self._process_cmts_us_ofdma_rxmer,
         }
 
         handler = dispatch_map.get(file_type_enum)
@@ -214,13 +216,18 @@ class GetPnmParserAndParameters(PnmHeader):
         """OFDM modulation profile parser."""
         return CmDsOfdmModulationProfile(self.byte_stream)
 
+    def _process_cmts_us_ofdma_rxmer(self) -> CmtsUsOfdmaRxMer:
+        """CMTS Upstream OFDMA RxMER per subcarrier parser."""
+        return CmtsUsOfdmaRxMer(self.byte_stream)
+
     def _process_latency_report(self) -> NoReturn:
         """Latency report parser (not implemented)."""
         raise NotImplementedError("Latency report parsing not implemented.")
 
-    def _process_spectrum_analysis(self) -> NoReturn:
-        """Spectrum analysis parser (not implemented)."""
-        raise NotImplementedError("Spectrum analysis parsing not implemented.")
+    def _process_spectrum_analysis(self):
+        """Spectrum analysis parser."""
+        from pypnm.pnm.parser.CmSpectrumAnalysis import CmSpectrumAnalysis
+        return CmSpectrumAnalysis(self.byte_stream)
 
     """This method may never be implemented by CableLabs, no real intrest from operators"""
     def _process_symbol_capture(self) -> NoReturn:

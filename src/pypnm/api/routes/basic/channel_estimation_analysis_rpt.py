@@ -175,7 +175,7 @@ class ChanEstimationReport(AnalysisReport):
                     fn_iq = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'iq_scatter'])
                     self.logger.info("Creating MatPlot IQ scatter: %s for channel: %s", fn_iq, channel_id)
 
-                    mgr = MatplotManager(default_cfg=cfg)
+                    mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                     mgr.plot_scatter(filename=fn_iq)
                     matplot_mgr.append(mgr)
 
@@ -204,7 +204,7 @@ class ChanEstimationReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'linear'])
                 self.logger.info("Creating MatPlot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_multi_line(filename=multi)
                 matplot_mgr.append(mgr)
 
@@ -233,7 +233,7 @@ class ChanEstimationReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'db'])
                 self.logger.info("Creating MatPlot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_multi_line(filename=multi)
                 matplot_mgr.append(mgr)
 
@@ -268,7 +268,7 @@ class ChanEstimationReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'dbfit'])
                 self.logger.info("Creating MatPlot (dB fit): %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_multi_line(filename=multi)
                 matplot_mgr.append(mgr)
 
@@ -296,7 +296,7 @@ class ChanEstimationReport(AnalysisReport):
                 fname = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'dbresid'])
                 self.logger.info("Creating Residual Ripple MatPlot: %s for channel: %s", fname, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=fname)
                 matplot_mgr.append(mgr)
 
@@ -323,7 +323,7 @@ class ChanEstimationReport(AnalysisReport):
                 multi = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'groupdelay'])
                 self.logger.info("Creating Group Delay MatPlot: %s for channel: %s", multi, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_line(filename=multi)
                 matplot_mgr.append(mgr)
 
@@ -369,7 +369,7 @@ class ChanEstimationReport(AnalysisReport):
                     fname = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG, 'ifft'])
                     self.logger.info("Creating IFFT Time Response MatPlot: %s for channel: %s", fname, channel_id)
 
-                    mgr = MatplotManager(default_cfg=cfg)
+                    mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                     mgr.plot_line(filename=fname)
                     matplot_mgr.append(mgr)
 

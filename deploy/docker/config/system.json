@@ -21,7 +21,7 @@
         },
         "method": "tftp",
         "tftp": {
-            "ip_v4": "172.19.8.28",
+            "ip_v4": "172.16.6.101",
             "ip_v6": "::1",
             "remote_dir": ""
         }
@@ -65,10 +65,10 @@
                 "local": {
                     "password": "",
                     "password_enc": "",
-                    "src_dir": "/srv/tftp"
+                    "src_dir": "/var/lib/tftpboot"
                 },
                 "sftp": {
-                    "host": "172.19.8.28",
+                    "host": "172.22.147.18",
                     "password": "",
                     "password_enc": "",
                     "port": 22,

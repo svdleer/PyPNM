@@ -46,21 +46,24 @@ class CmDocsDevService:
         raw_entries: list[dict] = await self._cm.getDocsDevEventEntry(to_dict=True)
 
         log_entries = []
-        for raw in raw_entries:
+        for i, raw in enumerate(raw_entries):
             if not isinstance(raw, dict) or not raw:
                 continue
 
             try:
                 _, event_data = next(iter(raw.items()))
-                log_entries.append(EventLogEntry(
+                log_entry = EventLogEntry(
                     docsDevEvFirstTime  =event_data.get("docsDevEvFirstTime", ""),
                     docsDevEvLastTime   =event_data.get("docsDevEvLastTime", ""),
                     docsDevEvCounts     =event_data.get("docsDevEvCounts", 0),
                     docsDevEvLevel      =event_data.get("docsDevEvLevel", 0),
                     docsDevEvId         =event_data.get("docsDevEvId", 0),
                     docsDevEvText       =event_data.get("docsDevEvText", ""),
-                ))
-            except Exception:
+                )
+                log_entries.append(log_entry)
+            except Exception as e:
+                # Log the exception for debugging but continue processing
+                print(f"Failed to process event entry {i}: {e}")
                 continue
 
         return log_entries

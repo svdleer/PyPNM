@@ -407,11 +407,11 @@ class MultiChanEstimationSignalAnalysis(MultiAnalysisRpt):
                         x_tick_decimals =   0,
                         xlabel_base     =   "Frequency",
                         ylabel          =   "dB",
-                        grid            =   False,
+                        grid            =   True,
                         legend          =   True,
                         transparent     =   False,
-                        line_colors     =   ["#FF5733",  "#3357FF", "#33FF57",],
-                        theme           =   "dark",
+                        line_colors     =   ["#36A2EB", "#FF6384", "#4BC0C0"],
+                        theme           =   "light",
                     )
 
                     mp = MatplotManager(default_cfg=cfg)
@@ -433,10 +433,10 @@ class MultiChanEstimationSignalAnalysis(MultiAnalysisRpt):
                         x_unit_out      = "mhz",
                         x_tick_decimals = 0,
                         ylabel          = "Group Delay (µs)",
-                        grid            = False,
+                        grid            = True,
                         legend          = False,
                         transparent     = False,
-                        theme           = "dark",
+                        theme           = "light",
                     )
 
                     mp = MatplotManager(default_cfg=cfg)
@@ -454,7 +454,7 @@ class MultiChanEstimationSignalAnalysis(MultiAnalysisRpt):
                             ylabel  =   "Amplitude (Linear Units)",
                             grid    =   True,
                             legend  =   False,
-                            theme   =   "dark",
+                            theme   =   "light",
                         )
 
                         mp = MatplotManager(default_cfg=cfg)
@@ -475,7 +475,7 @@ class MultiChanEstimationSignalAnalysis(MultiAnalysisRpt):
                             ylabel  =   "|h(t)| (linear)",
                             grid    =   True,
                             legend  =   False,
-                            theme   =   "dark",
+                            theme   =   "light",
                         )
                         mp = MatplotManager(default_cfg=cfg)
                         mp.plot_line(self.create_png_fname(tags=[f"ch{r.channel_id}", "echo-ifft-multi"]))

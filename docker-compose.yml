@@ -1,18 +1,21 @@
 services:
   pypnm-api:
+    container_name: pypnm-api
     build:
       context: .
       dockerfile: Dockerfile
       args:
         PYTHON_VERSION: "3.12"
     image: pypnm:latest
-    ports:
-      - "${PYPNM_PORT:-8000}:8000"
+    network_mode: host
+    environment:
+      - PYPNM_CONFIG_PATH=/app/deploy/config/system.json
     volumes:
       - pypnm_config:/app/config
       - pypnm_logs:/app/logs
       - pypnm_data:/app/.data
       - pypnm_output:/app/output
+      - /var/lib/tftpboot:/var/lib/tftpboot
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs').read()\""]
@@ -48,3 +51,4 @@ volumes:
   pypnm_logs:
   pypnm_data:
   pypnm_output:
+

@@ -73,7 +73,7 @@ class CableModem(CmSnmpOperation):
         Returns:
             bool: True if SNMP communication is successful, False otherwise.
         """
-        system_description = await self.getSysDescr(timeout=1, retries=1)
+        system_description = await self.getSysDescr(timeout=10, retries=2)
 
         self.logger.debug(f"SNMP.is_snmp_reachable: System Description for {system_description}, is_empty: {system_description.is_empty()}")
 
@@ -85,9 +85,15 @@ class CableModem(CmSnmpOperation):
 
     async def isCableModemMacCorrect(self) -> bool:
         "Checks to see if mac address is cable modem mac-address (docsCableMaclayer)"
-        mac = await self.getIfPhysAddress()
-        self.logger.debug(f"CableModem MAC Address: {self.get_mac_address}, SNMP Retrieved MAC Address: {mac}")
-        return self.get_mac_address.is_equal(mac)
+        try:
+            mac = await self.getIfPhysAddress()
+            self.logger.debug(f"CableModem MAC Address: {self.get_mac_address}, SNMP Retrieved MAC Address: {mac}, types: {type(self.get_mac_address)}, {type(mac)}")
+            result = self.get_mac_address.is_equal(mac)
+            self.logger.debug(f"MAC comparison result: {result}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error in isCableModemMacCorrect: {e}", exc_info=True)
+            raise
 
     def same_inet_version(self, other: Inet) -> bool:
         """

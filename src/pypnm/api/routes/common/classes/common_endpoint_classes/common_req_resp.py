@@ -32,8 +32,8 @@ class CommonOutput(BaseModel):
     type: OutputType = Field(default=OutputType.JSON, description="Desired output type for analysis results")
 
 class TftpConfig(BaseModel):
-    ipv4: IPv4Str | None = Field(..., description=f"TFTP server IPv4 address ({TFTP_IPV4_DEFAULT_DESC})")
-    ipv6: IPv6Str | None = Field(..., description=f"TFTP server IPv6 address ({TFTP_IPV6_DEFAULT_DESC})")
+    ipv4: IPv4Str | None = Field(default=None, description=f"TFTP server IPv4 address ({TFTP_IPV4_DEFAULT_DESC})")
+    ipv6: IPv6Str | None = Field(default=None, description=f"TFTP server IPv6 address ({TFTP_IPV6_DEFAULT_DESC})")
 
     @field_validator("ipv4", "ipv6", mode="before")
     def _reject_blank(cls, v: object, info: ValidationInfo) -> object:
@@ -73,7 +73,7 @@ class CableModemPnmConfig(BaseModel):
 
 
 class CommonMatPlotUiConfig(BaseModel):
-    theme: ThemeType = Field(default="dark", description="Matplotlib theme selection for plot rendering")
+    theme: ThemeType = Field(default="light", description="Matplotlib theme selection for plot rendering")
 
 class CommonMatPlotConfigRequest(BaseModel):
     ui: CommonMatPlotUiConfig = Field(default=CommonMatPlotUiConfig(), description="Matplotlib UI configuration for plot generation")

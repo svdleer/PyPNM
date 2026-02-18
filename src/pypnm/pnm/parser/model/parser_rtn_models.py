@@ -80,6 +80,37 @@ class CmDsOfdmRxMerModel(PnmBaseModel):
     signal_statistics:SignalStatisticsModel = Field(..., description="Aggregate statistics computed from values")
     modulation_statistics:dict[str, Any]    = Field(..., description="Shannon-based modulation metrics")
 
+
+class CmtsUsOfdmaRxMerModel(BaseModel):
+    """
+    Canonical payload for CMTS Upstream OFDMA RxMER Per Subcarrier data.
+    
+    This is CMTS-side measurement from docsPnmCmtsUsOfdmaRxMerTable.
+    File type: PNN105 (0x69 = 'i')
+    
+    Per Table 7-108 - RxMER File Format.
+    """
+    model_config = ConfigDict(extra="ignore")
+    
+    pnm_header: PnmHeaderParameters         = Field(..., description="PNM header metadata")
+    logical_ch_ifindex: int                 = Field(..., description="CMTS logical channel ifIndex")
+    ccap_id: str                            = Field(default="", description="Unique CCAP chassis identifier")
+    md_us_sg_ifindex: int                   = Field(..., description="MD-US-SG ifIndex")
+    cm_mac_address: MacAddressStr           = Field(..., description="Cable modem MAC address")
+    num_averages: int                       = Field(default=1, ge=1, description="Number of averaging periods")
+    preeq_enabled: bool                     = Field(default=False, description="Pre-equalization enabled during measurement")
+    num_active_subcarriers: int             = Field(..., ge=0, description="Number of active subcarriers")
+    first_active_subcarrier_index: int      = Field(..., ge=0, description="Index of first active subcarrier")
+    subcarrier_zero_frequency: FrequencyHz  = Field(..., ge=0, description="Subcarrier zero center frequency (Hz)")
+    subcarrier_spacing: FrequencyHz         = Field(..., ge=0, description="Subcarrier spacing (Hz)")
+    data_length: int                        = Field(..., ge=0, description="Length in bytes of RxMER data")
+    occupied_channel_bandwidth: FrequencyHz = Field(..., ge=0, description="OFDMA Occupied Bandwidth (Hz)")
+    value_units: str                        = Field(default="dB", description="Non-mutable")
+    values: FloatSeries                     = Field(..., description="RxMER values per subcarrier (dB)")
+    signal_statistics: SignalStatisticsModel = Field(..., description="Aggregate statistics computed from values")
+    modulation_statistics: dict[str, Any]   = Field(..., description="Shannon-based modulation metrics")
+
+
 class CmUsOfdmaPreEqModel(PnmBaseModel):
     model_config                            = ConfigDict(extra="ignore")
     cmts_mac_address: MacAddressStr         = Field(..., description="CMTS MAC address associated with this measurement.")

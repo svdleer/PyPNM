@@ -36,6 +36,20 @@ ThemeType = Literal["dark", "light", True, False]
 CROSSHAIR_MARKER_SIZE_PTS: float = 24.0
 CROSSHAIR_LINEWIDTH_PTS: float = 0.6
 
+# Standard PyPNM color palette for consistent plot styling
+# Matches Chart.js default palette used in web frontend
+DEFAULT_PRIMARY_COLOR: str = "#36A2EB"  # Blue - primary data line
+DEFAULT_LINE_COLORS: list[str] = [
+    "#36A2EB",  # Blue - primary
+    "#FF6384",  # Pink/Red - secondary (regression, errors)
+    "#4BC0C0",  # Teal - tertiary
+    "#FFCE56",  # Yellow
+    "#9966FF",  # Purple
+    "#FF9F40",  # Orange
+    "#C9CBCF",  # Gray
+    "#7BC043",  # Green
+]
+
 
 @dataclass(frozen=True)
 class PlotConfig:
@@ -97,9 +111,11 @@ class PlotConfig:
     x_tick_decimals: int | None = None
     xlabel_base: str | None = None
 
-    # Line color controls
-    line_color: str | None = None
-    line_colors: list[str] | None = None
+    # Line color controls - Standard PyPNM color palette
+    # Primary: #36A2EB (blue), Secondary: #FF6384 (pink/red), Tertiary: #4BC0C0 (teal)
+    # Additional: #FFCE56 (yellow), #9966FF (purple), #FF9F40 (orange)
+    line_color: str | None = "#36A2EB"
+    line_colors: list[str] | None = None  # Will use DEFAULT_LINE_COLORS if None
     scatter_size: float | None = None
 
     # X-axis visibility / human time label

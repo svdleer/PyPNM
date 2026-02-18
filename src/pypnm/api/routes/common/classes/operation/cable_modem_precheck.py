@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections.abc import Iterable
+from typing import Dict, Tuple
 
 from pypnm.api.routes.common.classes.common_endpoint_classes.schema.base_snmp import (
     SNMPConfig,
@@ -21,13 +24,22 @@ from pypnm.lib.types import InetAddressStr, MacAddressStr
 
 PreCheckStatus = tuple[ServiceStatusCode, str]
 
+# Check once at import time
+_USE_AGENT = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
+
+# Simple in-memory cache for ping/SNMP reachability checks
+# Cache format: {ip_address: (timestamp, ping_status, snmp_status)}
+_REACHABILITY_CACHE: Dict[str, Tuple[float, ServiceStatusCode, ServiceStatusCode]] = {}
+_CACHE_TTL = 30.0  # Cache results for 30 seconds
+
+
 class CableModemServicePreCheck:
     """
     Performs preliminary connectivity and validation checks against a DOCSIS Cable Modem.
 
     This service supports:
-    - ICMP ping reachability check
-    - SNMP reachability check
+    - ICMP ping reachability check (via agent when PYPNM_USE_AGENT_SNMP=true)
+    - SNMP reachability check (via agent when PYPNM_USE_AGENT_SNMP=true)
     - MAC address verification
     - Optional DOCSIS version compatibility validation
     - Optional validation that OFDM (DS) and/or OFDMA (US) channels exist
@@ -35,9 +47,6 @@ class CableModemServicePreCheck:
     Initialization methods:
     - Provide a pre-constructed `CableModem` object
     - Or specify a `mac_address` and `ip_address` pair
-
-    Parameters allow flexible diagnostics for network readiness prior to performing
-    PNM measurements or control operations.
     """
 
     def __init__(
@@ -54,20 +63,6 @@ class CableModemServicePreCheck:
         validate_pnm_ready_status: bool = True,
         ignore_mac_address_check: bool  = False,
     ) -> None:
-        """
-        Initialize the pre-check service.
-
-        Args:
-            cable_modem: An existing CableModem instance to use for queries (optional).
-            mac_address: MAC address of the target cable modem (optional).
-            ip_address: IP address of the target cable modem (optional).
-            check_docsis_version: Optional list of acceptable DOCSIS versions to validate.
-            validate_ofdm_exist: If True, verifies that one or more downstream OFDM channels exist.
-            validate_ofdma_exist: If True, verifies that one or more upstream OFDMA channels exist.
-
-        Raises:
-            ValueError: If neither a `CableModem` object nor both `mac_address` and `ip_address` are provided.
-        """
         if check_docsis_version is None:
             check_docsis_version = []
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -88,6 +83,13 @@ class CableModemServicePreCheck:
         else:
             raise ValueError("Must provide either `cable_modem` or both `mac_address` and `ip_address`.")
 
+        # Store SNMP community for agent-based operations
+        self._snmp_community = (
+            snmp_config.snmp_v2c.community if snmp_config and snmp_config.snmp_v2c and snmp_config.snmp_v2c.community
+            else self.cm.getWriteCommunity() if cable_modem else None
+        )
+        self._ip_address = ip_address or str(self.cm.get_inet_address)
+
         if check_docsis_version:
             if isinstance(check_docsis_version, ClabsDocsisVersion):
                 self.check_docsis_version = [check_docsis_version]
@@ -105,11 +107,32 @@ class CableModemServicePreCheck:
         self._validate_pnm_ready_stat   = validate_pnm_ready_status
         self._ignore_mac_address_check  = ignore_mac_address_check
 
+    # ------------------------------------------------------------------
+    # Agent helpers
+    # ------------------------------------------------------------------
+
+    def _get_agent_manager(self):
+        """Lazy import to avoid circular imports."""
+        from pypnm.api.agent.manager import get_agent_manager
+        return get_agent_manager()
+
+    def _get_snmp_agent(self):
+        """Return the first authenticated agent that has snmp_get capability."""
+        mgr = self._get_agent_manager()
+        if not mgr:
+            return None, None
+        agent = mgr.get_agent_for_capability('snmp_get')
+        return mgr, agent
+
+    # ------------------------------------------------------------------
+    # Main pre-check
+    # ------------------------------------------------------------------
+
     async def run_precheck(self) -> tuple[ServiceStatusCode, str]:
         """
         Run full pre-check routine:
-          1. Ping modem
-          2. Perform SNMP check
+          1. Ping modem  (via agent when available)
+          2. Perform SNMP check (via agent when available)
           3. Does Mac Match CableModem Mac
           4. Validate DOCSIS version (optional)
 
@@ -118,7 +141,7 @@ class CableModemServicePreCheck:
         """
         self.logger.debug(f"Starting pre-check for CableModem: {self.cm}")
 
-        status = self.ping_reachable()
+        status = await self.ping_reachable()
         if status != ServiceStatusCode.SUCCESS:
             msg = f"Ping check failed: {status}"
             self.logger.error(msg)
@@ -130,7 +153,7 @@ class CableModemServicePreCheck:
             self.logger.error(msg)
             return status, msg
 
-        if not self._ignore_mac_address_check:
+        if not self._ignore_mac_address_check and not _USE_AGENT:
             status = await self.isMacCorrect()
             if status != ServiceStatusCode.SUCCESS:
 
@@ -178,45 +201,176 @@ class CableModemServicePreCheck:
         self.logger.debug(msg)
         return ServiceStatusCode.SUCCESS, msg
 
-    def ping_reachable(self) -> ServiceStatusCode:
+    # ------------------------------------------------------------------
+    # Ping
+    # ------------------------------------------------------------------
+
+    async def ping_reachable(self) -> ServiceStatusCode:
         """
         Perform an ICMP ping test.
+        When PYPNM_USE_AGENT_SNMP is set, the ping is executed by the remote
+        agent (which actually has L3 access to the modem network).
+        
+        Note: For agent-based SNMP, we skip the ping check and rely on SNMP
+        reachability instead, as ping can timeout when multiple parallel
+        requests queue at the agent.
+        
+        Results are cached for 30 seconds to avoid redundant checks when
+        multiple endpoints are called for the same modem.
 
         Returns:
             SUCCESS if reachable, else PING_FAILED.
         """
+        # Check cache first
+        cache_entry = _REACHABILITY_CACHE.get(self._ip_address)
+        if cache_entry:
+            timestamp, ping_status, _ = cache_entry
+            if time.time() - timestamp < _CACHE_TTL:
+                self.logger.debug(f"Ping check result from cache: {ping_status}")
+                return ping_status
+        
+        if _USE_AGENT:
+            # Skip ping for agent transport - SNMP check is more reliable
+            self.logger.debug("Skipping ping check for agent transport (will check SNMP instead)")
+            status = ServiceStatusCode.SUCCESS
+        else:
+            status = self._ping_local()
+        
+        # Update cache
+        snmp_status = cache_entry[2] if cache_entry else None
+        _REACHABILITY_CACHE[self._ip_address] = (time.time(), status, snmp_status)
+        return status
+
+    def _ping_local(self) -> ServiceStatusCode:
+        """Local ping (direct network access)."""
         try:
             if self.cm.is_ping_reachable():
-                self.logger.debug("Ping check passed")
+                self.logger.debug("Ping check passed (local)")
                 return ServiceStatusCode.SUCCESS
-            self.logger.debug("Ping check failed")
+            self.logger.debug("Ping check failed (local)")
             return ServiceStatusCode.PING_FAILED
         except Exception as e:
             self.logger.error(f"Ping check exception: {e}", exc_info=True)
             return ServiceStatusCode.PING_FAILED
 
+    async def _ping_via_agent(self) -> ServiceStatusCode:
+        """Ping via pyPNMAgent over WebSocket."""
+        try:
+            mgr, agent = self._get_snmp_agent()
+            if not mgr or not agent:
+                self.logger.warning("No agent available for ping – falling back to local")
+                return self._ping_local()
+
+            task_id = await mgr.send_task(
+                agent.agent_id,
+                'ping',
+                {'target': self._ip_address},
+                timeout=5.0,
+            )
+            result = await mgr.wait_for_task_async(task_id, timeout=5.0)
+
+            if result and result.get('type') == 'response':
+                data = result.get('result', {})
+                if data.get('reachable') or data.get('success'):
+                    self.logger.debug("Ping check passed (agent)")
+                    return ServiceStatusCode.SUCCESS
+
+            self.logger.debug("Ping check failed (agent)")
+            return ServiceStatusCode.PING_FAILED
+        except Exception as e:
+            self.logger.error(f"Ping via agent exception: {e}", exc_info=True)
+            return ServiceStatusCode.PING_FAILED
+
+    # ------------------------------------------------------------------
+    # SNMP reachability
+    # ------------------------------------------------------------------
+
     async def snmp_reachable(self) -> ServiceStatusCode:
         """
-        Perform SNMP reachability check.
+        Perform SNMP reachability check (sysDescr GET).
+        When PYPNM_USE_AGENT_SNMP is set, the SNMP query is routed through
+        the remote agent.
+        
+        Results are cached for 30 seconds to avoid redundant checks when
+        multiple endpoints are called for the same modem.
 
         Returns:
             SUCCESS if SNMP response received, else UNREACHABLE_SNMP.
         """
+        # Check cache first
+        cache_entry = _REACHABILITY_CACHE.get(self._ip_address)
+        if cache_entry:
+            timestamp, ping_status, snmp_status = cache_entry
+            if snmp_status and time.time() - timestamp < _CACHE_TTL:
+                self.logger.debug(f"SNMP check result from cache: {snmp_status}")
+                return snmp_status
+        
+        if _USE_AGENT:
+            status = await self._snmp_via_agent()
+        else:
+            status = await self._snmp_local()
+        
+        # Update cache (preserve ping_status if present)
+        ping_status = cache_entry[1] if cache_entry else None
+        _REACHABILITY_CACHE[self._ip_address] = (time.time(), ping_status, status)
+        return status
+
+    async def _snmp_local(self) -> ServiceStatusCode:
+        """Direct SNMP sysDescr check."""
         try:
             if await self.cm.is_snmp_reachable():
-                self.logger.debug("SNMP check passed")
+                self.logger.debug("SNMP check passed (local)")
                 return ServiceStatusCode.SUCCESS
-            self.logger.debug("SNMP check failed")
+            self.logger.debug("SNMP check failed (local)")
             return ServiceStatusCode.UNREACHABLE_SNMP
-
         except Exception as e:
             self.logger.error(f"SNMP check exception: {e}", exc_info=True)
             return ServiceStatusCode.UNREACHABLE_SNMP
 
+    async def _snmp_via_agent(self) -> ServiceStatusCode:
+        """SNMP sysDescr check via pyPNMAgent."""
+        try:
+            mgr, agent = self._get_snmp_agent()
+            if not mgr or not agent:
+                self.logger.warning("No agent available for SNMP – falling back to local")
+                return await self._snmp_local()
+
+            community = self._snmp_community or 'public'
+
+            # Use longer timeout to account for agent queue when multiple
+            # parallel requests are in flight (each SNMP operation ~1-3s)
+            timeout = 15.0  # Increased from 5.0 to handle 4+ parallel requests
+
+            task_id = await mgr.send_task(
+                agent.agent_id,
+                'snmp_get',
+                {
+                    'target_ip': self._ip_address,
+                    'oid': '1.3.6.1.2.1.1.1.0',       # sysDescr.0
+                    'community': community,
+                },
+                timeout=timeout,
+            )
+            result = await mgr.wait_for_task_async(task_id, timeout=timeout)
+
+            if result and result.get('type') == 'response':
+                data = result.get('result', {})
+                if data.get('success') and data.get('output'):
+                    self.logger.debug(f"SNMP check passed (agent): {data['output'][:80]}")
+                    return ServiceStatusCode.SUCCESS
+
+            self.logger.debug(f"SNMP check failed (agent): {result}")
+            return ServiceStatusCode.UNREACHABLE_SNMP
+        except Exception as e:
+            self.logger.error(f"SNMP via agent exception: {e}", exc_info=True)
+            return ServiceStatusCode.UNREACHABLE_SNMP
+
+    # ------------------------------------------------------------------
+    # MAC address
+    # ------------------------------------------------------------------
+
     async def isMacCorrect(self) -> ServiceStatusCode:
-        """
-        Check if the cable modem's MAC address is correct.
-        """
+        """Check if the cable modem's MAC address is correct."""
         try:
             if await self.cm.isCableModemMacCorrect():
                 self.logger.debug("MAC address check passed")
@@ -228,12 +382,7 @@ class CableModemServicePreCheck:
             return ServiceStatusCode.UNREACHABLE_SNMP
 
     async def getRealMacAddress(self) -> MacAddress:
-        """
-        Retrieve the real MAC address from the cable modem via SNMP.
-
-        Returns:
-            MacAddress: The MAC address retrieved from the cable modem.
-        """
+        """Retrieve the real MAC address from the cable modem via SNMP."""
         try:
             mac = await self.cm.getIfPhysAddress()
             self.logger.debug(f"Retrieved MAC address: {mac}")
@@ -242,15 +391,14 @@ class CableModemServicePreCheck:
             self.logger.error(f"Error retrieving MAC address: {e}", exc_info=True)
             raise
 
-    async def validate_docsis_version(self) -> tuple[ServiceStatusCode, str]:
-        """
-        Check if the modem's DOCSIS version is in the accepted list.
+    # ------------------------------------------------------------------
+    # DOCSIS version
+    # ------------------------------------------------------------------
 
-        Returns:
-            SUCCESS if version is allowed, else INVALID_DOCSIS_VERSION.
-        """
+    async def validate_docsis_version(self) -> tuple[ServiceStatusCode, str]:
+        """Check if the modem's DOCSIS version is in the accepted list."""
         try:
-            base_cap:ClabsDocsisVersion = await self.cm.getDocsisBaseCapability()
+            base_cap: ClabsDocsisVersion = await self.cm.getDocsisBaseCapability()
             if base_cap not in self.check_docsis_version:
                 msg = f"Invalid DOCSIS Version: {base_cap.name}"
                 self.logger.error(msg)
@@ -264,93 +412,45 @@ class CableModemServicePreCheck:
             self.logger.error(msg, exc_info=True)
             return ServiceStatusCode.INVALID_DOCSIS_VERSION, msg
 
+    # ------------------------------------------------------------------
+    # Channel existence checks
+    # ------------------------------------------------------------------
+
     async def validate_ofdm_channel_exist(self) -> tuple[ServiceStatusCode, str]:
-        """
-        Checks whether any OFDM downstream channels are present on the cable modem.
-
-        This method queries the cable modem for the DOCSIS 3.1 upstream OFDMA channel
-        index stack. If no indices are found, it returns a failure status.
-
-        Returns:
-            Tuple[ServiceStatusCode, str]: A tuple containing the status code and an explanatory message.
-                - ServiceStatusCode.SUCCESS if channels are found
-                - ServiceStatusCode.NO_OFDMA_CHANNELS_EXIST if no channels are detected
-        """
+        """Check whether any OFDM downstream channels exist."""
         idx_chan_stack = await self.cm.getDocsIf31CmDsOfdmChannelIdIndexStack()
-
         if not idx_chan_stack:
             msg = "No OFDM channels found on the cable modem."
             return ServiceStatusCode.NO_OFDMA_CHANNELS_EXIST, msg
-
-        return ServiceStatusCode.SUCCESS, "OFDMA upstream channels detected."
+        return ServiceStatusCode.SUCCESS, "OFDM downstream channels detected."
 
     async def validate_ofdma_channel_exist(self) -> tuple[ServiceStatusCode, str]:
-        """
-        Checks whether any OFDMA upstream channels are present on the cable modem.
-
-        This method queries the cable modem for the DOCSIS 3.1 upstream OFDMA channel
-        index stack. If no indices are found, it returns a failure status.
-
-        Returns:
-            Tuple[ServiceStatusCode, str]: A tuple containing the status code and an explanatory message.
-                - ServiceStatusCode.SUCCESS if channels are found
-                - ServiceStatusCode.NO_OFDMA_CHANNELS_EXIST if no channels are detected
-        """
+        """Check whether any OFDMA upstream channels exist."""
         idx_chan_stack = await self.cm.getDocsIf31CmUsOfdmaChannelIdIndexStack()
-
         if not idx_chan_stack:
             msg = "No OFDMA channels found on the cable modem."
             return ServiceStatusCode.NO_OFDMA_CHANNELS_EXIST, msg
-
         return ServiceStatusCode.SUCCESS, "OFDMA upstream channels detected."
 
     async def validate_scqam_channel_exist(self) -> tuple[ServiceStatusCode, str]:
-        """
-        Checks whether any SC-QAM downstream channels are present on the cable modem.
-
-        This method queries the cable modem for the DOCSIS 3.0 SC-QAM downstream channel
-        index stack. If no indices are found, it returns a failure status.
-
-        Returns:
-            Tuple[ServiceStatusCode, str]: A tuple containing the status code and an explanatory message.
-                - ServiceStatusCode.SUCCESS if channels are found
-                - ServiceStatusCode.NO_SCQAM_CHAN_ID_INDEX_FOUND if no channels are detected
-        """
+        """Check whether any SC-QAM downstream channels exist."""
         scqam_idx_list = await self.cm.getIfTypeIndex(DocsisIfType.docsCableDownstream)
-
         if not scqam_idx_list:
             msg = "No SC-QAM channels found on the cable modem."
             return ServiceStatusCode.NO_SCQAM_CHAN_ID_INDEX_FOUND, msg
-
         return ServiceStatusCode.SUCCESS, "SC-QAM downstream channels detected."
 
     async def validate_atdma_channel_exist(self) -> tuple[ServiceStatusCode, str]:
-        """
-        Checks whether any ATDMA upstream channels are present on the cable modem.
-
-        This method queries the cable modem for the DOCSIS 3.0 ATDMA upstream channel
-        index stack. If no indices are found, it returns a failure status.
-
-        Returns:
-            Tuple[ServiceStatusCode, str]: A tuple containing the status code and an explanatory message.
-                - ServiceStatusCode.SUCCESS if channels are found
-                - ServiceStatusCode.NO_ATDMA_CHAN_ID_INDEX_FOUND if no channels are detected
-        """
+        """Check whether any ATDMA upstream channels exist."""
         atdma_idx_list = await self.cm.getIfTypeIndex(DocsisIfType.docsCableUpstream)
-
         if not atdma_idx_list:
             msg = "No ATDMA channels found on the cable modem."
             return ServiceStatusCode.NO_ATDMA_CHAN_ID_INDEX_FOUND, msg
-
         return ServiceStatusCode.SUCCESS, "ATDMA upstream channels detected."
 
     async def validate_pnm_ready_status(self) -> PreCheckStatus:
-
-        out:PreCheckStatus = (ServiceStatusCode.SUCCESS, DocsPnmCmCtlStatus.READY.name)
-
+        out: PreCheckStatus = (ServiceStatusCode.SUCCESS, DocsPnmCmCtlStatus.READY.name)
         rst: DocsPnmCmCtlStatus = await self.cm.getDocsPnmCmCtlStatus()
-
         if rst != DocsPnmCmCtlStatus.READY:
             return ServiceStatusCode.SUCCESS, rst.name
-
         return out

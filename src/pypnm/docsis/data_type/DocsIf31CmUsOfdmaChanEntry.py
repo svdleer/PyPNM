@@ -109,9 +109,15 @@ class DocsIf31CmUsOfdmaChanEntry(BaseModel):
     async def get(cls, snmp: Snmp_v2c, indices: list[int]) -> list[DocsIf31CmUsOfdmaChanEntry]:
         results: list[DocsIf31CmUsOfdmaChanEntry] = []
 
-        for index in indices:
-            result = await cls.from_snmp(index, snmp)
-            if result is not None:
+        # Parallelize from_snmp calls for all indices
+        import asyncio
+        tasks = [cls.from_snmp(index, snmp) for index in indices]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for index, result in zip(indices, responses):
+            if isinstance(result, Exception):
+                pass  # from_snmp already logs warnings
+            elif result is not None:
                 results.append(result)
 
         return results

@@ -410,6 +410,61 @@ class DocsIf3CmSpectrumAnalysisCtrlCmd:
         self.docsIf3CmSpectrumAnalysisCtrlCmdFileName = value
         self.logger.debug(f"Set file name to {value}")
 
+    def apply_vendor_settings(self, mac_address: str) -> bool:
+        """
+        Apply vendor-specific spectrum analyzer settings based on modem MAC address.
+        
+        Different modem vendors have different limitations on spectrum analyzer
+        parameters. This method adjusts the segment span based on known vendor
+        capabilities to avoid measurement failures.
+        
+        Args:
+            mac_address: MAC address of the target cable modem
+            
+        Returns:
+            True if settings were adjusted, False if using defaults
+            
+        Example:
+            >>> cmd = DocsIf3CmSpectrumAnalysisCtrlCmd()
+            >>> cmd.apply_vendor_settings("90:32:4b:c8:17:b3")  # Ubee modem
+            True
+            >>> cmd.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan
+            2000000  # 2 MHz for Ubee
+        """
+        from pypnm.lib.vendor_capabilities import (
+            get_vendor_from_mac,
+            get_vendor_capabilities,
+            get_recommended_spectrum_span,
+        )
+        
+        vendor = get_vendor_from_mac(mac_address)
+        caps = get_vendor_capabilities(mac_address)
+        
+        first_freq = self.docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency
+        last_freq = self.docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency
+        current_span = self.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan
+        
+        recommended_span = get_recommended_spectrum_span(mac_address, first_freq, last_freq)
+        
+        if recommended_span > current_span:
+            self.docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan = recommended_span
+            self.logger.info(
+                "Adjusted segment span from %d Hz to %d Hz for vendor %s (MAC: %s)",
+                current_span,
+                recommended_span,
+                vendor,
+                mac_address,
+            )
+            return True
+        
+        self.logger.debug(
+            "Using segment span %d Hz for vendor %s (MAC: %s)",
+            current_span,
+            vendor,
+            mac_address,
+        )
+        return False
+
     def to_dict(self) -> dict[str, Any]:
         spectrum_cmd = {
             "docsIf3CmSpectrumAnalysisCtrlCmdEnable":                          self.docsIf3CmSpectrumAnalysisCtrlCmdEnable,

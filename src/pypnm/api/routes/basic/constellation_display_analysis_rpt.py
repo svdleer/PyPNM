@@ -129,13 +129,14 @@ class ConstellationDisplayReport(AnalysisReport):
                     legend          =   True,
                     transparent     =   False,
                     show_crosshair  =   self._matplot_config.display_crosshair,
-                    theme           =   self._matplot_config.theme,
+                    theme           =   False,  # Light theme to match DS RxMER
+                    line_color      =   "#36A2EB",  # Match DS RxMER blue
                 )
 
                 const_disp = self.create_png_fname(tags=[str(channel_id), self.FNAME_TAG])
                 self.logger.debug("Creating MatPlot: %s for channel: %s", const_disp, channel_id)
 
-                mgr = MatplotManager(default_cfg=cfg)
+                mgr = MatplotManager(default_cfg=cfg, figsize=(14, 6), dpi=150)
                 mgr.plot_constellation(filename=const_disp)
 
                 matplot_mgr.append(mgr)

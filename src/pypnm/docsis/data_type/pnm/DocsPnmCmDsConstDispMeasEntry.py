@@ -74,6 +74,10 @@ class DocsPnmCmDsConstDispMeasEntry(BaseModel):
             docsPnmCmDsConstDispMeasStatus      = meas_status_s,
             docsPnmCmDsConstDispFileName        = str(file_name or ""),
         )
+        
+        print(f"=== SNMP FILENAME DEBUG ===", flush=True)
+        print(f"Index: {index}, Status: {meas_status_s}, Filename: {file_name}", flush=True)
+        print(f"=== END SNMP FILENAME DEBUG ===", flush=True)
 
         return cls(index=index, channel_id=index, entry=entry)
 

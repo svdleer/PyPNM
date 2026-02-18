@@ -83,14 +83,14 @@ class Snmp_v2c:
         Initializes the SNMPv2c client.
 
         Args:
-            host (Inet): Host address of the SNMP device.
+            host (Inet | str): Host address of the SNMP device (Inet object or string).
             community (str | None): Legacy community string for SNMP access.
             read_community (SnmpReadCommunity | None): Read community string override.
             write_community (SnmpWriteCommunity | None): Write community string override.
             port (int): SNMP port (default 161).
         """
         self.logger     = logging.getLogger(self.__class__.__name__)
-        self._host      = host.inet
+        self._host      = host.inet if hasattr(host, 'inet') else str(host)
         self._port      = port
         if read_community is not None:
             self._read_community = str(read_community)
@@ -421,6 +421,10 @@ class Snmp_v2c:
             ContextData(),
             ObjectType(ObjectIdentity(oid), snmp_value),
         )
+        
+        if errorIndication:
+            self.logger.warning(f'SNMP-SET error: {errorIndication}')
+        
         try:
             self._raise_on_snmp_error(errorIndication, errorStatus, errorIndex)
 
@@ -480,9 +484,9 @@ class Snmp_v2c:
         return bool(re.fullmatch(r"\.?(\d+\.)+\d+", oid))
 
     @staticmethod
-    def get_result_value(pysnmp_get_result: ObjectType | tuple[ObjectType, ...] | None) -> str | None:
+    def get_result_value(pysnmp_get_result: ObjectType | tuple[ObjectType, ...] | list | None) -> str | None:
         """
-        Extract the value from a pysnmp GET result.
+        Extract the value from a pysnmp GET result or AgentVarBind.
 
         Args:
             pysnmp_get_result: SNMP response from get().
@@ -491,10 +495,18 @@ class Snmp_v2c:
             Optional[str]: The extracted value as string, or None if not found.
         """
         try:
+            # Handle tuple result (multiple ObjectType)
             if isinstance(pysnmp_get_result, tuple):
                 pysnmp_get_result = pysnmp_get_result[0]
+            
+            # Handle list result
+            elif isinstance(pysnmp_get_result, list):
+                if len(pysnmp_get_result) == 0:
+                    return None
+                pysnmp_get_result = pysnmp_get_result[0]
 
-            if isinstance(pysnmp_get_result, ObjectType):
+            # Extract value from ObjectType or AgentVarBind (both support [1])
+            if hasattr(pysnmp_get_result, '__getitem__'):
                 value = pysnmp_get_result[1]
                 if isinstance(value, OctetString):
                     return value.prettyPrint()

@@ -310,6 +310,9 @@ class Analysis:
         elif pnm_file_type == PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY.value:
             self.logger.debug("Processing: DOWNSTREAM_CONSTELLATION_DISPLAY")
             model = self.basic_analysis_ds_constellation_display(measurement)
+            if model is None:
+                self.logger.warning("Constellation analysis returned None (no samples?), skipping")
+                return
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
             self.__add_pnmType(PnmFileType.DOWNSTREAM_CONSTELLATION_DISPLAY)
@@ -1154,7 +1157,7 @@ class Analysis:
         return result_model
 
     @classmethod
-    def basic_analysis_ds_constellation_display(cls, measurement: dict[str, Any]) -> ConstellationDisplayAnalysisModel:
+    def basic_analysis_ds_constellation_display(cls, measurement: dict[str, Any]) -> ConstellationDisplayAnalysisModel | None:
         """
         Build a minimal constellation analysis payload from a downstream OFDM
         measurement dictionary.
@@ -1179,19 +1182,40 @@ class Analysis:
 
         Returns
         -------
-        ConstellationDisplayAnalysisModel
+        ConstellationDisplayAnalysisModel | None
             Typed model carrying device/header info, inferred QAM order,
             **hard** constellation points from the LUT, and the **unscaled soft**
             decision coordinates provided by the CM.
+            Returns None if samples are empty (modem doesn't support this channel).
 
         Raises
         ------
-        ValueError
-            If ``samples`` is missing or empty.
+        None
+            This method now returns None instead of raising for empty samples.
         """
-        samples: ComplexArray = measurement.get("samples") or []
+        # DEBUG: Log incoming measurement structure
+        print(f"=== CONSTELLATION DISPLAY DEBUG ===", flush=True)
+        print(f"measurement keys: {measurement.keys()}", flush=True)
+        print(f"measurement has 'samples': {'samples' in measurement}", flush=True)
+        raw_samples = measurement.get("samples")
+        print(f"raw_samples type: {type(raw_samples)}", flush=True)
+        print(f"raw_samples is None: {raw_samples is None}", flush=True)
+        if raw_samples is not None:
+            print(f"raw_samples length: {len(raw_samples) if hasattr(raw_samples, '__len__') else 'N/A'}", flush=True)
+            if len(raw_samples) > 0:
+                print(f"first sample type: {type(raw_samples[0])}, value: {raw_samples[0]}", flush=True)
+        print(f"=== END CONSTELLATION DISPLAY DEBUG ===", flush=True)
+        
+        # Convert samples from list of lists to list of tuples if needed
+        samples: ComplexArray = []
+        if raw_samples:
+            samples = [(float(s[0]), float(s[1])) if isinstance(s, (list, tuple)) else s for s in raw_samples]
+        
         if not samples:
-            raise ValueError("measurement['samples'] is required and must be a non-empty ComplexArray.")
+            # Return None for empty samples instead of raising - this allows other channels to succeed
+            channel_id = measurement.get("channel_id", "unknown")
+            print(f"WARNING: Channel {channel_id} has no constellation samples, skipping", flush=True)
+            return None
 
         # Map actual modulation order → QamModulation
         amo: int | str = measurement.get("actual_modulation_order", DsOfdmModulationType.UNKNOWN)
