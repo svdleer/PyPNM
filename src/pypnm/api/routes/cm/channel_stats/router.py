@@ -200,7 +200,7 @@ class ChannelStatsRouter:
                 fiber_node_sg_task_id = None
                 cached_cm_index = None
                 if request.cmts_ip and request.mac_address:
-                    cached_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address)
+                    cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                     if cached_cm_index is not None:
                         # Fast path: direct snmpget for SG ID using known cm_index
                         try:
@@ -360,7 +360,7 @@ class ChannelStatsRouter:
                                         break
                         if cm_index is not None:
                             self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
-                            _set_cached_cm_index(request.cmts_ip, mac_address, cm_index)
+                            _set_cached_cm_index(request.cmts_ip, request.mac_address, cm_index)
                             # Now that we have cm_index, pre-fetch SG ID for fiber node
                             try:
                                 fiber_node_sg_task_id = await agent_manager.send_task(
@@ -468,7 +468,7 @@ class ChannelStatsRouter:
                 fiber_node_table_task_id = None
                 if request.cmts_ip and request.mac_address:
                     try:
-                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
+                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address) if request.mac_address else None
                         if fn_cm_index is not None:
                             # Get SG ID directly via snmpget using known cm_index
                             fiber_node_sg_task_id = await agent_manager.send_task(
@@ -488,7 +488,7 @@ class ChannelStatsRouter:
                 fiber_node = None
                 if request.cmts_ip and request.mac_address:
                     try:
-                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
+                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address) if request.mac_address else None
                         if fiber_node_sg_task_id and fn_cm_index is not None:
                             sg_result = await agent_manager.wait_for_task_async(fiber_node_sg_task_id, timeout=5.0)
                             cm_sg_id = None
