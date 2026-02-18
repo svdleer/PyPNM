@@ -198,24 +198,50 @@ class ChannelStatsRouter:
                 cmts_chanid_task_id = None
                 cmts_profile_task_id = None
                 fiber_node_sg_task_id = None
+                cached_cm_index = None
+                if request.cmts_ip and request.mac_address:
+                    cached_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address)
+                    if cached_cm_index is not None:
+                        # Fast path: direct snmpget for SG ID using known cm_index
+                        try:
+                            fiber_node_sg_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_get",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=5.0,
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"Fiber node pre-task failed: {e}")
+                    else:
+                        # First call: walk MAC table to resolve cm_index
+                        try:
+                            cmts_cmindex_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=15.0,
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"CMTS cmindex task failed: {e}")
+
                 if request.cmts_ip and request.cmts_stats:
                     try:
-                        # Check cm_index cache — avoids full MAC table walk on repeat calls
-                        cached_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
-
-                        # Only fetch CMTS OFDMA channel table as fallback if modem doesn't report it
-                        # We check after modem walk; send speculatively only on first call
                         if cached_cm_index is None:
                             cmts_ofdma_task_id = await agent_manager.send_task(
                                 agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
-                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',  # docsIf31CmtsUsOfdmaChanTable
+                                    "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',
                                     "community": request.cmts_community or "public",
                                 },
                                 timeout=15.0,
                             )
-
                         if cached_cm_index is not None:
                             # Scoped walks — tiny, fast
                             cmts_rxmer_task_id = await agent_manager.send_task(
@@ -313,39 +339,50 @@ class ChannelStatsRouter:
                 )
 
                 # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
+                # First: resolve cm_index (needed for both rxmer and fiber node)
+                cm_index = cached_cm_index
+                if cmts_cmindex_task_id and cm_index is None and request.mac_address:
+                    try:
+                        cmidx_result = await agent_manager.wait_for_task_async(cmts_cmindex_task_id, timeout=15.0)
+                        if cmidx_result and cmidx_result.get('result', {}).get('success'):
+                            mac_clean = request.mac_address.replace(':', '').lower()
+                            for entry in cmidx_result.get('result', {}).get('results', []):
+                                val = entry.get('value', '')
+                                if isinstance(val, str):
+                                    entry_mac = val.replace(' ', '').replace(':', '').lower()
+                                    if entry_mac == mac_clean:
+                                        oid = entry.get('oid', '')
+                                        suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
+                                        try:
+                                            cm_index = int(suffix.strip('.'))
+                                        except ValueError:
+                                            pass
+                                        break
+                        if cm_index is not None:
+                            self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
+                            _set_cached_cm_index(request.cmts_ip, mac_address, cm_index)
+                            # Now that we have cm_index, pre-fetch SG ID for fiber node
+                            try:
+                                fiber_node_sg_task_id = await agent_manager.send_task(
+                                    agent_id, "snmp_get",
+                                    {
+                                        "target_ip": request.cmts_ip,
+                                        "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}',
+                                        "community": request.cmts_community or "public",
+                                    },
+                                    timeout=5.0,
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        self.logger.debug(f'cm_index resolution failed: {e}')
+
                 if cmts_rxmer_task_id and parsed.get('success'):
                     try:
-                        # Resolve mac -> cm_index from CMTS reg status table
-                        cm_index = None
-                        if cmts_cmindex_task_id and request.mac_address:
-                            cmidx_result = await agent_manager.wait_for_task_async(cmts_cmindex_task_id, timeout=15.0)
-                            if cmidx_result and cmidx_result.get('result', {}).get('success'):
-                                mac_clean = request.mac_address.replace(':', '').lower()
-                                for entry in cmidx_result.get('result', {}).get('results', []):
-                                    val = entry.get('value', '')
-                                    # value is hex bytes like '90 32 4B C8 19 0B' or already a string
-                                    if isinstance(val, str):
-                                        entry_mac = val.replace(' ', '').replace(':', '').lower()
-                                        if entry_mac == mac_clean:
-                                            # OID suffix is the cm_index
-                                            oid = entry.get('oid', '')
-                                            suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
-                                            try:
-                                                cm_index = int(suffix.strip('.'))
-                                            except ValueError:
-                                                pass
-                                            break
-                            self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
-                            if cm_index is not None:
-                                _set_cached_cm_index(request.cmts_ip, mac_address, cm_index)
-
                         rxmer_result = await agent_manager.wait_for_task_async(cmts_rxmer_task_id, timeout=15.0)
                         if rxmer_result and rxmer_result.get('result', {}).get('success'):
                             rxmer_entries = rxmer_result.get('result', {}).get('results', [])
                             base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
-
-                            # Build positional list of (ofdma_ifindex, rx_mer) filtered by cm_index
-                            # Cisco CCAP: no channel_id in this table, match by sorted ifindex order
                             cm_rxmer_list = []
                             for entry in rxmer_entries:
                                 oid = entry.get('oid', '')
@@ -362,8 +399,6 @@ class ChannelStatsRouter:
                                     except (ValueError, TypeError):
                                         pass
                             cm_rxmer_list.sort(key=lambda x: x[0])
-
-                            # Inject positionally into OFDMA channels (sorted by index)
                             ofdma_channels = sorted(
                                 parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
                                 key=lambda c: c.get('index', 0)
