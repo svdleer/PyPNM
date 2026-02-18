@@ -545,7 +545,13 @@ class CMTSModemService:
                 modem['ofdma_ifindex'] = ofdma_ifidx
                 modem['ofdma_enabled'] = True
                 if ofdma_ifidx in ofdma_descr_map:
-                    modem['upstream_interface'] = ofdma_descr_map[ofdma_ifidx]
+                    descr = ofdma_descr_map[ofdma_ifidx]
+                    # Ensure 'ofdma' appears in the interface name so the GUI
+                    # badge check (upstream_interface.includes('ofdma')) works
+                    # for all vendors (Cisco names like C1/0/6/UB lack it)
+                    if 'ofdma' not in descr.lower():
+                        descr = f'cable-us-ofdma {descr}'
+                    modem['upstream_interface'] = descr
             else:
                 modem['ofdma_enabled'] = False
                 # Collect SC-QAM US-CH ifIndexes for later resolution
