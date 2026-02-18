@@ -190,7 +190,45 @@ class ChannelStatsRouter:
                 
                 raw_results = agent_result.get("results", {})
                 walk_time = time.time() - start_time
-                
+
+                # --- CMTS-side OFDMA fallback for Cisco (cBR-8) ---
+                # Cisco modems do not implement docsIf31CmUsOfdmaChanTable on the
+                # modem side. When the modem OFDMA walk is empty and a CMTS IP is
+                # provided, walk the CMTS-side docsIf31CmtsUsOfdmaChanTable
+                # (1.3.6.1.4.1.4491.2.1.28.1.4) and inject a synthetic entry so
+                # the parser can report OFDMA channel presence.
+                ofdma_oid = '1.3.6.1.4.1.4491.2.1.28.1.13'
+                modem_ofdma_empty = not raw_results.get(ofdma_oid)
+                if modem_ofdma_empty and request.cmts_ip:
+                    try:
+                        cmts_ofdma_oid = '1.3.6.1.4.1.4491.2.1.28.1.4'  # docsIf31CmtsUsOfdmaChanTable
+                        self.logger.info(
+                            f"Modem OFDMA walk empty, falling back to CMTS-side "
+                            f"walk on {request.cmts_ip} (Cisco/vendor-agnostic)"
+                        )
+                        cmts_task_id = await agent_manager.send_task(
+                            agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": cmts_ofdma_oid,
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=15.0,
+                        )
+                        cmts_result = await agent_manager.wait_for_task_async(cmts_task_id, timeout=15.0)
+                        if cmts_result and cmts_result.get("result", {}).get("success"):
+                            cmts_ofdma_entries = cmts_result.get("result", {}).get("results", [])
+                            # Inject as synthetic modem OID so the parser sees it
+                            if cmts_ofdma_entries:
+                                raw_results[ofdma_oid] = cmts_ofdma_entries
+                                self.logger.info(
+                                    f"Injected {len(cmts_ofdma_entries)} CMTS OFDMA entries "
+                                    f"as modem OFDMA fallback"
+                                )
+                    except Exception as cmts_ofdma_err:
+                        self.logger.warning(f"CMTS OFDMA fallback failed: {cmts_ofdma_err}")
+                # --- end CMTS-side OFDMA fallback ---
+
                 # Parse results in API (NOT in agent)
                 parsed = parse_channel_stats_raw(
                     raw_results, walk_time, request.mac_address, request.modem_ip
