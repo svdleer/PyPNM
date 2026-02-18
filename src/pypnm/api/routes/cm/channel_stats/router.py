@@ -202,7 +202,7 @@ class ChannelStatsRouter:
                 if request.cmts_ip and request.mac_address:
                     cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                     if cached_cm_index is not None:
-                        # Fast path: direct snmpget for SG ID using known cm_index
+                        # Fast path: direct snmpget for SG ID using known cm_index (runs in parallel with modem walk)
                         try:
                             fiber_node_sg_task_id = await agent_manager.send_task(
                                 agent_id, "snmp_get",
@@ -215,20 +215,6 @@ class ChannelStatsRouter:
                             )
                         except Exception as e:
                             self.logger.debug(f"Fiber node pre-task failed: {e}")
-                    else:
-                        # First call: walk MAC table to resolve cm_index
-                        try:
-                            cmts_cmindex_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
-                                {
-                                    "target_ip": request.cmts_ip,
-                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',
-                                    "community": request.cmts_community or "public",
-                                },
-                                timeout=15.0,
-                            )
-                        except Exception as e:
-                            self.logger.debug(f"CMTS cmindex task failed: {e}")
 
                 if request.cmts_ip and request.cmts_stats:
                     try:
@@ -462,47 +448,21 @@ class ChannelStatsRouter:
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
-                # Fiber node lookup - send task BEFORE waiting for modem walk
-                # so it runs in parallel. Use cm_index cache to skip MAC table walk.
-                fiber_node_sg_task_id = None
-                fiber_node_table_task_id = None
-                if request.cmts_ip and request.mac_address:
-                    try:
-                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address) if request.mac_address else None
-                        if fn_cm_index is not None:
-                            # Get SG ID directly via snmpget using known cm_index
-                            fiber_node_sg_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_get",
-                                {
-                                    "target_ip": request.cmts_ip,
-                                    "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{fn_cm_index}',
-                                    "community": request.cmts_community or "public",
-                                },
-                                timeout=5.0,
-                            )
-                    except Exception as e:
-                        self.logger.debug(f"Fiber node pre-task failed: {e}")
-
-                
-                # Resolve fiber node from pre-fetched SG ID task
+                # Resolve fiber node
                 fiber_node = None
                 if request.cmts_ip and request.mac_address:
                     try:
-                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address) if request.mac_address else None
+                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                         if fiber_node_sg_task_id and fn_cm_index is not None:
+                            # Fast path: use pre-fetched SG ID (sent before modem walk)
                             sg_result = await agent_manager.wait_for_task_async(fiber_node_sg_task_id, timeout=5.0)
                             cm_sg_id = None
                             if sg_result and sg_result.get('result', {}).get('success'):
                                 cm_sg_id = sg_result.get('result', {}).get('value')
                             if cm_sg_id:
-                                # Walk fiber node table once
                                 fn_task_id = await agent_manager.send_task(
                                     agent_id, "snmp_walk",
-                                    {
-                                        "target_ip": request.cmts_ip,
-                                        "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3',
-                                        "community": request.cmts_community or "public",
-                                    },
+                                    {"target_ip": request.cmts_ip, "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3', "community": request.cmts_community or "public"},
                                     timeout=10.0,
                                 )
                                 fn_result = await agent_manager.wait_for_task_async(fn_task_id, timeout=10.0)
@@ -525,13 +485,15 @@ class ChannelStatsRouter:
                                             if fiber_node:
                                                 break
                         else:
-                            # Fallback: full sequential lookup (first call, no cm_index cached yet)
+                            # First call: full sequential lookup (also caches cm_index)
                             fiber_node = await self._get_fiber_node_from_cmts(
                                 agent_manager, agent_id, request.cmts_ip,
                                 request.mac_address, request.cmts_community or "public"
                             )
                     except Exception as fn_err:
                         self.logger.debug(f'Fiber node lookup failed: {fn_err}')
+
+                if parsed.get("success"):
                     return ChannelStatsResponse(
                         success=True,
                         status=0,
@@ -549,7 +511,7 @@ class ChannelStatsRouter:
                         status=-1,
                         error=parsed.get("error") or "Parsing failed"
                     )
-                    
+
             except ValueError as e:
                 self.logger.error(f"Agent error: {e}")
                 raise HTTPException(status_code=404, detail=str(e))
@@ -578,10 +540,8 @@ class ChannelStatsRouter:
             
             # Walk docsIfCmtsCmStatusMacAddress table to find CM index
             oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
-            self.logger.info(f"Walking CMTS CM table: {oid}")
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
-            self.logger.info(f"SNMP walk result: success={result.get('result',{}).get('success') if result else None}, results_count={len(result.get('result',{}).get('results',[])) if result else 0}")
             
             if not result or not result.get("result", {}).get("success"):
                 self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
@@ -590,47 +550,34 @@ class ChannelStatsRouter:
             # Find CM index by matching MAC address
             cm_index = None
             results = result.get("result", {}).get("results", [])
-            self.logger.info(f"CMTS returned {len(results)} CMs, looking for {mac_normalized}")
             for entry in results:
                 cmts_mac = entry.get("value", "")
-                # Normalize CMTS MAC to match format (strip leading zeros from bytes)
                 cmts_mac_parts = cmts_mac.split(':')
                 cmts_mac_normalized = ':'.join([f"{int(b, 16):x}" if b else '0' for b in cmts_mac_parts])
-                self.logger.info(f"Comparing: '{cmts_mac}' (normalized: '{cmts_mac_normalized}') == '{mac_normalized}'")
                 if cmts_mac_normalized.lower() == mac_normalized.lower():
-                    # Extract index from OID (last component)
                     oid_parts = entry.get("oid", "").split(".")
                     if oid_parts:
                         cm_index = oid_parts[-1]
-                        self.logger.info(f"Found CM index {cm_index} for MAC {mac_address}")
                         break
             
             if not cm_index:
                 self.logger.warning(f"MAC {mac_address} not found in CMTS table")
                 return None
+
+            # Cache cm_index for future calls (avoids MAC table walk)
+            _set_cached_cm_index(cmts_ip, mac_address, int(cm_index))
             
-            # Get CM's Service Group ID - needed to match fiber node
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.8'  # docsIf3CmtsCmRegStatusMdCmSgId base
-            self.logger.info(f"Walking CM Service Group ID table: {oid}")
-            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=5.0)
+            # Get CM's Service Group ID via snmpget (direct, no walk needed)
+            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}', "community": community}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             
             cm_sg_id = None
             if result and result.get("result", {}).get("success"):
-                results = result.get("result", {}).get("results", [])
-                for entry in results:
-                    oid_str = entry.get("oid", "")
-                    # OID format: ...1.3.1.4.{cm_index}
-                    parts = oid_str.split('.')
-                    if parts and parts[-1] == str(cm_index):
-                        cm_sg_id = entry.get("value")
-                        break
+                cm_sg_id = result.get("result", {}).get("value")
             
             if not cm_sg_id:
                 self.logger.warning(f"No Service Group ID found for CM index {cm_index}")
                 return None
-            
-            self.logger.info(f"Found CM Service Group ID: {cm_sg_id}")
             
             # Walk the full fiber node table and match by SG ID directly
             # This approach works for both E6000 and Cisco without needing US/DS ifIndex mapping
