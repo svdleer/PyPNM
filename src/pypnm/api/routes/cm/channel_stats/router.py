@@ -197,6 +197,7 @@ class ChannelStatsRouter:
                 cmts_cmindex_task_id = None
                 cmts_chanid_task_id = None
                 cmts_profile_task_id = None
+                fiber_node_sg_task_id = None
                 if request.cmts_ip and request.cmts_stats:
                     try:
                         # Check cm_index cache — avoids full MAC table walk on repeat calls
@@ -426,15 +427,76 @@ class ChannelStatsRouter:
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
-                # Fiber node lookup (also runs concurrently via asyncio.gather)
+                # Fiber node lookup - send task BEFORE waiting for modem walk
+                # so it runs in parallel. Use cm_index cache to skip MAC table walk.
+                fiber_node_sg_task_id = None
+                fiber_node_table_task_id = None
+                if request.cmts_ip and request.mac_address:
+                    try:
+                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
+                        if fn_cm_index is not None:
+                            # Get SG ID directly via snmpget using known cm_index
+                            fiber_node_sg_task_id = await agent_manager.send_task(
+                                agent_id, "snmp_get",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{fn_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=5.0,
+                            )
+                    except Exception as e:
+                        self.logger.debug(f"Fiber node pre-task failed: {e}")
+
+                
+                # Resolve fiber node from pre-fetched SG ID task
                 fiber_node = None
                 if request.cmts_ip and request.mac_address:
-                    fiber_node = await self._get_fiber_node_from_cmts(
-                        agent_manager, agent_id, request.cmts_ip,
-                        request.mac_address, request.cmts_community or "public"
-                    )
-                
-                if parsed.get("success"):
+                    try:
+                        fn_cm_index = _get_cached_cm_index(request.cmts_ip, mac_address) if request.mac_address else None
+                        if fiber_node_sg_task_id and fn_cm_index is not None:
+                            sg_result = await agent_manager.wait_for_task_async(fiber_node_sg_task_id, timeout=5.0)
+                            cm_sg_id = None
+                            if sg_result and sg_result.get('result', {}).get('success'):
+                                cm_sg_id = sg_result.get('result', {}).get('value')
+                            if cm_sg_id:
+                                # Walk fiber node table once
+                                fn_task_id = await agent_manager.send_task(
+                                    agent_id, "snmp_walk",
+                                    {
+                                        "target_ip": request.cmts_ip,
+                                        "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3',
+                                        "community": request.cmts_community or "public",
+                                    },
+                                    timeout=10.0,
+                                )
+                                fn_result = await agent_manager.wait_for_task_async(fn_task_id, timeout=10.0)
+                                if fn_result and fn_result.get('result', {}).get('success'):
+                                    for entry in fn_result.get('result', {}).get('results', []):
+                                        if entry.get('oid', '').endswith(f'.{cm_sg_id}'):
+                                            parts = entry.get('oid', '').split('.')
+                                            for i in range(len(parts) - 1, 1, -1):
+                                                try:
+                                                    length = int(parts[i])
+                                                    if 1 <= length <= 50:
+                                                        ascii_parts = parts[i+1:i+1+length]
+                                                        if len(ascii_parts) == length:
+                                                            vals = [int(p) for p in ascii_parts]
+                                                            if all(32 <= v <= 126 for v in vals):
+                                                                fiber_node = ''.join(chr(v) for v in vals)
+                                                                break
+                                                except (ValueError, IndexError):
+                                                    continue
+                                            if fiber_node:
+                                                break
+                        else:
+                            # Fallback: full sequential lookup (first call, no cm_index cached yet)
+                            fiber_node = await self._get_fiber_node_from_cmts(
+                                agent_manager, agent_id, request.cmts_ip,
+                                request.mac_address, request.cmts_community or "public"
+                            )
+                    except Exception as fn_err:
+                        self.logger.debug(f'Fiber node lookup failed: {fn_err}')
                     return ChannelStatsResponse(
                         success=True,
                         status=0,
