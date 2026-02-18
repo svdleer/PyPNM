@@ -451,10 +451,10 @@ class CmtsUsOfdmaRxMerService:
             # 4. Set number of averages (Gauge32)
             await self._snmp_set(f"{self.OID_US_RXMER_NUM_AVGS}{idx}", num_averages, 'g')
             
-            # 5. Set destination index for bulk upload (0=local storage only, Gauge32)
-            if destination_index > 0:
-                await self._snmp_set(f"{self.OID_US_RXMER_DEST_INDEX}{idx}", destination_index, 'g')
-            
+            # 5. Set destination index (always SET — Cisco ignores enable when this
+            #    is left at its default 0xFFFFFFFF "not configured" value)
+            await self._snmp_set(f"{self.OID_US_RXMER_DEST_INDEX}{idx}", destination_index, 'g')
+
             # 6. Enable measurement (1=true)
             await self._snmp_set(f"{self.OID_US_RXMER_ENABLE}{idx}", 1, 'i')
             
