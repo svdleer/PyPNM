@@ -649,16 +649,18 @@ class UtscRfPortDiscoveryService:
                 for i, part in enumerate(parts):
                     if part == str(cm_index) and i + 1 < len(parts):
                         candidate = int(parts[i + 1])
-                        if candidate >= 843087000:
+                        if candidate > 0:
                             ofdma_ifindex = candidate
                             break
                 if ofdma_ifindex:
                     break
         
-        # --- Build ifDescr lookup and find us-conn ports ---
+        # --- Build ifDescr lookup and find us-conn / cable-upstreamRfPort ---
         if_descr_map = {}  # ifindex -> description
         blade_to_ports = {}  # blade_slot -> [(ifindex, descr)]
         us_conn_found = False
+        arris_rfport_map = {}  # (linecard, connector) -> (ifindex, descr)
+        arris_rfport_found = False
         
         for entry in if_descr_data:
             ifindex = int(str(entry['oid']).split('.')[-1])
@@ -671,6 +673,14 @@ class UtscRfPortDiscoveryService:
                 if blade_match:
                     slot = int(blade_match.group(1))
                     blade_to_ports.setdefault(slot, []).append((ifindex, descr))
+            
+            # Arris E6000: cable-upstreamRfPort <linecard>/<connector>
+            rfport_match = re.match(r'cable-upstreamRfPort\s+(\d+)/(\d+)', descr)
+            if rfport_match:
+                arris_rfport_found = True
+                lc = int(rfport_match.group(1))
+                conn = int(rfport_match.group(2))
+                arris_rfport_map[(lc, conn)] = (ifindex, descr)
         
         # --- CommScope E6000: map OFDMA slot -> us-conn RF port ---
         if us_conn_found and ofdma_ifindex:
@@ -693,6 +703,28 @@ class UtscRfPortDiscoveryService:
                     self.logger.info(f"CommScope us-conn RF port: {port_descr} ({port_ifindex})")
                     return result
                 self.logger.warning(f"No us-conn port for blade slot {slot}")
+        
+        # --- Arris E6000: map OFDMA linecard/connector -> cable-upstreamRfPort ---
+        if arris_rfport_found and ofdma_ifindex:
+            ofdma_descr = if_descr_map.get(ofdma_ifindex)
+            if not ofdma_descr:
+                get_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{ofdma_ifindex}")
+                ofdma_descr = self._parse_get_value(get_result) or ""
+            
+            # cable-us-ofdma <linecard>/<connector>/<channel>.<subif>
+            arris_match = re.match(r'cable-us(?:-ofdma)?\s+(\d+)/(\d+)/', ofdma_descr)
+            if arris_match:
+                lc = int(arris_match.group(1))
+                conn = int(arris_match.group(2))
+                if (lc, conn) in arris_rfport_map:
+                    port_ifindex, port_descr = arris_rfport_map[(lc, conn)]
+                    result["success"] = True
+                    result["rf_port_ifindex"] = port_ifindex
+                    result["rf_port_description"] = port_descr
+                    result["logical_channel"] = port_ifindex
+                    self.logger.info(f"Arris cable-upstreamRfPort: {port_descr} ({port_ifindex})")
+                    return result
+                self.logger.warning(f"No cable-upstreamRfPort for linecard={lc} connector={conn}")
         
         # --- Fallback: use OFDMA channel directly ---
         if ofdma_ifindex:
