@@ -620,12 +620,10 @@ class CMTSModemService:
                     timeout=30,
                 )
                 if not result or not result.get('success'):
-                    self.logger.debug(f"Enrich {ip}: no result or not success: {result}")
                     return
 
                 oid_results = result.get('results', {})
                 if not oid_results:
-                    self.logger.debug(f"Enrich {ip}: empty oid_results from bulk_get")
                     return
 
                 # ── sysDescr ──
