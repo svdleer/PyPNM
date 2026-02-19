@@ -597,7 +597,7 @@ class CMTSModemService:
                          and m.get('ip_address') != '0.0.0.0'
                          and m.get('status') in online_statuses][:200]
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, max_concurrent=50)")
+        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, max_concurrent=15, community={modem_community})")
         if not online_modems:
             return modems
 
@@ -620,9 +620,13 @@ class CMTSModemService:
                     timeout=30,
                 )
                 if not result or not result.get('success'):
+                    self.logger.debug(f"Enrich {ip}: no result or not success: {result}")
                     return
 
                 oid_results = result.get('results', {})
+                if not oid_results:
+                    self.logger.debug(f"Enrich {ip}: empty oid_results from bulk_get")
+                    return
 
                 # ── sysDescr ──
                 sys_r = oid_results.get(OID_SYS_DESCR, {})
