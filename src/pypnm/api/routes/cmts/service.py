@@ -592,9 +592,11 @@ class CMTSModemService:
         ALL_OIDS = [OID_SYS_DESCR, OID_DOCSIS_CAP_31, OID_DOCSIS_CAP_30]
 
         online_statuses = {'operational', 'registrationComplete', 'ipComplete', 'online'}
+        skip_prefixes = ('10.253.', '10.254.')
         online_modems = [m for m in modems
                          if m.get('ip_address') and m.get('ip_address') != 'N/A'
                          and m.get('ip_address') != '0.0.0.0'
+                         and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses][:200]
 
         self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, max_concurrent=15, community={modem_community})")
