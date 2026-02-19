@@ -51,11 +51,24 @@ class AgentManager:
                 if agent_id:
                     break
             
-            # Main message loop
+            # Main message loop with periodic ping
+            async def ping_loop():
+                while agent_id in self.agents:
+                    await asyncio.sleep(30)
+                    if agent_id in self.agents:
+                        try:
+                            await websocket.send_text(json.dumps({'type': 'ping', 'timestamp': time.time()}))
+                        except Exception:
+                            break
+
+            asyncio.ensure_future(ping_loop())
+
             while True:
                 message = await websocket.receive_text()
+                # Update last_seen on any message — agent is clearly alive
+                if agent_id and agent_id in self.agents:
+                    self.agents[agent_id].last_seen = time.time()
                 response = await self.handle_message(websocket, message)
-                
                 if response:
                     await websocket.send_text(response)
                     

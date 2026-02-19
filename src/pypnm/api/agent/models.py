@@ -38,5 +38,5 @@ class ConnectedAgent:
             'connected_at': self.connected_at,
             'last_seen': self.last_seen,
             'authenticated': self.authenticated,
-            'is_alive': (time.time() - self.last_seen) < 60
+            'is_alive': (time.time() - self.last_seen) < 90
         }
