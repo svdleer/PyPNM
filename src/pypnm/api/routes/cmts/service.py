@@ -591,8 +591,6 @@ class CMTSModemService:
         OID_DOCSIS_CAP_30 = '1.3.6.1.2.1.10.127.1.1.5.0'
         ALL_OIDS = [OID_SYS_DESCR, OID_DOCSIS_CAP_31, OID_DOCSIS_CAP_30]
 
-        BATCH_SIZE = 20  # concurrent modem queries
-
         online_statuses = {'operational', 'registrationComplete', 'ipComplete', 'online'}
         online_modems = [m for m in modems
                          if m.get('ip_address') and m.get('ip_address') != 'N/A'
@@ -656,10 +654,17 @@ class CMTSModemService:
             except Exception as e:
                 self.logger.debug(f"Failed to enrich modem {ip}: {e}")
 
-        # ── Run in parallel batches ──────────────────────────────────
-        for i in range(0, len(online_modems), BATCH_SIZE):
-            batch = online_modems[i:i + BATCH_SIZE]
-            await asyncio.gather(*[_enrich_one(m) for m in batch])
+        # ── Send ALL tasks at once, wait concurrently ────────────────────
+        # Sending all tasks first lets the agent pipeline them; waiting
+        # concurrently means we pay the RTT only once instead of per-batch.
+        MAX_CONCURRENT = 50  # cap to avoid overwhelming the agent queue
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+        async def _enrich_one_sem(modem: dict):
+            async with sem:
+                await _enrich_one(modem)
+
+        await asyncio.gather(*[_enrich_one_sem(m) for m in online_modems])
 
         self.logger.info(f"Direct enrichment done: {enriched_count}/{len(online_modems)} modems enriched")
 
