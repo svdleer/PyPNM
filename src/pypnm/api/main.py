@@ -60,6 +60,15 @@ def health() -> dict[str, str]:
     """Lightweight health endpoint for probes."""
     return {"status": "ok", "version": __version__}
 
+
+@app.post("/cache/clear", tags=["health"])
+def clear_cache() -> dict[str, str]:
+    """Clear all in-memory caches (enrichment, etc.)."""
+    from pypnm.api.routes.cmts.service import _enrichment_cache
+    count = len(_enrichment_cache)
+    _enrichment_cache.clear()
+    return {"status": "ok", "cleared": str(count)}
+
 app.add_middleware(GZipMiddleware, minimum_size=100_000)
 app.add_middleware(
     CORSMiddleware,
