@@ -597,7 +597,7 @@ class CMTSModemService:
                          and m.get('ip_address') != '0.0.0.0'
                          and m.get('status') in online_statuses][:200]
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, batch={BATCH_SIZE})")
+        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, max_concurrent=50)")
         if not online_modems:
             return modems
 
