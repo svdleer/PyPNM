@@ -720,9 +720,10 @@ class CmtsUsOfdmaRxMerService:
             # IP address (4-byte OctetString, e.g. "ac100884")
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
 
-            # BaseUri — required by Cisco for TFTP upload path
-            base_uri = f"tftp://{tftp_ip}/"
-            await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", base_uri, 's')
+            # Only set BaseUri for Cisco cBR-8, skip for Arris/CommScope
+            if hasattr(self, 'cmts_vendor') and self.cmts_vendor and self.cmts_vendor.lower() == 'cisco':
+                base_uri = f"tftp://{tftp_ip}/"
+                await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", base_uri, 's')
             
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             
