@@ -617,7 +617,7 @@ class CMTSModemService:
                         'timeout': 5,
                         'max_concurrent': 3,
                     },
-                    timeout=10,
+                    timeout=30,
                 )
                 if not result or not result.get('success'):
                     return
@@ -654,10 +654,10 @@ class CMTSModemService:
             except Exception as e:
                 self.logger.debug(f"Failed to enrich modem {ip}: {e}")
 
-        # ── Send ALL tasks at once, wait concurrently ────────────────────
-        # Sending all tasks first lets the agent pipeline them; waiting
-        # concurrently means we pay the RTT only once instead of per-batch.
-        MAX_CONCURRENT = 50  # cap to avoid overwhelming the agent queue
+        # ── Send tasks with bounded concurrency ─────────────────────────
+        # Limit to 15 in-flight at once: agent processes them quickly enough
+        # that later tasks don't time out waiting in the queue.
+        MAX_CONCURRENT = 15
         sem = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def _enrich_one_sem(modem: dict):
