@@ -5,6 +5,9 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        http_proxy: ${http_proxy}
+        https_proxy: ${https_proxy}
+      args:
         PYTHON_VERSION: "3.12"
     image: pypnm:latest
     network_mode: host
