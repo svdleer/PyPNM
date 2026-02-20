@@ -320,8 +320,9 @@ class CMTSModemService:
                 idx = self._extract_index(item['oid'], OID_PARTIAL_SVC)
                 val = item['value']
                 if isinstance(val, int):
-                    # INTEGER encoding: 0 = no partial service
-                    partial_svc_map[idx] = val != 0
+                    # INTEGER encoding: 1=other (N/A), 2=yes (partial), 3=no (full service)
+                    # Only set partial_service=true when explicitly 2 (yes)
+                    partial_svc_map[idx] = val == 2
                 elif isinstance(val, str) and val:
                     # BITS encoded as string — check if any byte is non-zero
                     try:
