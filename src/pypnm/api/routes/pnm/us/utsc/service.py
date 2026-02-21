@@ -842,7 +842,9 @@ class CmtsUtscService:
             Dict with success status
         """
         import asyncio
-        # If cfg_index not specified (<=0), probe for the active row
+        # Probe for the row matching cfg_index by TriggerMode — on Casa rows are
+        # always createAndWait so probing RowStatus=active never works.
+        # Use the same TriggerMode-based probe as configure().
         resolved = cfg_index if cfg_index > 0 else 1
         for probe_idx in range(1, 4):
             r = await self._snmp_get(
@@ -850,11 +852,17 @@ class CmtsUtscService:
             )
             v = self._parse_get_value(r)
             if v is not None and 'No Such' not in str(v):
+                # Accept any existing row (active or createAndWait) — prefer the one
+                # matching cfg_index, but if cfg_index doesn't exist use first found
                 try:
-                    if int(v) == 1:  # active
+                    int(v)  # valid row status
+                    if probe_idx == cfg_index:
                         resolved = probe_idx
-                        self.logger.info(f"Found active UTSC row at cfg_index={probe_idx}")
                         break
+                    elif resolved == cfg_index:
+                        pass  # keep looking for exact match
+                    else:
+                        resolved = probe_idx  # take first valid as fallback
                 except (ValueError, TypeError):
                     pass
         idx = f".{rf_port_ifindex}.{resolved}"
