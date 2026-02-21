@@ -627,16 +627,32 @@ class CmtsUtscService:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
                 output_format = 5
 
-            # Destroy rows 1-3 for this rf_port, then createAndWait at index 1.
-            self.logger.info(f"Destroying UTSC rows 1-3 for rf_port={rf_port_ifindex}...")
-            for destroy_idx in range(1, 4):
-                await self._snmp_set(
-                    f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{destroy_idx}", 6, 'i'
+            # Find the cfg_index whose TriggerMode matches what we want.
+            # On Casa, TriggerMode is fixed per index (e.g. 1=idleSid, 3=freeRunning).
+            # Setting TriggerMode on the wrong index is silently ignored.
+            target_idx = cfg_index  # fallback to caller-supplied index
+            for probe_idx in range(1, 4):
+                r = await self._snmp_get(
+                    f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
                 )
+                v = self._parse_get_value(r)
+                if v is not None and 'No Such' not in str(v):
+                    try:
+                        if int(v) == trigger_mode:
+                            target_idx = probe_idx
+                            self.logger.info(
+                                f"TriggerMode={trigger_mode} found at cfg_index={probe_idx}"
+                            )
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
+            idx = f".{rf_port_ifindex}.{target_idx}"
+            self.logger.info(f"Destroying row at cfg_index={target_idx} (RowStatus=6)...")
+            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i')
             await asyncio.sleep(0.5)
 
-            idx = f".{rf_port_ifindex}.1"
-            self.logger.info("Creating UTSC row at cfg_index=1 with createAndWait(5)...")
+            self.logger.info(f"Creating row at cfg_index={target_idx} with createAndWait(5)...")
             create_result = await self._snmp_set(
                 f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
             )
