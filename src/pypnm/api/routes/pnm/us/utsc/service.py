@@ -646,7 +646,12 @@ class CmtsUtscService:
             self.logger.info("UTSC row created (suspended) — setting parameters...")
             
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
-            
+
+            # 0. LogicalChIfIndex (.2) — mandatory on Casa even for freeRunning (0 = any channel)
+            await self._snmp_set(
+                f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex or 0, 'i'
+            )
+
             # 1. Trigger mode (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}", trigger_mode, 'i')
             
