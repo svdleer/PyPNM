@@ -697,46 +697,51 @@ class CmtsUtscService:
             trigger_count = max(trigger_count, 1)
 
             # ===== Vendor-specific timing constraints =====
+            clamp_warnings = []
+            orig_repeat = repeat_period_us
+            orig_freerun = freerun_duration_ms
+
             if is_casa:
                 # Casa E6000 constraints (from syslog errors):
                 #   1. RepeatPeriod >= 100ms
                 #   2. FreeRunDuration >= 120s  (is_freerun_trigger_valid)
                 #   3. FreeRunDuration / RepeatPeriod <= 300 files
                 if repeat_period_us < 100000:
-                    self.logger.info(f"Casa: clamping RepeatPeriod {repeat_period_us}µs -> 100000µs")
                     repeat_period_us = 100000
+                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {repeat_period_us} (Casa minimum 100ms)")
 
                 if freerun_duration_ms <= 0:
-                    freerun_duration_ms = 120000  # default to minimum
+                    freerun_duration_ms = 120000
                 elif freerun_duration_ms < 120000:
-                    self.logger.info(f"Casa: clamping FreeRunDuration {freerun_duration_ms}ms -> 120000ms")
+                    clamp_warnings.append(f"freerun_duration_ms clamped {orig_freerun} -> 120000 (Casa minimum 120s)")
                     freerun_duration_ms = 120000
 
                 # files = freerun / repeat <= 300  →  repeat >= freerun / 300
                 repeat_period_ms = repeat_period_us // 1000 or 1
                 max_freerun_ms = 300 * repeat_period_ms
                 if freerun_duration_ms > max_freerun_ms:
-                    self.logger.info(f"Casa: clamping FreeRunDuration {freerun_duration_ms}ms -> {max_freerun_ms}ms (300 files max)")
+                    clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (Casa max 300 files)")
                     freerun_duration_ms = max_freerun_ms
-                min_repeat_us = ((freerun_duration_ms + 299) // 300) * 1000  # ceil(freerun/300) ms → µs
+                min_repeat_us = ((freerun_duration_ms + 299) // 300) * 1000
                 if repeat_period_us < min_repeat_us:
-                    self.logger.info(f"Casa: raising RepeatPeriod {repeat_period_us}µs -> {min_repeat_us}µs (300 files max)")
+                    clamp_warnings.append(f"repeat_period_us raised {repeat_period_us} -> {min_repeat_us} (Casa max 300 files)")
                     repeat_period_us = min_repeat_us
             else:
                 # CommScope/Arris E6000 and Cisco cBR-8:
                 #   RepeatPeriod >= 50ms, FreeRunDuration >= RepeatPeriod
                 if repeat_period_us < 50000:
-                    self.logger.info(f"E6000/Cisco: clamping RepeatPeriod {repeat_period_us}µs -> 50000µs")
+                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> 50000 (E6000/Cisco minimum 50ms)")
                     repeat_period_us = 50000
 
                 if freerun_duration_ms <= 0:
                     calc_ms = repeat_period_us * trigger_count * 2
                     freerun_duration_ms = max(calc_ms, repeat_period_us, 60000)
-                    self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms}ms")
 
                 if freerun_duration_ms < repeat_period_us:
+                    clamp_warnings.append(f"freerun_duration_ms raised {orig_freerun} -> {repeat_period_us} (must be >= repeat_period)")
                     freerun_duration_ms = repeat_period_us
-                    self.logger.warning(f"FreeRunDuration clamped to {freerun_duration_ms}ms (>= RepeatPeriod)")
+
+            self.logger.info(f"Timing after clamp: repeat={repeat_period_us}µs freerun={freerun_duration_ms}ms warnings={clamp_warnings}")
             
             # 9. Set FreeRunDuration FIRST (Gauge32) — must be >= RepeatPeriod
             fr_result = await self._snmp_set(
@@ -828,6 +833,11 @@ class CmtsUtscService:
                 "message": "UTSC configured",
                 "rf_port_ifindex": rf_port_ifindex,
                 "cfg_index": target_idx,
+                "warnings": clamp_warnings if clamp_warnings else None,
+                "applied": {
+                    "repeat_period_us": repeat_period_us,
+                    "freerun_duration_ms": freerun_duration_ms,
+                },
                 "trigger_mode": trigger_mode,
                 "filename": filename,
                 "row_status": row_status_names.get(int(row_status), 'unknown') if row_status and 'No Such' not in str(row_status) else None,

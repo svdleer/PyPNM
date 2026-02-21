@@ -135,6 +135,8 @@ class UtscConfigureResponse(BaseModel):
     filename: Optional[str] = None
     row_status: Optional[str] = Field(None, description="RowStatus after configure: active, notReady, etc.")
     verify: Optional[dict] = Field(None, description="Parameter verification results")
+    warnings: Optional[List[str]] = Field(None, description="Values that were auto-clamped to meet vendor constraints")
+    applied: Optional[dict] = Field(None, description="Actual values applied after clamping (repeat_period_us, freerun_duration_ms)")
     message: Optional[str] = None
     error: Optional[str] = None
 
