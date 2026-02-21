@@ -435,15 +435,12 @@ class CmtsUtscService:
                 
                 # Skip logical/virtual channels — only want physical RF ports
                 # Cisco logical channels: ifIndex >= 840M, descriptions like "Cable8/0/0-upstream3"
-                # Casa logical channels: ifIndex 16000000-16999999, no "physical" in description
                 if ifindex >= 840000000:
                     continue
                 
-                # Casa: Skip logical channels (16M range) unless description has "physical"
-                if 16000000 <= ifindex < 17000000:
-                    if 'physical' not in descr.lower():
-                        self.logger.debug(f"Skipping Casa logical channel: ifIndex={ifindex}, descr={descr}")
-                        continue
+                # Casa: Accept both physical (4M range) and logical OFDMA (16M range)
+                # Note: Casa mapping is logical_ifindex = physical_ifindex + 12000000
+                # For UTSC, physical ports are preferred but both are listed
                 
                 rf_ports.append({
                     "rf_port_ifindex": ifindex,
