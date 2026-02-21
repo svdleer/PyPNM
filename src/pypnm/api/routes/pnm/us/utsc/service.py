@@ -612,57 +612,38 @@ class CmtsUtscService:
             
             if is_casa:
                 self.logger.info("Detected Casa CCAP - configuring bulk data control for UTSC file upload")
+                from pypnm.config.system_config_settings import SystemConfigSettings
+                tftp_ip = str(SystemConfigSettings.bulk_tftp_ip_v4() or "127.0.0.1")
                 bulk_result = await self.configure_bulk_data_control(
-                    dest_ip="172.22.147.18",  # Casa backbone TFTP server
+                    dest_ip=tftp_ip,
                     dest_path="./",
                     index=1
                 )
                 if not bulk_result.get('success'):
                     self.logger.warning(f"Bulk data control configuration failed: {bulk_result.get('error')}")
-            
+
             # Auto-detect output format if not specified
             if output_format is None or output_format == 0:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
-                # Try FFT_AMPLITUDE(5) first (E6000 supports it)
-                # If SET fails, will fallback to FFT_POWER(2) below
                 output_format = 5
-            
-            # Check if UTSC config row exists by reading trigger mode
-            check_result = await self._snmp_get(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}")
-            check_value = self._parse_get_value(check_result)
-            row_exists = (check_result.get('success', False) 
-                         and check_value is not None
-                         and 'No Such' not in str(check_value))
-            
-            if row_exists:
-                # Row exists (CommScope E6000 pre-creates rows, Cisco cBR-8
-                # also pre-creates rows for each us-conn port).
-                # Stop any running test so parameters can be modified in-place.
-                self.logger.info("UTSC row exists — stopping any running test...")
-                stop_result = await self.stop(rf_port_ifindex, cfg_index)
-                self.logger.info(f"Stop result: {stop_result}")
-                await asyncio.sleep(0.5)
-                # Note: Do NOT destroy+recreate — Cisco cBR-8 pre-creates rows
-                # and will reject createAndGo after destroy. Just modify in-place.
-            else:
-                # Row does not exist - Casa CCAP requires manual creation
-                # Use notInService(2) to create row, then set parameters, then active(1)
-                self.logger.info("UTSC row does not exist - creating with notInService(2)...")
-                create_result = await self._snmp_set(
-                    f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i'  # 2 = notInService
-                )
-                if not create_result.get('success'):
-                    # Try createAndWait(5) as fallback
-                    self.logger.warning(f"notInService failed: {create_result.get('error')}, "
-                                       f"trying createAndWait(5)")
-                    create_result = await self._snmp_set(
-                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
-                    )
-                    if not create_result.get('success'):
-                        return {"success": False, 
-                                "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
-                await asyncio.sleep(0.5)
-                self.logger.info("UTSC config row created, will activate after setting parameters")
+
+            # Always destroy and recreate the row to guarantee a clean slate.
+            # This is required for Casa CCAP (TriggerMode is locked after createAndGo
+            # and cannot be changed on an active row). The destroy/createAndWait sequence
+            # works on all vendors: E6000, Casa, and Cisco cBR-8.
+            self.logger.info("Destroying existing UTSC row (RowStatus=6) for clean slate...")
+            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i')
+            await asyncio.sleep(0.3)
+
+            self.logger.info("Creating UTSC row with createAndWait(5)...")
+            create_result = await self._snmp_set(
+                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
+            )
+            if not create_result.get('success'):
+                return {"success": False,
+                        "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
+            await asyncio.sleep(0.3)
+            self.logger.info("UTSC row created (suspended) — setting parameters...")
             
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
             
@@ -750,9 +731,18 @@ class CmtsUtscService:
                     await self._snmp_set(
                         f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex, 'i'
                     )
-            
+
+            # ===== Activate row (createAndWait -> active) =====
+            self.logger.info("Activating UTSC row (RowStatus=1)...")
+            activate_result = await self._snmp_set(
+                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'
+            )
+            if not activate_result.get('success'):
+                self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')} "
+                                    "(row may self-activate when all required columns are set)")
+            await asyncio.sleep(0.3)
+
             # ===== Verify RowStatus is Active =====
-            await asyncio.sleep(0.5)
             status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
             row_status = self._parse_get_value(status_result)
             row_status_names = {1: "active", 2: "notInService", 3: "notReady",
