@@ -649,9 +649,7 @@ class CmtsUtscService:
                         pass
 
             idx = f".{rf_port_ifindex}.{target_idx}"
-            self.logger.info(f"Suspending row at cfg_index={target_idx} (RowStatus=notInService) before writes...")
-            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i')  # notInService
-            await asyncio.sleep(0.3)
+            self.logger.info(f"Writing columns in-place at cfg_index={target_idx} (no RowStatus touch)...")
 
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
@@ -771,16 +769,7 @@ class CmtsUtscService:
                         f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex, 'i'
                     )
 
-            # ===== Reactivate row (notInService -> active) =====
-            self.logger.info("Reactivating row (RowStatus=active)...")
-            activate_result = await self._snmp_set(
-                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'
-            )
-            if not activate_result.get('success'):
-                self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')}")
-            await asyncio.sleep(0.3)
-
-            # ===== Verify RowStatus (do NOT set it — Casa manages its own rows) =====
+            # ===== Verify RowStatus =====
             await asyncio.sleep(0.3)
             status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
             row_status = self._parse_get_value(status_result)
