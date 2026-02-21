@@ -202,6 +202,31 @@ class UtscGetConfigRequest(BaseModel):
     cfg_index: int = Field(default=1, description="Config table index")
 
 
+class UtscBulkDestRequest(BaseModel):
+    """Request to configure docsPnmCcapBulkDataControlTable for UTSC/RxMER upload."""
+    cmts: CmtsSnmpConfig
+    dest_ip: str = Field(..., description="TFTP server IP address")
+    dest_path: str = Field(default="./", description="Destination path on TFTP server")
+    index: int = Field(default=1, description="Table row index (1-10)")
+    pnm_types: List[str] = Field(
+        default=["utsc"],
+        description=(
+            "PNM test types to associate with this destination. "
+            "Valid values: 'utsc' (bit8 usTriggeredSpectrumCapture), "
+            "'rxmer' (bit5 usOfdmaRxMerPerSubcarrier), 'both'."
+        )
+    )
+
+
+class UtscBulkDestResponse(BaseModel):
+    """Response from bulk destination configuration."""
+    success: bool
+    index: int = Field(default=1)
+    dest_ip: Optional[str] = None
+    pnm_test_selector_hex: Optional[str] = None
+    error: Optional[str] = None
+
+
 class UtscGetConfigResponse(BaseModel):
     """Response with current UTSC configuration."""
     success: bool

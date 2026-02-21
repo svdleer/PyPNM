@@ -283,7 +283,8 @@ class CmtsUtscService:
         self,
         dest_ip: str = "172.29.10.68",
         dest_path: str = "./",
-        index: int = 1
+        index: int = 1,
+        pnm_types: list[str] = None
     ) -> dict[str, Any]:
         """
         Configure bulk data control for Casa CCAP (UTSC file upload).
@@ -302,11 +303,14 @@ class CmtsUtscService:
         Returns:
             Dict with success status
         """
+        if pnm_types is None:
+            pnm_types = ['utsc']
+
         try:
             import asyncio
             import ipaddress
-            
-            self.logger.info(f"Configuring bulk data control for UTSC upload to {dest_ip}:{dest_path}")
+
+            self.logger.info(f"Configuring bulk data control for {pnm_types} upload to {dest_ip}:{dest_path}")
             
             # Convert IP to hex string
             ip_obj = ipaddress.ip_address(dest_ip)
@@ -325,12 +329,23 @@ class CmtsUtscService:
             # 4. Set UploadControl = autoUpload(3)
             await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')
             
-            # 5. Set PnmTestSelector bit 8 (usTriggeredSpectrumCapture)
-            # BITS: 00 80 = bit 8 set
-            await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", "00 80", 'x')
-            
-            self.logger.info("Bulk data control configured successfully")
-            return {"success": True}
+            # 5. Set PnmTestSelector BITS value based on requested pnm_types
+            # BITS encoding (MSB first):
+            #   bit5 = usOfdmaRxMerPerSubcarrier -> byte0 |= 0x04
+            #   bit8 = usTriggeredSpectrumCapture -> byte1 |= 0x80
+            byte0 = 0x00
+            byte1 = 0x00
+            for t in pnm_types:
+                t = t.lower()
+                if t in ('utsc', 'both'):
+                    byte1 |= 0x80  # bit8
+                if t in ('rxmer', 'both'):
+                    byte0 |= 0x04  # bit5
+            selector_hex = f"{byte0:02X} {byte1:02X}"
+            await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", selector_hex, 'x')
+
+            self.logger.info(f"Bulk data control configured: selector={selector_hex}")
+            return {"success": True, "index": index, "dest_ip": dest_ip, "pnm_test_selector_hex": selector_hex}
             
         except Exception as e:
             self.logger.error(f"Failed to configure bulk data control: {e}")
