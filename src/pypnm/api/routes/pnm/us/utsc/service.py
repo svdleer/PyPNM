@@ -675,17 +675,9 @@ class CmtsUtscService:
             vendor = 'casa' if is_casa else ('arris' if is_arris else ('cisco' if is_cisco else 'unknown'))
             self.logger.info(f"Vendor detection: {vendor} — sysDescr='{sys_descr[:80]}'")
 
-            if is_casa:
-                self.logger.info(f"Detected Casa CCAP ({vendor}) - configuring bulk data control for UTSC file upload")
-                from pypnm.config.system_config_settings import SystemConfigSettings
-                tftp_ip = str(SystemConfigSettings.bulk_tftp_ip_v4() or "127.0.0.1")
-                bulk_result = await self.configure_bulk_data_control(
-                    dest_ip=tftp_ip,
-                    dest_path="./",
-                    index=1
-                )
-                if not bulk_result.get('success'):
-                    self.logger.warning(f"Bulk data control configuration failed: {bulk_result.get('error')}")
+            # Note: bulk destination configuration (docsPnmBulkDataTransferCfgTable and
+            # Casa docsPnmCcapBulkDataControlTable) is now handled by the caller via
+            # POST /pnm/us/bulk-destination before calling configure.
 
             # Auto-detect output format if not specified
             if output_format is None or output_format == 0:
