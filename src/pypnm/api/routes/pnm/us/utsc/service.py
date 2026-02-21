@@ -611,15 +611,21 @@ class CmtsUtscService:
             # Cisco cBR-8:        "Cisco IOS-XE ..." or "CISCO ..."
             sys_descr_result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
             sys_descr_raw = str(sys_descr_result.get('output', ''))
+            # Agent output format: "SNMPV2-SMI::MIB-2.1.1.0 = <value>"
+            # Extract value after " = "
+            if ' = ' in sys_descr_raw:
+                sys_descr_val = sys_descr_raw.split(' = ', 1)[1].strip()
+            else:
+                sys_descr_val = sys_descr_raw.strip()
             # Agent may return hex-encoded string for long OctetStrings (e.g. Cisco cBR-8)
             # Format: "0X436973636F20494F5320536F667477617265..."
-            if sys_descr_raw.upper().startswith('0X'):
+            if sys_descr_val.upper().startswith('0X'):
                 try:
-                    sys_descr = bytes.fromhex(sys_descr_raw[2:]).decode('utf-8', errors='replace').upper()
+                    sys_descr = bytes.fromhex(sys_descr_val[2:]).decode('utf-8', errors='replace').upper()
                 except Exception:
-                    sys_descr = sys_descr_raw.upper()
+                    sys_descr = sys_descr_val.upper()
             else:
-                sys_descr = sys_descr_raw.upper()
+                sys_descr = sys_descr_val.upper()
             is_casa = 'CASA' in sys_descr
             is_arris = 'ARRIS' in sys_descr
             is_cisco = 'CISCO' in sys_descr
