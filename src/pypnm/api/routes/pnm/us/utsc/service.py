@@ -605,10 +605,12 @@ class CmtsUtscService:
         try:
             import asyncio
 
-            # For Casa CCAP, configure bulk data control first
-            # Check if this is a Casa CMTS by testing bulk data control OID
-            bulk_check = await self._snmp_get(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.1")
-            is_casa = bulk_check.get('success', False) and 'No Such' not in str(bulk_check.get('output', ''))
+            # Detect vendor via sysDescr (1.3.6.1.2.1.1.1.0)
+            # Casa DCTS returns "CASA DCTS ..." — reliable across all Casa platforms
+            sys_descr_result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
+            sys_descr = str(sys_descr_result.get('output', '')).upper()
+            is_casa = 'CASA' in sys_descr
+            self.logger.info(f"Vendor detection: sysDescr='{sys_descr[:60]}' is_casa={is_casa}")
 
             if is_casa:
                 self.logger.info("Detected Casa CCAP - configuring bulk data control for UTSC file upload")
