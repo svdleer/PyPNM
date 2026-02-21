@@ -644,8 +644,16 @@ class UtscRfPortDiscoveryService:
         ofdma_ifindex = None
         for entry in ofdma_data:
             oid_str = str(entry.get('oid', ''))
-            if f".{cm_index}." in oid_str:
-                parts = oid_str.split(".")
+            # Strip the base OID to get just the instance part: {cm_index}.{ofdma_ifindex}
+            # Base OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2
+            # Full OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cm_index}.{ofdma_ifindex}
+            # Without stripping, ".{cm_index}." matches inside the base OID itself
+            # (e.g. cm_index=2 matches "4491.2.1" → returns ofdma_ifindex=1 → "eth 6/0")
+            instance = oid_str
+            if self.CM_OFDMA_STATUS in oid_str:
+                instance = oid_str[len(self.CM_OFDMA_STATUS):]
+            if f".{cm_index}." in instance:
+                parts = instance.strip('.').split(".")
                 for i, part in enumerate(parts):
                     if part == str(cm_index) and i + 1 < len(parts):
                         candidate = int(parts[i + 1])
