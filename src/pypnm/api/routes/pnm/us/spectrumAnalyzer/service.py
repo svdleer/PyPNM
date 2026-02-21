@@ -408,7 +408,152 @@ class CmtsUtscService:
             error_msg = f"Failed to start UTSC: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
             return {"success": False, "error": error_msg}
-    
+
+    async def configure_row(
+        self,
+        center_freq_hz: int,
+        span_hz: int,
+        num_bins: int,
+        trigger_mode: int,
+        filename: str,
+        cm_mac: str | None = None,
+        logical_ch_ifindex: int | None = None,
+        repeat_period_ms: int = 100,
+        freerun_duration_ms: int = 60000,
+        trigger_count: int = 1,
+        output_format: int = 5,
+        window: int = 2
+    ) -> dict:
+        """Configure UTSC using destroy/createAndWait/set-columns/activate sequence.
+
+        Works on all CMTS vendors (E6000, Casa, Cisco). Setting TriggerMode on
+        an already-active row is rejected by some vendors, so we always destroy
+        and recreate to guarantee a clean slate.
+
+        Casa CCAP does NOT accept TriggerMode changes on an existing active row, and
+        createAndGo always defaults to idleSid(5).  The only reliable sequence is:
+          1. destroy (CfgStatus=6)  — removes stale row
+          2. createAndWait (CfgStatus=5) — creates row in suspended state
+          3. Set ALL config columns individually (including TriggerMode)
+          4. Activate (CfgStatus=1)
+          5. Caller fires docsPnmCmtsUtscCtrlInitiateTest=1
+
+        Casa CCAP UTSC column mapping (docsPnmCmtsUtscCfgEntry):
+          .2  = LogicalChIfIndex
+          .3  = TriggerMode   (2=freeRunning, 5=idleSid, 6=cmMAC)
+          .6  = CmMacAddr
+          .8  = CenterFreq    (Hz, Unsigned32)
+          .9  = Span          (Hz, Unsigned32)
+          .10 = NumBins
+          .12 = Filename      (OctetString)
+          .16 = Window        (2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming)
+          .17 = OutputFormat  (5=fftAmplitude)
+          .18 = RepeatPeriod  (microseconds)
+          .19 = FreeRunDuration (milliseconds)
+          .20 = TriggerCount
+          .21 = RowStatus     (1=active, 5=createAndWait, 6=destroy)
+        """
+        try:
+            self.logger.info(
+                f"[Casa] Configuring UTSC on {self.cmts_ip} port {self.rf_port_ifindex} "
+                f"trigger_mode={trigger_mode} center={center_freq_hz}Hz span={span_hz}Hz "
+                f"bins={num_bins} filename={filename}"
+            )
+            idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
+
+            # ── Step 1: Destroy existing row (ignore errors — row may not exist) ──
+            self.logger.info("[Casa] Step 1: Destroying existing UTSC row (RowStatus=6)")
+            await self._safe_snmp_set(
+                f"{self.UTSC_CFG_BASE}.21{idx}", 6, 'i', "Casa RowStatus=destroy"
+            )
+            await asyncio.sleep(0.3)  # give CMTS time to remove row
+
+            # ── Step 2: Create row in suspended state (createAndWait=5) ──
+            self.logger.info("[Casa] Step 2: Creating row with RowStatus=createAndWait")
+            ok = await self._safe_snmp_set(
+                f"{self.UTSC_CFG_BASE}.21{idx}", 5, 'i', "Casa RowStatus=createAndWait"
+            )
+            if not ok:
+                return {"success": False, "error": "[Casa] Failed to create UTSC row (createAndWait)"}
+            await asyncio.sleep(0.3)
+
+            # ── Step 3: Set all config columns ──
+            repeat_period_us = repeat_period_ms * 1000
+
+            config_steps = [
+                # TriggerMode — must be set BEFORE activate
+                (f"{self.UTSC_CFG_BASE}.3{idx}",  trigger_mode,       'i', f"TriggerMode={trigger_mode}"),
+                # Frequencies
+                (f"{self.UTSC_CFG_BASE}.8{idx}",  center_freq_hz,     'u', f"CenterFreq={center_freq_hz}Hz"),
+                (f"{self.UTSC_CFG_BASE}.9{idx}",  span_hz,            'u', f"Span={span_hz}Hz"),
+                (f"{self.UTSC_CFG_BASE}.10{idx}", num_bins,           'u', f"NumBins={num_bins}"),
+                # Output
+                (f"{self.UTSC_CFG_BASE}.17{idx}", output_format,      'i', f"OutputFormat={output_format}"),
+                (f"{self.UTSC_CFG_BASE}.16{idx}", window,             'i', f"Window={window}"),
+                # Filename — Casa uses docsPnmCmtsUtscCfgFilename (.12)
+                (f"{self.UTSC_CFG_BASE}.12{idx}", filename,           's', f"Filename={filename}"),
+            ]
+
+            # FreeRunning-specific timing
+            if trigger_mode == 2:
+                config_steps += [
+                    (f"{self.UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, 'u', f"FreeRunDuration={freerun_duration_ms}ms"),
+                    (f"{self.UTSC_CFG_BASE}.18{idx}", repeat_period_us,   'u', f"RepeatPeriod={repeat_period_us}us"),
+                ]
+            else:
+                # IdleSID / CM-MAC: set TriggerCount
+                config_steps.append(
+                    (f"{self.UTSC_CFG_BASE}.20{idx}", trigger_count, 'u', f"TriggerCount={trigger_count}")
+                )
+
+            # CM-specific columns
+            if trigger_mode in (5, 6) and cm_mac:
+                config_steps.append(
+                    (f"{self.UTSC_CFG_BASE}.6{idx}", cm_mac, 's', f"CmMacAddr={cm_mac}")
+                )
+            if logical_ch_ifindex:
+                config_steps.append(
+                    (f"{self.UTSC_CFG_BASE}.2{idx}", logical_ch_ifindex, 'i', f"LogicalChIfIndex={logical_ch_ifindex}")
+                )
+
+            for oid, value, vtype, desc in config_steps:
+                self.logger.info(f"[Casa] Set {desc}")
+                result = await self._safe_snmp_set(oid, value, vtype, desc)
+                if not result:
+                    self.logger.warning(f"[Casa] SET failed (non-fatal): {desc}")
+                await asyncio.sleep(0.15)
+
+            # ── Step 4: Activate row (RowStatus=1) ──
+            self.logger.info("[Casa] Step 4: Activating row (RowStatus=1)")
+            ok = await self._safe_snmp_set(
+                f"{self.UTSC_CFG_BASE}.21{idx}", 1, 'i', "Casa RowStatus=active"
+            )
+            if not ok:
+                return {"success": False, "error": "[Casa] Failed to activate UTSC row"}
+            await asyncio.sleep(0.3)
+
+            # Verify TriggerMode was accepted
+            result = await self._safe_snmp_get(f"{self.UTSC_CFG_BASE}.3{idx}", "Verify TriggerMode")
+            actual_mode = self._parse_get_int(result)
+            if actual_mode is not None and actual_mode != trigger_mode:
+                self.logger.warning(
+                    f"[Casa] TriggerMode verify mismatch: expected={trigger_mode} actual={actual_mode}"
+                )
+            else:
+                self.logger.info(f"[Casa] TriggerMode verified: {actual_mode}")
+
+            self.logger.info("UTSC row configuration complete")
+            return {"success": True, "cmts_ip": str(self.cmts_ip)}
+
+        except asyncio.TimeoutError:
+            error_msg = "UTSC configure_row timed out"
+            self.logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+        except Exception as e:
+            error_msg = f"UTSC configure_row failed: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            return {"success": False, "error": error_msg}
+
     async def get_latest_data(self) -> dict:
         """
         Get latest UTSC spectrum data.

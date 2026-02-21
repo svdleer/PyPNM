@@ -346,15 +346,15 @@ async def _stream_spectrum_data(
     )
     
     try:
-        # Clean all old UTSC files before starting a new capture
-        old_files = glob.glob(f"{TFTP_BASE}/utsc_*")
+        # Clean all old UTSC files before starting a new capture (E6000: utsc_*, Casa: PNMCcapUsSpecAn_*)
+        old_files = glob.glob(f"{TFTP_BASE}/utsc_*") + glob.glob(f"{TFTP_BASE}/PNMCcapUsSpecAn_*")
         if old_files:
             for f in old_files:
                 try:
                     os.remove(f)
                 except OSError:
                     pass
-            logger.info(f"Cleaned {len(old_files)} old UTSC files from {TFTP_BASE}")
+            logger.info(f"Cleaned {len(old_files)} old UTSC/Casa files from {TFTP_BASE}")
         
         await websocket.send_json({
             "type": "connected",
@@ -405,10 +405,11 @@ async def _stream_spectrum_data(
                 break
             
             try:
-                # Look for UTSC files in TFTP directory
-                pattern = f"{TFTP_BASE}/utsc_*"
-                files = glob.glob(pattern)
-                files = sorted(files, key=os.path.getmtime)  # Oldest first
+                # Look for UTSC files in TFTP directory — E6000: utsc_*, Casa: PNMCcapUsSpecAn_*
+                files = sorted(
+                    glob.glob(f"{TFTP_BASE}/utsc_*") + glob.glob(f"{TFTP_BASE}/PNMCcapUsSpecAn_*"),
+                    key=os.path.getmtime
+                )  # Oldest first
                 
                 new_files = [f for f in files if f not in processed_files]
                 
@@ -586,83 +587,37 @@ async def _configure_utsc(
     repeat_period_us: int = 50001,
     freerun_duration_ms: int = 600000
 ):
-    """Configure UTSC via SNMP OIDs — all parameters from GUI, nothing hardcoded."""
-    from pypnm.api.agent.manager import get_agent_manager
+    """Configure UTSC using destroy → createAndWait → set columns → activate.
+
+    This sequence works on all CMTS vendors (E6000, Casa, Cisco).
+    Setting TriggerMode on an already-active row is rejected by some vendors,
+    so we always destroy and recreate to guarantee a clean slate.
+    """
     from pypnm.config.pnm_config_manager import PnmConfigManager
-    from pypnm.config.system_config_settings import SystemConfigSettings
-    
-    agent_manager = get_agent_manager()
-    if not agent_manager:
-        raise Exception("Agent manager not available")
-    
-    agent = agent_manager.get_agent_for_capability('snmp_set')
-    if not agent:
-        raise Exception("No agent with snmp_set capability")
-    
-    # Use configured write community
+    from pypnm.api.routes.pnm.us.spectrumAnalyzer.service import CmtsUtscService
+
     write_community = os.environ.get('CMTS_WRITE_COMMUNITY') or PnmConfigManager.get_write_community() or community
-    
-    # UTSC Config OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1
-    UTSC_CFG_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1"
-    cfg_idx = 1  # Configuration index (always 1 on E6000)
-    idx = f".{rf_port_ifindex}.{cfg_idx}"
-    
-    mode_name = {2: "FreeRunning", 5: "IdleSID", 6: "CM MAC"}.get(trigger_mode, f"mode {trigger_mode}")
-    window_name = {2: "rectangular", 3: "hann", 4: "blackmanHarris", 5: "hamming"}.get(window, f"window {window}")
-    output_name = {1: "timeIQ", 2: "fftPower", 4: "fftIQ", 5: "fftAmplitude"}.get(output_format, f"format {output_format}")
-    
-    # All values from GUI selections — mapped to correct SNMP OIDs
-    config_steps = [
-        # .2 = LogicalChIfIndex
-        (f"{UTSC_CFG_BASE}.2{idx}", logical_channel_ifindex or 0, 'i', f"LogicalChIfIndex={logical_channel_ifindex or 0}"),
-        # .3 = TriggerMode
-        (f"{UTSC_CFG_BASE}.3{idx}", trigger_mode, 'i', f"TriggerMode={trigger_mode} ({mode_name})"),
-        # .10 = NumBins
-        (f"{UTSC_CFG_BASE}.10{idx}", num_bins, 'u', f"NumBins={num_bins}"),
-        # .8 = CenterFreq (Hz)
-        (f"{UTSC_CFG_BASE}.8{idx}", center_freq_hz, 'u', f"CenterFreq={center_freq_hz}Hz ({center_freq_hz/1e6:.1f}MHz)"),
-        # .9 = Span (Hz)
-        (f"{UTSC_CFG_BASE}.9{idx}", span_hz, 'u', f"Span={span_hz}Hz ({span_hz/1e6:.0f}MHz)"),
-        # .17 = OutputFormat
-        (f"{UTSC_CFG_BASE}.17{idx}", output_format, 'i', f"OutputFormat={output_format} ({output_name})"),
-        # .16 = Window
-        (f"{UTSC_CFG_BASE}.16{idx}", window, 'i', f"Window={window} ({window_name})"),
-        # .19 = FreeRunDuration (ms) — SET BEFORE RepeatPeriod (must be >= RepeatPeriod raw value)
-        (f"{UTSC_CFG_BASE}.19{idx}", freerun_duration_ms, 'u', f"FreeRunDuration={freerun_duration_ms}ms"),
-        # .18 = RepeatPeriod (microseconds)
-        (f"{UTSC_CFG_BASE}.18{idx}", repeat_period_us, 'u', f"RepeatPeriod={repeat_period_us}us ({repeat_period_us/1000:.0f}ms)"),
-        # .12 = Filename
-        (f"{UTSC_CFG_BASE}.12{idx}", "utsc_spectrum", 's', "Filename=utsc_spectrum"),
-        # .24 = DestinationIndex (pre-configured TFTP)
-        (f"{UTSC_CFG_BASE}.24{idx}", 1, 'g', "DestinationIndex=1"),
-    ]
-    
-    for oid, value, val_type, desc in config_steps:
-        logger.info(f"UTSC config: {desc}")
-        try:
-            task_id = await agent_manager.send_task(
-                agent_id=agent.agent_id,
-                command='snmp_set',
-                params={
-                    'target_ip': cmts_ip,
-                    'oid': oid,
-                    'value': value,
-                    'type': val_type,
-                    'community': write_community
-                },
-                timeout=5.0
-            )
-            result = await agent_manager.wait_for_task_async(task_id, timeout=10)
-            if result and result.get('result', {}).get('success'):
-                logger.info(f"UTSC config OK: {desc}")
-            else:
-                error = result.get('result', {}).get('error', 'unknown') if result else 'timeout'
-                logger.error(f"UTSC config FAILED: {desc} -> {error}")
-        except Exception as e:
-            logger.error(f"UTSC config ERROR: {desc} -> {e}")
-        await asyncio.sleep(0.1)  # Small delay between config steps
-    
-    logger.info(f"UTSC configured for FreeRunning mode on {cmts_ip} port {rf_port_ifindex}")
+
+    svc = CmtsUtscService(
+        cmts_ip=cmts_ip,
+        rf_port_ifindex=rf_port_ifindex,
+        community=write_community
+    )
+    result = await svc.configure_row(
+        center_freq_hz=center_freq_hz,
+        span_hz=span_hz,
+        num_bins=num_bins,
+        trigger_mode=trigger_mode,
+        filename="utsc_spectrum",
+        logical_ch_ifindex=logical_channel_ifindex,
+        repeat_period_ms=max(50, repeat_period_us // 1000),
+        freerun_duration_ms=freerun_duration_ms,
+        output_format=output_format,
+        window=window
+    )
+    if not result.get("success"):
+        raise Exception(f"UTSC configure failed: {result.get('error')}")
+    logger.info(f"UTSC configured on {cmts_ip} port {rf_port_ifindex} — trigger_mode={trigger_mode}")
 
 
 async def _trigger_utsc(cmts_ip: str, rf_port_ifindex: int, community: str):
