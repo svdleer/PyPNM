@@ -610,7 +610,16 @@ class CmtsUtscService:
             # CommScope/Arris E6000: "CER_V... VENDOR: ARRIS ..."
             # Cisco cBR-8:        "Cisco IOS-XE ..." or "CISCO ..."
             sys_descr_result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
-            sys_descr = str(sys_descr_result.get('output', '')).upper()
+            sys_descr_raw = str(sys_descr_result.get('output', ''))
+            # Agent may return hex-encoded string for long OctetStrings (e.g. Cisco cBR-8)
+            # Format: "0X436973636F20494F5320536F667477617265..."
+            if sys_descr_raw.upper().startswith('0X'):
+                try:
+                    sys_descr = bytes.fromhex(sys_descr_raw[2:]).decode('utf-8', errors='replace').upper()
+                except Exception:
+                    sys_descr = sys_descr_raw.upper()
+            else:
+                sys_descr = sys_descr_raw.upper()
             is_casa = 'CASA' in sys_descr
             is_arris = 'ARRIS' in sys_descr
             is_cisco = 'CISCO' in sys_descr
