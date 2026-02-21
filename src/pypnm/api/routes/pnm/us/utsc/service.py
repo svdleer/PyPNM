@@ -618,7 +618,7 @@ class CmtsUtscService:
             self.logger.info(f"Vendor detection: {vendor} — sysDescr='{sys_descr[:80]}'")
 
             if is_casa:
-                self.logger.info(f"Detected Casa CCAP ({vendor}) - configuring bulk data control for UTSC file upload"
+                self.logger.info(f"Detected Casa CCAP ({vendor}) - configuring bulk data control for UTSC file upload")
                 from pypnm.config.system_config_settings import SystemConfigSettings
                 tftp_ip = str(SystemConfigSettings.bulk_tftp_ip_v4() or "127.0.0.1")
                 bulk_result = await self.configure_bulk_data_control(
@@ -739,7 +739,7 @@ class CmtsUtscService:
             else:
                 # CommScope/Arris E6000 (repeat >= 50ms) and Cisco cBR-8 (repeat >= 50ms)
                 min_repeat = 50000
-                vendor_label = 'Arris E6000' if is_arris else 'Cisco cBR-8' if is_cisco else 'E6000/Cisco'
+                vendor_label = 'Arris/CommScope E6000' if is_arris else 'Cisco cBR-8' if is_cisco else 'E6000/Cisco'
                 if repeat_period_us < min_repeat:
                     clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {min_repeat} ({vendor_label} minimum 50ms)")
                     repeat_period_us = min_repeat
