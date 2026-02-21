@@ -627,10 +627,11 @@ class CmtsUtscService:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
                 output_format = 5
 
-            # Find the cfg_index whose TriggerMode matches what we want.
-            # On Casa, TriggerMode is fixed per index (e.g. 1=idleSid, 3=freeRunning).
-            # Setting TriggerMode on the wrong index is silently ignored.
-            target_idx = cfg_index  # fallback to caller-supplied index
+            # Find the existing active row for this trigger_mode (probe indices 1-3).
+            # Casa/E6000 pre-provision rows with TriggerMode fixed per index.
+            # We must modify the correct row in-place — destroying it removes the
+            # DestinationIndex which Casa manages internally and won't let us re-set.
+            target_idx = cfg_index
             for probe_idx in range(1, 4):
                 r = await self._snmp_get(
                     f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
@@ -641,26 +642,14 @@ class CmtsUtscService:
                         if int(v) == trigger_mode:
                             target_idx = probe_idx
                             self.logger.info(
-                                f"TriggerMode={trigger_mode} found at cfg_index={probe_idx}"
+                                f"Found row with TriggerMode={trigger_mode} at cfg_index={probe_idx}"
                             )
                             break
                     except (ValueError, TypeError):
                         pass
 
             idx = f".{rf_port_ifindex}.{target_idx}"
-            self.logger.info(f"Destroying row at cfg_index={target_idx} (RowStatus=6)...")
-            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i')
-            await asyncio.sleep(0.5)
-
-            self.logger.info(f"Creating row at cfg_index={target_idx} with createAndWait(5)...")
-            create_result = await self._snmp_set(
-                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
-            )
-            if not create_result.get('success'):
-                return {"success": False,
-                        "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
-            await asyncio.sleep(0.3)
-            self.logger.info("UTSC row created (suspended) — setting parameters...")
+            self.logger.info(f"Modifying existing row in-place at cfg_index={target_idx}...")
 
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
@@ -694,6 +683,12 @@ class CmtsUtscService:
             
             # 7. Clamp trigger_count (1-10 on E6000, no limit on Cisco)
             trigger_count = max(trigger_count, 1)
+
+            # Casa requires RepeatPeriod >= 100000 µs (100ms); E6000 minimum is 50000 µs.
+            # Clamp to 100000 to be safe on all vendors.
+            if repeat_period_us < 100000:
+                self.logger.info(f"Clamping RepeatPeriod {repeat_period_us}µs -> 100000µs (Casa minimum)")
+                repeat_period_us = 100000
             
             # 8. Auto-calculate FreeRunDuration if not explicitly set
             if freerun_duration_ms <= 0:

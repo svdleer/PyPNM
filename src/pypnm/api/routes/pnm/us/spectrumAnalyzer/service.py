@@ -461,23 +461,29 @@ class CmtsUtscService:
             )
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
 
-            # Destroy rows 1-3 for this rf_port, then createAndWait at index 1.
-            self.logger.info(f"Destroying UTSC rows 1-3 for rf_port={self.rf_port_ifindex}...")
-            for destroy_idx in range(1, 4):
-                await self._safe_snmp_set(
-                    f"{self.UTSC_CFG_BASE}.21.{self.rf_port_ifindex}.{destroy_idx}",
-                    6, 'i', f"Destroy row idx={destroy_idx}"
+            # Find the existing row for this trigger_mode (probe indices 1-3).
+            # Modify in-place — do NOT destroy, as Casa manages DestinationIndex
+            # internally and won't allow re-setting it after row is destroyed.
+            target_idx = self.cfg_idx
+            for probe_idx in range(1, 4):
+                r = await self._safe_snmp_get(
+                    f"{self.UTSC_CFG_BASE}.3.{self.rf_port_ifindex}.{probe_idx}",
+                    f"Probe TriggerMode idx={probe_idx}"
                 )
-            await asyncio.sleep(0.5)
+                v = str(r) if r is not None else None
+                if v and 'No Such' not in v and 'None' not in v:
+                    try:
+                        if int(v) == trigger_mode:
+                            target_idx = probe_idx
+                            self.logger.info(
+                                f"Found row TriggerMode={trigger_mode} at cfg_index={probe_idx}"
+                            )
+                            break
+                    except (ValueError, TypeError):
+                        pass
 
-            idx = f".{self.rf_port_ifindex}.1"
-            self.logger.info("Creating UTSC row at cfg_index=1 with createAndWait(5)...")
-            ok = await self._safe_snmp_set(
-                f"{self.UTSC_CFG_BASE}.21{idx}", 5, 'i', "RowStatus=createAndWait"
-            )
-            if not ok:
-                return {"success": False, "error": "Failed to create UTSC row (createAndWait)"}
-            await asyncio.sleep(0.3)
+            idx = f".{self.rf_port_ifindex}.{target_idx}"
+            self.logger.info(f"Modifying existing row in-place at cfg_index={target_idx}...")
 
             # ── Step 3: Set all config columns ──
             repeat_period_us = repeat_period_ms * 1000
