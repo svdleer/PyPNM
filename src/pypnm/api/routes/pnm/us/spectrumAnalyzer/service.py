@@ -726,6 +726,39 @@ class UtscRfPortDiscoveryService:
                     return result
                 self.logger.warning(f"No cable-upstreamRfPort for linecard={lc} connector={conn}")
         
+        # --- Casa 100G: map OFDMA logical (16M range) -> physical RF port (4M range) ---
+        # Casa ifDescr: "OFDMA Upstream 0/6.0" (ifIndex 16000048)
+        #            -> "Upstream Physical Interface 0/6.0" (ifIndex 4000048)
+        # Mapping: physical = logical - 12000000
+        if ofdma_ifindex and 16000000 <= ofdma_ifindex < 17000000:
+            physical_ifindex = ofdma_ifindex - 12000000
+            physical_descr = if_descr_map.get(physical_ifindex)
+            if physical_descr and 'physical' in physical_descr.lower():
+                result["success"] = True
+                result["rf_port_ifindex"] = physical_ifindex
+                result["rf_port_description"] = physical_descr
+                result["logical_channel"] = ofdma_ifindex
+                self.logger.info(f"Casa physical RF port: {physical_descr} ({physical_ifindex}) "
+                                f"from OFDMA logical {ofdma_ifindex}")
+                return result
+            else:
+                self.logger.warning(f"Casa physical ifIndex {physical_ifindex} not found in ifDescr, "
+                                   f"trying pattern match")
+                # Try pattern match: find physical port with same slot/port
+                ofdma_descr = if_descr_map.get(ofdma_ifindex, '')
+                slot_match = re.search(r'(\d+/\d+\.\d+)', ofdma_descr)
+                if slot_match:
+                    target_suffix = slot_match.group(1)
+                    for ifidx, descr in if_descr_map.items():
+                        if ('Upstream Physical Interface' in descr and 
+                            target_suffix in descr):
+                            result["success"] = True
+                            result["rf_port_ifindex"] = ifidx
+                            result["rf_port_description"] = descr
+                            result["logical_channel"] = ofdma_ifindex
+                            self.logger.info(f"Casa physical RF port (pattern): {descr} ({ifidx})")
+                            return result
+        
         # --- Fallback: use OFDMA channel directly ---
         if ofdma_ifindex:
             ofdma_descr = if_descr_map.get(ofdma_ifindex, f"OFDMA {ofdma_ifindex}")
