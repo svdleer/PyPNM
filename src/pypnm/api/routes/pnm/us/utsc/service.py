@@ -606,14 +606,19 @@ class CmtsUtscService:
             import asyncio
 
             # Detect vendor via sysDescr (1.3.6.1.2.1.1.1.0)
-            # Casa DCTS returns "CASA DCTS ..." — reliable across all Casa platforms
+            # Casa DCTS:          "CASA DCTS ..."
+            # CommScope/Arris E6000: "CER_V... VENDOR: ARRIS ..."
+            # Cisco cBR-8:        "Cisco IOS-XE ..." or "CISCO ..."
             sys_descr_result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
             sys_descr = str(sys_descr_result.get('output', '')).upper()
             is_casa = 'CASA' in sys_descr
-            self.logger.info(f"Vendor detection: sysDescr='{sys_descr[:60]}' is_casa={is_casa}")
+            is_arris = 'ARRIS' in sys_descr
+            is_cisco = 'CISCO' in sys_descr
+            vendor = 'casa' if is_casa else ('arris' if is_arris else ('cisco' if is_cisco else 'unknown'))
+            self.logger.info(f"Vendor detection: {vendor} — sysDescr='{sys_descr[:80]}'")
 
             if is_casa:
-                self.logger.info("Detected Casa CCAP - configuring bulk data control for UTSC file upload")
+                self.logger.info(f"Detected Casa CCAP ({vendor}) - configuring bulk data control for UTSC file upload"
                 from pypnm.config.system_config_settings import SystemConfigSettings
                 tftp_ip = str(SystemConfigSettings.bulk_tftp_ip_v4() or "127.0.0.1")
                 bulk_result = await self.configure_bulk_data_control(
@@ -732,11 +737,12 @@ class CmtsUtscService:
                     clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (Casa max 300 files)")
                     freerun_duration_ms = max_freerun_ms
             else:
-                # CommScope/Arris E6000 and Cisco cBR-8:
-                #   RepeatPeriod >= 50ms, FreeRunDuration >= RepeatPeriod
-                if repeat_period_us < 50000:
-                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> 50000 (E6000/Cisco minimum 50ms)")
-                    repeat_period_us = 50000
+                # CommScope/Arris E6000 (repeat >= 50ms) and Cisco cBR-8 (repeat >= 50ms)
+                min_repeat = 50000
+                vendor_label = 'Arris E6000' if is_arris else 'Cisco cBR-8' if is_cisco else 'E6000/Cisco'
+                if repeat_period_us < min_repeat:
+                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {min_repeat} ({vendor_label} minimum 50ms)")
+                    repeat_period_us = min_repeat
 
                 if freerun_duration_ms <= 0:
                     calc_ms = repeat_period_us * trigger_count * 2
