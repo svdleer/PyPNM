@@ -546,7 +546,7 @@ class CmtsUtscService:
         num_bins: int = 800,
         output_format: Optional[int] = None,  # None = auto-detect
         window_function: int = 2,
-        repeat_period_us: int = 50000,
+        repeat_period_us: int = 100000,
         freerun_duration_ms: int = 0,  # 0 = auto-calculate
         trigger_count: int = 10,
         filename: str = "utsc_capture",
@@ -749,17 +749,8 @@ class CmtsUtscService:
                         f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex, 'i'
                     )
 
-            # ===== Activate row (createAndWait -> active) =====
-            self.logger.info("Activating UTSC row (RowStatus=1)...")
-            activate_result = await self._snmp_set(
-                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'
-            )
-            if not activate_result.get('success'):
-                self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')} "
-                                    "(row may self-activate when all required columns are set)")
+            # ===== Verify RowStatus (do NOT set it — Casa manages its own rows) =====
             await asyncio.sleep(0.3)
-
-            # ===== Verify RowStatus is Active =====
             status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
             row_status = self._parse_get_value(status_result)
             row_status_names = {1: "active", 2: "notInService", 3: "notReady",
@@ -805,7 +796,7 @@ class CmtsUtscService:
                 "success": True,
                 "message": "UTSC configured",
                 "rf_port_ifindex": rf_port_ifindex,
-                "cfg_index": cfg_index,
+                "cfg_index": target_idx,
                 "trigger_mode": trigger_mode,
                 "filename": filename,
                 "row_status": row_status_names.get(int(row_status), 'unknown') if row_status and 'No Such' not in str(row_status) else None,
@@ -825,12 +816,28 @@ class CmtsUtscService:
         
         Args:
             rf_port_ifindex: RF port ifIndex
-            cfg_index: Config table index
+            cfg_index: Config table index (0 = auto-probe for active row)
             
         Returns:
             Dict with success status
         """
-        idx = f".{rf_port_ifindex}.{cfg_index}"
+        import asyncio
+        # If cfg_index not specified (<=0), probe for the active row
+        resolved = cfg_index if cfg_index > 0 else 1
+        for probe_idx in range(1, 4):
+            r = await self._snmp_get(
+                f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{probe_idx}"
+            )
+            v = self._parse_get_value(r)
+            if v is not None and 'No Such' not in str(v):
+                try:
+                    if int(v) == 1:  # active
+                        resolved = probe_idx
+                        self.logger.info(f"Found active UTSC row at cfg_index={probe_idx}")
+                        break
+                except (ValueError, TypeError):
+                    pass
+        idx = f".{rf_port_ifindex}.{resolved}"
         
         self.logger.info(f"Starting UTSC for RF port {rf_port_ifindex}")
         
@@ -845,7 +852,7 @@ class CmtsUtscService:
                 "success": True,
                 "message": "UTSC test started",
                 "rf_port_ifindex": rf_port_ifindex,
-                "cfg_index": cfg_index
+                "cfg_index": resolved
             }
             
         except Exception as e:
