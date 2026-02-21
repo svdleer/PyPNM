@@ -116,8 +116,9 @@ class UtscConfigureRequest(BaseModel):
     window_function: int = Field(default=2, ge=1, le=8, description="Window: 1=other, 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming (Cisco supports 2-5 only)")
     
     # Timing settings
-    repeat_period_us: int = Field(default=1000000, description="Repeat period in microseconds")
-    freerun_duration_ms: int = Field(default=60000, description="Free run duration in milliseconds")
+    # Casa E6000 constraints: RepeatPeriod>=100ms, FreeRunDuration>=120s, files=FreeRun/Repeat<=300
+    repeat_period_us: int = Field(default=400000, description="Repeat period in microseconds (Casa min: 100000=100ms; default 400ms satisfies 120s/300files)")
+    freerun_duration_ms: int = Field(default=0, description="Free run duration in milliseconds (0=auto: service enforces Casa min 120000ms)")
     trigger_count: int = Field(default=1, description="Trigger count (number of captures)")
     
     # File settings
