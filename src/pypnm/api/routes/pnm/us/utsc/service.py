@@ -102,14 +102,15 @@ class CmtsUtscService:
     OID_UTSC_CFG_DEST_INDEX = f"{OID_UTSC_CFG_TABLE}.24"      # DestinationIndex
     OID_UTSC_CFG_NUM_AVGS = f"{OID_UTSC_CFG_TABLE}.25"        # NumAvgs
     
-    # Bulk Data Control Table (docsPnmCcapBulkDataControl) - 1.3.6.1.4.1.4491.2.1.27.1.1.1
-    # Standard DOCS-PNM-MIB - required for UTSC file upload on Casa CCAP
-    OID_BULK_DATA_CTRL_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.1.1"
-    OID_BULK_DATA_DEST_IP_TYPE = f"{OID_BULK_DATA_CTRL_TABLE}.1"     # DestIpAddrType
-    OID_BULK_DATA_DEST_IP = f"{OID_BULK_DATA_CTRL_TABLE}.2"           # DestIpAddr
-    OID_BULK_DATA_DEST_PATH = f"{OID_BULK_DATA_CTRL_TABLE}.3"         # DestPath
-    OID_BULK_DATA_UPLOAD_CTRL = f"{OID_BULK_DATA_CTRL_TABLE}.4"       # UploadControl
-    OID_BULK_DATA_TEST_SELECTOR = f"{OID_BULK_DATA_CTRL_TABLE}.5"     # PnmTestSelector
+    # Bulk Data Control Table (docsPnmCcapBulkDataControl) - 1.3.6.1.4.1.4491.2.1.27.1.1.1.5.1
+    # Standard DOCS-PNM-MIB - required for UTSC file upload
+    # OIDs verified via: snmptranslate -On DOCS-PNM-MIB::docsPnmCcapBulkDataControl*
+    OID_BULK_DATA_CTRL_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.1.1.5.1"
+    OID_BULK_DATA_DEST_IP_TYPE = f"{OID_BULK_DATA_CTRL_TABLE}.2"     # DestIpAddrType
+    OID_BULK_DATA_DEST_IP = f"{OID_BULK_DATA_CTRL_TABLE}.3"           # DestIpAddr
+    OID_BULK_DATA_DEST_PATH = f"{OID_BULK_DATA_CTRL_TABLE}.4"         # DestPath
+    OID_BULK_DATA_UPLOAD_CTRL = f"{OID_BULK_DATA_CTRL_TABLE}.5"       # UploadControl
+    OID_BULK_DATA_TEST_SELECTOR = f"{OID_BULK_DATA_CTRL_TABLE}.6"     # PnmTestSelector
     
     # UTSC Capability Table - 1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1
     OID_UTSC_CAPAB_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1"
