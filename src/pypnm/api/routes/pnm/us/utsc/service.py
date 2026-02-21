@@ -410,8 +410,8 @@ class CmtsUtscService:
                 re.compile(r'Upstream-Cable\d+', re.I),                             # Cisco legacy
                 re.compile(r'us-conn\s+\d+/\d+', re.I),                             # CommScope E6000
                 re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),                # Casa / Generic
-                re.compile(r'^Upstream Physical Interface\s+\d+/\d+\.\d+', re.I),  # Casa 100G physical
-                re.compile(r'^OFDMA Upstream\s+\d+/\d+\.\d+', re.I),               # Casa 100G OFDMA logical
+                re.compile(r'^Upstream Physical Interface\s+\d+/\d+\.\d+', re.I),  # Casa 100G physical (UTSC target)
+                # Note: OFDMA logical channels excluded - use physical port for UTSC
             ]
             
             # Exclude patterns (ethernet, management, etc)
