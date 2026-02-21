@@ -672,13 +672,25 @@ class CmtsUtscService:
             # 4. Number of bins (Gauge32)
             await self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
             
-            # 5. Output format (INTEGER) — Cisco: only 1 or 2, E6000: all formats
-            format_result = await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
-            if not format_result.get('success') and output_format == 5:
-                # FFT_AMPLITUDE not supported (Cisco), fallback to FFT_POWER
-                self.logger.warning(f"Output format {output_format} not supported, falling back to FFT_POWER(2)")
-                output_format = 2
-                await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
+            # 5. Output format (INTEGER)
+            # Casa silently accepts fftAmplitude(5) SET but then rejects row activation.
+            # Read back after SET — if it reverted, fall back to fftPower(2).
+            await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
+            await asyncio.sleep(0.1)
+            fmt_readback = self._parse_get_value(
+                await self._snmp_get(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}")
+            )
+            try:
+                if fmt_readback is not None and int(fmt_readback) != output_format:
+                    self.logger.warning(
+                        f"OutputFormat readback={fmt_readback} != requested={output_format}, using {fmt_readback}"
+                    )
+                    output_format = int(fmt_readback)
+            except (ValueError, TypeError):
+                pass
+            if output_format not in (1, 2, 3, 4, 5):
+                output_format = 2  # safe fallback
+            self.logger.info(f"OutputFormat confirmed={output_format}")
             
             # 6. Window function (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_WINDOW}{idx}", window_function, 'i')
