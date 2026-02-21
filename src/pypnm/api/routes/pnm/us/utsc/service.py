@@ -405,14 +405,21 @@ class CmtsUtscService:
             
             # Patterns for upstream interfaces on various vendors
             us_patterns = [
-                re.compile(r'Cable\d+/\d+/US\d+', re.I),                    # Cisco cBR-8
-                re.compile(r'Integrated-Cable\d+/\d+/US\d+', re.I),         # Cisco cBR-8 integrated
-                re.compile(r'Upstream-Cable\d+', re.I),                      # Cisco legacy
-                re.compile(r'us-conn\s+\d+/\d+', re.I),                      # CommScope E6000
-                re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),         # Casa / Generic
-                re.compile(r'physical.*upstream', re.I),                     # Casa 100G physical upstream
-                re.compile(r'upstream.*physical', re.I),                     # Casa 100G (alternate order)
-                re.compile(r'upstream\d+', re.I),                            # Generic
+                re.compile(r'Cable\d+/\d+/US\d+', re.I),                           # Cisco cBR-8
+                re.compile(r'Integrated-Cable\d+/\d+/US\d+', re.I),                # Cisco cBR-8 integrated
+                re.compile(r'Upstream-Cable\d+', re.I),                             # Cisco legacy
+                re.compile(r'us-conn\s+\d+/\d+', re.I),                             # CommScope E6000
+                re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),                # Casa / Generic
+                re.compile(r'^Upstream Physical Interface\s+\d+/\d+\.\d+', re.I),  # Casa 100G physical
+                re.compile(r'^OFDMA Upstream\s+\d+/\d+\.\d+', re.I),               # Casa 100G OFDMA logical
+            ]
+            
+            # Exclude patterns (ethernet, management, etc)
+            exclude_patterns = [
+                re.compile(r'ethernet', re.I),
+                re.compile(r'management', re.I),
+                re.compile(r'loopback', re.I),
+                re.compile(r'null', re.I),
             ]
             
             for entry in descr_result['results']:
@@ -420,6 +427,11 @@ class CmtsUtscService:
                 descr = str(entry.get('value', ''))
                 
                 if not descr or 'No Such' in descr:
+                    continue
+                
+                # Exclude non-RF interfaces (ethernet, management, etc)
+                is_excluded = any(p.search(descr) for p in exclude_patterns)
+                if is_excluded:
                     continue
                 
                 # Check if this is an upstream RF interface
