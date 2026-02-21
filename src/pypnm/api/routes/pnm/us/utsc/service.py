@@ -102,6 +102,15 @@ class CmtsUtscService:
     OID_UTSC_CFG_DEST_INDEX = f"{OID_UTSC_CFG_TABLE}.24"      # DestinationIndex
     OID_UTSC_CFG_NUM_AVGS = f"{OID_UTSC_CFG_TABLE}.25"        # NumAvgs
     
+    # Bulk Data Control Table (docsPnmCcapBulkDataControl) - 1.3.6.1.4.1.4998.1.1.115.1.3.1
+    # Casa CCAP specific - required for UTSC file upload
+    OID_BULK_DATA_CTRL_TABLE = "1.3.6.1.4.1.4998.1.1.115.1.3.1"
+    OID_BULK_DATA_DEST_IP_TYPE = f"{OID_BULK_DATA_CTRL_TABLE}.1"     # DestIpAddrType
+    OID_BULK_DATA_DEST_IP = f"{OID_BULK_DATA_CTRL_TABLE}.2"           # DestIpAddr
+    OID_BULK_DATA_DEST_PATH = f"{OID_BULK_DATA_CTRL_TABLE}.3"         # DestPath
+    OID_BULK_DATA_UPLOAD_CTRL = f"{OID_BULK_DATA_CTRL_TABLE}.5"       # UploadControl
+    OID_BULK_DATA_TEST_SELECTOR = f"{OID_BULK_DATA_CTRL_TABLE}.6"     # PnmTestSelector
+    
     # UTSC Capability Table - 1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1
     OID_UTSC_CAPAB_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1"
     OID_UTSC_CAPAB_TRIGGER_MODE = f"{OID_UTSC_CAPAB_TABLE}.1"  # Supported trigger modes
@@ -268,6 +277,63 @@ class CmtsUtscService:
         if ' = ' in output:
             return output.split(' = ', 1)[1].strip()
         return output.strip() if output else None
+    
+    async def configure_bulk_data_control(
+        self,
+        dest_ip: str = "172.29.10.68",
+        dest_path: str = "./",
+        index: int = 1
+    ) -> dict[str, Any]:
+        """
+        Configure bulk data control for Casa CCAP (UTSC file upload).
+        
+        Sets up row in docsPnmCcapBulkDataControlTable for UTSC file upload:
+        - DestIpAddr: TFTP server IP
+        - DestPath: Upload path
+        - UploadControl: autoUpload(3)
+        - PnmTestSelector: bit 8 (usTriggeredSpectrumCapture)
+        
+        Args:
+            dest_ip: TFTP/FTP server IP for file upload
+            dest_path: Destination path (default: "./")
+            index: Table index (default: 1)
+            
+        Returns:
+            Dict with success status
+        """
+        try:
+            import asyncio
+            import ipaddress
+            
+            self.logger.info(f"Configuring bulk data control for UTSC upload to {dest_ip}:{dest_path}")
+            
+            # Convert IP to hex string
+            ip_obj = ipaddress.ip_address(dest_ip)
+            ip_hex = ip_obj.packed.hex()
+            ip_hex_formatted = ' '.join([ip_hex[i:i+2] for i in range(0, len(ip_hex), 2)]).upper()
+            
+            # 1. Set DestIpAddrType = ipv4(1)
+            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
+            
+            # 2. Set DestIpAddr (hex string)
+            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP}.{index}", ip_hex_formatted, 'x')
+            
+            # 3. Set DestPath
+            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_PATH}.{index}", dest_path, 's')
+            
+            # 4. Set UploadControl = autoUpload(3)
+            await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')
+            
+            # 5. Set PnmTestSelector bit 8 (usTriggeredSpectrumCapture)
+            # BITS: 00 80 = bit 8 set
+            await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", "00 80", 'x')
+            
+            self.logger.info("Bulk data control configured successfully")
+            return {"success": True}
+            
+        except Exception as e:
+            self.logger.error(f"Failed to configure bulk data control: {e}")
+            return {"success": False, "error": str(e)}
     
     @staticmethod
     def mac_to_hex_string(mac_address: str) -> str:
@@ -521,6 +587,21 @@ class CmtsUtscService:
         try:
             import asyncio
             
+            # For Casa CCAP, configure bulk data control first
+            # Check if this is a Casa CMTS by testing bulk data control OID
+            bulk_check = await self._snmp_get(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.1")
+            is_casa = bulk_check.get('success', False) and 'No Such' not in str(bulk_check.get('output', ''))
+            
+            if is_casa:
+                self.logger.info("Detected Casa CCAP - configuring bulk data control for UTSC file upload")
+                bulk_result = await self.configure_bulk_data_control(
+                    dest_ip="172.29.10.68",  # TFTP server
+                    dest_path="./",
+                    index=1
+                )
+                if not bulk_result.get('success'):
+                    self.logger.warning(f"Bulk data control configuration failed: {bulk_result.get('error')}")
+            
             # Auto-detect output format if not specified
             if output_format is None or output_format == 0:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
@@ -546,11 +627,24 @@ class CmtsUtscService:
                 # Note: Do NOT destroy+recreate — Cisco cBR-8 pre-creates rows
                 # and will reject createAndGo after destroy. Just modify in-place.
             else:
-                # Row does not exist - on most modern CMTS (E6000, Cisco, Casa),
-                # rows are pre-created by the system. Manual row creation via
-                # SNMP RowStatus is unreliable and vendor-specific.
-                self.logger.warning(f"UTSC config row {idx} does not exist - it should be pre-created by CMTS. "
-                                   f"Proceeding to set parameters anyway - this may fail.")
+                # Row does not exist - Casa CCAP requires manual creation
+                # Use notInService(2) to create row, then set parameters, then active(1)
+                self.logger.info("UTSC row does not exist - creating with notInService(2)...")
+                create_result = await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i'  # 2 = notInService
+                )
+                if not create_result.get('success'):
+                    # Try createAndWait(5) as fallback
+                    self.logger.warning(f"notInService failed: {create_result.get('error')}, "
+                                       f"trying createAndWait(5)")
+                    create_result = await self._snmp_set(
+                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
+                    )
+                    if not create_result.get('success'):
+                        return {"success": False, 
+                                "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
+                await asyncio.sleep(0.5)
+                self.logger.info("UTSC config row created, will activate after setting parameters")
             
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
             
