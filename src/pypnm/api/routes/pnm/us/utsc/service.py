@@ -696,51 +696,47 @@ class CmtsUtscService:
             # 7. Clamp trigger_count (1-10 on E6000, no limit on Cisco)
             trigger_count = max(trigger_count, 1)
 
-            # Casa requires RepeatPeriod >= 100000 µs (100ms); E6000 minimum is 50000 µs.
-            # Clamp to 100000 to be safe on all vendors.
-            if repeat_period_us < 100000:
-                self.logger.info(f"Clamping RepeatPeriod {repeat_period_us}µs -> 100000µs (Casa minimum)")
-                repeat_period_us = 100000
-            
-            # 8. Auto-calculate FreeRunDuration if not explicitly set
-            if freerun_duration_ms <= 0:
-                # Cisco cBR-8: FreeRunDuration must be large enough for captures.
-                # Use max(repeat_period * trigger_count * 2, 60000ms) to be safe.
-                # E6000: compares raw values, so FreeRunDuration >= RepeatPeriod.
-                calc_ms = repeat_period_us * trigger_count * 2
-                freerun_duration_ms = max(calc_ms, repeat_period_us, 60000)
-                self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms}ms "
-                                f"(repeat={repeat_period_us}us * count={trigger_count} * 2)")
-            
-            # Cisco constraint: RepeatPeriod must not exceed FreeRunDuration
-            # E6000 constraint: FreeRunDuration raw >= RepeatPeriod raw
-            if freerun_duration_ms < repeat_period_us:
-                freerun_duration_ms = repeat_period_us
-                self.logger.warning(f"FreeRunDuration clamped to {freerun_duration_ms} "
-                                   f"(>= RepeatPeriod)")
+            # ===== Vendor-specific timing constraints =====
+            if is_casa:
+                # Casa E6000 constraints (from syslog errors):
+                #   1. RepeatPeriod >= 100ms
+                #   2. FreeRunDuration >= 120s  (is_freerun_trigger_valid)
+                #   3. FreeRunDuration / RepeatPeriod <= 300 files
+                if repeat_period_us < 100000:
+                    self.logger.info(f"Casa: clamping RepeatPeriod {repeat_period_us}µs -> 100000µs")
+                    repeat_period_us = 100000
 
-            # Casa constraint: FreeRunDuration / RepeatPeriod <= 300 capture files
-            repeat_period_ms = repeat_period_us // 1000 or 1
-            max_freerun_ms = 300 * repeat_period_ms
-            if freerun_duration_ms > max_freerun_ms:
-                self.logger.info(f"Clamping FreeRunDuration {freerun_duration_ms}ms -> {max_freerun_ms}ms "
-                                 f"(Casa max 300 files @ {repeat_period_ms}ms period)")
-                freerun_duration_ms = max_freerun_ms
+                if freerun_duration_ms <= 0:
+                    freerun_duration_ms = 120000  # default to minimum
+                elif freerun_duration_ms < 120000:
+                    self.logger.info(f"Casa: clamping FreeRunDuration {freerun_duration_ms}ms -> 120000ms")
+                    freerun_duration_ms = 120000
 
-            # Casa constraint: FreeRunDuration >= 120s (is_freerun_trigger_valid delay check)
-            # If FreeRunDuration < 120000ms, increase RepeatPeriod so file count stays <= 300
-            if freerun_duration_ms < 120000:
-                freerun_duration_ms = 120000
-                self.logger.info(f"Clamped FreeRunDuration to 120000ms (Casa 120s minimum)")
-            # Ensure RepeatPeriod is large enough: repeat_period >= freerun/300
-            min_repeat_ms = (freerun_duration_ms + 299) // 300  # ceil
-            min_repeat_us = min_repeat_ms * 1000
-            if repeat_period_us < min_repeat_us:
-                self.logger.info(
-                    f"Increasing RepeatPeriod {repeat_period_us}µs -> {min_repeat_us}µs "
-                    f"(Casa max 300 files: {freerun_duration_ms}ms / {min_repeat_ms}ms = 300)"
-                )
-                repeat_period_us = min_repeat_us
+                # files = freerun / repeat <= 300  →  repeat >= freerun / 300
+                repeat_period_ms = repeat_period_us // 1000 or 1
+                max_freerun_ms = 300 * repeat_period_ms
+                if freerun_duration_ms > max_freerun_ms:
+                    self.logger.info(f"Casa: clamping FreeRunDuration {freerun_duration_ms}ms -> {max_freerun_ms}ms (300 files max)")
+                    freerun_duration_ms = max_freerun_ms
+                min_repeat_us = ((freerun_duration_ms + 299) // 300) * 1000  # ceil(freerun/300) ms → µs
+                if repeat_period_us < min_repeat_us:
+                    self.logger.info(f"Casa: raising RepeatPeriod {repeat_period_us}µs -> {min_repeat_us}µs (300 files max)")
+                    repeat_period_us = min_repeat_us
+            else:
+                # CommScope/Arris E6000 and Cisco cBR-8:
+                #   RepeatPeriod >= 50ms, FreeRunDuration >= RepeatPeriod
+                if repeat_period_us < 50000:
+                    self.logger.info(f"E6000/Cisco: clamping RepeatPeriod {repeat_period_us}µs -> 50000µs")
+                    repeat_period_us = 50000
+
+                if freerun_duration_ms <= 0:
+                    calc_ms = repeat_period_us * trigger_count * 2
+                    freerun_duration_ms = max(calc_ms, repeat_period_us, 60000)
+                    self.logger.info(f"Auto-set FreeRunDuration={freerun_duration_ms}ms")
+
+                if freerun_duration_ms < repeat_period_us:
+                    freerun_duration_ms = repeat_period_us
+                    self.logger.warning(f"FreeRunDuration clamped to {freerun_duration_ms}ms (>= RepeatPeriod)")
             
             # 9. Set FreeRunDuration FIRST (Gauge32) — must be >= RepeatPeriod
             fr_result = await self._snmp_set(
