@@ -726,6 +726,21 @@ class CmtsUtscService:
                 self.logger.info(f"Clamping FreeRunDuration {freerun_duration_ms}ms -> {max_freerun_ms}ms "
                                  f"(Casa max 300 files @ {repeat_period_ms}ms period)")
                 freerun_duration_ms = max_freerun_ms
+
+            # Casa constraint: FreeRunDuration >= 120s (is_freerun_trigger_valid delay check)
+            # If FreeRunDuration < 120000ms, increase RepeatPeriod so file count stays <= 300
+            if freerun_duration_ms < 120000:
+                freerun_duration_ms = 120000
+                self.logger.info(f"Clamped FreeRunDuration to 120000ms (Casa 120s minimum)")
+            # Ensure RepeatPeriod is large enough: repeat_period >= freerun/300
+            min_repeat_ms = (freerun_duration_ms + 299) // 300  # ceil
+            min_repeat_us = min_repeat_ms * 1000
+            if repeat_period_us < min_repeat_us:
+                self.logger.info(
+                    f"Increasing RepeatPeriod {repeat_period_us}µs -> {min_repeat_us}µs "
+                    f"(Casa max 300 files: {freerun_duration_ms}ms / {min_repeat_ms}ms = 300)"
+                )
+                repeat_period_us = min_repeat_us
             
             # 9. Set FreeRunDuration FIRST (Gauge32) — must be >= RepeatPeriod
             fr_result = await self._snmp_set(
