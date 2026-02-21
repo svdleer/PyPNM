@@ -545,27 +545,14 @@ class CmtsUtscService:
                 await asyncio.sleep(0.5)
                 # Note: Do NOT destroy+recreate — Cisco cBR-8 pre-creates rows
                 # and will reject createAndGo after destroy. Just modify in-place.
-            
-            if not row_exists:
-                # Create config entry with RowStatus = createAndGo(4)
-                # Per Cisco doc: "All capture entries must first be created
-                # by a client on a port before attempting to initiate any tests"
-                self.logger.info("Creating UTSC config entry with createAndGo(4)...")
-                create_result = await self._snmp_set(
-                    f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 4, 'i'  # 4 = createAndGo
-                )
-                if not create_result.get('success'):
-                    # Fallback: createAndWait(5)
-                    self.logger.warning(f"createAndGo failed: {create_result.get('error')}, "
-                                       f"trying createAndWait(5)")
-                    create_result = await self._snmp_set(
-                        f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
-                    )
-                    if not create_result.get('success'):
-                        return {"success": False, 
-                                "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
+            else:
+                # Casa CCAP also pre-creates rows - skip RowStatus creation
+                # which causes "commitFailed at 1" errors
+                self.logger.info("UTSC row doesn't exist, but assuming pre-created (Casa/Cisco behavior)")
                 await asyncio.sleep(0.5)
-                self.logger.info("UTSC config entry created")
+            
+            # Note: Skipping explicit row creation (createAndGo/createAndWait)
+            # Casa CCAP and Cisco cBR-8 pre-create rows - just set parameters directly
             
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
             
