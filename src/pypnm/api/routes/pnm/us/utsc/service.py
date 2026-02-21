@@ -649,7 +649,9 @@ class CmtsUtscService:
                         pass
 
             idx = f".{rf_port_ifindex}.{target_idx}"
-            self.logger.info(f"Modifying existing row in-place at cfg_index={target_idx}...")
+            self.logger.info(f"Suspending row at cfg_index={target_idx} (RowStatus=notInService) before writes...")
+            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i')  # notInService
+            await asyncio.sleep(0.3)
 
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
