@@ -36,8 +36,6 @@ from pypnm.api.routes.pnm.us.utsc.schemas import (
     UtscStopResponse,
     UtscStatusRequest,
     UtscStatusResponse,
-    UtscBulkDestRequest,
-    UtscBulkDestResponse,
 )
 from pypnm.api.routes.pnm.us.utsc.service import CmtsUtscService
 
@@ -317,48 +315,6 @@ class UtscRouter:
                     cfg_index=request.cfg_index
                 )
                 return UtscStatusResponse(**result)
-            finally:
-                service.close()
-
-
-        @self.router.post(
-            "/bulk-destination",
-            summary="Configure Casa docsPnmCcapBulkDataControl for UTSC/RxMER upload",
-            response_model=UtscBulkDestResponse,
-        )
-        async def configure_bulk_destination(
-            request: UtscBulkDestRequest
-        ) -> UtscBulkDestResponse:
-            """
-            Configure docsPnmCcapBulkDataControlTable on a Casa CCAP (E6000).
-
-            Sets the TFTP destination IP, path, upload mode (autoUpload), and
-            PnmTestSelector BITS for the specified PNM test types:
-            - 'utsc'  → bit8 usTriggeredSpectrumCapture  (Casa UTSC file upload)
-            - 'rxmer' → bit5 usOfdmaRxMerPerSubcarrier   (Casa US OFDMA RxMER upload)
-            - 'both'  → bit5 + bit8
-
-            Must be called once after CMTS reload before UTSC or US RxMER captures
-            will upload files to the TFTP server.
-            """
-            self.logger.info(
-                f"Configuring bulk destination index={request.index} "
-                f"dest={request.dest_ip} types={request.pnm_types} "
-                f"on CMTS {request.cmts.cmts_ip}"
-            )
-            service = CmtsUtscService(
-                cmts_ip=request.cmts.cmts_ip,
-                community=request.cmts.community,
-                write_community=request.cmts.write_community
-            )
-            try:
-                result = await service.configure_bulk_data_control(
-                    dest_ip=request.dest_ip,
-                    dest_path=request.dest_path,
-                    index=request.index,
-                    pnm_types=request.pnm_types
-                )
-                return UtscBulkDestResponse(**result)
             finally:
                 service.close()
 
