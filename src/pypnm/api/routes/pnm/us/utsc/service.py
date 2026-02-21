@@ -612,7 +612,7 @@ class CmtsUtscService:
             if is_casa:
                 self.logger.info("Detected Casa CCAP - configuring bulk data control for UTSC file upload")
                 bulk_result = await self.configure_bulk_data_control(
-                    dest_ip="172.29.10.68",  # TFTP server
+                    dest_ip="172.22.147.18",  # Casa backbone TFTP server
                     dest_path="./",
                     index=1
                 )
