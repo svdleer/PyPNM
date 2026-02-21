@@ -2,11 +2,15 @@
 # Copyright (c) 2025-2026 Maurice Garcia
 
 """
-Router for Casa CCAP docsPnmCcapBulkDataControl configuration.
+Router for CMTS bulk data destination configuration.
 
 Endpoint:
-- POST /pnm/us/bulk-destination  Configure TFTP destination and PnmTestSelector
-                                  for UTSC and/or US OFDMA RxMER file upload.
+- POST /pnm/us/bulk-destination  Auto-detects vendor and configures the correct
+                                  TFTP destination table(s) for UTSC/RxMER upload.
+
+  Vendor logic:
+  - All vendors:  docsPnmBulkDataTransferCfgTable (standard DOCS-PNM-MIB)
+  - Casa only:    docsPnmCcapBulkDataControlTable + PnmTestSelector BITS
 """
 
 from __future__ import annotations
@@ -19,10 +23,11 @@ from pydantic import BaseModel, Field
 
 from pypnm.api.routes.pnm.us.utsc.schemas import CmtsSnmpConfig
 from pypnm.api.routes.pnm.us.utsc.service import CmtsUtscService
+from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 
 
 class BulkDestinationRequest(BaseModel):
-    """Request to configure docsPnmCcapBulkDataControlTable on a Casa CCAP."""
+    """Request to configure CMTS bulk data destination for PNM file uploads."""
     cmts: CmtsSnmpConfig
     dest_ip: str = Field(..., description="TFTP server IP address")
     dest_path: str = Field(default="./", description="Destination path on TFTP server")
@@ -30,7 +35,7 @@ class BulkDestinationRequest(BaseModel):
     pnm_types: List[str] = Field(
         default=["utsc", "rxmer"],
         description=(
-            "PNM test types to associate with this destination. "
+            "PNM test types to associate with this destination (Casa only). "
             "Valid values: 'utsc' (bit8 usTriggeredSpectrumCapture), "
             "'rxmer' (bit5 usOfdmaRxMerPerSubcarrier), 'both'."
         )
@@ -40,19 +45,21 @@ class BulkDestinationRequest(BaseModel):
 class BulkDestinationResponse(BaseModel):
     """Response from bulk destination configuration."""
     success: bool
-    index: int = Field(default=1)
+    vendor: Optional[str] = None
+    standard_dest_index: Optional[int] = None
+    casa_index: Optional[int] = None
     dest_ip: Optional[str] = None
     pnm_test_selector_hex: Optional[str] = None
     error: Optional[str] = None
 
 
 class BulkDestinationRouter:
-    """Router for Casa CCAP bulk data destination configuration."""
+    """Router for CMTS bulk data destination configuration."""
 
     def __init__(self) -> None:
         self.router = APIRouter(
             prefix="/pnm/us/bulk-destination",
-            tags=["PNM Operations - Casa CCAP Bulk Data Destination"]
+            tags=["PNM Operations - CMTS Bulk Data Destination"]
         )
         self.logger = logging.getLogger(self.__class__.__name__)
         self.__routes()
@@ -61,45 +68,87 @@ class BulkDestinationRouter:
 
         @self.router.post(
             "",
-            summary="Configure Casa docsPnmCcapBulkDataControl for UTSC/RxMER upload",
+            summary="Configure CMTS bulk data destination for UTSC/RxMER upload",
             response_model=BulkDestinationResponse,
         )
         async def configure_bulk_destination(
             request: BulkDestinationRequest
         ) -> BulkDestinationResponse:
             """
-            Configure docsPnmCcapBulkDataControlTable on a Casa CCAP (E6000).
+            Auto-detects CMTS vendor and configures the correct destination table(s).
 
-            Sets the TFTP destination IP, path, upload mode (autoUpload), and
-            PnmTestSelector BITS for the specified PNM test types:
+            **All vendors** — configures `docsPnmBulkDataTransferCfgTable` (standard):
+            - Sets TFTP IP, port, RowStatus=active
 
-            - **'utsc'**  → bit8 `usTriggeredSpectrumCapture`  (UTSC file upload)
-            - **'rxmer'** → bit5 `usOfdmaRxMerPerSubcarrier`   (US OFDMA RxMER upload)
-            - **'both'**  → bit5 + bit8
+            **Casa only** — additionally configures `docsPnmCcapBulkDataControlTable`:
+            - Sets DestIpAddr, UploadControl=autoUpload, PnmTestSelector BITS:
+              - `'utsc'`  → bit8 `usTriggeredSpectrumCapture`
+              - `'rxmer'` → bit5 `usOfdmaRxMerPerSubcarrier`
+              - `'both'`  → bit5 + bit8
 
-            Must be called once after CMTS reload before UTSC or US RxMER captures
-            will upload files to the TFTP server.
+            Must be called once after CMTS reload before captures upload to TFTP.
             """
             self.logger.info(
                 f"Configuring bulk destination index={request.index} "
                 f"dest={request.dest_ip} types={request.pnm_types} "
                 f"on CMTS {request.cmts.cmts_ip}"
             )
-            service = CmtsUtscService(
+
+            utsc_svc = CmtsUtscService(
                 cmts_ip=request.cmts.cmts_ip,
                 community=request.cmts.community,
                 write_community=request.cmts.write_community
             )
+            rxmer_svc = CmtsUsOfdmaRxMerService(
+                cmts_ip=request.cmts.cmts_ip,
+                community=request.cmts.community,
+                write_community=request.cmts.write_community
+            )
+
             try:
-                result = await service.configure_bulk_data_control(
-                    dest_ip=request.dest_ip,
-                    dest_path=request.dest_path,
-                    index=request.index,
-                    pnm_types=request.pnm_types
+                # 1. Detect vendor
+                vendor = await utsc_svc.detect_vendor()
+                self.logger.info(f"Detected vendor: {vendor}")
+
+                response = BulkDestinationResponse(
+                    success=True,
+                    vendor=vendor,
+                    dest_ip=request.dest_ip
                 )
-                return BulkDestinationResponse(**result)
+
+                # 2. Standard table — all vendors (Cisco, CommScope, Casa)
+                std_result = await rxmer_svc.create_bulk_destination(
+                    tftp_ip=request.dest_ip,
+                    port=69,
+                    local_store=True,
+                    dest_index=request.index
+                )
+                if not std_result.get('success'):
+                    self.logger.warning(f"Standard dest table failed: {std_result.get('error')}")
+                    response.success = False
+                    response.error = std_result.get('error')
+                else:
+                    response.standard_dest_index = std_result.get('destination_index', request.index)
+
+                # 3. Casa-only: docsPnmCcapBulkDataControlTable + PnmTestSelector
+                if vendor == 'casa':
+                    casa_result = await utsc_svc.configure_bulk_data_control(
+                        dest_ip=request.dest_ip,
+                        dest_path=request.dest_path,
+                        index=request.index,
+                        pnm_types=request.pnm_types
+                    )
+                    if not casa_result.get('success'):
+                        self.logger.warning(f"Casa bulk control failed: {casa_result.get('error')}")
+                    else:
+                        response.casa_index = casa_result.get('index', request.index)
+                        response.pnm_test_selector_hex = casa_result.get('pnm_test_selector_hex')
+
+                return response
+
             finally:
-                service.close()
+                utsc_svc.close()
+                rxmer_svc.close()
 
 
 # Required for dynamic auto-registration

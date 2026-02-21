@@ -351,6 +351,34 @@ class CmtsUtscService:
             self.logger.error(f"Failed to configure bulk data control: {e}")
             return {"success": False, "error": str(e)}
     
+    async def detect_vendor(self) -> str:
+        """
+        Detect CMTS vendor via sysDescr (1.3.6.1.2.1.1.1.0).
+
+        Returns:
+            'casa' | 'arris' | 'cisco' | 'unknown'
+        """
+        try:
+            result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
+            raw = str(result.get('output', ''))
+            val = raw.split(' = ', 1)[1].strip() if ' = ' in raw else raw.strip()
+            if val.upper().startswith('0X'):
+                try:
+                    val = bytes.fromhex(val[2:]).decode('utf-8', errors='replace')
+                except Exception:
+                    pass
+            val = val.upper()
+            if 'CASA' in val:
+                return 'casa'
+            if 'ARRIS' in val or 'COMMSCOPE' in val:
+                return 'arris'
+            if 'CISCO' in val:
+                return 'cisco'
+            return 'unknown'
+        except Exception as e:
+            self.logger.warning(f"Vendor detection failed: {e}")
+            return 'unknown'
+
     @staticmethod
     def mac_to_hex_string(mac_address: str) -> str:
         """Convert MAC address to hex string for agent SNMP SET (type='x')."""
