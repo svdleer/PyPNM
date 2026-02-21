@@ -546,13 +546,11 @@ class CmtsUtscService:
                 # Note: Do NOT destroy+recreate — Cisco cBR-8 pre-creates rows
                 # and will reject createAndGo after destroy. Just modify in-place.
             else:
-                # Casa CCAP also pre-creates rows - skip RowStatus creation
-                # which causes "commitFailed at 1" errors
-                self.logger.info("UTSC row doesn't exist, but assuming pre-created (Casa/Cisco behavior)")
-                await asyncio.sleep(0.5)
-            
-            # Note: Skipping explicit row creation (createAndGo/createAndWait)
-            # Casa CCAP and Cisco cBR-8 pre-create rows - just set parameters directly
+                # Row does not exist - on most modern CMTS (E6000, Cisco, Casa),
+                # rows are pre-created by the system. Manual row creation via
+                # SNMP RowStatus is unreliable and vendor-specific.
+                self.logger.warning(f"UTSC config row {idx} does not exist - it should be pre-created by CMTS. "
+                                   f"Proceeding to set parameters anyway - this may fail.")
             
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
             
