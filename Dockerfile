@@ -20,11 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 
 # Use HTTPS for Ubuntu repos (archive + security)
-RUN find /etc/apt -type f -exec sed -i \
-      -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-      -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
-    {} \; \
- && apt-get update \
+RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
       gosu \
