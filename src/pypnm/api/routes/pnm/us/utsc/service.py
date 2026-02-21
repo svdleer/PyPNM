@@ -410,6 +410,7 @@ class CmtsUtscService:
                 re.compile(r'Integrated-Cable\d+/\d+/US\d+', re.I),                # Cisco cBR-8 integrated
                 re.compile(r'Upstream-Cable\d+', re.I),                             # Cisco legacy
                 re.compile(r'us-conn\s+\d+/\d+', re.I),                             # CommScope E6000
+                re.compile(r'cable-upstream\s+\d+/\w+/\d+', re.I),                 # Arris CER (e.g. cable-upstream 1/scq/0)
                 re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),                # Casa / Generic
                 re.compile(r'^Upstream Physical Interface\s+\d+/\d+\.\d+', re.I),  # Casa 100G physical (UTSC target)
                 # Note: OFDMA logical channels excluded - use physical port for UTSC
@@ -446,11 +447,13 @@ class CmtsUtscService:
                 except (ValueError, IndexError):
                     continue
                 
-                # Skip logical/virtual channels — only want physical RF ports
-                # Cisco logical channels: ifIndex >= 840M, descriptions like "Cable8/0/0-upstream3"
+                # Skip Cisco logical/virtual channels (>= 840M, e.g. "Cable8/0/0-upstream3")
+                # Arris CER uses 843M range for physical upstream ports — don't skip those
                 if ifindex >= 840000000:
-                    continue
-                
+                    # Allow if matched by Arris pattern (cable-upstream N/scq/N)
+                    if not re.search(r'cable-upstream\s+\d+/\w+/\d+', descr, re.I):
+                        continue
+
                 # Casa: Accept both physical (4M range) and logical OFDMA (16M range)
                 # Note: Casa mapping is logical_ifindex = physical_ifindex + 12000000
                 # For UTSC, physical ports are preferred but both are listed
