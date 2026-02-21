@@ -598,18 +598,18 @@ class CmtsUtscService:
             Dict with success status
         """
         idx = f".{rf_port_ifindex}.{cfg_index}"
-        
+
         self.logger.info(f"Configuring UTSC for RF port {rf_port_ifindex}, "
                          f"trigger_mode={trigger_mode}, auto_clear={auto_clear}")
         
         try:
             import asyncio
-            
+
             # For Casa CCAP, configure bulk data control first
             # Check if this is a Casa CMTS by testing bulk data control OID
             bulk_check = await self._snmp_get(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.1")
             is_casa = bulk_check.get('success', False) and 'No Such' not in str(bulk_check.get('output', ''))
-            
+
             if is_casa:
                 self.logger.info("Detected Casa CCAP - configuring bulk data control for UTSC file upload")
                 from pypnm.config.system_config_settings import SystemConfigSettings
@@ -627,15 +627,16 @@ class CmtsUtscService:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
                 output_format = 5
 
-            # Always destroy and recreate the row to guarantee a clean slate.
-            # This is required for Casa CCAP (TriggerMode is locked after createAndGo
-            # and cannot be changed on an active row). The destroy/createAndWait sequence
-            # works on all vendors: E6000, Casa, and Cisco cBR-8.
-            self.logger.info("Destroying existing UTSC row (RowStatus=6) for clean slate...")
-            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i')
-            await asyncio.sleep(0.3)
+            # Destroy all existing rows for this rf_port (indices 1-10), then
+            # createAndWait at index 1. Simple and vendor-agnostic.
+            self.logger.info(f"Destroying all existing UTSC rows for rf_port={rf_port_ifindex}...")
+            for destroy_idx in range(1, 11):
+                d_oid = f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{destroy_idx}"
+                await self._snmp_set(d_oid, 6, 'i')
+            await asyncio.sleep(0.5)
 
-            self.logger.info("Creating UTSC row with createAndWait(5)...")
+            idx = f".{rf_port_ifindex}.1"
+            self.logger.info("Creating UTSC row at cfg_index=1 with createAndWait(5)...")
             create_result = await self._snmp_set(
                 f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i'
             )
@@ -644,7 +645,7 @@ class CmtsUtscService:
                         "error": f"Cannot create UTSC config row: {create_result.get('error')}"}
             await asyncio.sleep(0.3)
             self.logger.info("UTSC row created (suspended) — setting parameters...")
-            
+
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
             # 0. LogicalChIfIndex (.2) — mandatory on Casa even for freeRunning (0 = any channel)

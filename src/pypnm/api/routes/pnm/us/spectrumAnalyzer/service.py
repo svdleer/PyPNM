@@ -461,15 +461,16 @@ class CmtsUtscService:
             )
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
 
-            # ── Step 1: Destroy existing row (ignore errors — row may not exist) ──
-            self.logger.info("[Casa] Step 1: Destroying existing UTSC row (RowStatus=6)")
-            await self._safe_snmp_set(
-                f"{self.UTSC_CFG_BASE}.21{idx}", 6, 'i', "Casa RowStatus=destroy"
-            )
-            await asyncio.sleep(0.3)  # give CMTS time to remove row
+            # Destroy all existing rows for this rf_port (indices 1-10), then
+            # createAndWait at index 1.
+            self.logger.info(f"Destroying all existing UTSC rows for rf_port={self.rf_port_ifindex}...")
+            for destroy_idx in range(1, 11):
+                d_oid = f"{self.UTSC_CFG_BASE}.21.{self.rf_port_ifindex}.{destroy_idx}"
+                await self._safe_snmp_set(d_oid, 6, 'i', f"Destroy row idx={destroy_idx}")
+            await asyncio.sleep(0.5)
 
-            # ── Step 2: Create row in suspended state (createAndWait=5) ──
-            self.logger.info("[Casa] Step 2: Creating row with RowStatus=createAndWait")
+            idx = f".{self.rf_port_ifindex}.1"
+            self.logger.info("Creating UTSC row at cfg_index=1 with createAndWait(5)...")
             ok = await self._safe_snmp_set(
                 f"{self.UTSC_CFG_BASE}.21{idx}", 5, 'i', "Casa RowStatus=createAndWait"
             )
