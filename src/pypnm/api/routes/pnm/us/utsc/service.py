@@ -759,6 +759,15 @@ class CmtsUtscService:
                         f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex, 'i'
                     )
 
+            # ===== Reactivate row (notInService -> active) =====
+            self.logger.info("Reactivating row (RowStatus=active)...")
+            activate_result = await self._snmp_set(
+                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'
+            )
+            if not activate_result.get('success'):
+                self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')}")
+            await asyncio.sleep(0.3)
+
             # ===== Verify RowStatus (do NOT set it — Casa manages its own rows) =====
             await asyncio.sleep(0.3)
             status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
