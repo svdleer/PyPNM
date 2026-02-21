@@ -100,7 +100,7 @@ async def spectrum_stream(websocket: WebSocket):
                 num_bins = config.get("num_bins", 800)
                 output_format = config.get("output_format", 5)        # 5=fftAmplitude
                 window = config.get("window", 4)                      # 4=blackmanHarris
-                repeat_period_us = config.get("repeat_period_us", 50001)
+                repeat_period_us = config.get("repeat_period_us", 100000)
                 freerun_duration_ms = config.get("freerun_duration_ms", 600000)
                 runtime = config.get("runtime", 60)  # seconds - total streaming runtime
                 
@@ -288,7 +288,7 @@ async def _stream_spectrum_data(
     num_bins: int = 800,
     output_format: int = 5,
     window: int = 4,
-    repeat_period_us: int = 50001,
+    repeat_period_us: int = 100000,
     freerun_duration_ms: int = 600000,
     runtime: int = 60
 ):
@@ -584,7 +584,7 @@ async def _configure_utsc(
     num_bins: int = 800,
     output_format: int = 5,
     window: int = 4,
-    repeat_period_us: int = 50001,
+    repeat_period_us: int = 100000,
     freerun_duration_ms: int = 600000
 ):
     """Configure UTSC using destroy → createAndWait → set columns → activate.
