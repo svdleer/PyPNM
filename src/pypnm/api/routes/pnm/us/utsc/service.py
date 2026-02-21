@@ -410,6 +410,8 @@ class CmtsUtscService:
                 re.compile(r'Upstream-Cable\d+', re.I),                      # Cisco legacy
                 re.compile(r'us-conn\s+\d+/\d+', re.I),                      # CommScope E6000
                 re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),         # Casa / Generic
+                re.compile(r'physical.*upstream', re.I),                     # Casa 100G physical upstream
+                re.compile(r'upstream.*physical', re.I),                     # Casa 100G (alternate order)
                 re.compile(r'upstream\d+', re.I),                            # Generic
             ]
             
@@ -432,10 +434,16 @@ class CmtsUtscService:
                     continue
                 
                 # Skip logical/virtual channels — only want physical RF ports
-                # Cisco logical channels have very high ifIndexes (>840M)
-                # and descriptions like "Cable8/0/0-upstream3"
+                # Cisco logical channels: ifIndex >= 840M, descriptions like "Cable8/0/0-upstream3"
+                # Casa logical channels: ifIndex 16000000-16999999, no "physical" in description
                 if ifindex >= 840000000:
                     continue
+                
+                # Casa: Skip logical channels (16M range) unless description has "physical"
+                if 16000000 <= ifindex < 17000000:
+                    if 'physical' not in descr.lower():
+                        self.logger.debug(f"Skipping Casa logical channel: ifIndex={ifindex}, descr={descr}")
+                        continue
                 
                 rf_ports.append({
                     "rf_port_ifindex": ifindex,
