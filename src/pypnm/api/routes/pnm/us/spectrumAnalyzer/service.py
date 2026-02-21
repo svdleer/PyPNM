@@ -461,21 +461,22 @@ class CmtsUtscService:
             )
             idx = f".{self.rf_port_ifindex}.{self.cfg_idx}"
 
-            # Destroy all existing rows for this rf_port (indices 1-10), then
-            # createAndWait at index 1.
-            self.logger.info(f"Destroying existing UTSC rows 1-3 for rf_port={self.rf_port_ifindex}...")
+            # Destroy rows 1-3 for this rf_port, then createAndWait at index 1.
+            self.logger.info(f"Destroying UTSC rows 1-3 for rf_port={self.rf_port_ifindex}...")
             for destroy_idx in range(1, 4):
-                d_oid = f"{self.UTSC_CFG_BASE}.21.{self.rf_port_ifindex}.{destroy_idx}"
-                await self._safe_snmp_set(d_oid, 6, 'i', f"Destroy row idx={destroy_idx}")
+                await self._safe_snmp_set(
+                    f"{self.UTSC_CFG_BASE}.21.{self.rf_port_ifindex}.{destroy_idx}",
+                    6, 'i', f"Destroy row idx={destroy_idx}"
+                )
             await asyncio.sleep(0.5)
 
             idx = f".{self.rf_port_ifindex}.1"
             self.logger.info("Creating UTSC row at cfg_index=1 with createAndWait(5)...")
             ok = await self._safe_snmp_set(
-                f"{self.UTSC_CFG_BASE}.21{idx}", 5, 'i', "Casa RowStatus=createAndWait"
+                f"{self.UTSC_CFG_BASE}.21{idx}", 5, 'i', "RowStatus=createAndWait"
             )
             if not ok:
-                return {"success": False, "error": "[Casa] Failed to create UTSC row (createAndWait)"}
+                return {"success": False, "error": "Failed to create UTSC row (createAndWait)"}
             await asyncio.sleep(0.3)
 
             # ── Step 3: Set all config columns ──

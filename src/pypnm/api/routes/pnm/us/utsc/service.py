@@ -627,12 +627,12 @@ class CmtsUtscService:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
                 output_format = 5
 
-            # Destroy all existing rows for this rf_port (indices 1-10), then
-            # createAndWait at index 1. Simple and vendor-agnostic.
-            self.logger.info(f"Destroying existing UTSC rows 1-3 for rf_port={rf_port_ifindex}...")
+            # Destroy rows 1-3 for this rf_port, then createAndWait at index 1.
+            self.logger.info(f"Destroying UTSC rows 1-3 for rf_port={rf_port_ifindex}...")
             for destroy_idx in range(1, 4):
-                d_oid = f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{destroy_idx}"
-                await self._snmp_set(d_oid, 6, 'i')
+                await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{destroy_idx}", 6, 'i'
+                )
             await asyncio.sleep(0.5)
 
             idx = f".{rf_port_ifindex}.1"
