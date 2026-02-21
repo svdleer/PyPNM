@@ -463,8 +463,8 @@ class CmtsUtscService:
 
             # Destroy all existing rows for this rf_port (indices 1-10), then
             # createAndWait at index 1.
-            self.logger.info(f"Destroying all existing UTSC rows for rf_port={self.rf_port_ifindex}...")
-            for destroy_idx in range(1, 11):
+            self.logger.info(f"Destroying existing UTSC rows 1-3 for rf_port={self.rf_port_ifindex}...")
+            for destroy_idx in range(1, 4):
                 d_oid = f"{self.UTSC_CFG_BASE}.21.{self.rf_port_ifindex}.{destroy_idx}"
                 await self._safe_snmp_set(d_oid, 6, 'i', f"Destroy row idx={destroy_idx}")
             await asyncio.sleep(0.5)
