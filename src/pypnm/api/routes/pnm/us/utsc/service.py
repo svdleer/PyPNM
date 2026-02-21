@@ -708,9 +708,10 @@ class CmtsUtscService:
                 #   1. RepeatPeriod >= 100ms
                 #   2. FreeRunDuration >= 120s  (is_freerun_trigger_valid)
                 #   3. FreeRunDuration / RepeatPeriod <= 300 files
+                # Apply in order: floor repeat → floor freerun → raise repeat to satisfy files≤300
                 if repeat_period_us < 100000:
+                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> 100000 (Casa minimum 100ms)")
                     repeat_period_us = 100000
-                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {repeat_period_us} (Casa minimum 100ms)")
 
                 if freerun_duration_ms <= 0:
                     freerun_duration_ms = 120000
@@ -718,16 +719,18 @@ class CmtsUtscService:
                     clamp_warnings.append(f"freerun_duration_ms clamped {orig_freerun} -> 120000 (Casa minimum 120s)")
                     freerun_duration_ms = 120000
 
-                # files = freerun / repeat <= 300  →  repeat >= freerun / 300
+                # files = freerun / repeat <= 300  →  repeat >= ceil(freerun / 300)
+                min_repeat_us = ((freerun_duration_ms + 299) // 300) * 1000
+                if repeat_period_us < min_repeat_us:
+                    clamp_warnings.append(f"repeat_period_us raised {repeat_period_us} -> {min_repeat_us} (Casa max 300 files)")
+                    repeat_period_us = min_repeat_us
+
+                # Clamp freerun down only if still > 300 files after repeat was raised
                 repeat_period_ms = repeat_period_us // 1000 or 1
                 max_freerun_ms = 300 * repeat_period_ms
                 if freerun_duration_ms > max_freerun_ms:
                     clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (Casa max 300 files)")
                     freerun_duration_ms = max_freerun_ms
-                min_repeat_us = ((freerun_duration_ms + 299) // 300) * 1000
-                if repeat_period_us < min_repeat_us:
-                    clamp_warnings.append(f"repeat_period_us raised {repeat_period_us} -> {min_repeat_us} (Casa max 300 files)")
-                    repeat_period_us = min_repeat_us
             else:
                 # CommScope/Arris E6000 and Cisco cBR-8:
                 #   RepeatPeriod >= 50ms, FreeRunDuration >= RepeatPeriod
