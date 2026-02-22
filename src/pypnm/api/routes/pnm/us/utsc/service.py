@@ -413,8 +413,11 @@ class CmtsUtscService:
 
                 ip_str = None
                 if ip_raw:
-                    # OctetString returned as hex e.g. "ac 10 06 01" or "ac10060d"
-                    hex_str = ip_raw.strip().replace(' ', '').replace(':', '')
+                    # OctetString returned as hex e.g. "0xac10060d", "ac 10 06 01", "ac10060d"
+                    hex_str = ip_raw.strip()
+                    if hex_str.lower().startswith('0x'):
+                        hex_str = hex_str[2:]
+                    hex_str = hex_str.replace(' ', '').replace(':', '')
                     if len(hex_str) == 8:
                         try:
                             ip_str = str(_ip.ip_address(bytes.fromhex(hex_str)))

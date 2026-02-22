@@ -232,7 +232,10 @@ class CmtsUsOfdmaRxMerService:
                 pass
 
         # Strip 0x prefix and any whitespace/colons to get bare hex
-        hex_str = raw.lstrip('0x').replace(' ', '').replace(':', '')
+        hex_str = raw
+        if hex_str.lower().startswith('0x'):
+            hex_str = hex_str[2:]
+        hex_str = hex_str.replace(' ', '').replace(':', '')
         if len(hex_str) == 8:
             try:
                 return '.'.join(str(int(hex_str[i:i+2], 16)) for i in range(0, 8, 2))
