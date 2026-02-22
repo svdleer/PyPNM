@@ -863,6 +863,8 @@ class PNMDiagnosticsService:
     OID_MOD_PROF_MEAS_STATUS = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.2'
     OID_MOD_PROF_FILE_NAME   = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.3'
 
+    TFTP_LOCAL_PATH = '/var/lib/tftpboot'
+
     async def trigger_modulation_profile(
         self,
         tftp_server: str = '172.22.147.18',
@@ -937,22 +939,68 @@ class PNMDiagnosticsService:
                     if val == 4:  # complete
                         completed.add(ifindex)
 
+            # Step 5: Parse binary files from TFTP mount
+            import glob
+            import os
+            from pypnm.pnm.parser.CmDsOfdmModulationProfile import CmDsOfdmModulationProfile
+
+            mac_clean = (self.mac_address or '').replace(':', '').lower()
+            tftp_dir = self.TFTP_LOCAL_PATH
+            parsed_channels = []
+            first_filename = None
+
+            for ifindex in ofdm_ifindexes:
+                # Modem names files: ds_ofdm_modulation_profile_<mac>_<chanid>_<ts>.bin
+                pattern = os.path.join(tftp_dir, f'ds_ofdm_modulation_profile_{mac_clean}_*_*.bin')
+                # Pick the most recent matching file
+                matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+                bin_file = matches[0] if matches else None
+
+                chan_profiles = []
+                if bin_file and os.path.exists(bin_file):
+                    if first_filename is None:
+                        first_filename = os.path.basename(bin_file)
+                    try:
+                        raw = open(bin_file, 'rb').read()
+                        parser = CmDsOfdmModulationProfile(raw)
+                        model = parser.to_model()
+                        for p in model.profiles:
+                            subcarriers = []
+                            if hasattr(p, 'subcarriers'):
+                                for sc in p.subcarriers:
+                                    subcarriers.append({
+                                        'index': sc.index if hasattr(sc, 'index') else 0,
+                                        'modulation_order': sc.modulation_order if hasattr(sc, 'modulation_order') else sc.actual_modulation_order if hasattr(sc, 'actual_modulation_order') else 0
+                                    })
+                            chan_profiles.append({
+                                'profile_id': p.profile_id,
+                                'subcarriers': subcarriers
+                            })
+                    except Exception as e:
+                        self.logger.error(f"Failed to parse modulation profile file {bin_file}: {e}")
+
+                parsed_channels.append({
+                    'channel_id': ifindex,
+                    'ifindex': ifindex,
+                    'filename': os.path.basename(bin_file) if bin_file else filenames.get(ifindex, ''),
+                    'complete': ifindex in completed,
+                    'profiles': chan_profiles,
+                })
+
             return {
                 'success': True,
                 'mac_address': self.mac_address,
                 'modem_ip': self.modem_ip,
                 'timestamp': datetime.now().isoformat(),
-                'channels': [
-                    {
-                        'channel_id': idx,
-                        'ifindex': idx,
-                        'filename': filenames[idx],
-                        'complete': idx in completed,
-                        'profiles': []  # raw file on TFTP; parsed separately
-                    }
-                    for idx in ofdm_ifindexes
-                ],
-                'filename': filenames[ofdm_ifindexes[0]] if ofdm_ifindexes else None,
+                'channels': parsed_channels,
+                'filename': first_filename,
+                'data': {
+                    'modulation_profiles': [
+                        prof
+                        for ch in parsed_channels
+                        for prof in ch['profiles']
+                    ]
+                }
             }
 
         except Exception as e:
