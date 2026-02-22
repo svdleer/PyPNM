@@ -980,8 +980,8 @@ class PNMDiagnosticsService:
                                 'qam_4096': 4096, 'qam_8192': 8192, 'qam_16384': 16384,
                             }
                             for scheme in (p.schemes if hasattr(p, 'schemes') else []):
-                                mod = scheme.modulation_order
-                                num_sc = scheme.num_subcarriers if hasattr(scheme, 'num_subcarriers') else 1
+                                mod = getattr(scheme, 'modulation_order', None) or getattr(scheme, 'main_modulation_order', None) or 0
+                                num_sc = getattr(scheme, 'num_subcarriers', 1)
                                 mod_val = mod_order_map.get(str(mod).lower(), 0) if isinstance(mod, str) else int(mod)
                                 for i in range(num_sc):
                                     subcarriers.append({
