@@ -19,7 +19,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter
 
@@ -54,63 +54,64 @@ class UtscRouter:
     
     def __routes(self) -> None:
         
-        @self.router.post(
+        @self.router.get(
             "/ports",
             summary="List RF ports available for UTSC",
             response_model=UtscListPortsResponse,
         )
         async def list_rf_ports(
-            request: UtscListPortsRequest
+            cmts_ip: str,
+            community: str = "public",
+            write_community: Optional[str] = None
         ) -> UtscListPortsResponse:
             """
             List available RF ports for UTSC tests.
-            
+
             Returns a list of RF port ifIndexes that can be used for
             upstream triggered spectrum capture measurements.
             """
-            self.logger.info(f"Listing RF ports on CMTS {request.cmts.cmts_ip}")
-            
+            self.logger.info(f"Listing RF ports on CMTS {cmts_ip}")
             service = CmtsUtscService(
-                cmts_ip=request.cmts.cmts_ip,
-                community=request.cmts.community,
-                write_community=request.cmts.write_community
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
             )
-            
             try:
                 result = await service.list_rf_ports()
                 return UtscListPortsResponse(**result)
             finally:
                 service.close()
         
-        @self.router.post(
+        @self.router.get(
             "/config",
             summary="Get current UTSC configuration",
             response_model=UtscGetConfigResponse,
         )
         async def get_config(
-            request: UtscGetConfigRequest
+            cmts_ip: str,
+            rf_port_ifindex: int,
+            community: str = "public",
+            write_community: Optional[str] = None,
+            cfg_index: int = 1
         ) -> UtscGetConfigResponse:
             """
             Get current UTSC configuration for an RF port.
-            
+
             Returns the current settings including trigger mode, frequency range,
             output format, timing parameters, and filename.
             """
             self.logger.info(
-                f"Getting UTSC config for RF port {request.rf_port_ifindex} "
-                f"on CMTS {request.cmts.cmts_ip}"
+                f"Getting UTSC config for RF port {rf_port_ifindex} on CMTS {cmts_ip}"
             )
-            
             service = CmtsUtscService(
-                cmts_ip=request.cmts.cmts_ip,
-                community=request.cmts.community,
-                write_community=request.cmts.write_community
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
             )
-            
             try:
                 result = await service.get_config(
-                    rf_port_ifindex=request.rf_port_ifindex,
-                    cfg_index=request.cfg_index
+                    rf_port_ifindex=rf_port_ifindex,
+                    cfg_index=cfg_index
                 )
                 return UtscGetConfigResponse(**result)
             finally:
@@ -276,20 +277,24 @@ class UtscRouter:
             finally:
                 service.close()
         
-        @self.router.post(
+        @self.router.get(
             "/status",
             summary="Get UTSC test status",
             response_model=UtscStatusResponse,
         )
         async def get_status(
-            request: UtscStatusRequest
+            cmts_ip: str,
+            rf_port_ifindex: int,
+            community: str = "public",
+            write_community: Optional[str] = None,
+            cfg_index: int = 1
         ) -> UtscStatusResponse:
             """
             Get UTSC test status.
-            
+
             Returns the measurement status, average power, and filename.
             Poll this endpoint after starting a test to check for completion.
-            
+
             Status values:
             - OTHER (1): Unknown state
             - INACTIVE (2): No test running
@@ -299,20 +304,16 @@ class UtscRouter:
             - RESOURCE_UNAVAILABLE (6): Resources not available
             - SAMPLE_TRUNCATED (7): Data was truncated
             """
-            self.logger.debug(
-                f"Getting UTSC status for RF port {request.rf_port_ifindex}"
-            )
-            
+            self.logger.debug(f"Getting UTSC status for RF port {rf_port_ifindex}")
             service = CmtsUtscService(
-                cmts_ip=request.cmts.cmts_ip,
-                community=request.cmts.community,
-                write_community=request.cmts.write_community
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
             )
-            
             try:
                 result = await service.get_status(
-                    rf_port_ifindex=request.rf_port_ifindex,
-                    cfg_index=request.cfg_index
+                    rf_port_ifindex=rf_port_ifindex,
+                    cfg_index=cfg_index
                 )
                 return UtscStatusResponse(**result)
             finally:

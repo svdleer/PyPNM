@@ -25,7 +25,7 @@ from __future__ import annotations
 import io
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import Response
@@ -37,8 +37,6 @@ from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerStartResponse,
     UsOfdmaRxMerStatusRequest,
     UsOfdmaRxMerStatusResponse,
-    BulkDestinationsRequest,
-    BulkDestinationsResponse,
     UsOfdmaRxMerCaptureRequest,
     UsOfdmaRxMerCaptureResponse,
 )
@@ -142,71 +140,32 @@ class UsOfdmaRxMerRouter:
             finally:
                 service.close()
         
-        @self.router.post(
+        @self.router.get(
             "/status",
             summary="Get US OFDMA RxMER measurement status",
             response_model=UsOfdmaRxMerStatusResponse,
         )
         async def get_status(
-            request: UsOfdmaRxMerStatusRequest
+            cmts_ip: str,
+            ofdma_ifindex: int,
+            community: str = "public",
+            write_community: Optional[str] = None
         ) -> UsOfdmaRxMerStatusResponse:
             """
             Get the status of an Upstream OFDMA RxMER measurement.
-            
-            Poll this endpoint after starting a measurement to check when
-            it completes. Status values:
-            - INACTIVE (2): No measurement running
-            - BUSY (3): Measurement in progress
-            - SAMPLE_READY (4): Measurement complete, data available
-            - ERROR (5): Measurement failed
+
+            Poll this after starting a measurement to check when it completes.
+            Status: INACTIVE(2), BUSY(3), SAMPLE_READY(4), ERROR(5)
             """
-            self.logger.debug(
-                f"Getting US RxMER status for OFDMA ifIndex {request.ofdma_ifindex}"
-            )
-            
+            self.logger.debug(f"Getting US RxMER status for OFDMA ifIndex {ofdma_ifindex}")
             service = CmtsUsOfdmaRxMerService(
-                cmts_ip=request.cmts.cmts_ip,
-                community=request.cmts.community,
-                write_community=request.cmts.write_community
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
             )
-            
             try:
-                result = await service.get_status(request.ofdma_ifindex)
+                result = await service.get_status(ofdma_ifindex)
                 return UsOfdmaRxMerStatusResponse(**result)
-            finally:
-                service.close()
-        
-        @self.router.post(
-            "/destinations",
-            summary="Get bulk transfer destinations",
-            response_model=BulkDestinationsResponse,
-        )
-        async def get_bulk_destinations(
-            request: BulkDestinationsRequest
-        ) -> BulkDestinationsResponse:
-            """
-            Get list of configured bulk data transfer destinations.
-            
-            Returns the available destination indexes that can be used with
-            the destination_index parameter in the /start endpoint to enable
-            automatic TFTP upload of measurement results.
-            
-            Destination index 0 means local storage only. Non-zero values
-            reference rows in the docsPnmBulkDataTransferCfgTable.
-            """
-            self.logger.info(
-                f"Getting bulk destinations on CMTS {request.cmts.cmts_ip}"
-            )
-            
-            service = CmtsUsOfdmaRxMerService(
-                cmts_ip=request.cmts.cmts_ip,
-                community=request.cmts.community,
-                write_community=request.cmts.write_community
-            )
-            
-            try:
-                result = await service.get_bulk_destinations()
-                return BulkDestinationsResponse(**result)
             finally:
                 service.close()
 

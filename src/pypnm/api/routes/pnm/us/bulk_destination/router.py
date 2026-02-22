@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from pypnm.api.routes.pnm.us.utsc.schemas import CmtsSnmpConfig
 from pypnm.api.routes.pnm.us.utsc.service import CmtsUtscService
 from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
+from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import BulkDestinationsResponse
 
 
 class BulkDestinationRequest(BaseModel):
@@ -65,6 +66,35 @@ class BulkDestinationRouter:
         self.__routes()
 
     def __routes(self) -> None:
+
+        @self.router.get(
+            "",
+            summary="List configured CMTS bulk data destinations",
+            response_model=BulkDestinationsResponse,
+        )
+        async def get_bulk_destinations(
+            cmts_ip: str,
+            community: str = "public",
+            write_community: Optional[str] = None
+        ) -> BulkDestinationsResponse:
+            """
+            List all configured rows in docsPnmBulkDataTransferCfgTable.
+
+            Returns destination indexes, IPs, and protocols.
+            Use the returned index as destination_index in /utsc/configure or
+            /ofdma/rxmer/start.
+            """
+            self.logger.info(f"Listing bulk destinations on CMTS {cmts_ip}")
+            rxmer_svc = CmtsUsOfdmaRxMerService(
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
+            )
+            try:
+                result = await rxmer_svc.get_bulk_destinations()
+                return BulkDestinationsResponse(**result)
+            finally:
+                rxmer_svc.close()
 
         @self.router.post(
             "",
