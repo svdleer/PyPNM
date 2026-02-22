@@ -7,13 +7,13 @@ Router for CMTS Upstream Triggered Spectrum Capture (UTSC) operations.
 This module provides FastAPI endpoints for CMTS-side UTSC measurements.
 
 Endpoints:
-- POST /ports: List available RF ports for UTSC
-- POST /config: Get current UTSC configuration
+- GET  /ports:     List available RF ports for UTSC
+- GET  /config:    Get current UTSC configuration
 - POST /configure: Configure UTSC test parameters
-- POST /start: Start UTSC test
-- POST /stop: Stop UTSC test
-- POST /clear: Clear/reset UTSC configuration
-- POST /status: Get UTSC test status
+- POST /start:     Start UTSC test
+- POST /stop:      Stop UTSC test
+- POST /clear:     Clear/reset UTSC configuration
+- GET  /status:    Get UTSC test status
 """
 
 from __future__ import annotations
