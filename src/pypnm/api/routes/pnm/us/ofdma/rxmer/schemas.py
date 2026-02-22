@@ -100,10 +100,22 @@ class BulkDestinationsRequest(BaseModel):
     cmts: CmtsSnmpConfig
 
 
+class CasaBulkDestination(BaseModel):
+    """Casa docsPnmCcapBulkDataControlTable entry."""
+    index: int
+    ip_address: Optional[str] = None
+    dest_path: Optional[str] = None
+    pnm_test_selector_hex: Optional[str] = None
+
+
 class BulkDestinationsResponse(BaseModel):
     """Response with list of bulk transfer destinations."""
     success: bool
     destinations: list[BulkDestination] = Field(default_factory=list)
+    casa_destinations: list[CasaBulkDestination] = Field(
+        default_factory=list,
+        description="Casa-only: docsPnmCcapBulkDataControlTable entries with PnmTestSelector"
+    )
     error: Optional[str] = None
 
 

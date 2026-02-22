@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from pypnm.api.routes.pnm.us.utsc.schemas import CmtsSnmpConfig
 from pypnm.api.routes.pnm.us.utsc.service import CmtsUtscService
 from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
-from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import BulkDestinationsResponse
+from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import BulkDestinationsResponse, CasaBulkDestination
 
 
 class BulkDestinationRequest(BaseModel):
@@ -90,11 +90,25 @@ class BulkDestinationRouter:
                 community=community,
                 write_community=write_community or community
             )
+            utsc_svc = CmtsUtscService(
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
+            )
             try:
                 result = await rxmer_svc.get_bulk_destinations()
-                return BulkDestinationsResponse(**result)
+                resp = BulkDestinationsResponse(**result)
+
+                # Casa: also read docsPnmCcapBulkDataControlTable
+                vendor = await utsc_svc.detect_vendor()
+                if vendor == 'casa':
+                    casa_entries = await utsc_svc.get_bulk_data_control()
+                    resp.casa_destinations = [CasaBulkDestination(**e) for e in casa_entries]
+
+                return resp
             finally:
                 rxmer_svc.close()
+                utsc_svc.close()
 
         @self.router.post(
             "",

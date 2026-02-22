@@ -281,7 +281,7 @@ class CmtsUtscService:
     
     async def configure_bulk_data_control(
         self,
-        dest_ip: str = "172.29.10.68",
+        dest_ip: str,
         dest_path: str = "./",
         index: int = 1,
         pnm_types: list[str] = None
@@ -388,6 +388,65 @@ class CmtsUtscService:
     # UTSC Operations
     # ============================================
     
+    async def get_bulk_data_control(self) -> list[dict]:
+        """
+        Read Casa docsPnmCcapBulkDataControlTable entries.
+        Returns list of dicts with index, ip_address, dest_path, upload_control,
+        pnm_test_selector_hex.
+        """
+        import ipaddress as _ip
+        entries = []
+        try:
+            result = await self._snmp_walk(self.OID_BULK_DATA_UPLOAD_CTRL)
+            if not result.get('success') or not result.get('results'):
+                return entries
+            for entry in result['results']:
+                oid_str = str(entry.get('oid', ''))
+                idx = int(oid_str.split('.')[-1])
+
+                ip_raw = None
+                try:
+                    r = await self._snmp_get(f"{self.OID_BULK_DATA_DEST_IP}.{idx}")
+                    ip_raw = self._parse_get_value(r)
+                except Exception:
+                    pass
+
+                ip_str = None
+                if ip_raw:
+                    # OctetString returned as hex e.g. "ac 10 06 01" or "ac10060d"
+                    hex_str = ip_raw.strip().replace(' ', '').replace(':', '')
+                    if len(hex_str) == 8:
+                        try:
+                            ip_str = str(_ip.ip_address(bytes.fromhex(hex_str)))
+                        except Exception:
+                            ip_str = ip_raw
+                    else:
+                        ip_str = ip_raw
+
+                selector_raw = None
+                try:
+                    r = await self._snmp_get(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{idx}")
+                    selector_raw = self._parse_get_value(r)
+                except Exception:
+                    pass
+
+                path_raw = None
+                try:
+                    r = await self._snmp_get(f"{self.OID_BULK_DATA_DEST_PATH}.{idx}")
+                    path_raw = self._parse_get_value(r)
+                except Exception:
+                    pass
+
+                entries.append({
+                    "index": idx,
+                    "ip_address": ip_str,
+                    "dest_path": path_raw,
+                    "pnm_test_selector_hex": selector_raw,
+                })
+        except Exception as e:
+            self.logger.error(f"Failed to read Casa bulk data control table: {e}")
+        return entries
+
     async def list_rf_ports(self) -> dict[str, Any]:
         """
         List available RF ports for UTSC.
