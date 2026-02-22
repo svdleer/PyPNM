@@ -307,6 +307,7 @@ class ModulationProfileResponse(BaseModel):
     timestamp: Optional[str] = Field(default=None, description="Timestamp of measurement")
     channels: List[ModulationProfileData] = Field(default_factory=list, description="Modulation profile data")
     filename: Optional[str] = Field(default=None, description="Generated filename")
+    data: Optional[Dict[str, Any]] = Field(default=None, description="Parsed modulation profile data for frontend rendering")
     error: Optional[str] = Field(default=None, description="Error message if failed")
 
 
