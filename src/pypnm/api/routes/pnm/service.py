@@ -942,22 +942,23 @@ class PNMDiagnosticsService:
             # Step 5: Parse binary files from TFTP mount
             import glob
             import os
+            import time as _time
             from pypnm.pnm.parser.CmDsOfdmModulationProfile import CmDsOfdmModulationProfile
 
             mac_clean = (self.mac_address or '').replace(':', '').lower()
             tftp_dir = self.TFTP_LOCAL_PATH
+            trigger_time = _time.time() - 5  # files created during/after trigger
             parsed_channels = []
             first_filename = None
 
-            for ifindex in ofdm_ifindexes:
-                # Walk OFDM channel table to map ifindex -> channel_id for file matching
-                # Files are named: ds_ofdm_modulation_profile_<mac>_<chan_id>_<ts>.bin
-                # Use ifindex as chan_id approximation; scan all matching files
-                pattern = os.path.join(tftp_dir, f'ds_ofdm_modulation_profile_{mac_clean}_*.bin')
-                all_matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-                # Pick most recent file per ifindex (take turn: ifindexes[0] -> newest, etc.)
-                idx_pos = ofdm_ifindexes.index(ifindex)
+            # Find all modulation profile files for this modem, newest first
+            pattern = os.path.join(tftp_dir, f'ds_ofdm_modulation_profile_{mac_clean}_*.bin')
+            all_matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+            self.logger.info(f"ModProf files found: {all_matches[:4]}")
+
+            for idx_pos, ifindex in enumerate(ofdm_ifindexes):
                 bin_file = all_matches[idx_pos] if idx_pos < len(all_matches) else None
+                self.logger.info(f"ModProf ifindex={ifindex} using file: {bin_file}")
 
                 chan_profiles = []
                 if bin_file and os.path.exists(bin_file):
@@ -967,20 +968,19 @@ class PNMDiagnosticsService:
                         raw = open(bin_file, 'rb').read()
                         parser = CmDsOfdmModulationProfile(raw)
                         model = parser.to_model()
+                        self.logger.info(f"ModProf parsed: num_profiles={model.num_profiles}, profiles={len(model.profiles)}")
                         for p in model.profiles:
-                            # Expand schemes into per-subcarrier list
                             subcarriers = []
                             sc_index = model.first_active_subcarrier_index
+                            mod_order_map = {
+                                'exclusion': 0, 'continuous_pilot': 0, 'scattered_pilot': 0,
+                                'plc': 0, 'bpsk': 2, 'qpsk': 4, 'qam_16': 16, 'qam_32': 32,
+                                'qam_64': 64, 'qam_128': 128, 'qam_256': 256,
+                                'qam_512': 512, 'qam_1024': 1024, 'qam_2048': 2048,
+                                'qam_4096': 4096, 'qam_8192': 8192, 'qam_16384': 16384,
+                            }
                             for scheme in (p.schemes if hasattr(p, 'schemes') else []):
-                                mod = scheme.modulation_order if hasattr(scheme, 'modulation_order') else 0
-                                # Convert string enum to numeric order for chart
-                                mod_order_map = {
-                                    'exclusion': 0, 'continuous_pilot': 0, 'scattered_pilot': 0,
-                                    'bpsk': 2, 'qpsk': 4, 'qam_16': 16, 'qam_32': 32,
-                                    'qam_64': 64, 'qam_128': 128, 'qam_256': 256,
-                                    'qam_512': 512, 'qam_1024': 1024, 'qam_2048': 2048,
-                                    'qam_4096': 4096, 'qam_8192': 8192, 'qam_16384': 16384,
-                                }
+                                mod = scheme.modulation_order
                                 num_sc = scheme.num_subcarriers if hasattr(scheme, 'num_subcarriers') else 1
                                 mod_val = mod_order_map.get(str(mod).lower(), 0) if isinstance(mod, str) else int(mod)
                                 for i in range(num_sc):
@@ -994,7 +994,7 @@ class PNMDiagnosticsService:
                                 'subcarriers': subcarriers
                             })
                     except Exception as e:
-                        self.logger.error(f"Failed to parse modulation profile file {bin_file}: {e}")
+                        self.logger.error(f"Failed to parse modulation profile file {bin_file}: {e}", exc_info=True)
 
                 parsed_channels.append({
                     'channel_id': ifindex,
