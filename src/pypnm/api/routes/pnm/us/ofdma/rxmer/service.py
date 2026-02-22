@@ -544,7 +544,21 @@ class CmtsUsOfdmaRxMerService:
             value = self._parse_get_value(result)
             
             if value is None:
-                return {"success": False, "error": result.get('error', 'No response from CMTS')}
+                # Row doesn't exist yet (No Such Instance / no active measurement).
+                # Treat as INACTIVE rather than an error — the row is created on first
+                # start_measurement() call, so absence means no measurement running.
+                snmp_err = result.get('error')
+                if snmp_err:
+                    return {"success": False, "error": snmp_err}
+                return {
+                    "success": True,
+                    "ofdma_ifindex": ofdma_ifindex,
+                    "meas_status": MeasStatus.INACTIVE,
+                    "meas_status_name": "INACTIVE",
+                    "is_ready": False,
+                    "is_busy": False,
+                    "is_error": False,
+                }
 
             # Guard against SNMP "No Such Instance" strings (e.g. Cisco cBR-8
             # returns a text error string instead of None when the row does not
