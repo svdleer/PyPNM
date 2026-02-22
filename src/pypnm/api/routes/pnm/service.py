@@ -858,6 +858,101 @@ class PNMDiagnosticsService:
             'upstream': sorted(upstream, key=lambda x: x['channel_id'])
         }
 
+    # Modulation Profile OIDs (docsPnmCmDsOfdmModProfTable)
+    OID_MOD_PROF_FILE_ENABLE = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.1'
+    OID_MOD_PROF_MEAS_STATUS = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.2'
+    OID_MOD_PROF_FILE_NAME   = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.3'
+
+    async def trigger_modulation_profile(
+        self,
+        tftp_server: str = '172.22.147.18',
+        channel_ids: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        """
+        Trigger DS OFDM modulation profile capture via raw SNMP.
+
+        Flow:
+          1. Set TFTP/bulk destination on modem
+          2. Walk OFDM channel table to find ifIndexes
+          3. For each relevant ifIndex: set filename + enable
+          4. Poll status until complete or timeout
+        """
+        import asyncio
+
+        self.logger.info(f"Triggering modulation profile for modem {self.modem_ip}")
+
+        try:
+            # Step 1: Set TFTP server (same bulk-destination OIDs as spectrum)
+            await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
+            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')
+            await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
+
+            # Step 2: Walk OFDM channel table to discover ifIndexes
+            walk_result = await self._snmp_walk(self.OID_DS_OFDM_CHAN_ID)
+            ofdm_ifindexes = []
+            if walk_result.get('success'):
+                for entry in walk_result.get('results', []):
+                    oid_str = entry.get('oid', '')
+                    ifindex = int(oid_str.split('.')[-1])
+                    chan_id = entry.get('value')
+                    if channel_ids is None or chan_id in channel_ids:
+                        ofdm_ifindexes.append(ifindex)
+
+            if not ofdm_ifindexes:
+                return {'success': False, 'error': 'No OFDM channels found on modem'}
+
+            # Step 3: Set filename and enable for each ifIndex
+            mac_clean = (self.mac_address or '').replace(':', '').lower()
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filenames = {}
+
+            for ifindex in ofdm_ifindexes:
+                filename = f"modprof_{mac_clean}_{ifindex}_{timestamp}"
+                filenames[ifindex] = filename
+                await self._snmp_set(f"{self.OID_MOD_PROF_FILE_NAME}.{ifindex}", filename, 's')
+                await self._snmp_set(f"{self.OID_MOD_PROF_FILE_ENABLE}.{ifindex}", 1, 'i')
+
+            # Step 4: Poll status for all ifIndexes (max 60s)
+            max_wait = 60
+            poll_interval = 3
+            elapsed = 0
+            completed = set()
+
+            while elapsed < max_wait and len(completed) < len(ofdm_ifindexes):
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                for ifindex in ofdm_ifindexes:
+                    if ifindex in completed:
+                        continue
+                    status = await self._snmp_get(f"{self.OID_MOD_PROF_MEAS_STATUS}.{ifindex}")
+                    val = None
+                    if status.get('success') and status.get('output'):
+                        # output is "OID = value"
+                        try:
+                            val = int(status['output'].split('=')[-1].strip())
+                        except (ValueError, IndexError):
+                            pass
+                    self.logger.info(f"ModProf status ifindex={ifindex}: {val} (elapsed={elapsed}s)")
+                    if val == 4:  # complete
+                        completed.add(ifindex)
+
+            return {
+                'success': True,
+                'mac_address': self.mac_address,
+                'modem_ip': self.modem_ip,
+                'timestamp': datetime.now().isoformat(),
+                'channels': [
+                    {'ifindex': idx, 'filename': filenames[idx], 'complete': idx in completed}
+                    for idx in ofdm_ifindexes
+                ],
+                'filename': filenames[ofdm_ifindexes[0]] if ofdm_ifindexes else None,
+            }
+
+        except Exception as e:
+            self.logger.exception(f"Modulation profile error: {e}")
+            return {'success': False, 'error': str(e)}
+
     async def trigger_pnm_measurement(
         self,
         test_type: int,
@@ -866,50 +961,25 @@ class PNMDiagnosticsService:
     ) -> Dict[str, Any]:
         """
         Trigger a PNM measurement on the cable modem.
-        
-        Args:
-            test_type: PNM test type (4=ChannelEstCoeff, 5=ConstellationDisp, 8=Histogram, 10=ModulationProfile)
-            tftp_server: TFTP server IP address
-            channel_ids: List of specific channel IDs (None = all channels)
-            
-        Returns:
-            Dict with 'success', measurement data, filename, etc.
+
+        test_type 10 (ModulationProfile) is handled directly via SNMP primitives.
+        Other test types (4, 5, 8) are dispatched to the agent as named commands
+        once those handlers are implemented.
         """
         self.logger.info(f"Triggering PNM measurement type {test_type} for modem {self.modem_ip}")
-        
-        # Map test types to command names
-        test_type_map = {
-            4: 'pnm_channel_estimation',
-            5: 'pnm_constellation_display', 
-            8: 'pnm_histogram',
-            10: 'pnm_modulation_profile'
+
+        if test_type == 10:
+            return await self.trigger_modulation_profile(
+                tftp_server=tftp_server,
+                channel_ids=channel_ids
+            )
+
+        # Other test types not yet migrated to direct SNMP
+        return {
+            'success': False,
+            'error': f'PNM test type {test_type} not yet implemented via direct SNMP'
         }
-        
-        command = test_type_map.get(test_type)
-        if not command:
-            return {
-                'success': False,
-                'error': f'Unknown PNM test type: {test_type}'
-            }
-        
-        # Generate filename based on test type and timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        mac_suffix = self.mac_address.replace(':', '') if self.mac_address else 'unknown'
-        filename = f"pnm_{command.split('_')[-1]}_{mac_suffix}_{timestamp}"
-        
-        return await self._send_agent_command(
-            command,
-            {
-                'modem_ip': self.modem_ip,
-                'community': self.write_community,
-                'tftp_server': tftp_server,
-                'test_type': test_type,
-                'filename': filename,
-                'channel_ids': channel_ids or [],
-                'mac_address': self.mac_address
-            },
-            timeout=120  # PNM measurements can take longer
-        )
+
 
 
 class USRxMERService:
