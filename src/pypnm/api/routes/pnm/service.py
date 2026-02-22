@@ -943,7 +943,13 @@ class PNMDiagnosticsService:
                 'modem_ip': self.modem_ip,
                 'timestamp': datetime.now().isoformat(),
                 'channels': [
-                    {'ifindex': idx, 'filename': filenames[idx], 'complete': idx in completed}
+                    {
+                        'channel_id': idx,
+                        'ifindex': idx,
+                        'filename': filenames[idx],
+                        'complete': idx in completed,
+                        'profiles': []  # raw file on TFTP; parsed separately
+                    }
                     for idx in ofdm_ifindexes
                 ],
                 'filename': filenames[ofdm_ifindexes[0]] if ofdm_ifindexes else None,
