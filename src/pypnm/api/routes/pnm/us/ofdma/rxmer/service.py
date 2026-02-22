@@ -207,6 +207,40 @@ class CmtsUsOfdmaRxMerService:
             self.logger.exception(f"SNMP SET error: {e}")
             return {'success': False, 'error': str(e)}
     
+    @staticmethod
+    def _parse_ip_from_octetstring(raw: str) -> Optional[str]:
+        """Convert a raw SNMP OctetString value to a dotted-decimal IP string.
+
+        Handles all formats the agent may return:
+          - Already dotted-decimal: "172.16.6.1"
+          - 0x-prefixed hex:        "0xac10060d"  or  "0xAC 10 06 0D"
+          - Bare hex string:        "ac10060d"
+          - Hex with spaces/colons: "ac:10:06:0d"
+        """
+        if not raw:
+            return None
+        raw = raw.strip()
+
+        # Already dotted-decimal (IpAddress type)
+        parts = raw.split('.')
+        if len(parts) == 4:
+            try:
+                octets = [int(p) for p in parts]
+                if all(0 <= o <= 255 for o in octets):
+                    return raw
+            except ValueError:
+                pass
+
+        # Strip 0x prefix and any whitespace/colons to get bare hex
+        hex_str = raw.lstrip('0x').replace(' ', '').replace(':', '')
+        if len(hex_str) == 8:
+            try:
+                return '.'.join(str(int(hex_str[i:i+2], 16)) for i in range(0, 8, 2))
+            except ValueError:
+                pass
+
+        return None
+
     def _parse_get_value(self, result: Dict[str, Any]) -> Optional[str]:
         """Parse value from agent SNMP GET response.
         
@@ -605,15 +639,7 @@ class CmtsUsOfdmaRxMerService:
                     ip_result = await self._snmp_get(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}")
                     ip_value = self._parse_get_value(ip_result)
                     if ip_value:
-                        # Agent returns hex string for non-printable OctetStrings
-                        # or dotted-decimal if it's an IpAddress type
-                        if '.' in ip_value and len(ip_value.split('.')) == 4:
-                            dest_info["ip_address"] = ip_value
-                        elif len(ip_value) == 8:
-                            # Hex string like "ac1006d4"
-                            dest_info["ip_address"] = ".".join([
-                                str(int(ip_value[i:i+2], 16)) for i in range(0, 8, 2)
-                            ])
+                        dest_info["ip_address"] = self._parse_ip_from_octetstring(ip_value)
                 except Exception:
                     pass
                 
@@ -676,13 +702,7 @@ class CmtsUsOfdmaRxMerService:
                                 ip_result = await self._snmp_get(f"{self.OID_BULK_CFG_IP_ADDR}.{idx}")
                                 ip_value = self._parse_get_value(ip_result)
                                 if ip_value:
-                                    existing_ip = None
-                                    if '.' in ip_value and len(ip_value.split('.')) == 4:
-                                        existing_ip = ip_value
-                                    elif len(ip_value) == 8:
-                                        existing_ip = ".".join([
-                                            str(int(ip_value[i:i+2], 16)) for i in range(0, 8, 2)
-                                        ])
+                                    existing_ip = self._parse_ip_from_octetstring(ip_value)
                                     if existing_ip == tftp_ip:
                                         self.logger.info(f"Found existing TFTP destination at index {idx}")
                                         return {
