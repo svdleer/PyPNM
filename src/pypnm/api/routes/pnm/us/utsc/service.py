@@ -404,36 +404,59 @@ class CmtsUtscService:
         try:
             # 1. Try UTSC config table first (works on CommScope E6000 where rows are pre-created)
             result = await self._snmp_walk(self.OID_UTSC_CFG_TRIGGER_MODE)
-            
+
             if result.get('success') and result.get('results'):
+                import re as _re
+
+                # Collect all (rf_port_ifindex, cfg_index) pairs — keep lowest cfg_index per ifindex
+                raw_ports: dict[int, int] = {}  # ifindex -> cfg_index
                 for entry in result['results']:
                     oid_str = str(entry.get('oid', ''))
-                    
-                    # Extract RF port ifIndex and cfg index from OID suffix
-                    # Format: ...3.{rfPortIfIndex}.{cfgIndex}
                     suffix = oid_str.split(self.OID_UTSC_CFG_TRIGGER_MODE + ".")[-1]
                     parts = suffix.split(".")
                     if len(parts) >= 2:
                         rf_port_ifindex = int(parts[0])
                         cfg_index = int(parts[1])
-                        
-                        # Get port description
-                        description = None
-                        try:
-                            desc_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{rf_port_ifindex}")
-                            desc_value = self._parse_get_value(desc_result)
-                            if desc_value:
-                                description = desc_value
-                        except Exception:
-                            pass
-                        
-                        rf_ports.append({
-                            "rf_port_ifindex": rf_port_ifindex,
-                            "cfg_index": cfg_index,
-                            "description": description
-                        })
-            
+                        if rf_port_ifindex not in raw_ports or cfg_index < raw_ports[rf_port_ifindex]:
+                            raw_ports[rf_port_ifindex] = cfg_index
+
+                # Resolve descriptions and group CommScope E6000 us-conn ports by blade slot.
+                # E6000 pre-provisions "us-conn 0" and "us-conn 1" per blade slot — we keep
+                # only the first entry per slot (same strategy as spectrumAnalyzer discoverRfPort).
+                blade_slot_pat = _re.compile(r'RPS\d+-(\d+)', _re.I)
+                seen_slots: dict[int, dict] = {}   # blade_slot -> port_entry
+                other_ports: list[dict] = []
+
+                for ifindex, cfg_index in raw_ports.items():
+                    description = None
+                    try:
+                        desc_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{ifindex}")
+                        desc_value = self._parse_get_value(desc_result)
+                        if desc_value:
+                            description = desc_value
+                    except Exception:
+                        pass
+
+                    port_entry = {
+                        "rf_port_ifindex": ifindex,
+                        "cfg_index": cfg_index,
+                        "description": description
+                    }
+
+                    m = blade_slot_pat.search(description or "")
+                    if m:
+                        slot = int(m.group(1))
+                        # Keep only the first (lowest ifindex) entry per blade slot
+                        if slot not in seen_slots:
+                            seen_slots[slot] = port_entry
+                    else:
+                        other_ports.append(port_entry)
+
+                # Sort by blade slot for consistent ordering
+                rf_ports = [seen_slots[s] for s in sorted(seen_slots)] + other_ports
+
             if rf_ports:
+                self.logger.info(f"Found {len(rf_ports)} RF ports in UTSC config table")
                 return {"success": True, "rf_ports": rf_ports}
             
             # 2. Fallback: discover upstream RF channels from ifDescr
