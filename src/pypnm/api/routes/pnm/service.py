@@ -950,11 +950,14 @@ class PNMDiagnosticsService:
             first_filename = None
 
             for ifindex in ofdm_ifindexes:
-                # Modem names files: ds_ofdm_modulation_profile_<mac>_<chanid>_<ts>.bin
-                pattern = os.path.join(tftp_dir, f'ds_ofdm_modulation_profile_{mac_clean}_*_*.bin')
-                # Pick the most recent matching file
-                matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-                bin_file = matches[0] if matches else None
+                # Walk OFDM channel table to map ifindex -> channel_id for file matching
+                # Files are named: ds_ofdm_modulation_profile_<mac>_<chan_id>_<ts>.bin
+                # Use ifindex as chan_id approximation; scan all matching files
+                pattern = os.path.join(tftp_dir, f'ds_ofdm_modulation_profile_{mac_clean}_*.bin')
+                all_matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+                # Pick most recent file per ifindex (take turn: ifindexes[0] -> newest, etc.)
+                idx_pos = ofdm_ifindexes.index(ifindex)
+                bin_file = all_matches[idx_pos] if idx_pos < len(all_matches) else None
 
                 chan_profiles = []
                 if bin_file and os.path.exists(bin_file):
@@ -965,13 +968,27 @@ class PNMDiagnosticsService:
                         parser = CmDsOfdmModulationProfile(raw)
                         model = parser.to_model()
                         for p in model.profiles:
+                            # Expand schemes into per-subcarrier list
                             subcarriers = []
-                            if hasattr(p, 'subcarriers'):
-                                for sc in p.subcarriers:
+                            sc_index = model.first_active_subcarrier_index
+                            for scheme in (p.schemes if hasattr(p, 'schemes') else []):
+                                mod = scheme.modulation_order if hasattr(scheme, 'modulation_order') else 0
+                                # Convert string enum to numeric order for chart
+                                mod_order_map = {
+                                    'exclusion': 0, 'continuous_pilot': 0, 'scattered_pilot': 0,
+                                    'bpsk': 2, 'qpsk': 4, 'qam_16': 16, 'qam_32': 32,
+                                    'qam_64': 64, 'qam_128': 128, 'qam_256': 256,
+                                    'qam_512': 512, 'qam_1024': 1024, 'qam_2048': 2048,
+                                    'qam_4096': 4096, 'qam_8192': 8192, 'qam_16384': 16384,
+                                }
+                                num_sc = scheme.num_subcarriers if hasattr(scheme, 'num_subcarriers') else 1
+                                mod_val = mod_order_map.get(str(mod).lower(), 0) if isinstance(mod, str) else int(mod)
+                                for i in range(num_sc):
                                     subcarriers.append({
-                                        'index': sc.index if hasattr(sc, 'index') else 0,
-                                        'modulation_order': sc.modulation_order if hasattr(sc, 'modulation_order') else sc.actual_modulation_order if hasattr(sc, 'actual_modulation_order') else 0
+                                        'index': sc_index + i,
+                                        'modulation_order': mod_val
                                     })
+                                sc_index += num_sc
                             chan_profiles.append({
                                 'profile_id': p.profile_id,
                                 'subcarriers': subcarriers
