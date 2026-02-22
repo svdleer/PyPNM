@@ -406,8 +406,6 @@ class CmtsUtscService:
             result = await self._snmp_walk(self.OID_UTSC_CFG_TRIGGER_MODE)
 
             if result.get('success') and result.get('results'):
-                import re as _re
-
                 # Collect all (rf_port_ifindex, cfg_index) pairs — keep lowest cfg_index per ifindex
                 raw_ports: dict[int, int] = {}  # ifindex -> cfg_index
                 for entry in result['results']:
@@ -420,19 +418,9 @@ class CmtsUtscService:
                         if rf_port_ifindex not in raw_ports or cfg_index < raw_ports[rf_port_ifindex]:
                             raw_ports[rf_port_ifindex] = cfg_index
 
-                # CommScope E6000: blade slot deduplication.
-                # E6000 pre-provisions "us-conn 0" and "us-conn 1" per RF port group,
-                # resulting in 2× entries. Two known description formats:
-                #   "MNDGT0002RPS01-3 us-conn 0"  → slot key from RPS\d+-(\d+)
-                #   "MND-GT02-4 us-conn 0"         → full node name before " us-conn"
-                # Strategy (same as spectrumAnalyzer discoverRfPort):
-                #   group by node identifier, keep the first (lowest ifindex) entry per group.
-                blade_slot_pat = _re.compile(r'RPS\d+-(\d+)', _re.I)
-                us_conn_node_pat = _re.compile(r'^(.*?)\s+us-conn\s+\d+$', _re.I)
-
-                seen_nodes: dict[str, dict] = {}   # node_key -> port_entry
-                other_ports: list[dict] = []
-
+                # Resolve descriptions for all ports — each entry is a distinct fiber node.
+                # CommScope E6000: one RPS blade serves 2 fiber nodes (us-conn 0, us-conn 1),
+                # so both must be returned as separate RF ports.
                 for ifindex, cfg_index in raw_ports.items():
                     description = None
                     try:
@@ -443,29 +431,11 @@ class CmtsUtscService:
                     except Exception:
                         pass
 
-                    port_entry = {
+                    rf_ports.append({
                         "rf_port_ifindex": ifindex,
                         "cfg_index": cfg_index,
                         "description": description
-                    }
-
-                    descr = description or ""
-                    m = blade_slot_pat.search(descr)
-                    if m:
-                        node_key = "rps-" + m.group(1)
-                    else:
-                        n = us_conn_node_pat.match(descr)
-                        node_key = n.group(1).strip() if n else None
-
-                    if node_key:
-                        # Keep only the first (lowest ifindex) entry per node
-                        if node_key not in seen_nodes:
-                            seen_nodes[node_key] = port_entry
-                    else:
-                        other_ports.append(port_entry)
-
-                # Sort by node key for consistent ordering
-                rf_ports = [seen_nodes[k] for k in sorted(seen_nodes)] + other_ports
+                    })
 
             if rf_ports:
                 self.logger.info(f"Found {len(rf_ports)} RF ports in UTSC config table")
