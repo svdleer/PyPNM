@@ -869,6 +869,16 @@ class CmtsUtscService:
                     clamp_warnings.append(f"freerun_duration_ms raised {orig_freerun} -> {repeat_period_us} (must be >= repeat_period)")
                     freerun_duration_ms = repeat_period_us
 
+                # E6000: MaxResultsPerFile is read-only and fixed at 1 (one TFTP file per capture).
+                # Cap freerun so at most 250 files are queued per run to avoid overloading bulk transfer.
+                # 250 * repeat_period_ms = max safe freerun. GUI re-triggers when run ends.
+                if is_arris:
+                    repeat_period_ms = repeat_period_us // 1000 or 1
+                    max_freerun_ms = 250 * repeat_period_ms
+                    if freerun_duration_ms > max_freerun_ms:
+                        clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (E6000 MaxResultsPerFile=1, max 250 files)")
+                        freerun_duration_ms = max_freerun_ms
+
             self.logger.info(f"Timing after clamp: repeat={repeat_period_us}µs freerun={freerun_duration_ms}ms warnings={clamp_warnings}")
             
             # 9. Set FreeRunDuration FIRST (Gauge32) — must be >= RepeatPeriod
