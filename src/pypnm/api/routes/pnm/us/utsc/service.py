@@ -742,20 +742,20 @@ class CmtsUtscService:
             vendor = 'casa' if is_casa else ('arris' if is_arris else ('cisco' if is_cisco else 'unknown'))
             self.logger.info(f"Vendor detection: {vendor} — sysDescr='{sys_descr[:80]}'")
 
-            # For Arris/CommScope E6000: detect CORE (C-CCAP) vs I-CCAP via ifName.
-            # ifName contains 'scq' for CORE/C-CCAP (SC-QAM upstream) — window only supports rectangular(2).
-            # I-CCAP ifName does NOT contain 'scq' — supports window 2,3,4,5.
-            # IF-MIB::ifName OID: 1.3.6.1.2.1.31.1.1.1.1.<ifindex>
+            # For Arris/CommScope E6000: detect CORE (C-CCAP) vs I-CCAP via ifDescr.
+            # ifDescr contains 'scq' for CORE/C-CCAP (e.g. 'cable-upstream 1/scq/0') — window only supports rectangular(2).
+            # ifDescr contains 'us-conn' for I-CCAP (e.g. 'MNDGT0002RPS01-0 us-conn 0') — supports window 2,3,4,5.
+            # IF-MIB::ifDescr OID: 1.3.6.1.2.1.2.2.1.2.<ifindex>
             is_arris_core = False
             if is_arris:
                 try:
-                    ifname_result = await self._snmp_get(f"1.3.6.1.2.1.31.1.1.1.1.{rf_port_ifindex}")
-                    ifname_raw = str(ifname_result.get('output', ''))
-                    ifname = ifname_raw.split(' = ', 1)[1].strip() if ' = ' in ifname_raw else ifname_raw.strip()
-                    is_arris_core = 'scq' in ifname.lower()
-                    self.logger.info(f"E6000 ifName='{ifname}' -> {'CORE/C-CCAP (window=rectangular only)' if is_arris_core else 'I-CCAP (window 2-5 supported)'}")
+                    ifdescr_result = await self._snmp_get(f"1.3.6.1.2.1.2.2.1.2.{rf_port_ifindex}")
+                    ifdescr_raw = str(ifdescr_result.get('output', ''))
+                    ifdescr = ifdescr_raw.split(' = ', 1)[1].strip() if ' = ' in ifdescr_raw else ifdescr_raw.strip()
+                    is_arris_core = 'scq' in ifdescr.lower()
+                    self.logger.info(f"E6000 ifDescr='{ifdescr}' -> {'CORE/C-CCAP (window=rectangular only)' if is_arris_core else 'I-CCAP (window 2-5 supported)'}")
                 except Exception as e:
-                    self.logger.warning(f"ifName lookup failed, assuming CORE (safe): {e}")
+                    self.logger.warning(f"ifDescr lookup failed, assuming CORE (safe): {e}")
                     is_arris_core = True  # safe default: restrict to rectangular
 
             # Note: bulk destination configuration (docsPnmBulkDataTransferCfgTable and
