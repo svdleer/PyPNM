@@ -47,4 +47,17 @@ jobs:
           python -m uvicorn pypnm.api.main:app --host 127.0.0.1 --port 8000 &
           sleep 5
           curl -fsS http://127.0.0.1:8000/health
-          pkill -f "uvicorn pypnm.api.main:app"
+
+      - name: Install regression test dependencies
+        run: pip install websockets
+
+      - name: Run PNM page regression tests
+        run: |
+          python tests/test_pnm_page.py \
+            --api http://127.0.0.1:8000 \
+            --vendor arris \
+            --test health rf_port ws_stream
+
+      - name: Stop PyPNM
+        if: always()
+        run: pkill -f "uvicorn pypnm.api.main:app" || true
