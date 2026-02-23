@@ -815,6 +815,12 @@ class CmtsUtscService:
             self.logger.info(f"OutputFormat confirmed={output_format}")
             
             # 6. Window function (INTEGER)
+            # E6000 RRPS HF interfaces only support rectangular(2).
+            # Other E6000 types support 2-5, Cisco supports 1-5.
+            # Default to rectangular(2) for safety; only allow others on non-Arris.
+            if is_arris and window_function != 2:
+                clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000 RRPS HF only supports rectangular(2))")
+                window_function = 2
             await self._snmp_set(f"{self.OID_UTSC_CFG_WINDOW}{idx}", window_function, 'i')
             
             # 7. Clamp trigger_count (1-10 on E6000, no limit on Cisco)
