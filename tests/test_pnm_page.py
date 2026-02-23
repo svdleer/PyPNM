@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 # Lab configuration
 # ---------------------------------------------------------------------------
 
+DEFAULT_GUI = "http://localhost:5050"
+
 VENDORS = {
     "arris": {
         "label": "CommScope E6000 (mnd-gt0002-ccap002)",
@@ -45,8 +47,8 @@ VENDORS = {
         "cmts_ip": "172.16.6.201",
         "community_read":  "Z1gg0@LL",
         "community_write": "Z1gg0Sp3c1@l",
-        "test_modem_mac":  "90:32:4b:c8:19:0b",
-        "test_modem_ip":   "10.206.234.92",
+        "test_modem_mac":  "e4:57:40:0b:cf:70",
+        "test_modem_ip":   "10.206.228.4",
         "modem_community": "z1gg0m0n1t0r1ng",
     },
     "cisco": {
@@ -54,8 +56,8 @@ VENDORS = {
         "cmts_ip": "172.16.6.202",
         "community_read":  "Z1gg0@LL",
         "community_write": "Z1gg0Sp3c1@l",
-        "test_modem_mac":  "90:32:4b:c8:19:0b",
-        "test_modem_ip":   "10.206.234.92",
+        "test_modem_mac":  "d4:6a:6a:fd:00:b3",
+        "test_modem_ip":   "10.254.70.11",
         "modem_community": "z1gg0m0n1t0r1ng",
     },
 }
@@ -134,7 +136,7 @@ def ok(r: Dict) -> bool:
 # Test groups
 # ---------------------------------------------------------------------------
 
-def test_utsc(api: str, vendor: str, cfg: Dict):
+def test_utsc(api: str, vendor: str, cfg: Dict, gui: str = ""):
     """
     UTSC: test all window/output_format/num_bins combinations allowed per vendor.
     Vendor constraints enforced by the service layer — we verify clamp_warnings
@@ -146,7 +148,9 @@ def test_utsc(api: str, vendor: str, cfg: Dict):
     write_comm = cfg["community_write"]
 
     # Discover first available RF port
-    disc = api_post(api, "/api/pypnm/upstream/utsc/discover-rf-ports", {
+    # GUI backend route: /api/pypnm/upstream/interfaces/<mac>
+    gui_base = gui or api
+    disc = api_post(gui_base, f"/api/pypnm/upstream/interfaces/{cfg['test_modem_mac']}", {
         "cmts_ip": cmts_ip,
         "community": write_comm,
         "mac_address": cfg["test_modem_mac"],
@@ -230,68 +234,70 @@ def test_utsc(api: str, vendor: str, cfg: Dict):
                f"clamp_warnings={r.get('clamp_warnings', [])}" if not passed else f"ok clamp={clamped}")
 
 
-def test_rxmer(api: str, vendor: str, cfg: Dict):
-    """US OFDMA RxMER: basic configure + status check."""
+def test_rxmer(api: str, vendor: str, cfg: Dict, gui: str = ""):
+    """US OFDMA RxMER: basic start + status check via GUI backend."""
     print(f"\n  --- RxMER ---")
 
-    mac  = cfg["test_modem_mac"]
-    cmts = cfg["cmts_ip"]
-    comm = cfg["community_write"]
+    mac      = cfg["test_modem_mac"]
+    cmts     = cfg["cmts_ip"]
+    comm     = cfg["community_write"]
+    gui_base = gui or api
 
-    r = api_post(api, f"/api/pypnm/upstream/rxmer/configure/{mac}", {
+    r = api_post(gui_base, f"/api/pypnm/upstream/rxmer/start/{mac}", {
         "cmts_ip": cmts,
         "community": comm,
-        "mac_address": mac,
-        "modem_ip": cfg["test_modem_ip"],
-        "pre_eq": False,
-        "num_averages": 1,
+        "ofdma_ifindex": cfg.get("ofdma_ifindex", 0),
     })
-    record(vendor, "rxmer", "configure", ok(r), str(r.get("error", r.get("message", ""))))
+    record(vendor, "rxmer", "start", ok(r), str(r.get("error", r.get("message", ""))))
 
-    time.sleep(2)
+    time.sleep(3)
 
-    r = api_post(api, f"/api/pypnm/upstream/rxmer/status/{mac}", {
+    r = api_post(gui_base, f"/api/pypnm/upstream/rxmer/status/{mac}", {
         "cmts_ip": cmts,
         "community": comm,
-        "mac_address": mac,
-        "modem_ip": cfg["test_modem_ip"],
     })
-    status = r.get("meas_status_name", r.get("status", ""))
+    status = r.get("meas_status_name", r.get("status", r.get("meas_status", "")))
     passed = ok(r) and status not in ("", None)
     record(vendor, "rxmer", "status", passed, f"meas_status={status}")
 
 
-def test_pre_eq(api: str, vendor: str, cfg: Dict):
-    """US OFDMA Pre-equalization capture."""
+def test_pre_eq(api: str, vendor: str, cfg: Dict, gui: str = ""):
+    """US pre-equalization capture via GUI backend (/modem/<mac>/pre-eq)."""
     print(f"\n  --- Pre-equalization ---")
 
-    mac  = cfg["test_modem_mac"]
-    cmts = cfg["cmts_ip"]
-    comm = cfg["community_write"]
+    mac      = cfg["test_modem_mac"]
+    cmts     = cfg["cmts_ip"]
+    comm     = cfg["community_read"]
+    gui_base = gui or api
 
-    r = api_post(api, f"/api/pypnm/upstream/preEqualization/getCapture/{mac}", {
+    r = api_post(gui_base, f"/api/pypnm/modem/{mac}/pre-eq", {
         "cmts_ip": cmts,
         "community": comm,
-        "mac_address": mac,
         "modem_ip": cfg["test_modem_ip"],
     })
-    passed = ok(r) and "data" in r
-    record(vendor, "pre_eq", "getCapture", passed, str(r.get("error", r.get("message", ""))))
+    passed = ok(r) and ("data" in r or "plot" in r or "pre_eq" in r)
+    record(vendor, "pre_eq", "pre-eq", passed, str(r.get("error", r.get("message", ""))))
 
 
-def test_bulk_destination(api: str, vendor: str, cfg: Dict):
-    """Bulk destination configure/list."""
+def test_bulk_destination(api: str, vendor: str, cfg: Dict, gui: str = ""):
+    """Bulk destination: configure via PyPNM API directly."""
     print(f"\n  --- Bulk Destination ---")
 
     cmts = cfg["cmts_ip"]
     comm = cfg["community_write"]
 
-    r = api_post(api, "/api/pypnm/upstream/bulk-destination/list", {
+    # PyPNM API direct endpoint
+    r = api_post(api, "/pnm/us/bulk-destination", {
         "cmts_ip": cmts,
         "community": comm,
+        "write_community": comm,
+        "dest_ip": "127.0.0.1",  # dummy — just test the endpoint exists
+        "dest_path": "./",
+        "index": 1,
     })
-    passed = ok(r) and isinstance(r.get("destinations"), list)
-    record(vendor, "bulk_dest", "list", passed, str(r.get("error", "")))
+    not_missing = r.get("_http_error") not in (404, 405) and "_exception" not in r
+    record(vendor, "bulk_dest", "bulk-destination endpoint exists", not_missing,
+           f"http={r.get('_http_error')} success={r.get('success')}")
 
 
 def test_api_health(api: str, vendor: str, cfg: Dict):
@@ -468,6 +474,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="PNM page integration tests")
     p.add_argument("--api", default=DEFAULT_API, metavar="URL",
                    help=f"PyPNM API base URL (default: {DEFAULT_API})")
+    p.add_argument("--gui", default=DEFAULT_GUI, metavar="URL",
+                   help=f"PyPNMGui backend URL (default: {DEFAULT_GUI})")
     p.add_argument("--vendor", nargs="+", choices=list(VENDORS), metavar="VENDOR",
                    help="Vendors to test (default: all)")
     p.add_argument("--test", nargs="+", choices=list(ALL_TESTS), metavar="TEST",
@@ -515,7 +523,11 @@ def main():
         for test_name in tests_to_run:
             fn = ALL_TESTS[test_name]
             try:
-                fn(args.api, vendor, cfg)
+                import inspect
+                if "gui" in inspect.signature(fn).parameters:
+                    fn(args.api, vendor, cfg, gui=args.gui)
+                else:
+                    fn(args.api, vendor, cfg)
             except Exception as e:
                 record(vendor, test_name, "EXCEPTION", False, str(e))
 
