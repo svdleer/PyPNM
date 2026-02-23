@@ -742,6 +742,22 @@ class CmtsUtscService:
             vendor = 'casa' if is_casa else ('arris' if is_arris else ('cisco' if is_cisco else 'unknown'))
             self.logger.info(f"Vendor detection: {vendor} — sysDescr='{sys_descr[:80]}'")
 
+            # For Arris/CommScope E6000: detect CORE (C-CCAP) vs I-CCAP via ifName.
+            # ifName contains 'scq' for CORE/C-CCAP (SC-QAM upstream) — window only supports rectangular(2).
+            # I-CCAP ifName does NOT contain 'scq' — supports window 2,3,4,5.
+            # IF-MIB::ifName OID: 1.3.6.1.2.1.31.1.1.1.1.<ifindex>
+            is_arris_core = False
+            if is_arris:
+                try:
+                    ifname_result = await self._snmp_get(f"1.3.6.1.2.1.31.1.1.1.1.{rf_port_ifindex}")
+                    ifname_raw = str(ifname_result.get('output', ''))
+                    ifname = ifname_raw.split(' = ', 1)[1].strip() if ' = ' in ifname_raw else ifname_raw.strip()
+                    is_arris_core = 'scq' in ifname.lower()
+                    self.logger.info(f"E6000 ifName='{ifname}' -> {'CORE/C-CCAP (window=rectangular only)' if is_arris_core else 'I-CCAP (window 2-5 supported)'}")
+                except Exception as e:
+                    self.logger.warning(f"ifName lookup failed, assuming CORE (safe): {e}")
+                    is_arris_core = True  # safe default: restrict to rectangular
+
             # Note: bulk destination configuration (docsPnmBulkDataTransferCfgTable and
             # Casa docsPnmCcapBulkDataControlTable) is now handled by the caller via
             # POST /pnm/us/bulk-destination before calling configure.
@@ -815,17 +831,15 @@ class CmtsUtscService:
             self.logger.info(f"OutputFormat confirmed={output_format}")
             
             # 6. Window function (INTEGER)
-            # E6000 CORE/RRPS: only rectangular(2) supported.
+            # E6000 CORE/C-CCAP (ifName contains 'scq'): only rectangular(2) supported.
             # E6000 I-CCAP: supports 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming.
             # Cisco cBR-8: supports 1-5.
-            # Safe default is rectangular(2) for all Arris — GUI sends 2 by default.
-            # We clamp to 2 for Arris since we cannot reliably detect CORE vs I-CCAP.
-            if is_arris and window_function not in (2, 3, 4, 5):
-                clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000: unsupported window, using rectangular)")
+            if is_arris_core and window_function != 2:
+                clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000 CORE/C-CCAP only supports rectangular(2))")
                 window_function = 2
-            if is_arris and window_function != 2:
-                # Allow 3/4/5 on I-CCAP but warn — RRPS will reject and log
-                clamp_warnings.append(f"window_function={window_function} may be rejected on E6000 CORE/RRPS (only rectangular(2) supported there)")
+            elif is_arris and not is_arris_core and window_function not in (2, 3, 4, 5):
+                clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000 I-CCAP supported: 2-5)")
+                window_function = 2
             await self._snmp_set(f"{self.OID_UTSC_CFG_WINDOW}{idx}", window_function, 'i')
             
             # 7. Clamp trigger_count (1-10 on E6000, no limit on Cisco)
