@@ -1103,6 +1103,29 @@ class CmtsUtscService:
         self.logger.info(f"Starting UTSC for RF port {rf_port_ifindex}")
         
         try:
+            # Casa rows are always createAndWait after configure — must transition
+            # to active(1) before InitiateTest is accepted (otherwise CMTS returns
+            # commitFailed). Set RowStatus=active then verify before proceeding.
+            row_status_result = await self._snmp_get(
+                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}"
+            )
+            row_status_val = self._parse_get_value(row_status_result)
+            try:
+                row_status_int = int(row_status_val) if row_status_val and 'No Such' not in str(row_status_val) else None
+            except (ValueError, TypeError):
+                row_status_int = None
+
+            if row_status_int is not None and row_status_int != 1:  # not already active
+                self.logger.info(f"RowStatus={row_status_int} (not active) — setting active(1) before InitiateTest")
+                activate_result = await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'
+                )
+                if not activate_result.get('success'):
+                    self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')} — attempting InitiateTest anyway")
+                else:
+                    await asyncio.sleep(0.2)
+                    self.logger.info("RowStatus set to active(1)")
+
             # Set InitiateTest to true (1)
             result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
             
