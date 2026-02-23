@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 PyPNM Upstream Spectrum Integration
+# Copyright (c) 2025-2026 Maurice Garcia
 
 import asyncio
 import logging
@@ -94,7 +94,6 @@ async def spectrum_stream(websocket: WebSocket):
                 trigger_mode = config.get("trigger_mode", 2)  # Default to FreeRunning (2)
                 skip_configure = config.get("skip_configure", False)  # Skip if already configured via REST
                 
-                # Capture parameters from GUI (no more hardcoded values)
                 center_freq_hz = config.get("center_freq_hz", 37000000)
                 span_hz = config.get("span_hz", 60000000)
                 num_bins = config.get("num_bins", 800)
@@ -333,8 +332,7 @@ async def _stream_spectrum_data(
     # Cleanup tracking
     files_to_delete = []
     cleanup_batch_size = 50
-    
-    # Use params from GUI (no hardcoded values)
+
     actual_center_freq = center_freq_hz
     actual_span = span_hz
     actual_num_bins = num_bins

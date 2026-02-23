@@ -19,7 +19,7 @@ import logging
 from enum import IntEnum
 from typing import Any, Dict, Optional
 
-from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
+from pypnm.api.agent.manager import get_agent_manager
 
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ class CmtsUsOfdmaRxMerService:
         self.cmts_ip = cmts_ip
         self.community = community
         self.write_community = write_community or community
-        self.agent_manager = init_agent_manager()
+        self.agent_manager = get_agent_manager()
         self.logger = logging.getLogger(self.__class__.__name__)
     
     def close(self):

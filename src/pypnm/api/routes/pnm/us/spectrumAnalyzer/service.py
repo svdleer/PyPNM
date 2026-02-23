@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 PyPNM Upstream Spectrum Integration
-# Based on DOCSIS UTSC (Upstream Triggered Spectrum Capture)
+# Copyright (c) 2025-2026 Maurice Garcia
+
+"""
+Legacy spectrum analyzer service (CMTS-based UTSC via spectrumAnalyzer route).
+New code should use pnm/us/utsc/ instead.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
+from pypnm.api.agent.manager import get_agent_manager
 
 
 class CmtsUtscService:
@@ -605,9 +609,8 @@ class CmtsUtscService:
             freq_start = center_freq - (span // 2)
             freq_step = span // num_bins if num_bins > 0 else 100000
             
-            # Note: Actual amplitude data comes from TFTP file
-            # For WebSocket streaming, we'd need to parse the TFTP file
-            # This is a placeholder that returns the configuration
+            # Amplitude data is read from the TFTP file after capture.
+            # Returns config/status here; file parsing is done by the caller.
             return {
                 "success": True,
                 "spectrum": {
@@ -650,7 +653,7 @@ class UtscRfPortDiscoveryService:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cmts_ip = str(cmts_ip)
         self.community = community
-        self.agent_manager = init_agent_manager()
+        self.agent_manager = get_agent_manager()
     
     def _get_agent_id(self):
         if not self.agent_manager:
