@@ -743,8 +743,8 @@ class CmtsUtscService:
             self.logger.info(f"Vendor detection: {vendor} — sysDescr='{sys_descr[:80]}'")
 
             # For Arris/CommScope E6000: detect CORE (C-CCAP) vs I-CCAP via ifDescr.
-            # ifDescr contains 'scq' for CORE/C-CCAP (e.g. 'cable-upstream 1/scq/0') — window only supports rectangular(2).
-            # ifDescr contains 'us-conn' for I-CCAP (e.g. 'MNDGT0002RPS01-0 us-conn 0') — supports window 2,3,4,5.
+            # ifDescr contains 'us-conn' for CORE/C-CCAP (e.g. 'MNDGT0002RPS01-0 us-conn 0') — window only supports rectangular(2).
+            # ifDescr does NOT contain 'us-conn' for I-CCAP (e.g. 'cable-upstream 1/scq/0') — supports window 2,3,4,5.
             # IF-MIB::ifDescr OID: 1.3.6.1.2.1.2.2.1.2.<ifindex>
             is_arris_core = False
             if is_arris:
@@ -752,7 +752,7 @@ class CmtsUtscService:
                     ifdescr_result = await self._snmp_get(f"1.3.6.1.2.1.2.2.1.2.{rf_port_ifindex}")
                     ifdescr_raw = str(ifdescr_result.get('output', ''))
                     ifdescr = ifdescr_raw.split(' = ', 1)[1].strip() if ' = ' in ifdescr_raw else ifdescr_raw.strip()
-                    is_arris_core = 'scq' in ifdescr.lower()
+                    is_arris_core = 'us-conn' in ifdescr.lower()
                     self.logger.info(f"E6000 ifDescr='{ifdescr}' -> {'CORE/C-CCAP (window=rectangular only)' if is_arris_core else 'I-CCAP (window 2-5 supported)'}")
                 except Exception as e:
                     self.logger.warning(f"ifDescr lookup failed, assuming CORE (safe): {e}")
