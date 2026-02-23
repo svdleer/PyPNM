@@ -815,12 +815,17 @@ class CmtsUtscService:
             self.logger.info(f"OutputFormat confirmed={output_format}")
             
             # 6. Window function (INTEGER)
-            # E6000 RRPS HF interfaces only support rectangular(2).
-            # Other E6000 types support 2-5, Cisco supports 1-5.
-            # Default to rectangular(2) for safety; only allow others on non-Arris.
-            if is_arris and window_function != 2:
-                clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000 RRPS HF only supports rectangular(2))")
+            # E6000 CORE/RRPS: only rectangular(2) supported.
+            # E6000 I-CCAP: supports 2=rectangular, 3=hann, 4=blackmanHarris, 5=hamming.
+            # Cisco cBR-8: supports 1-5.
+            # Safe default is rectangular(2) for all Arris — GUI sends 2 by default.
+            # We clamp to 2 for Arris since we cannot reliably detect CORE vs I-CCAP.
+            if is_arris and window_function not in (2, 3, 4, 5):
+                clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000: unsupported window, using rectangular)")
                 window_function = 2
+            if is_arris and window_function != 2:
+                # Allow 3/4/5 on I-CCAP but warn — RRPS will reject and log
+                clamp_warnings.append(f"window_function={window_function} may be rejected on E6000 CORE/RRPS (only rectangular(2) supported there)")
             await self._snmp_set(f"{self.OID_UTSC_CFG_WINDOW}{idx}", window_function, 'i')
             
             # 7. Clamp trigger_count (1-10 on E6000, no limit on Cisco)
@@ -860,33 +865,69 @@ class CmtsUtscService:
                     clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (Casa max 300 files)")
                     freerun_duration_ms = max_freerun_ms
             else:
-                # CommScope/Arris E6000 (repeat >= 50ms) and Cisco cBR-8 (repeat >= 50ms)
-                min_repeat = 50000
+                # CommScope/Arris E6000 and Cisco cBR-8
+                # PDF limits (E6000 Release 13.0 User Guide):
+                #   repeat_period: 0=once, 1-49999µs=hw-restricted, 50000-1000000µs=normal, >1000000=rejected
+                #   freerun_duration: 1s-600000ms (10min), >600000ms rejected
+                #   output_format: if repeat_period 1-49999µs, only fftPower(2) supported
                 vendor_label = 'Arris/CommScope E6000' if is_arris else 'Cisco cBR-8' if is_cisco else 'E6000/Cisco'
-                if repeat_period_us < min_repeat:
-                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {min_repeat} ({vendor_label} minimum 50ms)")
+
+                # Clamp repeat_period max to 1000ms (PDF: >1000ms rejected)
+                max_repeat = 1000000
+                if repeat_period_us > max_repeat:
+                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {max_repeat} ({vendor_label} maximum 1000ms)")
+                    repeat_period_us = max_repeat
+
+                # Clamp repeat_period min to 50ms for normal mode
+                min_repeat = 50000
+                if 0 < repeat_period_us < min_repeat:
+                    clamp_warnings.append(f"repeat_period_us clamped {orig_repeat} -> {min_repeat} ({vendor_label} minimum 50ms for normal mode)")
                     repeat_period_us = min_repeat
 
+                # If repeat_period is in hardware-restricted range (1-49999µs), only fftPower(2) allowed
+                if 0 < repeat_period_us < 50000 and output_format != 2:
+                    clamp_warnings.append(f"output_format clamped {output_format} -> 2 (E6000: repeat_period<50ms requires fftPower(2))")
+                    output_format = 2
+
+                # Clamp freerun max to 600000ms (10min) — PDF: >600000ms rejected
+                max_freerun = 600000
+                if freerun_duration_ms > max_freerun:
+                    clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun} ({vendor_label} maximum 10 minutes)")
+                    freerun_duration_ms = max_freerun
+
                 if freerun_duration_ms <= 0:
-                    calc_ms = repeat_period_us * trigger_count * 2
-                    freerun_duration_ms = max(calc_ms, repeat_period_us, 60000)
+                    calc_ms = (repeat_period_us // 1000) * trigger_count * 2
+                    freerun_duration_ms = max(calc_ms, repeat_period_us // 1000, 60000)
 
-                if freerun_duration_ms < repeat_period_us:
-                    clamp_warnings.append(f"freerun_duration_ms raised {orig_freerun} -> {repeat_period_us} (must be >= repeat_period)")
-                    freerun_duration_ms = repeat_period_us
+                if freerun_duration_ms < (repeat_period_us // 1000):
+                    clamp_warnings.append(f"freerun_duration_ms raised {orig_freerun} -> {repeat_period_us // 1000} (must be >= repeat_period)")
+                    freerun_duration_ms = repeat_period_us // 1000
 
-                # E6000: MaxResultsPerFile is read-only and fixed at 1 (one TFTP file per capture).
-                # Cap freerun so at most 250 files are queued per run to avoid overloading bulk transfer.
-                # 250 * repeat_period_ms = max safe freerun. GUI re-triggers when run ends.
+                # E6000: MaxResultsPerFile is read-only fixed at 1 (one TFTP file per capture).
+                # Cap freerun so at most 250 files are queued per run. GUI re-triggers when run ends.
                 if is_arris:
                     repeat_period_ms = repeat_period_us // 1000 or 1
                     max_freerun_ms = 250 * repeat_period_ms
                     if freerun_duration_ms > max_freerun_ms:
-                        clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (E6000 MaxResultsPerFile=1, max 250 files)")
+                        clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (E6000 MaxResultsPerFile=1, max 250 files per run)")
                         freerun_duration_ms = max_freerun_ms
 
-            self.logger.info(f"Timing after clamp: repeat={repeat_period_us}µs freerun={freerun_duration_ms}ms warnings={clamp_warnings}")
-            
+                # E6000 num_bins (non-TimeIQ): only 200, 400, 800, 1600, 3200 are valid (PDF Table 6)
+                # For TimeIQ: 256, 512, 1024, 2048, 4096 are valid (PDF Table 3)
+                if is_arris and output_format != 1:  # non-TimeIQ
+                    valid_bins = (200, 400, 800, 1600, 3200)
+                    if num_bins not in valid_bins:
+                        nearest = min(valid_bins, key=lambda x: abs(x - num_bins))
+                        clamp_warnings.append(f"num_bins clamped {num_bins} -> {nearest} (E6000 non-TimeIQ supported values: {valid_bins})")
+                        num_bins = nearest
+
+            self.logger.info(f"Timing after clamp: repeat={repeat_period_us}µs freerun={freerun_duration_ms}ms num_bins={num_bins} output_format={output_format} warnings={clamp_warnings}")
+
+            # Re-SET num_bins and output_format if they were clamped by vendor rules above
+            # (they were initially SET before vendor detection, so re-apply corrected values)
+            await self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
+            await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
+
             # 9. Set FreeRunDuration FIRST (Gauge32) — must be >= RepeatPeriod
             fr_result = await self._snmp_set(
                 f"{self.OID_UTSC_CFG_FREERUN_DUR}{idx}", freerun_duration_ms, 'u'
