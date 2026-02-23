@@ -13,7 +13,22 @@ Usage:
     python tests/test_pnm_page.py --test utsc              # one test group
     python tests/test_pnm_page.py --vendor arris --test utsc rxmer
     python tests/test_pnm_page.py --list                   # list available tests
-    python tests/test_pnm_page.py --api http://localhost:8000  # custom API URL
+    python tests/test_pnm_page.py --api http://localhost:8000  # custom PyPNM API URL
+    python tests/test_pnm_page.py --gui http://localhost:5050  # custom GUI backend URL
+    python tests/test_pnm_page.py --offline                # CI mode: no SNMP assertions
+
+TODO / known gaps (2026-02-23):
+  1. Known-good UTSC config per vendor — Casa/Cisco have different allowed
+     window/output_format/num_bins combos. Tests need values confirmed working
+     per vendor, not generic defaults.
+  2. rxmer test passes ofdma_ifindex=0 — needs the discovered value piped from
+     ofdma_disc output rather than a hardcoded zero.
+  3. pre_eq — needs confirmed response shape per vendor before asserting fields.
+  4. bulk_dest — only checks endpoint exists; needs real TFTP IP for a full
+     configure round-trip test.
+  5. Test ordering — enrichment → rf_port → ofdma_disc should feed discovered
+     values (rf_port_ifindex, ofdma_ifindex) into utsc/rxmer rather than
+     re-discovering or defaulting to 0 each time.
 """
 
 import argparse
