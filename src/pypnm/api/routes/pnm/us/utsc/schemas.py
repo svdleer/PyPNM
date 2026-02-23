@@ -227,6 +227,24 @@ class UtscBulkDestResponse(BaseModel):
     error: Optional[str] = None
 
 
+class UtscDiscoverRequest(BaseModel):
+    """Request to discover RF port for a cable modem."""
+    cmts_ip: str
+    community: str = "public"
+    cm_mac_address: str
+
+
+class UtscDiscoverResponse(BaseModel):
+    """Response with discovered RF port for a cable modem."""
+    success: bool
+    rf_port_ifindex: Optional[int] = None
+    rf_port_description: Optional[str] = None
+    cm_index: Optional[int] = None
+    us_channels: List[int] = Field(default_factory=list)
+    logical_channel: Optional[int] = None
+    error: Optional[str] = None
+
+
 class UtscGetConfigResponse(BaseModel):
     """Response with current UTSC configuration."""
     success: bool

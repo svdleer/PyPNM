@@ -2,6 +2,12 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
+#
+# DEPRECATED: All active routes moved to pnm/us/utsc/.
+# This router is retained only for legacy /docs/pnm/ds/spectrumAnalyzer (DS).
+# The US UTSC endpoints (/pnm/us/spectrumAnalyzer/*) are retired.
+
+__skip_autoregister__ = True
 
 import asyncio
 import logging
