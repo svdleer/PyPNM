@@ -80,6 +80,10 @@ class TestResult:
 RESULTS: List[TestResult] = []
 
 
+# Set to True via --offline to skip SNMP-dependent assertions (CI without lab access)
+OFFLINE: bool = False
+
+
 def record(vendor: str, test: str, case: str, passed: bool, note: str = "", details: Dict = None):
     r = TestResult(vendor, test, case, passed, note, details or {})
     RESULTS.append(r)
@@ -343,8 +347,10 @@ def test_modem_enrichment(api: str, vendor: str, cfg: Dict):
 
 def test_rf_port_discovery(api: str, vendor: str, cfg: Dict):
     """
-    Regression: /spectrumAnalyzer/discoverRfPort must return a real ifindex.
-    Catches: endpoint returning 404, duplicate endpoint registered at module level.
+    Regression: /spectrumAnalyzer/discoverRfPort must exist (not 404/405).
+    In offline mode: only checks the endpoint is registered (no SNMP to CMTS).
+    Online mode: also validates the returned ifindex is a real value (> 1000).
+    Catches: endpoint returning 404, duplicate registered at module level.
     """
     print(f"\n  --- RF port discovery ---")
     r = api_post(api, "/pnm/us/spectrumAnalyzer/discoverRfPort", {
@@ -354,21 +360,27 @@ def test_rf_port_discovery(api: str, vendor: str, cfg: Dict):
     }, timeout=30)
 
     http_err = r.get("_http_error")
-    passed = r.get("success") is True and bool(r.get("rf_port_ifindex")) and not http_err
-    # ifindex must be a plausible value (> 1000), not a small OID component
-    ifindex = r.get("rf_port_ifindex") or 0
-    sane    = isinstance(ifindex, int) and ifindex > 1000
-    record(vendor, "rf_port", "discoverRfPort success", passed,
-           f"http={http_err} ifindex={ifindex}")
-    record(vendor, "rf_port", "rf_port_ifindex > 1000 (sane)", sane,
-           f"ifindex={ifindex}")
+    # Offline: endpoint must exist — any response except 404/405 is a pass
+    not_missing = http_err not in (404, 405) and "_exception" not in r
+    record(vendor, "rf_port", "discoverRfPort endpoint exists (not 404/405)", not_missing,
+           f"http={http_err}")
+
+    if not OFFLINE:
+        passed  = r.get("success") is True and bool(r.get("rf_port_ifindex")) and not http_err
+        ifindex = r.get("rf_port_ifindex") or 0
+        sane    = isinstance(ifindex, int) and ifindex > 1000
+        record(vendor, "rf_port", "discoverRfPort success", passed,
+               f"http={http_err} ifindex={ifindex}")
+        record(vendor, "rf_port", "rf_port_ifindex > 1000 (sane)", sane,
+               f"ifindex={ifindex}")
 
 
 def test_ofdma_discovery(api: str, vendor: str, cfg: Dict):
     """
-    Regression: /ofdma/rxmer/discover must return a real ofdma_ifindex.
-    Catches: false OID match returning small value (e.g. 3) due to cm_index=1
-    matching base OID prefix instead of suffix.
+    Regression: /ofdma/rxmer/discover must exist and return a sane ofdma_ifindex.
+    In offline mode: only checks the endpoint is registered (no SNMP to CMTS).
+    Online mode: also validates ifindex > 100 (catches false OID match returning 3).
+    Catches: false OID match on cm_index=1 matching base OID prefix.
     """
     print(f"\n  --- OFDMA ifindex discovery ---")
     r = api_post(api, "/pnm/us/ofdma/rxmer/discover", {
@@ -380,15 +392,21 @@ def test_ofdma_discovery(api: str, vendor: str, cfg: Dict):
         "cm_mac_address": cfg["test_modem_mac"],
     }, timeout=30)
 
-    passed  = r.get("success") is True and bool(r.get("ofdma_ifindex"))
-    ifindex = r.get("ofdma_ifindex") or 0
-    # Real OFDMA ifIndexes are always large (CommScope ~843M, Cisco ~488K, Casa similar)
-    # A value <= 100 means OID parsing picked up a base-OID component, not the real ifindex
-    sane    = isinstance(ifindex, int) and ifindex > 100
-    record(vendor, "ofdma_disc", "ofdma/rxmer/discover success", passed,
-           f"ifindex={ifindex} desc={r.get('ofdma_description')}")
-    record(vendor, "ofdma_disc", "ofdma_ifindex > 100 (not OID component)", sane,
-           f"ifindex={ifindex}")
+    http_err = r.get("_http_error")
+    not_missing = http_err not in (404, 405) and "_exception" not in r
+    record(vendor, "ofdma_disc", "ofdma/rxmer/discover endpoint exists (not 404/405)", not_missing,
+           f"http={http_err}")
+
+    if not OFFLINE:
+        passed  = r.get("success") is True and bool(r.get("ofdma_ifindex"))
+        ifindex = r.get("ofdma_ifindex") or 0
+        # Real OFDMA ifIndexes are always large (CommScope ~843M, Cisco ~488K, Casa similar)
+        # A value <= 100 means OID parsing picked up a base-OID component, not the real ifindex
+        sane    = isinstance(ifindex, int) and ifindex > 100
+        record(vendor, "ofdma_disc", "ofdma/rxmer/discover success", passed,
+               f"ifindex={ifindex} desc={r.get('ofdma_description')}")
+        record(vendor, "ofdma_disc", "ofdma_ifindex > 100 (not OID component)", sane,
+               f"ifindex={ifindex}")
 
 
 def test_websocket_stream(api: str, vendor: str, cfg: Dict):
@@ -458,11 +476,18 @@ def parse_args():
                    help="List available vendors and test groups")
     p.add_argument("--fail-fast", action="store_true",
                    help="Stop after first failure")
+    p.add_argument("--offline", action="store_true",
+                   help="Offline/CI mode: only verify endpoints exist, skip SNMP assertions")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    global OFFLINE
+    OFFLINE = args.offline
+    if OFFLINE:
+        print("[offline mode] SNMP assertions skipped — checking endpoint existence only")
 
     if args.list:
         print("Vendors:")

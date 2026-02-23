@@ -62,7 +62,8 @@ jobs:
           python tests/test_pnm_page.py \
             --api http://127.0.0.1:8000 \
             --vendor arris \
-            --test health rf_port ws_stream
+            --test health rf_port ofdma_disc ws_stream \
+            --offline
 
       - name: Stop PyPNM
         if: always()
