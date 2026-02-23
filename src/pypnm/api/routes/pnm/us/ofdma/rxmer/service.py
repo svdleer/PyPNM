@@ -372,26 +372,28 @@ class CmtsUsOfdmaRxMerService:
                 self.logger.warning("No OFDMA status entries found on CMTS")
                 return None
             
+            # OID format: <base>.<cmIndex>.<ofdmaIfIndex>
+            # Parse suffix relative to base to avoid false matches on small
+            # cm_index values (e.g. 1) appearing in the base OID prefix itself.
+            base = self.OID_CM_OFDMA_STATUS.rstrip(".")
+            
             for entry in result['results']:
                 oid_str = str(entry.get('oid', ''))
                 value = str(entry.get('value', ''))
                 
-                # OID format: ...1.2.<cmIndex>.<ofdmaIfIndex>
-                # Value is timing offset (0 means no OFDMA or not yet synchronized)
-                if f".{cm_index}." in oid_str:
-                    parts = oid_str.split(".")
-                    for i, part in enumerate(parts):
-                        if part == str(cm_index) and i + 1 < len(parts):
-                            ofdma_ifindex = int(parts[i + 1])
-                            # Check if timing offset is non-zero (indicates active OFDMA)
-                            # This is vendor-agnostic: works for all DOCSIS 3.1 CMTS
-                            try:
-                                timing_offset = int(value)
-                                if timing_offset > 0:
-                                    self.logger.info(f"Found OFDMA ifIndex: {ofdma_ifindex} (timing offset: {timing_offset})")
-                                    return ofdma_ifindex
-                            except (ValueError, TypeError):
-                                pass
+                # Strip base prefix to get the suffix: <cmIndex>.<ofdmaIfIndex>
+                if oid_str.startswith(base + "."):
+                    suffix = oid_str[len(base) + 1:]  # e.g. "1.843087877"
+                    parts = suffix.split(".")
+                    if len(parts) >= 2 and parts[0] == str(cm_index):
+                        ofdma_ifindex = int(parts[1])
+                        try:
+                            timing_offset = int(value)
+                            if timing_offset > 0:
+                                self.logger.info(f"Found OFDMA ifIndex: {ofdma_ifindex} (timing offset: {timing_offset})")
+                                return ofdma_ifindex
+                        except (ValueError, TypeError):
+                            pass
             
             self.logger.warning(f"No OFDMA channel found for CM index {cm_index}")
             return None

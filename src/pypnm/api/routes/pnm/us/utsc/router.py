@@ -324,39 +324,42 @@ class UtscRouter:
             finally:
                 service.close()
 
+        @self.router.post(
+            "/discover",
+            response_model=UtscDiscoverResponse,
+            summary="Discover UTSC RF port for a cable modem",
+        )
+        async def discover_rf_port(request: UtscDiscoverRequest) -> UtscDiscoverResponse:
+            """
+            Discover the UTSC RF port for a specific cable modem.
 
-@router.post("/discover", response_model=UtscDiscoverResponse)
-async def discover_rf_port(request: UtscDiscoverRequest) -> UtscDiscoverResponse:
-    """
-    Discover the UTSC RF port for a specific cable modem.
-
-    Uses the modem's upstream logical channel ifIndex to find which RF port
-    it belongs to on the CMTS. Faster than listing all ports manually.
-    """
-    logger.info(f"UTSC RF port discovery: CMTS={request.cmts_ip}, MAC={request.cm_mac_address}")
-    try:
-        service = UtscRfPortDiscoveryService(
-            cmts_ip=request.cmts_ip,
-            community=request.community
-        )
-        result = await asyncio.wait_for(
-            service.discover(request.cm_mac_address),
-            timeout=60.0
-        )
-        return UtscDiscoverResponse(
-            success=result.get("success", False),
-            rf_port_ifindex=result.get("rf_port_ifindex"),
-            rf_port_description=result.get("rf_port_description"),
-            cm_index=result.get("cm_index"),
-            us_channels=result.get("us_channels", []),
-            logical_channel=result.get("logical_channel"),
-            error=result.get("error")
-        )
-    except asyncio.TimeoutError:
-        return UtscDiscoverResponse(success=False, error="RF port discovery timed out")
-    except Exception as e:
-        logger.error(f"RF port discovery failed: {e}", exc_info=True)
-        return UtscDiscoverResponse(success=False, error=str(e))
+            Uses the modem's upstream logical channel ifIndex to find which RF port
+            it belongs to on the CMTS. Faster than listing all ports manually.
+            """
+            self.logger.info(f"UTSC RF port discovery: CMTS={request.cmts_ip}, MAC={request.cm_mac_address}")
+            try:
+                service = UtscRfPortDiscoveryService(
+                    cmts_ip=request.cmts_ip,
+                    community=request.community
+                )
+                result = await asyncio.wait_for(
+                    service.discover(request.cm_mac_address),
+                    timeout=60.0
+                )
+                return UtscDiscoverResponse(
+                    success=result.get("success", False),
+                    rf_port_ifindex=result.get("rf_port_ifindex"),
+                    rf_port_description=result.get("rf_port_description"),
+                    cm_index=result.get("cm_index"),
+                    us_channels=result.get("us_channels", []),
+                    logical_channel=result.get("logical_channel"),
+                    error=result.get("error")
+                )
+            except asyncio.TimeoutError:
+                return UtscDiscoverResponse(success=False, error="RF port discovery timed out")
+            except Exception as e:
+                self.logger.error(f"RF port discovery failed: {e}", exc_info=True)
+                return UtscDiscoverResponse(success=False, error=str(e))
 
 
 # Required for dynamic auto-registration
