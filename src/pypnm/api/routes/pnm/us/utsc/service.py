@@ -829,10 +829,10 @@ class CmtsUtscService:
             # clamp_warnings accumulates all vendor constraint adjustments returned to caller
             clamp_warnings = []
 
-            # Casa: output_format 1-6 all accepted (empirically verified 2026-02-23)
-            # E6000: 1-5 supported; Cisco cBR-8: only timeIQ(1) and fftPower(2)
-            if is_cisco and output_format not in (1, 2):
-                clamp_warnings.append(f"output_format clamped {output_format} -> 2 (Cisco cBR-8 only supports timeIQ(1) and fftPower(2))")
+            # Casa:          1-6 all accepted (empirically verified 2026-02-23 on mnd-gt0002-ccap101)
+            # E6000: 1-5 supported; Cisco cBR-8: only timeIQ(1), fftPower(2), fftIQ(4) accepted; 3/5/6 rejected
+            if is_cisco and output_format not in (1, 2, 4):
+                clamp_warnings.append(f"output_format clamped {output_format} -> 2 (Cisco cBR-8 supports timeIQ(1), fftPower(2), fftIQ(4) only — empirically verified 2026-02-23)")
                 output_format = 2
             if not is_casa and not is_cisco and output_format not in (1, 2, 3, 4, 5):
                 output_format = 2  # safe fallback for E6000
@@ -842,7 +842,7 @@ class CmtsUtscService:
             # Casa:          1-6 all accepted (empirically verified 2026-02-23 on mnd-gt0002-ccap101)
             # E6000 CORE/C-CCAP (ifDescr 'us-conn'): only rectangular(2) supported.
             # E6000 I-CCAP:  2-5 supported (rectangular/hann/blackmanHarris/hamming).
-            # Cisco cBR-8:   unknown — not clamped (TODO: verify empirically).
+            # Cisco cBR-8:   1-6 all SET accepted; 1 silently maps to 2, 6 silently maps to 5 (empirically verified 2026-02-23).
             if is_arris_core and window_function != 2:
                 clamp_warnings.append(f"window_function clamped {window_function} -> 2 (E6000 CORE/C-CCAP only supports rectangular(2))")
                 window_function = 2
@@ -942,6 +942,11 @@ class CmtsUtscService:
                         nearest = min(valid_bins, key=lambda x: abs(x - num_bins))
                         clamp_warnings.append(f"num_bins clamped {num_bins} -> {nearest} (E6000 non-TimeIQ supported values: {valid_bins})")
                         num_bins = nearest
+
+                # Cisco cBR-8: num_bins < 256 silently ignored (stays at previous value) — empirically verified 2026-02-23
+                if is_cisco and num_bins < 256:
+                    clamp_warnings.append(f"num_bins clamped {num_bins} -> 256 (Cisco cBR-8 minimum 256)")
+                    num_bins = 256
 
             self.logger.info(f"Timing after clamp: repeat={repeat_period_us}µs freerun={freerun_duration_ms}ms num_bins={num_bins} output_format={output_format} warnings={clamp_warnings}")
 
