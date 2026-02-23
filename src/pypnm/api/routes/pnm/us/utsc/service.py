@@ -1061,7 +1061,7 @@ class CmtsUtscService:
             self.logger.error(f"Failed to configure UTSC: {e}")
             return {"success": False, "error": str(e)}
     
-    async def start(self, rf_port_ifindex: int, cfg_index: int = 1) -> dict[str, Any]:
+    async def start(self, rf_port_ifindex: int, cfg_index: int = 1, trigger_mode: int = 2) -> dict[str, Any]:
         """
         Start UTSC test (set InitiateTest to true).
         
@@ -1069,35 +1069,33 @@ class CmtsUtscService:
         
         Args:
             rf_port_ifindex: RF port ifIndex
-            cfg_index: Config table index (0 = auto-probe for active row)
+            cfg_index: Config table index (0 = auto-probe by TriggerMode)
+            trigger_mode: TriggerMode to match when auto-probing (default 2=freeRunning)
             
         Returns:
             Dict with success status
         """
         import asyncio
-        # Probe for the row matching cfg_index by TriggerMode — on Casa rows are
-        # always createAndWait so probing RowStatus=active never works.
-        # Use the same TriggerMode-based probe as configure().
+        # Probe for the row by TriggerMode — same logic as configure().
+        # Casa pre-provisions rows 1-3 with fixed TriggerModes; RowStatus is
+        # always createAndWait so probing by RowStatus=active never finds anything.
+        # Must match by TriggerMode to find the row configure() actually wrote to.
         resolved = cfg_index if cfg_index > 0 else 1
-        for probe_idx in range(1, 4):
-            r = await self._snmp_get(
-                f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{probe_idx}"
-            )
-            v = self._parse_get_value(r)
-            if v is not None and 'No Such' not in str(v):
-                # Accept any existing row (active or createAndWait) — prefer the one
-                # matching cfg_index, but if cfg_index doesn't exist use first found
-                try:
-                    int(v)  # valid row status
-                    if probe_idx == cfg_index:
-                        resolved = probe_idx
-                        break
-                    elif resolved == cfg_index:
-                        pass  # keep looking for exact match
-                    else:
-                        resolved = probe_idx  # take first valid as fallback
-                except (ValueError, TypeError):
-                    pass
+        if cfg_index == 0:
+            # Auto-probe: find row matching trigger_mode
+            for probe_idx in range(1, 4):
+                r = await self._snmp_get(
+                    f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
+                )
+                v = self._parse_get_value(r)
+                if v is not None and 'No Such' not in str(v):
+                    try:
+                        if int(v) == trigger_mode:
+                            resolved = probe_idx
+                            self.logger.info(f"start: found TriggerMode={trigger_mode} at cfg_index={probe_idx}")
+                            break
+                    except (ValueError, TypeError):
+                        pass
         idx = f".{rf_port_ifindex}.{resolved}"
         
         self.logger.info(f"Starting UTSC for RF port {rf_port_ifindex}")

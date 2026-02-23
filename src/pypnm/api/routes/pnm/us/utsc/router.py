@@ -204,7 +204,8 @@ class UtscRouter:
             try:
                 result = await service.start(
                     rf_port_ifindex=request.rf_port_ifindex,
-                    cfg_index=request.cfg_index
+                    cfg_index=request.cfg_index,
+                    trigger_mode=request.trigger_mode
                 )
                 return UtscStartResponse(**result)
             finally:

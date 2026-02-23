@@ -145,7 +145,8 @@ class UtscStartRequest(BaseModel):
     """Request to start UTSC test."""
     cmts: CmtsSnmpConfig
     rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
-    cfg_index: int = Field(default=1, description="Config table index")
+    cfg_index: int = Field(default=0, description="Config table index (0=auto-probe by TriggerMode, required for Casa which always uses createAndWait rows)")
+    trigger_mode: int = Field(default=2, description="TriggerMode to match during auto-probe (default 2=freeRunning)")
 
 
 class UtscStartResponse(BaseModel):
