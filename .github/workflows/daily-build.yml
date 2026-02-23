@@ -82,6 +82,16 @@ jobs:
           docker compose logs
           exit 1
 
+      - name: Install test dependencies
+        run: pip install websockets
+
+      - name: Run PNM page regression tests (health + enrichment + rf_port + ofdma_disc + ws_stream)
+        run: |
+          python tests/test_pnm_page.py \
+            --api http://localhost:8000 \
+            --vendor arris \
+            --test health enrichment rf_port ofdma_disc ws_stream
+
       - name: Tear down
         if: always()
         run: |
