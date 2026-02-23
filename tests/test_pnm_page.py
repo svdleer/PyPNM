@@ -298,16 +298,147 @@ def test_api_health(api: str, vendor: str, cfg: Dict):
     record(vendor, "health", "GET /health", passed, str(r))
 
 
+def test_modem_enrichment(api: str, vendor: str, cfg: Dict):
+    """
+    Regression: GET /cmts/modems must return enriched fields.
+    Catches: wrong HTTP method (405), fields dropped in modem map,
+    Redis intercepting enrichment poll.
+    """
+    print(f"\n  --- modem enrichment ---")
+
+    # 1. Base call — must succeed (no 405)
+    path = (f"/cmts/modems?cmts_ip={cfg['cmts_ip']}"
+            f"&community={cfg['community_read']}&limit=3&enrich=false")
+    r = api_get(api, path)
+    passed = r.get("success") is True and "_http_error" not in r
+    record(vendor, "enrichment", "GET /cmts/modems (base)", passed,
+           f"http_error={r.get('_http_error', 'none')}")
+
+    # 2. Enriched call — wait up to 90s for enrichment to complete
+    path_enrich = (f"/cmts/modems?cmts_ip={cfg['cmts_ip']}"
+                   f"&community={cfg['community_read']}&limit=5"
+                   f"&enrich=true&modem_community={cfg['modem_community']}")
+    enriched = False
+    for attempt in range(6):
+        r2 = api_get(api, path_enrich, timeout=30)
+        if r2.get("enriched"):
+            enriched = True
+            break
+        if attempt < 5:
+            time.sleep(15)
+
+    record(vendor, "enrichment", "GET /cmts/modems enriched=True", enriched,
+           f"enriched={r2.get('enriched')} enriching={r2.get('enriching')}")
+
+    if enriched:
+        modems = r2.get("modems", [])
+        m = modems[0] if modems else {}
+        has_vendor   = bool(m.get("vendor"))
+        has_ofdma    = "ofdma_enabled" in m
+        has_docsis   = bool(m.get("docsis_version"))
+        record(vendor, "enrichment", "modem.vendor present",   has_vendor,   str(m.get("vendor")))
+        record(vendor, "enrichment", "modem.ofdma_enabled key exists", has_ofdma, str(m.get("ofdma_enabled")))
+        record(vendor, "enrichment", "modem.docsis_version present", has_docsis, str(m.get("docsis_version")))
+
+
+def test_rf_port_discovery(api: str, vendor: str, cfg: Dict):
+    """
+    Regression: /spectrumAnalyzer/discoverRfPort must return a real ifindex.
+    Catches: endpoint returning 404, duplicate endpoint registered at module level.
+    """
+    print(f"\n  --- RF port discovery ---")
+    r = api_post(api, "/pnm/us/spectrumAnalyzer/discoverRfPort", {
+        "cmts_ip": cfg["cmts_ip"],
+        "community": cfg["community_read"],
+        "cm_mac_address": cfg["test_modem_mac"],
+    }, timeout=30)
+
+    http_err = r.get("_http_error")
+    passed = r.get("success") is True and bool(r.get("rf_port_ifindex")) and not http_err
+    # ifindex must be a plausible value (> 1000), not a small OID component
+    ifindex = r.get("rf_port_ifindex") or 0
+    sane    = isinstance(ifindex, int) and ifindex > 1000
+    record(vendor, "rf_port", "discoverRfPort success", passed,
+           f"http={http_err} ifindex={ifindex}")
+    record(vendor, "rf_port", "rf_port_ifindex > 1000 (sane)", sane,
+           f"ifindex={ifindex}")
+
+
+def test_ofdma_discovery(api: str, vendor: str, cfg: Dict):
+    """
+    Regression: /ofdma/rxmer/discover must return a real ofdma_ifindex.
+    Catches: false OID match returning small value (e.g. 3) due to cm_index=1
+    matching base OID prefix instead of suffix.
+    """
+    print(f"\n  --- OFDMA ifindex discovery ---")
+    r = api_post(api, "/pnm/us/ofdma/rxmer/discover", {
+        "cmts": {
+            "cmts_ip": cfg["cmts_ip"],
+            "community": cfg["community_read"],
+            "write_community": cfg["community_write"],
+        },
+        "cm_mac_address": cfg["test_modem_mac"],
+    }, timeout=30)
+
+    passed  = r.get("success") is True and bool(r.get("ofdma_ifindex"))
+    ifindex = r.get("ofdma_ifindex") or 0
+    # Real OFDMA ifIndexes are always large (CommScope ~843M, Cisco ~488K, Casa similar)
+    # A value <= 100 means OID parsing picked up a base-OID component, not the real ifindex
+    sane    = isinstance(ifindex, int) and ifindex > 100
+    record(vendor, "ofdma_disc", "ofdma/rxmer/discover success", passed,
+           f"ifindex={ifindex} desc={r.get('ofdma_description')}")
+    record(vendor, "ofdma_disc", "ofdma_ifindex > 100 (not OID component)", sane,
+           f"ifindex={ifindex}")
+
+
+def test_websocket_stream(api: str, vendor: str, cfg: Dict):
+    """
+    Regression: WebSocket /spectrumAnalyzer/stream must be reachable.
+    Catches: __skip_autoregister__ on router silencing the WebSocket endpoint.
+    Only runs once (vendor-independent), skips if websockets package unavailable.
+    """
+    print(f"\n  --- WebSocket stream ---")
+
+    # Only test once — endpoint is not vendor-specific
+    if vendor != list(VENDORS.keys())[0]:
+        record(vendor, "ws_stream", "skipped (vendor-agnostic, tested once)", True, "n/a")
+        return
+
+    ws_url = api.replace("http://", "ws://").replace("https://", "wss://")
+    ws_url += "/pnm/us/spectrumAnalyzer/stream"
+
+    try:
+        import asyncio
+        import importlib
+        ws_mod = importlib.import_module("websockets")
+
+        async def _check():
+            async with ws_mod.connect(ws_url, open_timeout=5):
+                return True
+
+        connected = asyncio.run(_check())
+        record(vendor, "ws_stream", f"WS connect {ws_url}", connected, "")
+    except ImportError:
+        record(vendor, "ws_stream", "websockets package missing — skipped", True,
+               "pip install websockets to enable")
+    except Exception as e:
+        record(vendor, "ws_stream", f"WS connect {ws_url}", False, str(e))
+
+
 # ---------------------------------------------------------------------------
 # Test registry
 # ---------------------------------------------------------------------------
 
 ALL_TESTS = {
-    "health":   test_api_health,
-    "utsc":     test_utsc,
-    "rxmer":    test_rxmer,
-    "pre_eq":   test_pre_eq,
-    "bulk_dest": test_bulk_destination,
+    "health":      test_api_health,
+    "enrichment":  test_modem_enrichment,
+    "rf_port":     test_rf_port_discovery,
+    "ofdma_disc":  test_ofdma_discovery,
+    "ws_stream":   test_websocket_stream,
+    "utsc":        test_utsc,
+    "rxmer":       test_rxmer,
+    "pre_eq":      test_pre_eq,
+    "bulk_dest":   test_bulk_destination,
 }
 
 
