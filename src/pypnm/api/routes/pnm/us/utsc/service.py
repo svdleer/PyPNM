@@ -1121,8 +1121,24 @@ class CmtsUtscService:
                 if not activate_result.get('success'):
                     self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')} — attempting InitiateTest anyway")
                 else:
-                    await asyncio.sleep(0.2)
-                    self.logger.info("RowStatus set to active(1)")
+                    await asyncio.sleep(0.3)
+                    # Read back to confirm it stuck — Casa sometimes reverts silently
+                    readback = self._parse_get_value(
+                        await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
+                    )
+                    self.logger.info(f"RowStatus readback after activate: {readback}")
+                    try:
+                        rb_int = int(readback) if readback and 'No Such' not in str(readback) else None
+                        if rb_int is not None and rb_int != 1:
+                            self.logger.warning(f"RowStatus reverted to {rb_int} — trying notInService(2) then active(1)")
+                            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i')
+                            await asyncio.sleep(0.2)
+                            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
+                            await asyncio.sleep(0.2)
+                        else:
+                            self.logger.info("RowStatus confirmed active(1)")
+                    except (ValueError, TypeError):
+                        pass
 
             # Set InitiateTest to true (1)
             result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
