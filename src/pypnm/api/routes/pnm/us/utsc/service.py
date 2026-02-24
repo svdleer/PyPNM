@@ -767,29 +767,40 @@ class CmtsUtscService:
                 self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
                 output_format = 5
 
-            # Find the existing active row for this trigger_mode (probe indices 1-3).
-            # Casa/E6000 pre-provision rows with TriggerMode fixed per index.
-            # We must modify the correct row in-place — destroying it removes the
-            # DestinationIndex which Casa manages internally and won't let us re-set.
-            target_idx = cfg_index
-            for probe_idx in range(1, 4):
-                r = await self._snmp_get(
-                    f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
-                )
-                v = self._parse_get_value(r)
-                if v is not None and 'No Such' not in str(v):
-                    try:
-                        if int(v) == trigger_mode:
-                            target_idx = probe_idx
-                            self.logger.info(
-                                f"Found row with TriggerMode={trigger_mode} at cfg_index={probe_idx}"
-                            )
-                            break
-                    except (ValueError, TypeError):
-                        pass
+            if is_cisco:
+                # Cisco cBR-8: rows are NOT pre-provisioned per port.
+                # Must destroy existing row then createAndGo to create a fresh active row.
+                # Confirmed by test_utsc_cisco.py and operator SNMP scripts.
+                target_idx = cfg_index if cfg_index > 0 else 1
+                idx = f".{rf_port_ifindex}.{target_idx}"
+                self.logger.info(f"Cisco: destroy+createAndGo at cfg_index={target_idx}")
+                await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i')  # destroy
+                await asyncio.sleep(2)
+                r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 4, 'i')  # createAndGo
+                self.logger.info(f"Cisco createAndGo result: {r}")
+                await asyncio.sleep(1)
+            else:
+                # Casa/E6000: rows are pre-provisioned with TriggerMode fixed per index.
+                # Must modify in-place — destroying removes DestinationIndex managed by CMTS.
+                target_idx = cfg_index
+                for probe_idx in range(1, 4):
+                    r = await self._snmp_get(
+                        f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
+                    )
+                    v = self._parse_get_value(r)
+                    if v is not None and 'No Such' not in str(v):
+                        try:
+                            if int(v) == trigger_mode:
+                                target_idx = probe_idx
+                                self.logger.info(
+                                    f"Found row with TriggerMode={trigger_mode} at cfg_index={probe_idx}"
+                                )
+                                break
+                        except (ValueError, TypeError):
+                            pass
 
-            idx = f".{rf_port_ifindex}.{target_idx}"
-            self.logger.info(f"Writing columns in-place at cfg_index={target_idx} (no RowStatus touch)...")
+                idx = f".{rf_port_ifindex}.{target_idx}"
+                self.logger.info(f"Writing columns in-place at cfg_index={target_idx} (no RowStatus touch)...")
 
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
