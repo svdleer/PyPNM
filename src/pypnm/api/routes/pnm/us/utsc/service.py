@@ -874,18 +874,18 @@ class CmtsUtscService:
                     clamp_warnings.append(f"freerun_duration_ms clamped {orig_freerun} -> 120000 (Casa minimum 120s)")
                     freerun_duration_ms = 120000
 
+                # Casa absolute hard cap: freerun_duration <= 300000ms (5 min)
+                # syslog: utsc_freerun_param_check() freerun_duration > 300000 rejected
+                CASA_MAX_FREERUN_MS = 300000
+                if freerun_duration_ms > CASA_MAX_FREERUN_MS:
+                    clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {CASA_MAX_FREERUN_MS} (Casa hard max 300s)")
+                    freerun_duration_ms = CASA_MAX_FREERUN_MS
+
                 # files = freerun / repeat <= 300  →  repeat >= ceil(freerun / 300)
                 min_repeat_us = ((freerun_duration_ms + 299) // 300) * 1000
                 if repeat_period_us < min_repeat_us:
                     clamp_warnings.append(f"repeat_period_us raised {repeat_period_us} -> {min_repeat_us} (Casa max 300 files)")
                     repeat_period_us = min_repeat_us
-
-                # Clamp freerun down only if still > 300 files after repeat was raised
-                repeat_period_ms = repeat_period_us // 1000 or 1
-                max_freerun_ms = 300 * repeat_period_ms
-                if freerun_duration_ms > max_freerun_ms:
-                    clamp_warnings.append(f"freerun_duration_ms clamped {freerun_duration_ms} -> {max_freerun_ms} (Casa max 300 files)")
-                    freerun_duration_ms = max_freerun_ms
             else:
                 # CommScope/Arris E6000 and Cisco cBR-8
                 # PDF limits (E6000 Release 13.0 User Guide):
@@ -1114,31 +1114,10 @@ class CmtsUtscService:
                 row_status_int = None
 
             if row_status_int is not None and row_status_int != 1:  # not already active
-                self.logger.info(f"RowStatus={row_status_int} (not active) — setting active(1) before InitiateTest")
-                activate_result = await self._snmp_set(
-                    f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i'
-                )
-                if not activate_result.get('success'):
-                    self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')} — attempting InitiateTest anyway")
-                else:
-                    await asyncio.sleep(0.3)
-                    # Read back to confirm it stuck — Casa sometimes reverts silently
-                    readback = self._parse_get_value(
-                        await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
-                    )
-                    self.logger.info(f"RowStatus readback after activate: {readback}")
-                    try:
-                        rb_int = int(readback) if readback and 'No Such' not in str(readback) else None
-                        if rb_int is not None and rb_int != 1:
-                            self.logger.warning(f"RowStatus reverted to {rb_int} — trying notInService(2) then active(1)")
-                            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i')
-                            await asyncio.sleep(0.2)
-                            await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
-                            await asyncio.sleep(0.2)
-                        else:
-                            self.logger.info("RowStatus confirmed active(1)")
-                    except (ValueError, TypeError):
-                        pass
+                self.logger.info(f"RowStatus={row_status_int} — setting active(1) before InitiateTest")
+                await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
+                # Do NOT sleep or readback — Casa briefly accepts the transition.
+                # Firing InitiateTest immediately while row is in-flight works.
 
             # Set InitiateTest to true (1)
             result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
