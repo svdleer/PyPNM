@@ -774,6 +774,55 @@ class UsOfdmaRxMerRouter:
                 self.logger.error(f"fiberNode/plot error: {e}")
                 return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
 
+        @self.router.get(
+            "/channel/modems",
+            summary="List modems registered on an OFDMA upstream channel",
+        )
+        async def get_channel_modems(
+            cmts_ip: str,
+            ofdma_ifindex: int,
+            community: str = "public",
+            max_modems: int = 50,
+        ):
+            """
+            Walk docsIf3CmtsCmUsStatusTable to find all modems on a given
+            OFDMA upstream ifIndex.  Returns [{cm_mac_address, cm_index}].
+            """
+            service = CmtsUsOfdmaRxMerService(
+                cmts_ip=cmts_ip, community=community, write_community=community
+            )
+            try:
+                # Walk docsIf3CmtsCmUsStatusChIfIndex (1.3.6.1.4.1.4491.2.1.20.1.3.1.2)
+                # Table index is {cm_index}.{us_channel_index}
+                OID_CM_US_IFINDEX = "1.3.6.1.4.1.4491.2.1.20.1.3.1.2"
+                OID_CM_MAC        = "1.3.6.1.4.1.4491.2.1.20.1.3.2.1.27"
+                walk = await service._snmp_walk(OID_CM_US_IFINDEX)
+                # Collect cm_index values that match ofdma_ifindex
+                matching = set()
+                for oid, val in walk.items():
+                    try:
+                        ifidx = int(str(val).split()[-1])
+                        if ifidx == ofdma_ifindex:
+                            cm_idx = int(oid.split('.')[-2])
+                            matching.add(cm_idx)
+                    except (ValueError, IndexError):
+                        continue
+                modems = []
+                for cm_idx in list(matching)[:max_modems]:
+                    mac_result = await service._snmp_get(f"{OID_CM_MAC}.{cm_idx}")
+                    raw = service._parse_get_value(mac_result) or ""
+                    # raw is hex bytes like '90 32 4B C8 19 0B'
+                    parts = raw.replace("0x", "").split()
+                    if len(parts) == 6:
+                        mac = ":".join(p.lower().zfill(2) for p in parts)
+                        modems.append({"cm_mac_address": mac, "cm_index": cm_idx})
+                return {"success": True, "ofdma_ifindex": ofdma_ifindex, "modems": modems}
+            except Exception as e:
+                self.logger.error(f"channel/modems error: {e}")
+                return {"success": False, "error": str(e), "modems": []}
+            finally:
+                service.close()
+
 
 # Required for dynamic auto-registration
 router = UsOfdmaRxMerRouter().router
