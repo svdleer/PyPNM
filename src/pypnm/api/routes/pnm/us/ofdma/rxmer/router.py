@@ -793,9 +793,18 @@ class UsOfdmaRxMerRouter:
             try:
                 OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
                 walk = await service._snmp_walk(OID_IF_DESCR, timeout=30)
+                if not isinstance(walk, dict) or not walk.get('success'):
+                    return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "channels": [], "fiber_nodes": []}
+
+                # _snmp_walk returns {'success':True, 'result':{oid:val,...}, 'count':n}
+                oid_map = walk.get('result') or {}
+                if not isinstance(oid_map, dict):
+                    oid_map = {}
+
                 channels = []
-                for oid, raw_val in walk.items():
+                for oid, raw_val in oid_map.items():
                     desc = str(raw_val).strip().strip('"')
+                    # Cisco: "Cable1/0/0-upstream0"  NSN/E6000: "Upstream-channel xxx"
                     if not any(k in desc.lower() for k in ('upstream', 'ofdma')):
                         continue
                     try:
@@ -841,37 +850,55 @@ class UsOfdmaRxMerRouter:
             max_modems: int = 50,
         ):
             """
-            Walk docsIf3CmtsCmUsStatusTable to find all modems on a given
-            OFDMA upstream ifIndex.  Returns [{cm_mac_address, cm_index}].
+            Walk docsIf3CmtsCmUsStatusTable (.1) to find all CMs on a given
+            OFDMA upstream ifIndex, then get their MAC from
+            docsIf3CmtsCmRegStatusMacAddr (.3).
+            Returns [{cm_mac_address, cm_index}].
             """
             service = CmtsUsOfdmaRxMerService(
                 cmts_ip=cmts_ip, community=community, write_community=community
             )
             try:
-                # Walk docsIf3CmtsCmUsStatusChIfIndex (1.3.6.1.4.1.4491.2.1.20.1.3.1.2)
-                # Table index is {cm_index}.{us_channel_index}
-                OID_CM_US_IFINDEX = "1.3.6.1.4.1.4491.2.1.20.1.3.1.2"
-                OID_CM_MAC        = "1.3.6.1.4.1.4491.2.1.20.1.3.2.1.27"
+                # docsIf3CmtsCmUsStatusChIfIndex  1.3.6.1.4.1.4491.2.1.20.1.3.2.1.1
+                # index: {cm_index}.{us_channel_index}  value: ifIndex of US channel
+                OID_CM_US_IFINDEX = "1.3.6.1.4.1.4491.2.1.20.1.3.2.1.1"
+                # docsIf3CmtsCmRegStatusMacAddr   1.3.6.1.4.1.4491.2.1.20.1.3.1.1.3
+                # index: {cm_index}  value: MAC as 6 hex octets
+                OID_CM_REG_MAC    = "1.3.6.1.4.1.4491.2.1.20.1.3.1.1.3"
+
                 walk = await service._snmp_walk(OID_CM_US_IFINDEX)
-                # Collect cm_index values that match ofdma_ifindex
-                matching = set()
-                for oid, val in walk.items():
+                if not isinstance(walk, dict) or not walk.get('success'):
+                    return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "modems": []}
+
+                # _snmp_walk returns {'success':True, 'result':{oid:val,...}, 'count':n}
+                oid_map = walk.get('result') or {}
+                if not isinstance(oid_map, dict):
+                    oid_map = {}
+
+                matching_cm_idx: set = set()
+                for oid, val in oid_map.items():
                     try:
                         ifidx = int(str(val).split()[-1])
                         if ifidx == ofdma_ifindex:
-                            cm_idx = int(oid.split('.')[-2])
-                            matching.add(cm_idx)
+                            # index ends with {cm_index}.{channel_index}
+                            parts = str(oid).rstrip('.').split('.')
+                            cm_idx = int(parts[-2])
+                            matching_cm_idx.add(cm_idx)
                     except (ValueError, IndexError):
                         continue
+
                 modems = []
-                for cm_idx in list(matching)[:max_modems]:
-                    mac_result = await service._snmp_get(f"{OID_CM_MAC}.{cm_idx}")
+                for cm_idx in list(matching_cm_idx)[:max_modems]:
+                    mac_result = await service._snmp_get(f"{OID_CM_REG_MAC}.{cm_idx}")
+                    if not mac_result.get('success'):
+                        continue
                     raw = service._parse_get_value(mac_result) or ""
-                    # raw is hex bytes like '90 32 4B C8 19 0B'
-                    parts = raw.replace("0x", "").split()
+                    # raw is hex bytes like 'D4 6A 6A FD 00 B3'
+                    parts = raw.replace("0x", "").strip().split()
                     if len(parts) == 6:
                         mac = ":".join(p.lower().zfill(2) for p in parts)
                         modems.append({"cm_mac_address": mac, "cm_index": cm_idx})
+
                 return {"success": True, "ofdma_ifindex": ofdma_ifindex, "modems": modems}
             except Exception as e:
                 self.logger.error(f"channel/modems error: {e}")
