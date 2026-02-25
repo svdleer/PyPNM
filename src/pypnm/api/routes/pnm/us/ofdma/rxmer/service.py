@@ -731,6 +731,12 @@ class CmtsUsOfdmaRxMerService:
                                     existing_ip = self._parse_ip_from_octetstring(ip_value)
                                     if existing_ip == tftp_ip:
                                         self.logger.info(f"Found existing TFTP destination at index {idx}")
+                                        # Ensure BaseUri and Protocol are set correctly on the reused row
+                                        try:
+                                            await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{idx}", f"tftp://{tftp_ip}/", 's')
+                                            await self._snmp_set(f"{self.OID_BULK_CFG_PROTOCOL}.{idx}", 1, 'i')
+                                        except Exception:
+                                            pass
                                         return {
                                             "success": True,
                                             "destination_index": idx,
@@ -766,10 +772,15 @@ class CmtsUsOfdmaRxMerService:
             # IP address (4-byte OctetString, e.g. "ac100884")
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
 
-            # Only set BaseUri for Cisco cBR-8, skip for Arris/CommScope
-            if hasattr(self, 'cmts_vendor') and self.cmts_vendor and self.cmts_vendor.lower() == 'cisco':
-                base_uri = f"tftp://{tftp_ip}/"
-                await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", base_uri, 's')
+            # BaseUri — required by all vendors (Cisco, E6000/CommScope, Casa)
+            base_uri = f"tftp://{tftp_ip}/"
+            await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", base_uri, 's')
+
+            # Protocol = tftp(1) — required by E6000/CommScope; harmless on Cisco/Casa
+            try:
+                await self._snmp_set(f"{self.OID_BULK_CFG_PROTOCOL}.{dest_index}", 1, 'i')
+            except Exception:
+                pass  # OID may be notWritable on Cisco — not fatal
             
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             
