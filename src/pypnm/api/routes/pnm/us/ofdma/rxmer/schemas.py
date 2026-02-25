@@ -10,7 +10,7 @@ measurements as defined in DOCS-PNM-MIB (docsPnmCmtsUsOfdmaRxMerTable).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -32,8 +32,9 @@ class UsOfdmaRxMerDiscoverResponse(BaseModel):
     success: bool
     cm_mac_address: str
     cm_index: Optional[int] = None
-    ofdma_ifindex: Optional[int] = None
+    ofdma_ifindex: Optional[int] = None          # legacy single-channel field
     ofdma_description: Optional[str] = None
+    ofdma_channels: List[Dict[str, Any]] = []    # all active OFDMA channels [{ifindex, description}]
     error: Optional[str] = None
 
 
