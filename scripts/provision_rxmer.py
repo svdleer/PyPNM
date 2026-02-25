@@ -200,9 +200,9 @@ def configure_bdt_e6000(row: int):
     """E6000 BDT: docsPnmBulkDataTransferCfgTable."""
     step(f"BDT row {row} — E6000 (docsPnmBulkDataTransferCfgTable) — TFTP {TFTP_IP}")
     fields = [
-        (f"{OID_BDT_E6000}.3.{row}", "i", 1,        "DestHostIpAddrType = ipv4(1)"),
-        (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX,  f"DestHostIpAddress  = {TFTP_IP}"),
-        (f"{OID_BDT_E6000}.7.{row}", "i", 1,        "Protocol          = tftp(1)"),
+        (f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO, "RowStatus         = createAndGo(4)"),
+        (f"{OID_BDT_E6000}.3.{row}", "i", 1,                "DestHostIpAddrType = ipv4(1)"),
+        (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX,          f"DestHostIpAddress  = {TFTP_IP}"),
     ]
     for oid, t, v, desc in fields:
         print(f"  {desc}")
