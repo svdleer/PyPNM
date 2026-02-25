@@ -202,7 +202,6 @@ def configure_bdt_e6000(row: int):
     fields = [
         (f"{OID_BDT_E6000}.3.{row}", "i", 1,        "DestHostIpAddrType = ipv4(1)"),
         (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX,  f"DestHostIpAddress  = {TFTP_IP}"),
-        (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{TFTP_IP}/", f"DestBaseUri        = tftp://{TFTP_IP}/"),
         (f"{OID_BDT_E6000}.7.{row}", "i", 1,        "Protocol          = tftp(1)"),
     ]
     for oid, t, v, desc in fields:
