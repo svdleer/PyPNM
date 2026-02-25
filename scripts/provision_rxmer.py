@@ -58,7 +58,6 @@ TFTP_PATH  = "./"
 
 # RxMER parameters
 BDT_ROW       = 1
-FILENAME      = "us_rxmer"
 PRE_EQ        = 1    # 1=true (include pre-equalizer coefficients)
 NUM_AVGS      = 1    # number of averages
 
@@ -263,7 +262,6 @@ def configure_rxmer(ofdma_idx: int, cm_mac: str, dest_index: int, vendor: str):
 
     params = [
         (f"{OID_RXMER_CM_MAC}{idx}",  "x", mac_hex,     f"CmMac            = {cm_mac}"),
-        (f"{OID_RXMER_FILE}{idx}",    "s", FILENAME,     f"FileName         = {FILENAME}"),
         (f"{OID_RXMER_PRE_EQ}{idx}",  "i", PRE_EQ,       f"PreEq            = {PRE_EQ} (1=with pre-eq)"),
         (f"{OID_RXMER_AVGS}{idx}",    "u", NUM_AVGS,      f"NumAvgs          = {NUM_AVGS}"),
     ]
