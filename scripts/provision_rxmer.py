@@ -283,6 +283,13 @@ def configure_rxmer(ofdma_idx: int, cm_mac: str, dest_index: int, vendor: str):
         time.sleep(0.05)
 
     step(f"Enable=1  (trigger)  ofdma_ifindex={ofdma_idx}")
+    # If a previous measurement is still running, stop it first
+    raw = snmpget(f"{OID_RXMER_STATUS}.{ofdma_idx}")
+    s = val(raw)
+    if s == 3:  # busy
+        print(f"  MeasStatus=busy — sending Enable=2 to stop previous measurement")
+        snmpset(f"{OID_RXMER_ENABLE}.{ofdma_idx}", "i", 2)
+        time.sleep(2)
     r = snmpset(f"{OID_RXMER_ENABLE}{idx}", "i", 1)
     print(f"  {r}")
 
