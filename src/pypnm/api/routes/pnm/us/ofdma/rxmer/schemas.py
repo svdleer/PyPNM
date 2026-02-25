@@ -170,4 +170,5 @@ class UsOfdmaRxMerCaptureResponse(BaseModel):
     rxmer_max_db: Optional[float] = None
     rxmer_std_db: Optional[float] = None
     values: Optional[list[float]] = None
+    frequencies_mhz: Optional[list[float]] = None
     error: Optional[str] = None

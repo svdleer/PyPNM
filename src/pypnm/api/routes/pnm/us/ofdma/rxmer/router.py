@@ -320,6 +320,80 @@ class UsOfdmaRxMerRouter:
                     error=str(e)
                 )
 
+        @self.router.post(
+            "/getData",
+            summary="Get parsed US OFDMA RxMER capture as JSON",
+            response_model=UsOfdmaRxMerCaptureResponse,
+        )
+        async def get_data(
+            request: UsOfdmaRxMerCaptureRequest
+        ) -> UsOfdmaRxMerCaptureResponse:
+            """
+            Parse a US OFDMA RxMER capture file and return raw data as JSON.
+            Same file resolution logic as /getCapture, but returns parsed values instead of PNG.
+            """
+            from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
+            import glob
+
+            tftp_dir = Path(request.tftp_path)
+            filename = request.filename.lstrip('/')
+            filepath = tftp_dir / filename
+
+            if not filepath.exists():
+                basename = Path(filename).name
+                for pattern in [
+                    str(tftp_dir / f"{filename}_*"),
+                    str(tftp_dir / "**" / basename),
+                    str(tftp_dir / "**" / f"{basename}_*"),
+                ]:
+                    matching_files = sorted(glob.glob(pattern, recursive=True), reverse=True)
+                    if matching_files:
+                        filepath = Path(matching_files[0])
+                        break
+                else:
+                    return UsOfdmaRxMerCaptureResponse(
+                        success=False,
+                        error=f"File not found: {tftp_dir / Path(filename).name}"
+                    )
+
+            try:
+                data = filepath.read_bytes()
+                parser = CmtsUsOfdmaRxMer(data)
+                model = parser.to_model()
+
+                values = model.values
+                spacing_khz = model.subcarrier_spacing / 1000
+                zero_freq_mhz = model.subcarrier_zero_frequency / 1e6
+                first_idx = model.first_active_subcarrier_index
+                freqs_mhz = [
+                    round(zero_freq_mhz + (first_idx + i) * spacing_khz / 1000, 4)
+                    for i in range(len(values))
+                ]
+
+                stats = model.signal_statistics
+                valid = [v for v in values if v < 63.5]
+
+                return UsOfdmaRxMerCaptureResponse(
+                    success=True,
+                    cm_mac_address=model.cm_mac_address,
+                    ccap_id=model.ccap_id,
+                    num_active_subcarriers=model.num_active_subcarriers,
+                    first_active_subcarrier_index=model.first_active_subcarrier_index,
+                    subcarrier_zero_frequency_hz=model.subcarrier_zero_frequency,
+                    subcarrier_spacing_hz=model.subcarrier_spacing,
+                    num_averages=getattr(model, 'num_averages', None),
+                    preeq_enabled=model.preeq_enabled,
+                    rxmer_min_db=round(min(valid), 2) if valid else None,
+                    rxmer_avg_db=round(stats.mean, 2),
+                    rxmer_max_db=round(max(valid), 2) if valid else None,
+                    rxmer_std_db=round(stats.std, 2) if hasattr(stats, 'std') else None,
+                    values=[round(v, 2) for v in values],
+                    frequencies_mhz=freqs_mhz,
+                )
+            except Exception as e:
+                self.logger.error(f"Error parsing US RxMER file for getData: {e}")
+                return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
+
 
 # Required for dynamic auto-registration
 router = UsOfdmaRxMerRouter().router
