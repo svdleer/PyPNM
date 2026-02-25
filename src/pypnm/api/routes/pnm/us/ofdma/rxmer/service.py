@@ -344,43 +344,44 @@ class CmtsUsOfdmaRxMerService:
             self.logger.error(f"Error discovering CM index: {e}")
             return None
     
-    async def discover_ofdma_ifindex(self, cm_index: int) -> Optional[int]:
+    async def discover_ofdma_ifindex(self, cm_index: int) -> list[int]:
         """
-        Find OFDMA channel ifIndex for a cable modem.
-        
+        Find all active OFDMA channel ifIndexes for a cable modem.
+
         Uses vendor-agnostic detection: checks timing offset value from
         docsIf31CmtsCmUsOfdmaChannelTimingOffset table. A non-zero value
         indicates an active OFDMA channel regardless of vendor.
-        
+
         This works for all DOCSIS 3.1 CMTS vendors:
         - Cisco cBR-8: ifIndexes ~488334 (timing offset > 0 when active)
         - CommScope E6000: ifIndexes ~843087xxx (timing offset > 0 when active)
         - Casa CMTS: Similar to CommScope
-        
+
         Args:
             cm_index: CM registration index
-            
+
         Returns:
-            OFDMA channel ifIndex or None
+            List of active OFDMA channel ifIndexes (may be empty)
         """
-        self.logger.info(f"Looking for OFDMA channel for CM index {cm_index}")
-        
+        self.logger.info(f"Looking for OFDMA channels for CM index {cm_index}")
+
         try:
             result = await self._snmp_walk(self.OID_CM_OFDMA_STATUS, timeout=60)
-            
+
             if not result.get('success') or not result.get('results'):
                 self.logger.warning("No OFDMA status entries found on CMTS")
-                return None
-            
+                return []
+
             # OID format: <base>.<cmIndex>.<ofdmaIfIndex>
             # Parse suffix relative to base to avoid false matches on small
             # cm_index values (e.g. 1) appearing in the base OID prefix itself.
             base = self.OID_CM_OFDMA_STATUS.rstrip(".")
-            
+            found: list[int] = []
+
             for entry in result['results']:
                 oid_str = str(entry.get('oid', ''))
                 value = str(entry.get('value', ''))
-                
+
                 # Strip base prefix to get the suffix: <cmIndex>.<ofdmaIfIndex>
                 if oid_str.startswith(base + "."):
                     suffix = oid_str[len(base) + 1:]  # e.g. "1.843087877"
@@ -391,16 +392,17 @@ class CmtsUsOfdmaRxMerService:
                             timing_offset = int(value)
                             if timing_offset > 0:
                                 self.logger.info(f"Found OFDMA ifIndex: {ofdma_ifindex} (timing offset: {timing_offset})")
-                                return ofdma_ifindex
+                                found.append(ofdma_ifindex)
                         except (ValueError, TypeError):
                             pass
-            
-            self.logger.warning(f"No OFDMA channel found for CM index {cm_index}")
-            return None
-            
+
+            if not found:
+                self.logger.warning(f"No OFDMA channels found for CM index {cm_index}")
+            return found
+
         except Exception as e:
             self.logger.error(f"Error discovering OFDMA ifIndex: {e}")
-            return None
+            return []
     
     async def discover_modem_ofdma(self, cm_mac: str) -> dict[str, Any]:
         """
@@ -415,32 +417,37 @@ class CmtsUsOfdmaRxMerService:
         cm_index = await self.discover_cm_index(cm_mac)
         if not cm_index:
             return {"success": False, "error": "CM not found on CMTS", "cm_mac_address": cm_mac}
-        
-        ofdma_ifindex = await self.discover_ofdma_ifindex(cm_index)
-        if not ofdma_ifindex:
+
+        ofdma_ifindexes = await self.discover_ofdma_ifindex(cm_index)
+        if not ofdma_ifindexes:
             return {
                 "success": False,
                 "error": "No OFDMA channel for this modem",
                 "cm_mac_address": cm_mac,
                 "cm_index": cm_index
             }
-        
-        # Get OFDMA channel description
-        description = None
-        try:
-            result = await self._snmp_get(f"{self.OID_IF_DESCR}.{ofdma_ifindex}")
-            value = self._parse_get_value(result)
-            if value:
-                description = value
-        except Exception:
-            pass
-        
+
+        # Resolve description for each channel
+        ofdma_channels = []
+        for ifindex in ofdma_ifindexes:
+            description = None
+            try:
+                result = await self._snmp_get(f"{self.OID_IF_DESCR}.{ifindex}")
+                value = self._parse_get_value(result)
+                if value:
+                    description = value
+            except Exception:
+                pass
+            ofdma_channels.append({"ifindex": ifindex, "description": description})
+
         return {
             "success": True,
             "cm_mac_address": cm_mac,
             "cm_index": cm_index,
-            "ofdma_ifindex": ofdma_ifindex,
-            "ofdma_description": description
+            # keep legacy single-value field for backwards compat
+            "ofdma_ifindex": ofdma_channels[0]["ifindex"],
+            "ofdma_description": ofdma_channels[0]["description"],
+            "ofdma_channels": ofdma_channels,
         }
     
     # ============================================
