@@ -775,6 +775,62 @@ class UsOfdmaRxMerRouter:
                 return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
 
         @self.router.get(
+            "/channel/list",
+            summary="List all OFDMA upstream channels on a CMTS",
+        )
+        async def get_channel_list(
+            cmts_ip: str,
+            community: str = "public",
+        ):
+            """
+            Walk ifDescr via SNMP and return all OFDMA upstream interfaces,
+            grouped by MAC domain as suggested fiber nodes.
+            """
+            import re as _re
+            service = CmtsUsOfdmaRxMerService(
+                cmts_ip=cmts_ip, community=community, write_community=community
+            )
+            try:
+                OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
+                walk = await service._snmp_walk(OID_IF_DESCR, timeout=30)
+                channels = []
+                for oid, raw_val in walk.items():
+                    desc = str(raw_val).strip().strip('"')
+                    if not any(k in desc.lower() for k in ('upstream', 'ofdma')):
+                        continue
+                    try:
+                        ifindex = int(str(oid).rsplit('.', 1)[-1])
+                    except ValueError:
+                        continue
+                    mac_domain   = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
+                    suggested_fn = "FN-" + mac_domain.replace('/', '-').replace(' ', '-')
+                    channels.append({
+                        "ifindex":      ifindex,
+                        "description":  desc,
+                        "mac_domain":   mac_domain,
+                        "suggested_fn": suggested_fn,
+                    })
+
+                channels.sort(key=lambda c: c['description'])
+                seen: dict = {}
+                for ch in channels:
+                    md = ch['mac_domain']
+                    if md not in seen:
+                        seen[md] = {"name": ch['suggested_fn'], "mac_domain": md, "channels": []}
+                    seen[md]['channels'].append({"ifindex": ch['ifindex'], "description": ch['description']})
+
+                return {
+                    "success":     True,
+                    "channels":    channels,
+                    "fiber_nodes": sorted(seen.values(), key=lambda f: f['mac_domain']),
+                }
+            except Exception as e:
+                self.logger.error(f"channel/list error: {e}")
+                return {"success": False, "error": str(e), "channels": [], "fiber_nodes": []}
+            finally:
+                service.close()
+
+        @self.router.get(
             "/channel/modems",
             summary="List modems registered on an OFDMA upstream channel",
         )
