@@ -202,14 +202,18 @@ class UsOfdmaRxMerRouter:
             
             # Build file path - CMTS adds timestamp, so use glob to find latest
             tftp_dir = Path(request.tftp_path)
-            
+
+            # Strip leading '/' — Cisco/E6000 SNMP returns e.g. /pnm/mer/usrxmer_xxx
+            # which Python's Path join treats as absolute, discarding tftp_dir entirely.
+            filename = request.filename.lstrip('/')
+
             # First try exact filename
-            filepath = tftp_dir / request.filename
+            filepath = tftp_dir / filename
             
             if not filepath.exists():
                 # CMTS adds timestamp like: usrxmer_9c305bf81daf_2026-01-28_19.42.35.123
                 # Try to find the file with glob pattern
-                pattern = str(tftp_dir / f"{request.filename}_*")
+                pattern = str(tftp_dir / f"{filename}_*")
                 matching_files = sorted(glob.glob(pattern), reverse=True)
                 
                 if matching_files:
