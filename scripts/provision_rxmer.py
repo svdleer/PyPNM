@@ -133,8 +133,8 @@ def snmpget(oid: str) -> str:
     return _run(f"snmpget -v2c -c {SNMP_READ} -Ov {CMTS_IP} {oid}")
 
 
-def snmpset(oid: str, t: str, v, silent: bool = False) -> str:
-    return _run(f"snmpset -v2c -c {SNMP_WRITE} {CMTS_IP} {oid} {t} {v}", silent=silent)
+def snmpset(oid: str, t: str, v) -> str:
+    return _run(f"snmpset -v2c -c {SNMP_WRITE} {CMTS_IP} {oid} {t} {v}")
 
 
 def val(raw: str) -> int:
