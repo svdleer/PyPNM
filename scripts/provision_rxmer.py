@@ -202,10 +202,15 @@ def configure_bdt_cisco(row: int):
 def configure_bdt_e6000(row: int):
     """E6000 BDT: docsPnmBulkDataTransferCfgTable."""
     step(f"BDT row {row} — E6000 (docsPnmBulkDataTransferCfgTable) — TFTP {TFTP_IP}")
+    # Try createAndGo; if row already exists (inconsistentValue) skip RowStatus and just update IP
+    rs_raw = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
+    if "inconsistentValue" in rs_raw or "Error" in rs_raw:
+        print(f"  RowStatus row {row} already exists — updating existing row")
+    else:
+        print(f"  RowStatus         = createAndGo(4)  {rs_raw}")
     fields = [
-        (f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO, "RowStatus         = createAndGo(4)"),
-        (f"{OID_BDT_E6000}.3.{row}", "i", 1,                "DestHostIpAddrType = ipv4(1)"),
-        (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX,          f"DestHostIpAddress  = {TFTP_IP}"),
+        (f"{OID_BDT_E6000}.3.{row}", "i", 1,       "DestHostIpAddrType = ipv4(1)"),
+        (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX, f"DestHostIpAddress  = {TFTP_IP}"),
     ]
     for oid, t, v, desc in fields:
         print(f"  {desc}")
