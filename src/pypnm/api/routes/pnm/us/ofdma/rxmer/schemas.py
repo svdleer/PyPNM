@@ -153,10 +153,115 @@ class UsOfdmaRxMerCaptureRequest(BaseModel):
     tftp_path: str = Field(default="/var/lib/tftpboot", description="Local TFTP root path")
 
 
+class UsOfdmaRxMerComparisonRequest(BaseModel):
+    """Request to compare pre-eq ON vs OFF captures (convenience wrapper around FiberNodeAnalysisRequest)."""
+    filename_preeq_on: str = Field(..., description="Filename of the pre-eq ON capture")
+    filename_preeq_off: str = Field(..., description="Filename of the pre-eq OFF capture")
+    tftp_path: str = Field(default="/var/lib/tftpboot", description="Local TFTP root path")
+
+
+# ============================================================
+# Unified Fiber Node Analysis model
+# ============================================================
+
+class RxMerCapture(BaseModel):
+    """Parsed RxMER data for one modem/capture."""
+    cm_mac_address: str
+    preeq_enabled: bool
+    filename: Optional[str] = None
+    values: List[float] = []
+    frequencies_mhz: List[float] = []
+    rxmer_avg_db: Optional[float] = None
+    rxmer_min_db: Optional[float] = None
+    rxmer_max_db: Optional[float] = None
+    rxmer_std_db: Optional[float] = None
+
+
+class SubcarrierGroupStats(BaseModel):
+    """Per-subcarrier statistics across all captures in a fiber node group."""
+    frequency_mhz: float
+    index: int
+    values_db: List[float] = Field(default=[], description="RxMER dB per capture (same order as captures[])")
+    mean_db: float
+    std_db: float
+    min_db: float
+    max_db: float
+    p10_db: float
+    p90_db: float
+    outlier_macs: List[str] = Field(default=[], description="MACs where value is >2σ below group mean")
+
+
+class ModemAssessment(BaseModel):
+    """Per-modem assessment within a fiber node analysis."""
+    cm_mac_address: str
+    preeq_enabled: Optional[bool] = None
+    rxmer_avg_db: float
+    delta_from_group_avg_db: float = Field(description="This modem avg minus group avg (negative = worse)")
+    unique_bad_subcarriers: int = Field(description="Subcarriers bad on THIS modem but <50% of others")
+    shared_bad_subcarriers: int = Field(description="Subcarriers bad on >50% of all modems (network)")
+    outlier_score: float = Field(description="0.0–1.0 — fraction of subcarriers where this modem is an outlier")
+    assessment: str = Field(description="'in-home' | 'network' | 'clean' | 'outlier' | 'inconclusive'")
+    # Pre-eq comparison (populated when preeq ON+OFF exist for same MAC)
+    preeq_delta_avg_db: Optional[float] = Field(default=None, description="Mean(pre_eq_on) − Mean(pre_eq_off)")
+    preeq_num_improved: Optional[int] = Field(default=None, description="Subcarriers improved by pre-eq")
+    preeq_assessment: Optional[str] = Field(default=None, description="'in-home' | 'network' | 'clean' | 'inconclusive'")
+
+
+class FiberNodeSummary(BaseModel):
+    """Aggregate summary of a fiber node group analysis."""
+    num_captures: int
+    num_modems: int
+    group_avg_db: float
+    group_std_db: float
+    pct_network_impaired: float = Field(description="% of subcarriers bad on >50% of modems")
+    network_impaired_frequencies_mhz: List[float] = []
+    pct_modems_in_home: float = Field(description="% of modems with in-home impairment")
+    worst_modem_mac: Optional[str] = None
+    worst_modem_delta_db: Optional[float] = None
+
+
+class FiberNodeAnalysis(BaseModel):
+    """
+    Unified fiber node RxMER analysis — covers single-modem pre-eq comparison
+    and multi-modem group analysis with the same response shape.
+    """
+    success: bool
+    captures: List[RxMerCapture] = []
+    subcarrier_stats: List[SubcarrierGroupStats] = []
+    modem_assessments: List[ModemAssessment] = []
+    summary: Optional[FiberNodeSummary] = None
+    error: Optional[str] = None
+
+
+class FiberNodeCaptureEntry(BaseModel):
+    """One capture entry for a fiber node analysis request."""
+    cm_mac_address: str
+    filename: str
+    preeq_enabled: bool = Field(default=True)
+
+
+class FiberNodeAnalysisRequest(BaseModel):
+    """
+    Request a fiber node RxMER group analysis.
+
+    Provide one entry per capture file. The engine will:
+    - Group entries by cm_mac_address
+    - Compute per-subcarrier statistics across all captures
+    - Assess each modem (in-home / network / clean / outlier)
+    - If a modem has both preeq_enabled=True and preeq_enabled=False captures,
+      compute pre-eq delta and preeq_assessment automatically.
+    """
+    captures: List[FiberNodeCaptureEntry] = Field(..., min_length=1)
+    tftp_path: str = Field(default="/var/lib/tftpboot")
+    ofdma_ifindex: Optional[int] = None
+    cmts_ip: Optional[str] = None
+
+
 class UsOfdmaRxMerCaptureResponse(BaseModel):
     """Response with parsed US OFDMA RxMER data."""
     success: bool
     cm_mac_address: Optional[str] = None
+    filename: Optional[str] = None
     ccap_id: Optional[str] = None
     num_active_subcarriers: Optional[int] = None
     first_active_subcarrier_index: Optional[int] = None

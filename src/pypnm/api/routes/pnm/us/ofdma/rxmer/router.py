@@ -39,6 +39,14 @@ from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerStatusResponse,
     UsOfdmaRxMerCaptureRequest,
     UsOfdmaRxMerCaptureResponse,
+    UsOfdmaRxMerComparisonRequest,
+    FiberNodeAnalysisRequest,
+    FiberNodeAnalysis,
+    FiberNodeCaptureEntry,
+    RxMerCapture,
+    SubcarrierGroupStats,
+    ModemAssessment,
+    FiberNodeSummary,
 )
 from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 
@@ -376,6 +384,7 @@ class UsOfdmaRxMerRouter:
                 return UsOfdmaRxMerCaptureResponse(
                     success=True,
                     cm_mac_address=model.cm_mac_address,
+                    filename=str(filepath.name),
                     ccap_id=model.ccap_id,
                     num_active_subcarriers=model.num_active_subcarriers,
                     first_active_subcarrier_index=model.first_active_subcarrier_index,
@@ -392,6 +401,377 @@ class UsOfdmaRxMerRouter:
                 )
             except Exception as e:
                 self.logger.error(f"Error parsing US RxMER file for getData: {e}")
+                return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
+
+        # ------------------------------------------------------------------
+        # Shared analysis engine (used by all comparison + fiber node routes)
+        # ------------------------------------------------------------------
+
+        def _load_rxmer_capture(filename: str, tftp_path: str, preeq_enabled: bool, cm_mac: str = None) -> RxMerCapture:
+            """Parse one RxMER file into a RxMerCapture model."""
+            from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
+            import glob, statistics as _stat
+
+            tftp_dir = Path(tftp_path)
+            fn = filename.lstrip('/')
+            fp = tftp_dir / fn
+            if not fp.exists():
+                basename = Path(fn).name
+                for pat in [
+                    str(tftp_dir / f"{fn}_*"),
+                    str(tftp_dir / "**" / basename),
+                    str(tftp_dir / "**" / f"{basename}_*"),
+                ]:
+                    matches = sorted(glob.glob(pat, recursive=True), reverse=True)
+                    if matches:
+                        fp = Path(matches[0])
+                        break
+                else:
+                    raise FileNotFoundError(f"File not found: {Path(fn).name}")
+
+            model = CmtsUsOfdmaRxMer(fp.read_bytes()).to_model()
+            vals = model.values
+            spacing_khz = model.subcarrier_spacing / 1000
+            zero_mhz = model.subcarrier_zero_frequency / 1e6
+            first_idx = model.first_active_subcarrier_index
+            freqs = [round(zero_mhz + (first_idx + i) * spacing_khz / 1000, 4) for i in range(len(vals))]
+            valid = [v for v in vals if v < 63.5]
+            stats = model.signal_statistics
+            std = round(_stat.stdev(valid), 2) if len(valid) > 1 else 0.0
+            return RxMerCapture(
+                cm_mac_address=cm_mac or model.cm_mac_address,
+                preeq_enabled=preeq_enabled,
+                filename=str(fp.name),
+                values=[round(v, 2) for v in vals],
+                frequencies_mhz=freqs,
+                rxmer_avg_db=round(stats.mean, 2),
+                rxmer_min_db=round(min(valid), 2) if valid else None,
+                rxmer_max_db=round(max(valid), 2) if valid else None,
+                rxmer_std_db=std,
+            )
+
+        def _analyze(captures: list) -> FiberNodeAnalysis:
+            """
+            Core analysis engine — works for any number of captures.
+            Groups by MAC for pre-eq pairing; aligns subcarriers; computes
+            per-subcarrier group stats and per-modem assessments.
+            """
+            import statistics as _stat
+
+            if not captures:
+                return FiberNodeAnalysis(success=False, error="No captures provided")
+
+            # Align all captures to shortest subcarrier count
+            n = min(len(c.values) for c in captures)
+            freqs = captures[0].frequencies_mhz[:n]
+
+            # Per-subcarrier group stats (exclude 0xff = 63.75 markers)
+            subcarrier_stats: list[SubcarrierGroupStats] = []
+            for i in range(n):
+                sc_vals = [c.values[i] for c in captures if c.values[i] < 63.5]
+                if not sc_vals:
+                    sc_vals = [0.0]
+                mean = round(_stat.mean(sc_vals), 2)
+                std  = round(_stat.stdev(sc_vals), 2) if len(sc_vals) > 1 else 0.0
+                sorted_v = sorted(sc_vals)
+                p10 = round(sorted_v[max(0, int(len(sorted_v) * 0.10))], 2)
+                p90 = round(sorted_v[min(len(sorted_v) - 1, int(len(sorted_v) * 0.90))], 2)
+                outlier_macs = [
+                    c.cm_mac_address for c in captures
+                    if c.values[i] < 63.5 and c.values[i] < mean - 2 * std
+                ]
+                subcarrier_stats.append(SubcarrierGroupStats(
+                    frequency_mhz=freqs[i] if i < len(freqs) else i,
+                    index=i,
+                    values_db=[round(c.values[i], 2) for c in captures],
+                    mean_db=mean, std_db=std,
+                    min_db=round(min(sc_vals), 2), max_db=round(max(sc_vals), 2),
+                    p10_db=p10, p90_db=p90,
+                    outlier_macs=outlier_macs,
+                ))
+
+            # Group captures by MAC for pre-eq pairing
+            by_mac: dict[str, list] = {}
+            for c in captures:
+                by_mac.setdefault(c.cm_mac_address, []).append(c)
+
+            # Global group average across all captures
+            all_avgs = [c.rxmer_avg_db for c in captures if c.rxmer_avg_db is not None]
+            group_avg = round(_stat.mean(all_avgs), 2) if all_avgs else 0.0
+            group_std = round(_stat.stdev(all_avgs), 2) if len(all_avgs) > 1 else 0.0
+
+            # Subcarriers bad on >50% of all captures
+            num_caps = len(captures)
+            shared_bad_idxs = {
+                i for i, ss in enumerate(subcarrier_stats)
+                if len(ss.outlier_macs) > num_caps * 0.5
+            }
+            network_freqs = [subcarrier_stats[i].frequency_mhz for i in shared_bad_idxs]
+
+            modem_assessments: list[ModemAssessment] = []
+            for mac, mac_captures in by_mac.items():
+                # Split by pre-eq flag
+                on_list  = [c for c in mac_captures if c.preeq_enabled]
+                off_list = [c for c in mac_captures if not c.preeq_enabled]
+                # Representative capture: prefer preeq_on, else first
+                rep = on_list[0] if on_list else mac_captures[0]
+
+                mac_avg = rep.rxmer_avg_db or 0.0
+                delta_from_group = round(mac_avg - group_avg, 2)
+
+                # How many subcarriers is this MAC an outlier on?
+                mac_outlier_count = sum(1 for ss in subcarrier_stats if mac in ss.outlier_macs)
+                outlier_score = round(mac_outlier_count / n, 3) if n > 0 else 0.0
+
+                # Unique vs shared bad subcarriers
+                mac_bad_idxs = {i for i, ss in enumerate(subcarrier_stats) if mac in ss.outlier_macs}
+                unique_bad = len(mac_bad_idxs - shared_bad_idxs)
+                shared_bad = len(mac_bad_idxs & shared_bad_idxs)
+
+                # Multi-modem group assessment
+                if num_caps > 1:
+                    if unique_bad > shared_bad and outlier_score > 0.15:
+                        assessment = "in-home"
+                    elif len(shared_bad_idxs) > n * 0.3:
+                        assessment = "network"
+                    elif outlier_score < 0.05:
+                        assessment = "clean"
+                    else:
+                        assessment = "inconclusive"
+                else:
+                    assessment = "clean" if mac_avg >= 35 else ("outlier" if mac_avg < 28 else "inconclusive")
+
+                # Pre-eq comparison (ON vs OFF for same MAC)
+                preeq_delta_avg = preeq_num_improved = preeq_assessment = None
+                if on_list and off_list:
+                    vals_on  = on_list[0].values[:n]
+                    vals_off = off_list[0].values[:n]
+                    delta_vals = [vals_on[i] - vals_off[i] for i in range(n)
+                                  if vals_on[i] < 63.5 and vals_off[i] < 63.5]
+                    if delta_vals:
+                        preeq_delta_avg = round(_stat.mean(delta_vals), 2)
+                        preeq_num_improved = sum(1 for d in delta_vals if d > 0.5)
+                        pct_improved = preeq_num_improved / len(delta_vals)
+                        if preeq_delta_avg > 2.0 and pct_improved > 0.5:
+                            preeq_assessment = "in-home"
+                        elif preeq_delta_avg < -1.0:
+                            preeq_assessment = "network"
+                        elif abs(preeq_delta_avg) <= 1.0:
+                            preeq_assessment = "clean"
+                        else:
+                            preeq_assessment = "inconclusive"
+                        # Override group assessment with pre-eq result when available
+                        if num_caps <= 2:
+                            assessment = preeq_assessment or assessment
+
+                modem_assessments.append(ModemAssessment(
+                    cm_mac_address=mac,
+                    preeq_enabled=rep.preeq_enabled,
+                    rxmer_avg_db=mac_avg,
+                    delta_from_group_avg_db=delta_from_group,
+                    unique_bad_subcarriers=unique_bad,
+                    shared_bad_subcarriers=shared_bad,
+                    outlier_score=outlier_score,
+                    assessment=assessment,
+                    preeq_delta_avg_db=preeq_delta_avg,
+                    preeq_num_improved=preeq_num_improved,
+                    preeq_assessment=preeq_assessment,
+                ))
+
+            worst = min(modem_assessments, key=lambda m: m.rxmer_avg_db) if modem_assessments else None
+            pct_ih = round(sum(1 for m in modem_assessments if m.assessment == "in-home") / max(len(modem_assessments), 1) * 100, 1)
+            summary = FiberNodeSummary(
+                num_captures=len(captures),
+                num_modems=len(by_mac),
+                group_avg_db=group_avg,
+                group_std_db=group_std,
+                pct_network_impaired=round(len(shared_bad_idxs) / max(n, 1) * 100, 1),
+                network_impaired_frequencies_mhz=sorted(network_freqs),
+                pct_modems_in_home=pct_ih,
+                worst_modem_mac=worst.cm_mac_address if worst else None,
+                worst_modem_delta_db=worst.delta_from_group_avg_db if worst else None,
+            )
+            return FiberNodeAnalysis(
+                success=True,
+                captures=captures,
+                subcarrier_stats=subcarrier_stats,
+                modem_assessments=modem_assessments,
+                summary=summary,
+            )
+
+        def _plot_analysis(analysis: FiberNodeAnalysis) -> bytes:
+            """Generate overlay PNG from a FiberNodeAnalysis."""
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as mcm
+
+            captures = analysis.captures
+            n_plots = len(captures)
+            colors = [mcm.tab10(i / max(n_plots, 1)) for i in range(n_plots)]
+
+            # Two panels: top = RxMER traces; bottom = per-subcarrier mean ± std or delta
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True,
+                                           gridspec_kw={'height_ratios': [3, 1]})
+
+            for i, cap in enumerate(captures):
+                n = min(len(cap.values), len(cap.frequencies_mhz))
+                label = f"{cap.cm_mac_address} Pre-EQ={'ON' if cap.preeq_enabled else 'OFF'}"
+                ax1.plot(cap.frequencies_mhz[:n], cap.values[:n],
+                         color=colors[i], linewidth=1.2, alpha=0.85, label=label)
+
+            ax1.axhline(y=35, color='#4CAF50', linestyle='--', alpha=0.6, linewidth=1, label='Good (≥35 dB)')
+            ax1.axhline(y=30, color='#F44336', linestyle='--', alpha=0.6, linewidth=1, label='Marginal (≥30 dB)')
+            ax1.set_ylabel('RxMER (dB)', fontsize=11)
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc='lower right', fontsize=8, ncol=min(n_plots + 2, 4))
+
+            # Build title from assessments
+            summary = analysis.summary
+            title_lines = [f"US OFDMA RxMER — {summary.num_modems} modem(s), {summary.num_captures} capture(s)"]
+            for ma in analysis.modem_assessments:
+                parts = [f"{ma.cm_mac_address}: {ma.rxmer_avg_db:.1f} dB avg → {ma.assessment.upper()}"]
+                if ma.preeq_assessment:
+                    parts.append(f"(pre-eq: {ma.preeq_assessment}, Δ={ma.preeq_delta_avg_db:+.1f} dB)")
+                title_lines.append("  " + " ".join(parts))
+            ax1.set_title("\n".join(title_lines), fontsize=10)
+
+            # Bottom panel: if ≥2 captures with same MAC and both preeq flags → delta bar
+            # otherwise group mean ± 1σ
+            ss = analysis.subcarrier_stats
+            if ss:
+                freqs_ss = [s.frequency_mhz for s in ss]
+                means    = [s.mean_db for s in ss]
+                stds     = [s.std_db for s in ss]
+                bar_w = (freqs_ss[1] - freqs_ss[0]) if len(freqs_ss) > 1 else 0.05
+
+                # Check for pre-eq delta
+                preeq_pairs = [(ma.preeq_delta_avg_db, ma.cm_mac_address)
+                               for ma in analysis.modem_assessments if ma.preeq_delta_avg_db is not None]
+                if preeq_pairs and len(captures) == 2:
+                    n_sc = min(len(captures[0].values), len(captures[1].values), len(ss))
+                    deltas = [captures[0].values[i] - captures[1].values[i] for i in range(n_sc)]
+                    bar_colors = ['#4CAF50' if d > 0 else '#F44336' for d in deltas]
+                    ax2.bar(freqs_ss[:n_sc], deltas, width=bar_w, color=bar_colors, alpha=0.7)
+                    ax2.axhline(y=0, color='black', linewidth=0.8)
+                    ax2.set_ylabel('Δ RxMER (dB)\n(ON−OFF)', fontsize=9)
+                    ax2.set_title('Pre-EQ delta: green = pre-eq improves, red = degrades', fontsize=9)
+                else:
+                    ax2.plot(freqs_ss, means, color='#36A2EB', linewidth=1.5, label='Group mean')
+                    ax2.fill_between(freqs_ss,
+                                     [m - s for m, s in zip(means, stds)],
+                                     [m + s for m, s in zip(means, stds)],
+                                     alpha=0.2, color='#36A2EB', label='±1σ')
+                    ax2.set_ylabel('Group RxMER (dB)', fontsize=9)
+                    ax2.set_title('Per-subcarrier group statistics', fontsize=9)
+                    ax2.legend(fontsize=8)
+
+            ax2.set_xlabel('Frequency (MHz)', fontsize=11)
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+
+        # ------------------------------------------------------------------
+        # /getComparisonData  (2-capture pre-eq convenience wrapper)
+        # ------------------------------------------------------------------
+
+        @self.router.post(
+            "/getComparisonData",
+            summary="Compare pre-eq ON vs OFF as JSON (FiberNodeAnalysis)",
+            response_model=FiberNodeAnalysis,
+        )
+        async def get_comparison_data(
+            request: UsOfdmaRxMerComparisonRequest
+        ) -> FiberNodeAnalysis:
+            """Convenience wrapper: two captures (pre-eq ON/OFF) → FiberNodeAnalysis."""
+            try:
+                cap_on  = _load_rxmer_capture(request.filename_preeq_on,  request.tftp_path, True)
+                cap_off = _load_rxmer_capture(request.filename_preeq_off, request.tftp_path, False,
+                                              cm_mac=cap_on.cm_mac_address)
+                return _analyze([cap_on, cap_off])
+            except Exception as e:
+                self.logger.error(f"getComparisonData error: {e}")
+                return FiberNodeAnalysis(success=False, error=str(e))
+
+        # ------------------------------------------------------------------
+        # /getComparison  (2-capture pre-eq overlay PNG)
+        # ------------------------------------------------------------------
+
+        @self.router.post(
+            "/getComparison",
+            summary="Compare pre-eq ON vs OFF as overlay PNG",
+            response_model=None,
+            responses={200: {"content": {"image/png": {}}}},
+        )
+        async def get_comparison(request: UsOfdmaRxMerComparisonRequest):
+            """Convenience wrapper: two captures (pre-eq ON/OFF) → overlay PNG."""
+            try:
+                cap_on  = _load_rxmer_capture(request.filename_preeq_on,  request.tftp_path, True)
+                cap_off = _load_rxmer_capture(request.filename_preeq_off, request.tftp_path, False,
+                                              cm_mac=cap_on.cm_mac_address)
+                analysis = _analyze([cap_on, cap_off])
+                return Response(content=_plot_analysis(analysis), media_type="image/png",
+                                headers={"Content-Disposition": "inline; filename=us_rxmer_comparison.png"})
+            except Exception as e:
+                self.logger.error(f"getComparison error: {e}")
+                return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
+
+        # ------------------------------------------------------------------
+        # /fiberNode/analyze  — unified multi-modem JSON
+        # ------------------------------------------------------------------
+
+        @self.router.post(
+            "/fiberNode/analyze",
+            summary="Fiber node group RxMER analysis (JSON)",
+            response_model=FiberNodeAnalysis,
+        )
+        async def fiber_node_analyze(request: FiberNodeAnalysisRequest) -> FiberNodeAnalysis:
+            """
+            Analyze N RxMER captures across multiple modems on the same fiber node.
+
+            - Groups captures by cm_mac_address
+            - Computes per-subcarrier group statistics (mean, std, p10, p90)
+            - Assesses each modem: in-home / network / clean / outlier
+            - If a modem has both preeq_enabled=true and false captures, computes pre-eq delta
+            - Single modem + both preeq flags → same as /getComparisonData
+            """
+            try:
+                captures = [
+                    _load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address)
+                    for e in request.captures
+                ]
+                return _analyze(captures)
+            except Exception as e:
+                self.logger.error(f"fiberNode/analyze error: {e}")
+                return FiberNodeAnalysis(success=False, error=str(e))
+
+        # ------------------------------------------------------------------
+        # /fiberNode/plot  — unified multi-modem overlay PNG
+        # ------------------------------------------------------------------
+
+        @self.router.post(
+            "/fiberNode/plot",
+            summary="Fiber node group RxMER analysis (overlay PNG)",
+            response_model=None,
+            responses={200: {"content": {"image/png": {}}}},
+        )
+        async def fiber_node_plot(request: FiberNodeAnalysisRequest):
+            """Same as /fiberNode/analyze but returns a matplotlib overlay PNG."""
+            try:
+                captures = [
+                    _load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address)
+                    for e in request.captures
+                ]
+                analysis = _analyze(captures)
+                return Response(content=_plot_analysis(analysis), media_type="image/png",
+                                headers={"Content-Disposition": "inline; filename=us_rxmer_fibernode.png"})
+            except Exception as e:
+                self.logger.error(f"fiberNode/plot error: {e}")
                 return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
 
 
