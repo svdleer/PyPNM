@@ -114,7 +114,10 @@ TFTP_HEX = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))
 # SNMP helpers
 # ============================================================
 
-SNMP_PREFIX = 'ssh access-engineering.nl "docker exec pypnm-agent-lab {cmd}"'
+SNMP_PREFIX = os.environ.get(
+    "SNMP_PREFIX",
+    'ssh access-engineering.nl "docker exec pypnm-agent-lab {cmd}"'
+)
 
 
 def _run(cmd: str) -> str:
