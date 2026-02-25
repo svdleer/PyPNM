@@ -211,19 +211,26 @@ class UsOfdmaRxMerRouter:
             filepath = tftp_dir / filename
             
             if not filepath.exists():
-                # CMTS adds timestamp like: usrxmer_9c305bf81daf_2026-01-28_19.42.35.123
-                # Try to find the file with glob pattern
-                pattern = str(tftp_dir / f"{filename}_*")
-                matching_files = sorted(glob.glob(pattern), reverse=True)
-                
-                if matching_files:
-                    filepath = Path(matching_files[0])  # Use most recent
-                    self.logger.info(f"Found timestamped file: {filepath}")
+                # CMTS may add a path prefix (e.g. /pnm/mer/) and/or a timestamp suffix.
+                # Try in order:
+                #   1. glob for timestamped variant at same relative path
+                #   2. recursive search for bare filename anywhere under tftp_dir
+                basename = Path(filename).name
+                for pattern in [
+                    str(tftp_dir / f"{filename}_*"),           # timestamped, same subdir
+                    str(tftp_dir / "**" / basename),           # any subdir, exact name
+                    str(tftp_dir / "**" / f"{basename}_*"),    # any subdir, timestamped
+                ]:
+                    matching_files = sorted(glob.glob(pattern, recursive=True), reverse=True)
+                    if matching_files:
+                        filepath = Path(matching_files[0])
+                        self.logger.info(f"Found file via pattern '{pattern}': {filepath}")
+                        break
                 else:
-                    self.logger.error(f"File not found: {filepath} (tried pattern: {pattern})")
+                    self.logger.error(f"File not found: {tftp_dir / filename}")
                     return UsOfdmaRxMerCaptureResponse(
                         success=False,
-                        error=f"File not found: {filepath}"
+                        error=f"File not found: {tftp_dir / basename}"
                     )
             
             self.logger.info(f"Loading US RxMER file: {filepath}")
