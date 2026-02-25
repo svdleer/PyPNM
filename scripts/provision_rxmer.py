@@ -93,7 +93,6 @@ OID_IF_DESCR  = "1.3.6.1.2.1.2.2.1.2"
 
 # RowStatus values
 RS_ACTIVE        = 1
-RS_DESTROY       = 6
 RS_CREATE_AND_GO = 4
 
 MEAS_STATUS = {
@@ -181,15 +180,15 @@ def configure_bdt_cisco(row: int):
     tftp = TFTP_IP_CCAP
     tftp_hex = "".join(f"{int(o):02X}" for o in tftp.split("."))
     step(f"BDT row {row} — Cisco (docsPnmBulkDataTransferCfgTable) — TFTP {tftp}")
-    snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_DESTROY)
-    time.sleep(2)
-    print(f"  RowStatus.{row} = createAndGo(4)")
-    r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
-    print(f"    {r}")
-    time.sleep(1)
+    # Try createAndGo; if row already exists (commitFailed/inconsistentValue) just update fields
+    rs_raw = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
+    if "commitFailed" in rs_raw or "inconsistentValue" in rs_raw or "Error" in rs_raw:
+        print(f"  RowStatus row {row} already exists — updating existing row")
+    else:
+        print(f"  RowStatus.{row} = createAndGo(4)  {rs_raw}")
     fields = [
-        (f"{OID_BDT_E6000}.3.{row}", "i", 1,        "DestHostIpAddrType = ipv4(1)"),
-        (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex,  f"DestHostIpAddress  = {tftp}"),
+        (f"{OID_BDT_E6000}.3.{row}", "i", 1,                f"DestHostIpAddrType = ipv4(1)"),
+        (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex,          f"DestHostIpAddress  = {tftp}"),
         (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{tftp}/", f"DestBaseUri        = tftp://{tftp}/"),
     ]
     for oid, t, v, desc in fields:
