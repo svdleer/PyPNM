@@ -758,19 +758,13 @@ class CmtsUsOfdmaRxMerService:
                     dest_index = 1  # Default to index 1
             
             self.logger.info(f"Creating bulk destination at index {dest_index} for TFTP {tftp_ip}:{port}")
-
+            
             # Convert IP to hex bytes for OctetString SET
             ip_parts = tftp_ip.split(".")
             ip_hex = "".join([f"{int(p):02x}" for p in ip_parts])
-
-            # Cisco cBR-8 requires createAndGo(4) to activate the row first.
-            # E6000/CommScope does NOT use RowStatus — just set the fields directly.
-            # Detect Cisco by checking if RowStatus OID is writable: try createAndGo,
-            # ignore errors (E6000 will reject it but fields will be set below regardless).
-            try:
-                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 4, 'i')
-            except Exception:
-                pass  # E6000 rejects RowStatus writes — not fatal
+            
+            # Cisco cBR-8 flow: createAndGo(4) activates the row immediately
+            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 4, 'i')
 
             # IP address type (1=IPv4)
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
@@ -786,7 +780,7 @@ class CmtsUsOfdmaRxMerService:
             try:
                 await self._snmp_set(f"{self.OID_BULK_CFG_PROTOCOL}.{dest_index}", 1, 'i')
             except Exception:
-                pass  # OID may be notWritable on some vendors — not fatal
+                pass  # OID may be notWritable on Cisco — not fatal
             
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             

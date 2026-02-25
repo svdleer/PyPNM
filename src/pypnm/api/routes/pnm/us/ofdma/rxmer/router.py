@@ -202,44 +202,25 @@ class UsOfdmaRxMerRouter:
             
             # Build file path - CMTS adds timestamp, so use glob to find latest
             tftp_dir = Path(request.tftp_path)
-
-            # E6000 returns filename with an internal path prefix like /pnm/mer/usrxmer_xxx.
-            # Python's Path join treats absolute paths as overrides, so strip the leading /
-            # and also try basename-only as a fallback.
-            raw_name = request.filename.lstrip('/')
-            basename = Path(raw_name).name  # just the filename, no subdirs
-
-            # Candidates to try in order:
-            #   1. tftp_root/pnm/mer/usrxmer_xxx  (E6000 sub-path)
-            #   2. tftp_root/usrxmer_xxx           (flat, Cisco/Casa)
-            candidates = []
-            if raw_name != basename:
-                candidates.append(tftp_dir / raw_name)
-            candidates.append(tftp_dir / basename)
-
-            filepath = None
-            for candidate in candidates:
-                if candidate.exists():
-                    filepath = candidate
-                    self.logger.info(f"Found US RxMER file at: {filepath}")
-                    break
-
-            if filepath is None:
-                # CMTS may append a timestamp — try glob on the basename
-                for base in [raw_name, basename]:
-                    pattern = str(tftp_dir / f"{base}_*")
-                    matching_files = sorted(glob.glob(pattern), reverse=True)
-                    if matching_files:
-                        filepath = Path(matching_files[0])
-                        self.logger.info(f"Found timestamped file: {filepath}")
-                        break
-
-            if filepath is None:
-                self.logger.error(f"File not found: {tftp_dir / raw_name} (tried {candidates})")
-                return UsOfdmaRxMerCaptureResponse(
-                    success=False,
-                    error=f"File not found: {tftp_dir / basename}"
-                )
+            
+            # First try exact filename
+            filepath = tftp_dir / request.filename
+            
+            if not filepath.exists():
+                # CMTS adds timestamp like: usrxmer_9c305bf81daf_2026-01-28_19.42.35.123
+                # Try to find the file with glob pattern
+                pattern = str(tftp_dir / f"{request.filename}_*")
+                matching_files = sorted(glob.glob(pattern), reverse=True)
+                
+                if matching_files:
+                    filepath = Path(matching_files[0])  # Use most recent
+                    self.logger.info(f"Found timestamped file: {filepath}")
+                else:
+                    self.logger.error(f"File not found: {filepath} (tried pattern: {pattern})")
+                    return UsOfdmaRxMerCaptureResponse(
+                        success=False,
+                        error=f"File not found: {filepath}"
+                    )
             
             self.logger.info(f"Loading US RxMER file: {filepath}")
             
