@@ -787,14 +787,25 @@ class UsOfdmaRxMerRouter:
 
         async def _resolve_fn_names(svc, ofdma_ifindex_set: set) -> dict:
             """
-            Resolve real FN names from DOCS-IF3-MIB for all vendors.
+            Resolve real fiber node names from DOCS-IF3-MIB for all vendors.
             Returns {chIfIndex: fnName} or {} when tables are unavailable.
+
+            Confirmed OIDs (from snmpwalk -On on Commscope E6000 ccap002):
+              docsIf3MdChCfgChId        1.3.6.1.4.1.4491.2.1.20.1.5.1.3
+                index (mdIfIndex, chIfIndex)  → value: chId
+              docsIf3MdNodeStatusMdUsSgId 1.3.6.1.4.1.4491.2.1.20.1.12.1.4
+                index (mdIfIndex, strLen, fnNameBytes..., mCmSgId) → value: mUSsgId
+                e.g. .536871013.3.70.78.49.1 → mdIf=536871013, "FN1", mCmSgId=1
+              docsIf3MdUsSgStatusChSetId  1.3.6.1.4.1.4491.2.1.20.1.14.1.2
+                index (mdIfIndex, mUSsgId)   → value: chSetId
+              docsIf3UsChSetChList         1.3.6.1.4.1.4491.2.1.20.1.22.1.2
+                index (mdIfIndex, chSetId)   → value: STRING "1,2,3,4,25,26"
             """
-            BASE = "1.3.6.1.4.1.4491.2.1.20"
-            OID_CHID   = f"{BASE}.1.5.1.3"   # docsIf3MdChCfgChId
-            OID_CHLIST = f"{BASE}.1.22.1.2"  # docsIf3UsChSetChList  (Hex-STRING)
-            OID_SGSET  = f"{BASE}.1.14.1.2"  # docsIf3MdUsSgStatusChSetId
-            OID_FNSG   = f"{BASE}.1.12.1.4"  # docsIf3MdNodeStatusMdUsSgId (col 4)
+            BASE      = "1.3.6.1.4.1.4491.2.1.20"
+            OID_CHID  = f"{BASE}.1.5.1.3"    # docsIf3MdChCfgChId
+            OID_FNSG  = f"{BASE}.1.12.1.4"   # docsIf3MdNodeStatusMdUsSgId
+            OID_SGSET = f"{BASE}.1.14.1.2"   # docsIf3MdUsSgStatusChSetId
+            OID_CHLST = f"{BASE}.1.22.1.2"   # docsIf3UsChSetChList
 
             def _to_dict(walk_result):
                 if not isinstance(walk_result, dict) or not walk_result.get('success'):
@@ -803,92 +814,51 @@ class UsOfdmaRxMerRouter:
                 return {item['oid']: item['value']
                         for item in raw if isinstance(item, dict) and 'oid' in item}
 
+            def _parse_chids(val_str: str):
+                """Parse channel ID list: "1,2,3,4,25,26" or hex "01 02 03 04 19 1A"."""
+                s = val_str.strip().strip('"')
+                if ',' in s:
+                    return frozenset(int(x.strip()) for x in s.split(',') if x.strip().isdigit())
+                if ' ' in s or s.startswith('0x'):
+                    try:
+                        return frozenset(int(b, 16) for b in s.replace('0x', '').split())
+                    except ValueError:
+                        return frozenset()
+                return frozenset()
+
             # ── Step 1: (mdIfIndex, chIfIndex) → chId ──────────────────────
-            w1 = await svc._snmp_walk(OID_CHID, timeout=30)
-            d1 = _to_dict(w1)
+            d1 = _to_dict(await svc._snmp_walk(OID_CHID, timeout=30))
             if not d1:
                 return {}
 
             ifidx_to_md_chid: dict = {}   # chIfIndex → (mdIfIndex, chId)
-            pfx1 = OID_CHID + "."
             for oid, val in d1.items():
-                if not oid.startswith(pfx1):
+                sfx = oid.removeprefix(OID_CHID + ".")
+                if sfx == oid:
                     continue
-                parts = oid[len(pfx1):].split('.')
+                parts = sfx.split('.')
                 if len(parts) != 2:
                     continue
-                md_if = int(parts[0]);  ch_if = int(parts[1])
+                md_if, ch_if = int(parts[0]), int(parts[1])
                 if ch_if in ofdma_ifindex_set:
                     ifidx_to_md_chid[ch_if] = (md_if, int(str(val).strip()))
 
             if not ifidx_to_md_chid:
                 return {}
 
-            # ── Step 2: (mdIfIndex, chSetId) → frozenset of chIds ──────────
-            # Value is Hex-STRING: each byte is one chId
-            w2 = await svc._snmp_walk(OID_CHLIST, timeout=30)
-            d2 = _to_dict(w2)
-            if not d2:
-                return {}
-
-            chset_chids: dict = {}   # (mdIfIndex, chSetId) → frozenset of chIds
-            pfx2 = OID_CHLIST + "."
-            for oid, val in d2.items():
-                if not oid.startswith(pfx2):
-                    continue
-                parts = oid[len(pfx2):].split('.')
-                if len(parts) != 2:
-                    continue
-                md_if = int(parts[0]);  chset_id = int(parts[1])
-                # val may come as "0x01 02 03..." hex string or plain bytes
-                s = str(val).strip()
-                if s.startswith('0x') or ' ' in s:
-                    # Hex-STRING from SNMP agent: "01 02 03 04 19 1A"
-                    try:
-                        chids = frozenset(int(b, 16) for b in s.replace('0x','').split())
-                    except ValueError:
-                        continue
-                else:
-                    # Fallback: comma-separated integers
-                    try:
-                        chids = frozenset(int(x) for x in s.split(',') if x.strip().isdigit())
-                    except ValueError:
-                        continue
-                chset_chids[(md_if, chset_id)] = chids
-
-            # ── Step 3: (mdIfIndex, mUSsgId) → chSetId ─────────────────────
-            w3 = await svc._snmp_walk(OID_SGSET, timeout=30)
-            d3 = _to_dict(w3)
-            if not d3:
-                return {}
-
-            # Build: (mdIfIndex, chSetId) → mUSsgId  (reverse of table)
-            chset_to_ussg: dict = {}
-            pfx3 = OID_SGSET + "."
-            for oid, val in d3.items():
-                if not oid.startswith(pfx3):
-                    continue
-                parts = oid[len(pfx3):].split('.')
-                if len(parts) != 2:
-                    continue
-                md_if = int(parts[0]);  m_us_sg = int(parts[1])
-                chset_id = int(str(val).strip())
-                chset_to_ussg[(md_if, chset_id)] = m_us_sg
-
-            # ── Step 4: decode FN name from OID index of .1.12.1.4 ─────────
-            # OID suffix: {mdIfIndex}.{strLen}.{byte0}...{byteN-1}.{mCmSgId} = mUSsgId
-            w4 = await svc._snmp_walk(OID_FNSG, timeout=30)
-            d4 = _to_dict(w4)
+            # ── Step 2: FN name from string-indexed OID  ───────────────────
+            # suffix: {mdIfIndex}.{strLen}.{charByte0}...{mCmSgId}  value=mUSsgId
+            d4 = _to_dict(await svc._snmp_walk(OID_FNSG, timeout=30))
             if not d4:
                 return {}
 
-            ussg_to_fn: dict = {}   # (mdIfIndex, mUSsgId) → fnName (first wins)
-            pfx4 = OID_FNSG + "."
+            ussg_to_fn: dict = {}   # (mdIfIndex, mUSsgId) → fnName
             for oid, val in d4.items():
-                if not oid.startswith(pfx4):
+                sfx = oid.removeprefix(OID_FNSG + ".")
+                if sfx == oid:
                     continue
-                parts = oid[len(pfx4):].split('.')
-                if len(parts) < 3:
+                parts = sfx.split('.')
+                if len(parts) < 4:
                     continue
                 md_if   = int(parts[0])
                 str_len = int(parts[1])
@@ -898,16 +868,48 @@ class UsOfdmaRxMerRouter:
                 m_us_sg = int(str(val).strip())
                 ussg_to_fn.setdefault((md_if, m_us_sg), fn_name)
 
+            if not ussg_to_fn:
+                return {}
+
+            # ── Step 3: (mdIfIndex, mUSsgId) → chSetId ─────────────────────
+            d3 = _to_dict(await svc._snmp_walk(OID_SGSET, timeout=30))
+            if not d3:
+                return {}
+
+            ussg_to_chset: dict = {}   # (mdIfIndex, mUSsgId) → chSetId
+            for oid, val in d3.items():
+                sfx = oid.removeprefix(OID_SGSET + ".")
+                if sfx == oid:
+                    continue
+                parts = sfx.split('.')
+                if len(parts) != 2:
+                    continue
+                ussg_to_chset[(int(parts[0]), int(parts[1]))] = int(str(val).strip())
+
+            # ── Step 4: (mdIfIndex, chSetId) → frozenset of chIds ──────────
+            d2 = _to_dict(await svc._snmp_walk(OID_CHLST, timeout=30))
+            if not d2:
+                return {}
+
+            chset_chids: dict = {}   # (mdIfIndex, chSetId) → frozenset of chIds
+            for oid, val in d2.items():
+                sfx = oid.removeprefix(OID_CHLST + ".")
+                if sfx == oid:
+                    continue
+                parts = sfx.split('.')
+                if len(parts) != 2:
+                    continue
+                chids = _parse_chids(str(val))
+                if chids:
+                    chset_chids[(int(parts[0]), int(parts[1]))] = chids
+
             # ── Compose: chIfIndex → fnName ─────────────────────────────────
             result: dict = {}
             for ch_if, (md_if, ch_id) in ifidx_to_md_chid.items():
-                for (md2, chset_id), chids in chset_chids.items():
+                for (md2, m_us_sg), chset_id in ussg_to_chset.items():
                     if md2 != md_if:
                         continue
-                    if ch_id not in chids:
-                        continue
-                    m_us_sg = chset_to_ussg.get((md_if, chset_id))
-                    if m_us_sg is None:
+                    if ch_id not in chset_chids.get((md_if, chset_id), frozenset()):
                         continue
                     fn_name = ussg_to_fn.get((md_if, m_us_sg))
                     if fn_name:
