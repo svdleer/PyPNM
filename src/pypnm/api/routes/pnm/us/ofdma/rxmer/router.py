@@ -809,28 +809,31 @@ class UsOfdmaRxMerRouter:
                 for oid, raw_val in oid_map.items():
                     desc = str(raw_val).strip().strip('"')
                     lower = desc.lower()
-                    # Commscope OFDMA:  "cable-us-ofdma 1/ofd/32.0"  ← only these
-                    # Commscope SC-QAM: "cable-upstream 1/scq/7"    ← exclude
-                    # Commscope SC-QAM: "cable-upstream 1/nd/7"     ← exclude
-                    # Cisco/Casa OFDMA: "Cable1/0/0-upstream0"      ← include (no /scq/ or /nd/)
+                    # Vendor OFDMA channel detection (all others → skip):
+                    # Commscope OFDMA:    "cable-us-ofdma 1/ofd/32.0"
+                    # Commscope SC-QAM:   "cable-upstream 1/scq/7"  "cable-upstream 1/nd/7"  "cable-upstream 1/0/7" → exclude (lowercase 'cable-upstream')
+                    # Cisco OFDMA:        "Cable1/0/0-upstream0"    (capital C, hyphen before 'upstream')
+                    # Casa OFDMA:         "Logical Upstream Channel 0/0.0-0"
+                    # Casa SC-QAM:        "Upstream Physical Interface 0/0.0" → exclude
                     is_commscope_ofdma = 'us-ofdma' in lower
-                    is_cisco_upstream  = ('upstream' in lower
-                                          and '/ofd/' not in lower
-                                          and '/scq/' not in lower
-                                          and '/nd/' not in lower
-                                          and 'cable-mac' not in lower)
-                    if not (is_commscope_ofdma or is_cisco_upstream):
+                    is_cisco_ofdma     = desc.startswith('Cable') and '-upstream' in lower
+                    is_casa_ofdma      = lower.startswith('logical') and 'upstream' in lower
+                    if not (is_commscope_ofdma or is_cisco_ofdma or is_casa_ofdma):
                         continue
                     try:
                         ifindex = int(str(oid).rsplit('.', 1)[-1])
                     except ValueError:
                         continue
-                    # Extract MAC domain (= fiber node group) per vendor format:
-                    # Commscope: "cable-us-ofdma 1/ofd/32.0" → "cable-mac 1"
-                    # Cisco/Casa: "Cable1/0/0-upstream0" → "Cable1/0/0"
+                    # Extract MAC domain (= fiber node group) per vendor:
+                    # Commscope: "cable-us-ofdma 1/ofd/32.0"       → "cable-mac 1"
+                    # Cisco:     "Cable1/0/0-upstream0"             → "Cable1/0/0"
+                    # Casa:      "Logical Upstream Channel 0/0.0-0" → "LogicalUS-0/0" (grouped by slot/port)
                     m_arris = _re.match(r'cable-us-ofdma\s+(\d+)/', desc, _re.IGNORECASE)
+                    m_casa  = _re.match(r'Logical\s+Upstream\s+Channel\s+(\d+/\d+)', desc, _re.IGNORECASE)
                     if m_arris:
                         mac_domain = f"cable-mac {m_arris.group(1)}"
+                    elif m_casa:
+                        mac_domain = f"LogicalUS-{m_casa.group(1)}"
                     elif _re.search(r'[-_]upstream', desc, _re.IGNORECASE):
                         mac_domain = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
                     else:
