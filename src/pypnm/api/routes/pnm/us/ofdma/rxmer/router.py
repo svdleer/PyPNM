@@ -1003,13 +1003,37 @@ class UsOfdmaRxMerRouter:
                         ch['mac_domain']   = real_fn
                         ch['suggested_fn'] = real_fn
 
+                # ── Get modem counts per channel ────────────────────────────
+                # Walk docsIf3CmtsCmUsStatusChIfIndex to count modems per OFDMA channel
+                OID_CM_US_IFINDEX = "1.3.6.1.4.1.4491.2.1.20.1.3.2.1.1"
+                modem_counts: dict = {ch['ifindex']: 0 for ch in channels}
+                try:
+                    cm_walk = await service._snmp_walk(OID_CM_US_IFINDEX, timeout=30)
+                    if isinstance(cm_walk, dict) and cm_walk.get('success'):
+                        cm_raw = cm_walk.get('results') or []
+                        for item in cm_raw:
+                            if isinstance(item, dict) and 'value' in item:
+                                try:
+                                    ifidx = int(str(item['value']).split()[-1])
+                                    if ifidx in modem_counts:
+                                        modem_counts[ifidx] += 1
+                                except (ValueError, IndexError):
+                                    pass
+                except Exception as _cm_err:
+                    self.logger.warning(f"Modem count walk failed: {_cm_err}")
+
+                # Add modem_count to each channel
+                for ch in channels:
+                    ch['modem_count'] = modem_counts.get(ch['ifindex'], 0)
+
                 channels.sort(key=lambda c: c['description'])
                 seen: dict = {}
                 for ch in channels:
                     md = ch['mac_domain']
                     if md not in seen:
-                        seen[md] = {"name": ch['suggested_fn'], "mac_domain": md, "channels": []}
-                    seen[md]['channels'].append({"ifindex": ch['ifindex'], "description": ch['description']})
+                        seen[md] = {"name": ch['suggested_fn'], "mac_domain": md, "channels": [], "modem_count": 0}
+                    seen[md]['channels'].append({"ifindex": ch['ifindex'], "description": ch['description'], "modem_count": ch['modem_count']})
+                    seen[md]['modem_count'] += ch['modem_count']
 
                 return {
                     "success":     True,
