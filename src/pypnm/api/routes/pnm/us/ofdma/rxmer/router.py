@@ -723,7 +723,6 @@ class UsOfdmaRxMerRouter:
             ax1.axhline(y=30, color='#F44336', linestyle='--', alpha=0.6, linewidth=1, label='Marginal (≥30 dB)')
             ax1.set_ylabel('RxMER (dB)', fontsize=11)
             ax1.grid(True, alpha=0.3)
-            ax1.legend(loc='lower right', fontsize=8, ncol=min(n_plots + 2, 4))
 
             # Explicit x-axis limits covering all frequency bands in the data
             if all_plot_freqs:
@@ -783,10 +782,20 @@ class UsOfdmaRxMerRouter:
                                          alpha=0.2, color=bc)
                     ax2.set_ylabel('Group RxMER (dB)', fontsize=9)
                     ax2.set_title('Per-subcarrier group statistics', fontsize=9)
-                    ax2.legend(fontsize=8)
 
             ax2.set_xlabel('Frequency (MHz)', fontsize=11)
             ax2.grid(True, alpha=0.3)
+
+            # Collect all legend handles from both axes and place below the figure
+            h1, l1 = ax1.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
+            all_h, all_l = h1 + h2, l1 + l2
+            if all_h:
+                fig.legend(all_h, all_l,
+                           loc='upper center',
+                           bbox_to_anchor=(0.5, 0),
+                           ncol=min(len(all_l), 5),
+                           fontsize=8, frameon=True)
 
             plt.tight_layout()
             buf = io.BytesIO()
