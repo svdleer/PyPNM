@@ -525,38 +525,67 @@ class UsOfdmaRxMerRouter:
             per-subcarrier group stats and per-modem assessments.
             """
             import statistics as _stat
+            from collections import defaultdict
 
             if not captures:
                 return FiberNodeAnalysis(success=False, error="No captures provided")
 
-            # Align all captures to shortest subcarrier count
-            n = min(len(c.values) for c in captures)
-            freqs = captures[0].frequencies_mhz[:n]
+            # ----------------------------------------------------------------
+            # Group captures by frequency band (50 MHz buckets of first subcarrier).
+            # This ensures subcarrier stats are only computed across captures that
+            # are on the SAME OFDMA block — captures from different blocks (e.g. a
+            # 5-42 MHz low-split block and a 65-204 MHz high-split block) are never
+            # aligned by subcarrier index against each other.
+            # ----------------------------------------------------------------
+            def _band_key(cap):
+                f0 = cap.frequencies_mhz[0] if cap.frequencies_mhz else 0.0
+                return round(f0 / 50) * 50  # nearest 50 MHz bucket
 
-            # Per-subcarrier group stats (exclude 0xff = 63.75 markers)
+            bands: dict[int, list] = {}
+            for cap in captures:
+                bands.setdefault(_band_key(cap), []).append(cap)
+
             subcarrier_stats: list[SubcarrierGroupStats] = []
-            for i in range(n):
-                sc_vals = [c.values[i] for c in captures if c.values[i] < 63.5]
-                if not sc_vals:
-                    sc_vals = [0.0]
-                mean = round(_stat.mean(sc_vals), 2)
-                std  = round(_stat.stdev(sc_vals), 2) if len(sc_vals) > 1 else 0.0
-                sorted_v = sorted(sc_vals)
-                p10 = round(sorted_v[max(0, int(len(sorted_v) * 0.10))], 2)
-                p90 = round(sorted_v[min(len(sorted_v) - 1, int(len(sorted_v) * 0.90))], 2)
-                outlier_macs = [
-                    c.cm_mac_address for c in captures
-                    if c.values[i] < 63.5 and c.values[i] < mean - 2 * std
-                ]
-                subcarrier_stats.append(SubcarrierGroupStats(
-                    frequency_mhz=freqs[i] if i < len(freqs) else i,
-                    index=i,
-                    values_db=[round(c.values[i], 2) for c in captures],
-                    mean_db=mean, std_db=std,
-                    min_db=round(min(sc_vals), 2), max_db=round(max(sc_vals), 2),
-                    p10_db=p10, p90_db=p90,
-                    outlier_macs=outlier_macs,
-                ))
+            mac_outlier_count: dict[str, int] = defaultdict(int)
+            shared_bad_idx_set: set[int] = set()  # global index into subcarrier_stats
+            total_sc = 0  # total subcarrier slots across all bands
+
+            for band_f0 in sorted(bands):
+                band_caps = bands[band_f0]
+                n_band   = min(len(c.values) for c in band_caps)
+                n_all    = len(band_caps)
+                freqs_b  = band_caps[0].frequencies_mhz[:n_band]
+
+                for i in range(n_band):
+                    sc_vals = [c.values[i] for c in band_caps if c.values[i] < 63.5]
+                    if not sc_vals:
+                        sc_vals = [0.0]
+                    mean = round(_stat.mean(sc_vals), 2)
+                    std  = round(_stat.stdev(sc_vals), 2) if len(sc_vals) > 1 else 0.0
+                    sorted_v = sorted(sc_vals)
+                    p10 = round(sorted_v[max(0, int(len(sorted_v) * 0.10))], 2)
+                    p90 = round(sorted_v[min(len(sorted_v) - 1, int(len(sorted_v) * 0.90))], 2)
+                    outlier_macs = [
+                        c.cm_mac_address for c in band_caps
+                        if c.values[i] < 63.5 and c.values[i] < mean - 2 * std
+                    ]
+                    for mac in outlier_macs:
+                        mac_outlier_count[mac] += 1
+                    global_idx = total_sc + i
+                    if len(outlier_macs) > n_all * 0.5:
+                        shared_bad_idx_set.add(global_idx)
+                    subcarrier_stats.append(SubcarrierGroupStats(
+                        frequency_mhz=freqs_b[i] if i < len(freqs_b) else i,
+                        index=global_idx,
+                        values_db=[round(c.values[i], 2) for c in band_caps],
+                        mean_db=mean, std_db=std,
+                        min_db=round(min(sc_vals), 2), max_db=round(max(sc_vals), 2),
+                        p10_db=p10, p90_db=p90,
+                        outlier_macs=outlier_macs,
+                    ))
+                total_sc += n_band
+
+            n = total_sc  # used for percentage calculations below
 
             # Group captures by MAC for pre-eq pairing
             by_mac: dict[str, list] = {}
@@ -568,13 +597,11 @@ class UsOfdmaRxMerRouter:
             group_avg = round(_stat.mean(all_avgs), 2) if all_avgs else 0.0
             group_std = round(_stat.stdev(all_avgs), 2) if len(all_avgs) > 1 else 0.0
 
-            # Subcarriers bad on >50% of all captures
+            # Subcarriers bad on >50% of captures (shared network impairment)
             num_caps = len(captures)
-            shared_bad_idxs = {
-                i for i, ss in enumerate(subcarrier_stats)
-                if len(ss.outlier_macs) > num_caps * 0.5
-            }
-            network_freqs = [subcarrier_stats[i].frequency_mhz for i in shared_bad_idxs]
+            shared_bad_idxs = shared_bad_idx_set
+            network_freqs = [subcarrier_stats[i].frequency_mhz
+                             for i in sorted(shared_bad_idxs) if i < len(subcarrier_stats)]
 
             modem_assessments: list[ModemAssessment] = []
             for mac, mac_captures in by_mac.items():
@@ -587,11 +614,11 @@ class UsOfdmaRxMerRouter:
                 mac_avg = rep.rxmer_avg_db or 0.0
                 delta_from_group = round(mac_avg - group_avg, 2)
 
-                # How many subcarriers is this MAC an outlier on?
-                mac_outlier_count = sum(1 for ss in subcarrier_stats if mac in ss.outlier_macs)
-                outlier_score = round(mac_outlier_count / n, 3) if n > 0 else 0.0
+                # Outlier score based on band-grouped subcarrier stats
+                m_outlier_cnt = mac_outlier_count.get(mac, 0)
+                outlier_score = round(m_outlier_cnt / n, 3) if n > 0 else 0.0
 
-                # Unique vs shared bad subcarriers
+                # Unique vs shared bad subcarriers (using global indices)
                 mac_bad_idxs = {i for i, ss in enumerate(subcarrier_stats) if mac in ss.outlier_macs}
                 unique_bad = len(mac_bad_idxs - shared_bad_idxs)
                 shared_bad = len(mac_bad_idxs & shared_bad_idxs)
@@ -609,12 +636,13 @@ class UsOfdmaRxMerRouter:
                 else:
                     assessment = "clean" if mac_avg >= 35 else ("outlier" if mac_avg < 28 else "inconclusive")
 
-                # Pre-eq comparison (ON vs OFF for same MAC)
+                # Pre-eq comparison (ON vs OFF for same MAC — always on same channel)
                 preeq_delta_avg = preeq_num_improved = preeq_assessment = None
                 if on_list and off_list:
-                    vals_on  = on_list[0].values[:n]
-                    vals_off = off_list[0].values[:n]
-                    delta_vals = [vals_on[i] - vals_off[i] for i in range(n)
+                    n_mac = min(len(on_list[0].values), len(off_list[0].values))
+                    vals_on  = on_list[0].values[:n_mac]
+                    vals_off = off_list[0].values[:n_mac]
+                    delta_vals = [vals_on[i] - vals_off[i] for i in range(n_mac)
                                   if vals_on[i] < 63.5 and vals_off[i] < 63.5]
                     if delta_vals:
                         preeq_delta_avg = round(_stat.mean(delta_vals), 2)
@@ -682,17 +710,24 @@ class UsOfdmaRxMerRouter:
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True,
                                            gridspec_kw={'height_ratios': [3, 1]})
 
+            # Collect all frequencies across all captures to set xlim
+            all_plot_freqs = []
             for i, cap in enumerate(captures):
                 n = min(len(cap.values), len(cap.frequencies_mhz))
                 label = f"{cap.cm_mac_address} Pre-EQ={'ON' if cap.preeq_enabled else 'OFF'}"
                 ax1.plot(cap.frequencies_mhz[:n], cap.values[:n],
                          color=colors[i], linewidth=1.2, alpha=0.85, label=label)
+                all_plot_freqs.extend(cap.frequencies_mhz[:n])
 
             ax1.axhline(y=35, color='#4CAF50', linestyle='--', alpha=0.6, linewidth=1, label='Good (≥35 dB)')
             ax1.axhline(y=30, color='#F44336', linestyle='--', alpha=0.6, linewidth=1, label='Marginal (≥30 dB)')
             ax1.set_ylabel('RxMER (dB)', fontsize=11)
             ax1.grid(True, alpha=0.3)
             ax1.legend(loc='lower right', fontsize=8, ncol=min(n_plots + 2, 4))
+
+            # Explicit x-axis limits covering all frequency bands in the data
+            if all_plot_freqs:
+                ax1.set_xlim(min(all_plot_freqs) - 0.5, max(all_plot_freqs) + 0.5)
 
             # Build title from assessments
             summary = analysis.summary
@@ -704,19 +739,26 @@ class UsOfdmaRxMerRouter:
                 title_lines.append("  " + " ".join(parts))
             ax1.set_title("\n".join(title_lines), fontsize=10)
 
-            # Bottom panel: if ≥2 captures with same MAC and both preeq flags → delta bar
-            # otherwise group mean ± 1σ
+            # Bottom panel: group stats per frequency band
             ss = analysis.subcarrier_stats
             if ss:
                 freqs_ss = [s.frequency_mhz for s in ss]
                 means    = [s.mean_db for s in ss]
                 stds     = [s.std_db for s in ss]
-                bar_w = (freqs_ss[1] - freqs_ss[0]) if len(freqs_ss) > 1 else 0.05
+                bar_w    = (freqs_ss[1] - freqs_ss[0]) if len(freqs_ss) > 1 else 0.05
 
-                # Check for pre-eq delta
+                # Detect multiple frequency bands in ss (gap > 10 MHz between consecutive points)
+                band_breaks = [0]
+                for k in range(1, len(freqs_ss)):
+                    if freqs_ss[k] - freqs_ss[k - 1] > 10:
+                        band_breaks.append(k)
+                band_breaks.append(len(freqs_ss))
+                multi_band = len(band_breaks) > 2
+
+                # Check for pre-eq delta (single-band, 2-capture case only)
                 preeq_pairs = [(ma.preeq_delta_avg_db, ma.cm_mac_address)
                                for ma in analysis.modem_assessments if ma.preeq_delta_avg_db is not None]
-                if preeq_pairs and len(captures) == 2:
+                if preeq_pairs and len(captures) == 2 and not multi_band:
                     n_sc = min(len(captures[0].values), len(captures[1].values), len(ss))
                     deltas = [captures[0].values[i] - captures[1].values[i] for i in range(n_sc)]
                     bar_colors = ['#4CAF50' if d > 0 else '#F44336' for d in deltas]
@@ -725,11 +767,20 @@ class UsOfdmaRxMerRouter:
                     ax2.set_ylabel('Δ RxMER (dB)\n(ON−OFF)', fontsize=9)
                     ax2.set_title('Pre-EQ delta: green = pre-eq improves, red = degrades', fontsize=9)
                 else:
-                    ax2.plot(freqs_ss, means, color='#36A2EB', linewidth=1.5, label='Group mean')
-                    ax2.fill_between(freqs_ss,
-                                     [m - s for m, s in zip(means, stds)],
-                                     [m + s for m, s in zip(means, stds)],
-                                     alpha=0.2, color='#36A2EB', label='±1σ')
+                    # Plot each band with its own color (one line per frequency band)
+                    _band_palette = ['#36A2EB', '#FF6384', '#4CAF50', '#FF9800', '#9C27B0']
+                    for b_idx in range(len(band_breaks) - 1):
+                        sl = slice(band_breaks[b_idx], band_breaks[b_idx + 1])
+                        bf = freqs_ss[sl]
+                        bm = means[sl]
+                        bs = stds[sl]
+                        bc = _band_palette[b_idx % len(_band_palette)]
+                        band_label = f"Band {b_idx + 1} mean ({bf[0]:.0f}–{bf[-1]:.0f} MHz)" if multi_band else "Group mean"
+                        ax2.plot(bf, bm, color=bc, linewidth=1.5, label=band_label)
+                        ax2.fill_between(bf,
+                                         [m - s for m, s in zip(bm, bs)],
+                                         [m + s for m, s in zip(bm, bs)],
+                                         alpha=0.2, color=bc)
                     ax2.set_ylabel('Group RxMER (dB)', fontsize=9)
                     ax2.set_title('Per-subcarrier group statistics', fontsize=9)
                     ax2.legend(fontsize=8)
