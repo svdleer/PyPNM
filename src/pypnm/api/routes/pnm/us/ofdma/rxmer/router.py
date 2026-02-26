@@ -1083,9 +1083,9 @@ class UsOfdmaRxMerRouter:
                 # docsIf31CmtsCmUsOfdmaChannelStatus  1.3.6.1.4.1.4491.2.1.28.1.4.1.2
                 # OID index: {cm_index}.{ofdma_ifindex} — DOCSIS 3.1 OFDMA specific!
                 OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
-                # docsIf3CmtsCmRegStatusMacAddr   1.3.6.1.4.1.4491.2.1.20.1.3.1.1.3
-                # index: {cm_index}  value: MAC as 6 hex octets
-                OID_CM_REG_MAC    = "1.3.6.1.4.1.4491.2.1.20.1.3.1.1.3"
+                # docsIfCmtsCmStatusMacAddress  1.3.6.1.2.1.10.127.1.3.3.1.2
+                # index: {cm_index}  value: MAC as 6 hex octets  (works on E6000/Commscope)
+                OID_CM_REG_MAC = "1.3.6.1.2.1.10.127.1.3.3.1.2"
 
                 walk = await service._snmp_walk(OID_CM_OFDMA_STATUS)
                 if not isinstance(walk, dict) or not walk.get('success'):
@@ -1121,9 +1121,12 @@ class UsOfdmaRxMerRouter:
                 self.logger.info(f"channel/modems: matched {len(matching_cm_idx)} CMs, seen ifidx sample: {list(seen_ifidx)[:5]}")
 
                 modems = []
+                mac_failures = 0
                 for cm_idx in list(matching_cm_idx)[:max_modems]:
                     mac_result = await service._snmp_get(f"{OID_CM_REG_MAC}.{cm_idx}")
                     if not mac_result.get('success'):
+                        mac_failures += 1
+                        self.logger.debug(f"MAC lookup failed for cm_idx={cm_idx}: {mac_result.get('error')}")
                         continue
                     raw = service._parse_get_value(mac_result) or ""
                     # raw is hex bytes like 'D4 6A 6A FD 00 B3'
@@ -1131,6 +1134,9 @@ class UsOfdmaRxMerRouter:
                     if len(parts) == 6:
                         mac = ":".join(p.lower().zfill(2) for p in parts)
                         modems.append({"cm_mac_address": mac, "cm_index": cm_idx})
+                
+                if mac_failures:
+                    self.logger.warning(f"channel/modems: {mac_failures} MAC lookups failed")
 
                 return {"success": True, "ofdma_ifindex": ofdma_ifindex, "modems": modems}
             except Exception as e:
