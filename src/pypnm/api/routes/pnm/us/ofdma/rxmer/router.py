@@ -827,37 +827,48 @@ class UsOfdmaRxMerRouter:
                 return frozenset()
 
             # ── Step 1: (mdIfIndex, chIfIndex) → chId ──────────────────────
-            d1 = _to_dict(await svc._snmp_walk(OID_CHID, timeout=30))
+            w1_raw = await svc._snmp_walk(OID_CHID, timeout=30)
+            d1 = _to_dict(w1_raw)
+            self.logger.info(f"FN-resolve CHID walk: success={w1_raw.get('success')}, "
+                             f"rows={len(d1) if d1 else 0}, "
+                             f"first_oid={next(iter(d1), None) if d1 else None}")
             if not d1:
+                self.logger.info(f"FN-resolve: CHID walk empty/failed: {w1_raw.get('error')}")
                 return {}
 
             ifidx_to_md_chid: dict = {}   # chIfIndex → (mdIfIndex, chId)
+            pfx1 = OID_CHID + "."
             for oid, val in d1.items():
-                sfx = oid.removeprefix(OID_CHID + ".")
-                if sfx == oid:
+                if not oid.startswith(pfx1):
                     continue
-                parts = sfx.split('.')
+                parts = oid[len(pfx1):].split('.')
                 if len(parts) != 2:
                     continue
                 md_if, ch_if = int(parts[0]), int(parts[1])
                 if ch_if in ofdma_ifindex_set:
                     ifidx_to_md_chid[ch_if] = (md_if, int(str(val).strip()))
 
+            self.logger.info(f"FN-resolve: matched {len(ifidx_to_md_chid)}/{len(d1)} MdChCfg rows "
+                             f"(ofdma set size={len(ofdma_ifindex_set)}, "
+                             f"sample ifidx={list(ofdma_ifindex_set)[:2]})")
             if not ifidx_to_md_chid:
                 return {}
 
             # ── Step 2: FN name from string-indexed OID  ───────────────────
             # suffix: {mdIfIndex}.{strLen}.{charByte0}...{mCmSgId}  value=mUSsgId
-            d4 = _to_dict(await svc._snmp_walk(OID_FNSG, timeout=30))
+            pfx4 = OID_FNSG + "."
+            w4_raw = await svc._snmp_walk(OID_FNSG, timeout=30)
+            d4 = _to_dict(w4_raw)
+            self.logger.info(f"FN-resolve FNSG walk: success={w4_raw.get('success')}, "
+                             f"rows={len(d4) if d4 else 0}, error={w4_raw.get('error')}")
             if not d4:
                 return {}
 
             ussg_to_fn: dict = {}   # (mdIfIndex, mUSsgId) → fnName
             for oid, val in d4.items():
-                sfx = oid.removeprefix(OID_FNSG + ".")
-                if sfx == oid:
+                if not oid.startswith(pfx4):
                     continue
-                parts = sfx.split('.')
+                parts = oid[len(pfx4):].split('.')
                 if len(parts) < 4:
                     continue
                 md_if   = int(parts[0])
@@ -868,40 +879,49 @@ class UsOfdmaRxMerRouter:
                 m_us_sg = int(str(val).strip())
                 ussg_to_fn.setdefault((md_if, m_us_sg), fn_name)
 
+            self.logger.info(f"FN-resolve: {len(ussg_to_fn)} FN names decoded: "
+                             f"{dict(list(ussg_to_fn.items())[:5])}")
             if not ussg_to_fn:
                 return {}
 
             # ── Step 3: (mdIfIndex, mUSsgId) → chSetId ─────────────────────
+            pfx3 = OID_SGSET + "."
             d3 = _to_dict(await svc._snmp_walk(OID_SGSET, timeout=30))
             if not d3:
+                self.logger.warning("FN-resolve: SGSET walk empty/failed")
                 return {}
 
             ussg_to_chset: dict = {}   # (mdIfIndex, mUSsgId) → chSetId
             for oid, val in d3.items():
-                sfx = oid.removeprefix(OID_SGSET + ".")
-                if sfx == oid:
+                if not oid.startswith(pfx3):
                     continue
-                parts = sfx.split('.')
+                parts = oid[len(pfx3):].split('.')
                 if len(parts) != 2:
                     continue
                 ussg_to_chset[(int(parts[0]), int(parts[1]))] = int(str(val).strip())
 
+            self.logger.info(f"FN-resolve: {len(ussg_to_chset)} mUSsgId→chSetId entries")
+
             # ── Step 4: (mdIfIndex, chSetId) → frozenset of chIds ──────────
+            pfx2 = OID_CHLST + "."
             d2 = _to_dict(await svc._snmp_walk(OID_CHLST, timeout=30))
             if not d2:
+                self.logger.warning("FN-resolve: CHLST walk empty/failed")
                 return {}
 
             chset_chids: dict = {}   # (mdIfIndex, chSetId) → frozenset of chIds
             for oid, val in d2.items():
-                sfx = oid.removeprefix(OID_CHLST + ".")
-                if sfx == oid:
+                if not oid.startswith(pfx2):
                     continue
-                parts = sfx.split('.')
+                parts = oid[len(pfx2):].split('.')
                 if len(parts) != 2:
                     continue
                 chids = _parse_chids(str(val))
                 if chids:
                     chset_chids[(int(parts[0]), int(parts[1]))] = chids
+
+            self.logger.info(f"FN-resolve: {len(chset_chids)} chSetId→chIds entries, "
+                             f"sample: {dict(list(chset_chids.items())[:2])}")
 
             # ── Compose: chIfIndex → fnName ─────────────────────────────────
             result: dict = {}
