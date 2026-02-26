@@ -796,9 +796,13 @@ class UsOfdmaRxMerRouter:
                 if not isinstance(walk, dict) or not walk.get('success'):
                     return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "channels": [], "fiber_nodes": []}
 
-                # _snmp_walk returns {'success': True, 'results': {oid: val, ...}}
-                oid_map = walk.get('results') or {}
-                if not isinstance(oid_map, dict):
+                # agent returns {'results': [{oid, value, type}, ...]} (list)
+                raw = walk.get('results') or []
+                if isinstance(raw, list):
+                    oid_map = {item['oid']: item['value'] for item in raw if isinstance(item, dict) and 'oid' in item}
+                elif isinstance(raw, dict):
+                    oid_map = raw
+                else:
                     oid_map = {}
 
                 channels = []
@@ -884,9 +888,13 @@ class UsOfdmaRxMerRouter:
                 if not isinstance(walk, dict) or not walk.get('success'):
                     return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "modems": []}
 
-                # _snmp_walk returns {'success': True, 'results': {oid: val, ...}}
-                oid_map = walk.get('results') or {}
-                if not isinstance(oid_map, dict):
+                # agent returns {'results': [{oid, value, type}, ...]} (list)
+                raw = walk.get('results') or []
+                if isinstance(raw, list):
+                    oid_map = {item['oid']: item['value'] for item in raw if isinstance(item, dict) and 'oid' in item}
+                elif isinstance(raw, dict):
+                    oid_map = raw
+                else:
                     oid_map = {}
 
                 matching_cm_idx: set = set()
