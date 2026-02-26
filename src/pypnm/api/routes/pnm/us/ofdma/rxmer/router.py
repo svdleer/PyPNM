@@ -1093,62 +1093,39 @@ class UsOfdmaRxMerRouter:
 
                 # agent returns {'results': [{oid, value, type}, ...]} (list)
                 raw = walk.get('results') or []
-                self.logger.info(f"channel/modems walk: {len(raw)} results, target ifindex={ofdma_ifindex}")
                 if isinstance(raw, list):
                     oid_list = [item['oid'] for item in raw if isinstance(item, dict) and 'oid' in item]
                 elif isinstance(raw, dict):
                     oid_list = list(raw.keys())
                 else:
                     oid_list = []
-                
-                if oid_list:
-                    self.logger.info(f"channel/modems sample OIDs: {oid_list[:3]}")
 
                 matching_cm_idx: set = set()
-                seen_ifidx: set = set()
                 for oid in oid_list:
                     try:
                         # OID ends with cm_index.ofdma_ifindex
                         parts = str(oid).rstrip('.').split('.')
                         ifidx = int(parts[-1])   # last element is ofdma_ifindex
                         cm_idx = int(parts[-2])  # second-to-last is cm_index
-                        seen_ifidx.add(ifidx)
                         if ifidx == ofdma_ifindex:
                             matching_cm_idx.add(cm_idx)
                     except (ValueError, IndexError):
                         continue
-                
-                self.logger.info(f"channel/modems: matched {len(matching_cm_idx)} CMs, seen ifidx sample: {list(seen_ifidx)[:5]}")
 
                 modems = []
-                mac_failures = 0
                 for cm_idx in list(matching_cm_idx)[:max_modems]:
                     mac_result = await service._snmp_get(f"{OID_CM_REG_MAC}.{cm_idx}")
                     if not mac_result.get('success'):
-                        mac_failures += 1
-                        self.logger.warning(f"MAC lookup failed for cm_idx={cm_idx}: {mac_result.get('error')}")
                         continue
                     raw = service._parse_get_value(mac_result) or ""
-                    self.logger.info(f"MAC raw for cm_idx={cm_idx}: {repr(raw)[:80]}")
-                    # raw could be hex bytes 'D4 6A 6A FD 00 B3' or binary or other formats
-                    # Try parsing as space-separated hex
-                    parts = raw.replace("0x", "").strip().split()
-                    if len(parts) == 6:
-                        mac = ":".join(p.lower().zfill(2) for p in parts)
-                        modems.append({"cm_mac_address": mac, "cm_index": cm_idx})
-                    # Try parsing as colon-separated already
-                    elif ":" in raw and len(raw.split(":")) == 6:
-                        modems.append({"cm_mac_address": raw.lower(), "cm_index": cm_idx})
-                    # Try parsing as 12-char hex string
-                    elif len(raw.replace(" ", "").replace("0x", "")) == 12:
-                        hex_str = raw.replace(" ", "").replace("0x", "")
+                    # Handle various MAC formats:
+                    #  - '0x90324bc813df' (hex string from agent)
+                    #  - 'D4 6A 6A FD 00 B3' (space-separated hex)
+                    #  - 'aa:bb:cc:dd:ee:ff' (already formatted)
+                    hex_str = raw.replace("0x", "").replace(" ", "").replace(":", "").strip()
+                    if len(hex_str) == 12:
                         mac = ":".join(hex_str[i:i+2].lower() for i in range(0, 12, 2))
                         modems.append({"cm_mac_address": mac, "cm_index": cm_idx})
-                    else:
-                        self.logger.warning(f"Could not parse MAC for cm_idx={cm_idx}: {repr(raw)}")
-                
-                if mac_failures:
-                    self.logger.warning(f"channel/modems: {mac_failures} MAC lookups failed")
 
                 return {"success": True, "ofdma_ifindex": ofdma_ifindex, "modems": modems}
             except Exception as e:
