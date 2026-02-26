@@ -47,6 +47,8 @@ from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
     SubcarrierGroupStats,
     ModemAssessment,
     FiberNodeSummary,
+    PreEqDataRequest,
+    PreEqDataResponse,
 )
 from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 from pypnm.api.routes.common.service.fiber_node_utils import (
@@ -104,6 +106,64 @@ class UsOfdmaRxMerRouter:
             try:
                 result = await service.discover_modem_ofdma(request.cm_mac_address)
                 return UsOfdmaRxMerDiscoverResponse(**result)
+            finally:
+                service.close()
+        
+        @self.router.post(
+            "/preeq",
+            summary="Get pre-equalization data and group delay",
+            response_model=PreEqDataResponse,
+        )
+        async def get_preeq_data(
+            request: PreEqDataRequest
+        ) -> PreEqDataResponse:
+            """
+            Get ATDMA pre-equalization coefficients and group delay for a cable modem.
+            
+            This endpoint queries docsIf3CmtsCmUsStatusEqData and computes:
+            - Pre-equalization tap coefficients
+            - Key metrics (MTC, NMTER, tap energy ratios)
+            - Group delay variation (derived from phase response)
+            - Cable length equivalents for micro-reflections
+            
+            Group delay analysis helps identify:
+            - Network issues: Large group delay variation across all modems on a fiber node
+            - In-home issues: High group delay for a single modem (micro-reflections, impedance mismatches)
+            """
+            self.logger.info(
+                f"Getting pre-EQ for CM {request.cm_mac_address} on CMTS {request.cmts.cmts_ip}"
+            )
+            
+            service = CmtsUsOfdmaRxMerService(
+                cmts_ip=request.cmts.cmts_ip,
+                community=request.cmts.community,
+                write_community=request.cmts.write_community
+            )
+            
+            try:
+                # Get cm_index if not provided
+                cm_index = request.cm_index
+                if not cm_index:
+                    cm_index = await service.discover_cm_index(request.cm_mac_address)
+                    if not cm_index:
+                        return PreEqDataResponse(
+                            success=False,
+                            cm_mac_address=request.cm_mac_address,
+                            error="CM not found on CMTS"
+                        )
+                
+                result = await service.get_preeq_data(
+                    cm_index=cm_index,
+                    channel_width_hz=request.channel_width_hz
+                )
+                return PreEqDataResponse(
+                    success=result.get('success', False),
+                    cm_mac_address=request.cm_mac_address,
+                    cm_index=result.get('cm_index'),
+                    num_channels=result.get('num_channels', 0),
+                    channels=result.get('channels', []),
+                    error=result.get('error')
+                )
             finally:
                 service.close()
         

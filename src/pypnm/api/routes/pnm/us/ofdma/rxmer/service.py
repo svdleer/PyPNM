@@ -11,6 +11,7 @@ OIDs used (from DOCS-PNM-MIB):
 - docsIf3CmtsCmRegStatusMacAddr: 1.3.6.1.4.1.4491.2.1.20.1.3.1.2
 - docsIf31CmtsCmUsOfdmaChannelStatus: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2
 - docsPnmCmtsUsOfdmaRxMerTable: 1.3.6.1.4.1.4491.2.1.27.1.3.7
+- docsIf3CmtsCmUsStatusEqData: 1.3.6.1.4.1.4491.2.1.20.1.4.2.1.5 (ATDMA pre-EQ)
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from enum import IntEnum
 from typing import Any, Dict, Optional
 
 from pypnm.api.agent.manager import get_agent_manager
+from pypnm.pnm.data_type.DocsEqualizerData import DocsEqualizerData
+from pypnm.lib.types import BandwidthHz
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,10 @@ class CmtsUsOfdmaRxMerService:
     OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
     OID_CM_REG_MAC = "1.3.6.1.2.1.10.127.1.3.3.1.2"  # docsIfCmtsCmStatusMacAddress (works on E6000)
     OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"  # docsIf31CmtsCmUsOfdmaChannelTimingOffset (has cm_index.ofdma_ifindex)
+    
+    # Pre-equalization data (ATDMA upstream)
+    # OID: docsIf3CmtsCmUsStatusEqData.{cm_index}.{us_ifindex} → OCTET STRING (coefficients)
+    OID_CM_US_EQ_DATA = "1.3.6.1.4.1.4491.2.1.20.1.4.2.1.5"  # docsIf3CmtsCmUsStatusEqData
     
     # US OFDMA RxMER Table (docsPnmCmtsUsOfdmaRxMerTable)
     # OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
@@ -449,6 +456,152 @@ class CmtsUsOfdmaRxMerService:
             "ofdma_description": ofdma_channels[0]["description"],
             "ofdma_channels": ofdma_channels,
         }
+    
+    # ============================================
+    # Pre-Equalization / Group Delay
+    # ============================================
+    
+    async def get_preeq_data(
+        self,
+        cm_index: int,
+        channel_width_hz: int = 6_400_000,  # Default: 6.4 MHz ATDMA
+    ) -> dict[str, Any]:
+        """
+        Get pre-equalization coefficients and group delay for a cable modem.
+        
+        Queries docsIf3CmtsCmUsStatusEqData and computes group delay from the
+        ATDMA upstream pre-equalization coefficients.
+        
+        Args:
+            cm_index: CM registration index from docsIf3CmtsCmRegStatusMacAddr
+            channel_width_hz: ATDMA channel width in Hz (default 6.4 MHz)
+            
+        Returns:
+            Dict with pre-EQ metrics and group delay per upstream channel
+        """
+        self.logger.info(f"Getting pre-EQ data for CM index {cm_index}")
+        
+        try:
+            # Walk pre-EQ data for this CM index
+            result = await self._snmp_walk(self.OID_CM_US_EQ_DATA, timeout=30)
+            
+            if not result.get('success') or not result.get('results'):
+                self.logger.warning("No pre-EQ data found on CMTS")
+                return {"success": False, "error": "No pre-EQ data found", "cm_index": cm_index}
+            
+            # OID format: <base>.<cm_index>.<us_ifindex>
+            base = self.OID_CM_US_EQ_DATA.rstrip(".")
+            eq_parser = DocsEqualizerData()
+            channels_found = []
+            
+            for entry in result['results']:
+                oid_str = str(entry.get('oid', ''))
+                value = entry.get('value', '')
+                
+                # Parse suffix to get cm_index.us_ifindex
+                if oid_str.startswith(base + "."):
+                    suffix = oid_str[len(base) + 1:]
+                    parts = suffix.split(".")
+                    if len(parts) >= 2 and parts[0] == str(cm_index):
+                        us_ifindex = int(parts[1])
+                        
+                        # Value is hex string like "0x08011800..." or "08 01 18 00..."
+                        hex_str = str(value)
+                        if hex_str.lower().startswith('0x'):
+                            hex_str = hex_str[2:]
+                        # Remove spaces/colons
+                        hex_str = hex_str.replace(' ', '').replace(':', '')
+                        
+                        if hex_str and len(hex_str) >= 8:  # At least header
+                            try:
+                                eq_parser.add(
+                                    us_ifindex,
+                                    hex_str,
+                                    channel_width_hz=BandwidthHz(channel_width_hz),
+                                )
+                                channels_found.append(us_ifindex)
+                            except Exception as e:
+                                self.logger.warning(f"Failed to parse pre-EQ for ifindex {us_ifindex}: {e}")
+            
+            if not eq_parser.coefficients_found():
+                return {
+                    "success": False,
+                    "error": "Pre-EQ data found but failed to parse",
+                    "cm_index": cm_index,
+                }
+            
+            # Build response with parsed data
+            channel_data = []
+            for us_ifindex, eq_model in eq_parser.equalizer_data.items():
+                ch_info = {
+                    "us_ifindex": us_ifindex,
+                    "num_taps": eq_model.num_taps,
+                    "main_tap_location": eq_model.main_tap_location,
+                    "taps_per_symbol": eq_model.taps_per_symbol,
+                }
+                
+                # Add metrics if available
+                if eq_model.metrics:
+                    ch_info["metrics"] = {
+                        "main_tap_ratio": eq_model.metrics.main_tap_ratio,
+                        "tap_energy_ratio": eq_model.metrics.tap_energy_ratio,
+                        "mtc_dB": eq_model.metrics.mtc_dB,
+                        "nmter_dB": eq_model.metrics.nmter_dB,
+                        "pcter": eq_model.metrics.pcter,
+                        "pre_main_tap_energy_ratio": eq_model.metrics.pre_main_tap_energy_ratio,
+                        "post_main_tap_energy_ratio": eq_model.metrics.post_main_tap_energy_ratio,
+                    }
+                
+                # Add group delay if available
+                if eq_model.group_delay:
+                    gd = eq_model.group_delay
+                    # Compute peak-to-peak and RMS group delay variation
+                    delay_us_list = gd.delay_us
+                    if delay_us_list:
+                        gd_min = min(delay_us_list)
+                        gd_max = max(delay_us_list)
+                        gd_mean = sum(delay_us_list) / len(delay_us_list)
+                        gd_pp = gd_max - gd_min
+                        gd_rms = (sum((d - gd_mean)**2 for d in delay_us_list) / len(delay_us_list)) ** 0.5
+                    else:
+                        gd_min = gd_max = gd_mean = gd_pp = gd_rms = 0.0
+                    
+                    ch_info["group_delay"] = {
+                        "channel_width_hz": int(gd.channel_width_hz),
+                        "symbol_rate": gd.symbol_rate,
+                        "symbol_time_us": gd.symbol_time_us,
+                        "sample_period_us": gd.sample_period_us,
+                        "fft_size": gd.fft_size,
+                        "delay_us": delay_us_list[:32] if len(delay_us_list) > 32 else delay_us_list,  # Truncate for response
+                        "delay_min_us": round(gd_min, 4),
+                        "delay_max_us": round(gd_max, 4),
+                        "delay_pp_us": round(gd_pp, 4),
+                        "delay_rms_us": round(gd_rms, 4),
+                    }
+                
+                # Add tap delay summary if available
+                if eq_model.tap_delay_summary:
+                    tds = eq_model.tap_delay_summary
+                    ch_info["tap_delay_summary"] = {
+                        "main_tap_index": tds.main_tap_index,
+                        "max_pre_main_delay_us": tds.max_pre_main_delay_us,
+                        "max_post_main_delay_us": tds.max_post_main_delay_us,
+                        "pre_main_cable_ft": tds.pre_main_cable_equivalent_ft,
+                        "post_main_cable_ft": tds.post_main_cable_equivalent_ft,
+                    }
+                
+                channel_data.append(ch_info)
+            
+            return {
+                "success": True,
+                "cm_index": cm_index,
+                "num_channels": len(channel_data),
+                "channels": channel_data,
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting pre-EQ data: {e}")
+            return {"success": False, "error": str(e), "cm_index": cm_index}
     
     # ============================================
     # US OFDMA RxMER Measurement
