@@ -49,6 +49,14 @@ from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
     FiberNodeSummary,
 )
 from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
+from pypnm.api.routes.common.service.fiber_node_utils import (
+    OID_MD_CH_CFG_CH_ID,
+    OID_MD_NODE_STATUS_MD_US_SG_ID,
+    OID_MD_US_SG_STATUS_CH_SET_ID,
+    OID_US_CH_SET_CH_LIST,
+    parse_fn_name_from_oid,
+    parse_channel_id_list,
+)
 
 
 class UsOfdmaRxMerRouter:
@@ -776,13 +784,7 @@ class UsOfdmaRxMerRouter:
 
         # ------------------------------------------------------------------
         # DOCS-IF3-MIB fiber node name resolution
-        #
-        # Verified OIDs (1.3.6.1.4.1.4491.2.1.20 = docsIf3Mib):
-        #   docsIf3MdChCfgChId        .1.5.1.3  (mdIfIndex, chIfIndex) → chId
-        #   docsIf3UsChSetChList       .1.22.1.2 (mdIfIndex, chSetId)   → HEX bytes of chIds
-        #   docsIf3MdUsSgStatusChSetId .1.14.1.2 (mdIfIndex, mUSsgId)  → chSetId
-        #   docsIf3MdNodeStatusMdUsSgId.1.12.1.4 (mdIfIndex, strLen, chars..., mCmSgId) → mUSsgId
-        #     FN name extracted from OID index: strLen + char bytes
+        # Uses shared utilities from fiber_node_utils.py
         # ------------------------------------------------------------------
 
         async def _resolve_fn_names(svc, ofdma_ifindex_set: set) -> dict:
@@ -790,23 +792,8 @@ class UsOfdmaRxMerRouter:
             Resolve real fiber node names from DOCS-IF3-MIB for all vendors.
             Returns {chIfIndex: fnName} or {} when tables are unavailable.
 
-            Confirmed OIDs (from snmpwalk -On on Commscope E6000 ccap002):
-              docsIf3MdChCfgChId        1.3.6.1.4.1.4491.2.1.20.1.5.1.3
-                index (mdIfIndex, chIfIndex)  → value: chId
-              docsIf3MdNodeStatusMdUsSgId 1.3.6.1.4.1.4491.2.1.20.1.12.1.4
-                index (mdIfIndex, strLen, fnNameBytes..., mCmSgId) → value: mUSsgId
-                e.g. .536871013.3.70.78.49.1 → mdIf=536871013, "FN1", mCmSgId=1
-              docsIf3MdUsSgStatusChSetId  1.3.6.1.4.1.4491.2.1.20.1.14.1.2
-                index (mdIfIndex, mUSsgId)   → value: chSetId
-              docsIf3UsChSetChList         1.3.6.1.4.1.4491.2.1.20.1.22.1.2
-                index (mdIfIndex, chSetId)   → value: STRING "1,2,3,4,25,26"
+            Uses shared OID constants and parsing from fiber_node_utils.py.
             """
-            BASE      = "1.3.6.1.4.1.4491.2.1.20"
-            OID_CHID  = f"{BASE}.1.5.1.3"    # docsIf3MdChCfgChId
-            OID_FNSG  = f"{BASE}.1.12.1.4"   # docsIf3MdNodeStatusMdUsSgId
-            OID_SGSET = f"{BASE}.1.14.1.2"   # docsIf3MdUsSgStatusChSetId
-            OID_CHLST = f"{BASE}.1.22.1.2"   # docsIf3UsChSetChList
-
             def _to_dict(walk_result):
                 if not isinstance(walk_result, dict) or not walk_result.get('success'):
                     return None
@@ -814,48 +801,8 @@ class UsOfdmaRxMerRouter:
                 return {item['oid']: item['value']
                         for item in raw if isinstance(item, dict) and 'oid' in item}
 
-            def _parse_chids(val):
-                """Parse ChannelList (OCTET STRING) into a frozenset of integer channel IDs.
-
-                The agent may return:
-                  bytes  b'\\x01\\x02\\x03\\x04\\x19\\x1a'  ← raw octet string (most common)
-                  str    '1,2,3,4,25,26'                    ← comma-separated (some agents)
-                  str    '01 02 03 04 19 1a'                ← hex-spaced
-                  str    '0x0102...'                        ← 0x-prefixed hex
-                """
-                if isinstance(val, (bytes, bytearray)):
-                    return frozenset(val)
-                s = str(val).strip().strip('"')
-                # Raw Python repr of bytes: starts with b' or b"
-                if s.startswith("b'") or s.startswith('b"'):
-                    try:
-                        return frozenset(c for c in eval(s))  # safe: only byte literals
-                    except Exception:
-                        pass
-                # Escape sequences like \x01\x02 in a plain string
-                if '\\x' in s:
-                    try:
-                        return frozenset(c for c in bytes.fromhex(s.replace('\\x', '')))
-                    except Exception:
-                        pass
-                # Comma-separated integers: "1,2,3,4,25,26"
-                if ',' in s:
-                    return frozenset(int(x.strip()) for x in s.split(',') if x.strip().isdigit())
-                # Space-separated hex bytes: "01 02 03 04 19 1a"
-                if ' ' in s or s.startswith('0x'):
-                    try:
-                        return frozenset(int(b, 16) for b in s.replace('0x', '').split())
-                    except ValueError:
-                        pass
-                # Single printable chars that are control chars (raw octet string as str)
-                if s and all(ord(c) < 256 for c in s):
-                    ids = frozenset(ord(c) for c in s)
-                    if ids:
-                        return ids
-                return frozenset()
-
             # ── Step 1: (mdIfIndex, chIfIndex) → chId ──────────────────────
-            w1_raw = await svc._snmp_walk(OID_CHID, timeout=30)
+            w1_raw = await svc._snmp_walk(OID_MD_CH_CFG_CH_ID, timeout=30)
             d1 = _to_dict(w1_raw)
             self.logger.info(f"FN-resolve CHID walk: success={w1_raw.get('success')}, "
                              f"rows={len(d1) if d1 else 0}, "
@@ -865,7 +812,7 @@ class UsOfdmaRxMerRouter:
                 return {}
 
             ifidx_to_md_chid: dict = {}   # chIfIndex → (mdIfIndex, chId)
-            pfx1 = OID_CHID + "."
+            pfx1 = OID_MD_CH_CFG_CH_ID + "."
             for oid, val in d1.items():
                 if not oid.startswith(pfx1):
                     continue
@@ -882,10 +829,8 @@ class UsOfdmaRxMerRouter:
             if not ifidx_to_md_chid:
                 return {}
 
-            # ── Step 2: FN name from string-indexed OID  ───────────────────
-            # suffix: {mdIfIndex}.{strLen}.{charByte0}...{mCmSgId}  value=mUSsgId
-            pfx4 = OID_FNSG + "."
-            w4_raw = await svc._snmp_walk(OID_FNSG, timeout=30)
+            # ── Step 2: FN name from string-indexed OID (shared parse_fn_name_from_oid)
+            w4_raw = await svc._snmp_walk(OID_MD_NODE_STATUS_MD_US_SG_ID, timeout=30)
             d4 = _to_dict(w4_raw)
             self.logger.info(f"FN-resolve FNSG walk: success={w4_raw.get('success')}, "
                              f"rows={len(d4) if d4 else 0}, error={w4_raw.get('error')}")
@@ -894,18 +839,11 @@ class UsOfdmaRxMerRouter:
 
             ussg_to_fn: dict = {}   # (mdIfIndex, mUSsgId) → fnName
             for oid, val in d4.items():
-                if not oid.startswith(pfx4):
-                    continue
-                parts = oid[len(pfx4):].split('.')
-                if len(parts) < 4:
-                    continue
-                md_if   = int(parts[0])
-                str_len = int(parts[1])
-                if len(parts) < 2 + str_len + 1:
-                    continue
-                fn_name = ''.join(chr(int(b)) for b in parts[2:2 + str_len])
-                m_us_sg = int(str(val).strip())
-                ussg_to_fn.setdefault((md_if, m_us_sg), fn_name)
+                parsed = parse_fn_name_from_oid(oid, OID_MD_NODE_STATUS_MD_US_SG_ID)
+                if parsed:
+                    fn_name, md_if, _ = parsed
+                    m_us_sg = int(str(val).strip())  # value is mUSsgId
+                    ussg_to_fn.setdefault((md_if, m_us_sg), fn_name)
 
             self.logger.info(f"FN-resolve: {len(ussg_to_fn)} FN names decoded: "
                              f"{dict(list(ussg_to_fn.items())[:5])}")
@@ -913,8 +851,8 @@ class UsOfdmaRxMerRouter:
                 return {}
 
             # ── Step 3: (mdIfIndex, mUSsgId) → chSetId ─────────────────────
-            pfx3 = OID_SGSET + "."
-            d3 = _to_dict(await svc._snmp_walk(OID_SGSET, timeout=30))
+            pfx3 = OID_MD_US_SG_STATUS_CH_SET_ID + "."
+            d3 = _to_dict(await svc._snmp_walk(OID_MD_US_SG_STATUS_CH_SET_ID, timeout=30))
             if not d3:
                 self.logger.warning("FN-resolve: SGSET walk empty/failed")
                 return {}
@@ -930,9 +868,9 @@ class UsOfdmaRxMerRouter:
 
             self.logger.info(f"FN-resolve: {len(ussg_to_chset)} mUSsgId→chSetId entries")
 
-            # ── Step 4: (mdIfIndex, chSetId) → frozenset of chIds ──────────
-            pfx2 = OID_CHLST + "."
-            w2_raw = await svc._snmp_walk(OID_CHLST, timeout=30)
+            # ── Step 4: (mdIfIndex, chSetId) → frozenset of chIds (shared parse_channel_id_list)
+            pfx2 = OID_US_CH_SET_CH_LIST + "."
+            w2_raw = await svc._snmp_walk(OID_US_CH_SET_CH_LIST, timeout=30)
             d2 = _to_dict(w2_raw)
             self.logger.info(f"FN-resolve CHLST walk: success={w2_raw.get('success')}, "
                              f"rows={len(d2) if d2 else 0}, error={w2_raw.get('error')}, "
@@ -950,11 +888,11 @@ class UsOfdmaRxMerRouter:
                 parts = oid[len(pfx2):].split('.')
                 if len(parts) != 2:
                     continue
-                chids = _parse_chids(val)   # pass raw value, not str(val)
+                chids = parse_channel_id_list(val)   # shared utility
                 if chids:
                     chset_chids[(int(parts[0]), int(parts[1]))] = chids
                 elif not _parse_warn_done:
-                    self.logger.warning(f"FN-resolve: _parse_chids empty for val={repr(val)}")
+                    self.logger.warning(f"FN-resolve: parse_channel_id_list empty for val={repr(val)}")
                     _parse_warn_done = True
 
             self.logger.info(f"FN-resolve: {len(chset_chids)} chSetId→chIds entries, "
