@@ -809,10 +809,14 @@ class UsOfdmaRxMerRouter:
             - Single modem + both preeq flags → same as /getComparisonData
             """
             try:
-                captures = [
-                    _load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address)
-                    for e in request.captures
-                ]
+                captures = []
+                for e in request.captures:
+                    try:
+                        captures.append(_load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address))
+                    except FileNotFoundError as fnf:
+                        self.logger.warning(f"fiberNode/analyze: skipping missing capture {fnf}")
+                if not captures:
+                    return FiberNodeAnalysis(success=False, error="No capture files found")
                 return _analyze(captures)
             except Exception as e:
                 self.logger.error(f"fiberNode/analyze error: {e}")
@@ -831,10 +835,14 @@ class UsOfdmaRxMerRouter:
         async def fiber_node_plot(request: FiberNodeAnalysisRequest):
             """Same as /fiberNode/analyze but returns a matplotlib overlay PNG."""
             try:
-                captures = [
-                    _load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address)
-                    for e in request.captures
-                ]
+                captures = []
+                for e in request.captures:
+                    try:
+                        captures.append(_load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address))
+                    except FileNotFoundError as fnf:
+                        self.logger.warning(f"fiberNode/plot: skipping missing capture {fnf}")
+                if not captures:
+                    return UsOfdmaRxMerCaptureResponse(success=False, error="No capture files found")
                 analysis = _analyze(captures)
                 return Response(content=_plot_analysis(analysis), media_type="image/png",
                                 headers={"Content-Disposition": "inline; filename=us_rxmer_fibernode.png"})
