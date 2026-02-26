@@ -809,11 +809,16 @@ class UsOfdmaRxMerRouter:
                 for oid, raw_val in oid_map.items():
                     desc = str(raw_val).strip().strip('"')
                     lower = desc.lower()
-                    # Commscope/Arris OFDMA: "cable-us-ofdma 1/ofd/32.0"
-                    # Cisco/Casa OFDMA:     "Cable1/0/0-upstream0"  (no /ofd/ in name)
-                    # Exclude: SC-QAM "cable-upstream 1/ofd/7" (has /ofd/ but not us-ofdma)
+                    # Commscope OFDMA:  "cable-us-ofdma 1/ofd/32.0"  ← only these
+                    # Commscope SC-QAM: "cable-upstream 1/scq/7"    ← exclude
+                    # Commscope SC-QAM: "cable-upstream 1/nd/7"     ← exclude
+                    # Cisco/Casa OFDMA: "Cable1/0/0-upstream0"      ← include (no /scq/ or /nd/)
                     is_commscope_ofdma = 'us-ofdma' in lower
-                    is_cisco_upstream  = 'upstream' in lower and '/ofd/' not in lower and 'cable-mac' not in lower
+                    is_cisco_upstream  = ('upstream' in lower
+                                          and '/ofd/' not in lower
+                                          and '/scq/' not in lower
+                                          and '/nd/' not in lower
+                                          and 'cable-mac' not in lower)
                     if not (is_commscope_ofdma or is_cisco_upstream):
                         continue
                     try:
