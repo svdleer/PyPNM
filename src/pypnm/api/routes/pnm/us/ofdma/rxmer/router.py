@@ -1093,24 +1093,32 @@ class UsOfdmaRxMerRouter:
 
                 # agent returns {'results': [{oid, value, type}, ...]} (list)
                 raw = walk.get('results') or []
+                self.logger.info(f"channel/modems walk: {len(raw)} results, target ifindex={ofdma_ifindex}")
                 if isinstance(raw, list):
                     oid_list = [item['oid'] for item in raw if isinstance(item, dict) and 'oid' in item]
                 elif isinstance(raw, dict):
                     oid_list = list(raw.keys())
                 else:
                     oid_list = []
+                
+                if oid_list:
+                    self.logger.info(f"channel/modems sample OIDs: {oid_list[:3]}")
 
                 matching_cm_idx: set = set()
+                seen_ifidx: set = set()
                 for oid in oid_list:
                     try:
                         # OID ends with cm_index.ofdma_ifindex
                         parts = str(oid).rstrip('.').split('.')
                         ifidx = int(parts[-1])   # last element is ofdma_ifindex
                         cm_idx = int(parts[-2])  # second-to-last is cm_index
+                        seen_ifidx.add(ifidx)
                         if ifidx == ofdma_ifindex:
                             matching_cm_idx.add(cm_idx)
                     except (ValueError, IndexError):
                         continue
+                
+                self.logger.info(f"channel/modems: matched {len(matching_cm_idx)} CMs, seen ifidx sample: {list(seen_ifidx)[:5]}")
 
                 modems = []
                 for cm_idx in list(matching_cm_idx)[:max_modems]:
