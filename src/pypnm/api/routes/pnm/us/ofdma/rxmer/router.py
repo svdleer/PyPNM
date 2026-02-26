@@ -1004,28 +1004,33 @@ class UsOfdmaRxMerRouter:
                         ch['suggested_fn'] = real_fn
 
                 # ── Get modem counts per channel ────────────────────────────
-                # Walk docsIf3CmtsCmUsStatusChIfIndex to count modems per OFDMA channel
-                OID_CM_US_IFINDEX = "1.3.6.1.4.1.4491.2.1.20.1.3.2.1.1"
+                # Walk docsIf31CmtsCmUsOfdmaChannelStatus to count modems per OFDMA channel
+                # OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2 — indexed by (cm_index, ofdma_ifindex)
+                # This is the DOCSIS 3.1 OFDMA-specific table (not the D3.0 SC-QAM table!)
+                OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
                 modem_counts: dict = {ch['ifindex']: 0 for ch in channels}
                 try:
-                    cm_walk = await service._snmp_walk(OID_CM_US_IFINDEX, timeout=30)
-                    self.logger.info(f"CM walk: success={cm_walk.get('success') if isinstance(cm_walk, dict) else False}, "
+                    cm_walk = await service._snmp_walk(OID_CM_OFDMA_STATUS, timeout=30)
+                    self.logger.info(f"CM OFDMA walk: success={cm_walk.get('success') if isinstance(cm_walk, dict) else False}, "
                                      f"results={len(cm_walk.get('results', [])) if isinstance(cm_walk, dict) else 0}")
                     if isinstance(cm_walk, dict) and cm_walk.get('success'):
                         cm_raw = cm_walk.get('results') or []
                         matched = 0
                         seen_ifidx: set = set()
                         for item in cm_raw:
-                            if isinstance(item, dict) and 'value' in item:
+                            if isinstance(item, dict) and 'oid' in item:
                                 try:
-                                    ifidx = int(str(item['value']).split()[-1])
+                                    # OID ends with cm_index.ofdma_ifindex
+                                    oid = str(item['oid'])
+                                    parts = oid.rstrip('.').split('.')
+                                    ifidx = int(parts[-1])  # last element is ofdma_ifindex
                                     seen_ifidx.add(ifidx)
                                     if ifidx in modem_counts:
                                         modem_counts[ifidx] += 1
                                         matched += 1
                                 except (ValueError, IndexError):
                                     pass
-                        self.logger.info(f"CM walk matched {matched}/{len(cm_raw)} entries, "
+                        self.logger.info(f"CM OFDMA walk matched {matched}/{len(cm_raw)} entries, "
                                          f"ofdma_ifidx sample: {list(modem_counts.keys())[:3]}, "
                                          f"cm_ifidx sample: {list(seen_ifidx)[:5]}")
                 except Exception as _cm_err:
@@ -1066,43 +1071,43 @@ class UsOfdmaRxMerRouter:
             max_modems: int = 50,
         ):
             """
-            Walk docsIf3CmtsCmUsStatusTable (.1) to find all CMs on a given
+            Walk docsIf31CmtsCmUsOfdmaChannelStatus to find all CMs on a given
             OFDMA upstream ifIndex, then get their MAC from
-            docsIf3CmtsCmRegStatusMacAddr (.3).
+            docsIf3CmtsCmRegStatusMacAddr.
             Returns [{cm_mac_address, cm_index}].
             """
             service = CmtsUsOfdmaRxMerService(
                 cmts_ip=cmts_ip, community=community, write_community=community
             )
             try:
-                # docsIf3CmtsCmUsStatusChIfIndex  1.3.6.1.4.1.4491.2.1.20.1.3.2.1.1
-                # index: {cm_index}.{us_channel_index}  value: ifIndex of US channel
-                OID_CM_US_IFINDEX = "1.3.6.1.4.1.4491.2.1.20.1.3.2.1.1"
+                # docsIf31CmtsCmUsOfdmaChannelStatus  1.3.6.1.4.1.4491.2.1.28.1.4.1.2
+                # OID index: {cm_index}.{ofdma_ifindex} — DOCSIS 3.1 OFDMA specific!
+                OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
                 # docsIf3CmtsCmRegStatusMacAddr   1.3.6.1.4.1.4491.2.1.20.1.3.1.1.3
                 # index: {cm_index}  value: MAC as 6 hex octets
                 OID_CM_REG_MAC    = "1.3.6.1.4.1.4491.2.1.20.1.3.1.1.3"
 
-                walk = await service._snmp_walk(OID_CM_US_IFINDEX)
+                walk = await service._snmp_walk(OID_CM_OFDMA_STATUS)
                 if not isinstance(walk, dict) or not walk.get('success'):
                     return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "modems": []}
 
                 # agent returns {'results': [{oid, value, type}, ...]} (list)
                 raw = walk.get('results') or []
                 if isinstance(raw, list):
-                    oid_map = {item['oid']: item['value'] for item in raw if isinstance(item, dict) and 'oid' in item}
+                    oid_list = [item['oid'] for item in raw if isinstance(item, dict) and 'oid' in item]
                 elif isinstance(raw, dict):
-                    oid_map = raw
+                    oid_list = list(raw.keys())
                 else:
-                    oid_map = {}
+                    oid_list = []
 
                 matching_cm_idx: set = set()
-                for oid, val in oid_map.items():
+                for oid in oid_list:
                     try:
-                        ifidx = int(str(val).split()[-1])
+                        # OID ends with cm_index.ofdma_ifindex
+                        parts = str(oid).rstrip('.').split('.')
+                        ifidx = int(parts[-1])   # last element is ofdma_ifindex
+                        cm_idx = int(parts[-2])  # second-to-last is cm_index
                         if ifidx == ofdma_ifindex:
-                            # index ends with {cm_index}.{channel_index}
-                            parts = str(oid).rstrip('.').split('.')
-                            cm_idx = int(parts[-2])
                             matching_cm_idx.add(cm_idx)
                     except (ValueError, IndexError):
                         continue
