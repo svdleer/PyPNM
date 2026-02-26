@@ -580,12 +580,23 @@ class CmtsUsOfdmaRxMerService:
                 # Add tap delay summary if available
                 if eq_model.tap_delay_summary:
                     tds = eq_model.tap_delay_summary
+                    # Find cable length equivalents from annotated taps
+                    pre_main_cable_ft = None
+                    post_main_cable_ft = None
+                    for tap in tds.taps:
+                        if tap.tap_offset < 0 and tap.cable_hardline_echo_ft:
+                            if pre_main_cable_ft is None or tap.cable_hardline_echo_ft > pre_main_cable_ft:
+                                pre_main_cable_ft = tap.cable_hardline_echo_ft
+                        if tap.tap_offset > 0 and tap.cable_hardline_echo_ft:
+                            if post_main_cable_ft is None or tap.cable_hardline_echo_ft > post_main_cable_ft:
+                                post_main_cable_ft = tap.cable_hardline_echo_ft
+                    
                     ch_info["tap_delay_summary"] = {
                         "main_tap_index": tds.main_tap_index,
-                        "max_pre_main_delay_us": tds.max_pre_main_delay_us,
-                        "max_post_main_delay_us": tds.max_post_main_delay_us,
-                        "pre_main_cable_ft": tds.pre_main_cable_equivalent_ft,
-                        "post_main_cable_ft": tds.post_main_cable_equivalent_ft,
+                        "main_echo_tap_index": tds.main_echo_tap_index,
+                        "main_echo_tap_offset": tds.main_echo_tap_offset,
+                        "pre_main_cable_ft": pre_main_cable_ft,
+                        "post_main_cable_ft": post_main_cable_ft,
                     }
                 
                 channel_data.append(ch_info)
