@@ -904,12 +904,18 @@ class UsOfdmaRxMerRouter:
 
             # ── Step 4: (mdIfIndex, chSetId) → frozenset of chIds ──────────
             pfx2 = OID_CHLST + "."
-            d2 = _to_dict(await svc._snmp_walk(OID_CHLST, timeout=30))
+            w2_raw = await svc._snmp_walk(OID_CHLST, timeout=30)
+            d2 = _to_dict(w2_raw)
+            self.logger.info(f"FN-resolve CHLST walk: success={w2_raw.get('success')}, "
+                             f"rows={len(d2) if d2 else 0}, error={w2_raw.get('error')}, "
+                             f"sample_oid={next(iter(d2), None) if d2 else None}, "
+                             f"sample_val={next(iter(d2.values()), None) if d2 else None}")
             if not d2:
                 self.logger.warning("FN-resolve: CHLST walk empty/failed")
                 return {}
 
             chset_chids: dict = {}   # (mdIfIndex, chSetId) → frozenset of chIds
+            _parse_warn_done = False
             for oid, val in d2.items():
                 if not oid.startswith(pfx2):
                     continue
@@ -919,6 +925,9 @@ class UsOfdmaRxMerRouter:
                 chids = _parse_chids(str(val))
                 if chids:
                     chset_chids[(int(parts[0]), int(parts[1]))] = chids
+                elif not _parse_warn_done:
+                    self.logger.warning(f"FN-resolve: _parse_chids empty for val={repr(val)}")
+                    _parse_warn_done = True
 
             self.logger.info(f"FN-resolve: {len(chset_chids)} chSetId→chIds entries, "
                              f"sample: {dict(list(chset_chids.items())[:2])}")
