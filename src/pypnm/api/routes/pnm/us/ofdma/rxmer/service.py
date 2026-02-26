@@ -544,12 +544,10 @@ class CmtsUsOfdmaRxMerService:
                 if eq_model.metrics:
                     ch_info["metrics"] = {
                         "main_tap_ratio": eq_model.metrics.main_tap_ratio,
-                        "tap_energy_ratio": eq_model.metrics.tap_energy_ratio,
-                        "mtc_dB": eq_model.metrics.mtc_dB,
-                        "nmter_dB": eq_model.metrics.nmter_dB,
-                        "pcter": eq_model.metrics.pcter,
-                        "pre_main_tap_energy_ratio": eq_model.metrics.pre_main_tap_energy_ratio,
-                        "post_main_tap_energy_ratio": eq_model.metrics.post_main_tap_energy_ratio,
+                        "mtc_dB": eq_model.metrics.main_tap_compression,
+                        "nmter_dB": eq_model.metrics.non_main_tap_energy_ratio,
+                        "pre_main_tap_energy_ratio": eq_model.metrics.pre_main_tap_total_energy_ratio,
+                        "post_main_tap_energy_ratio": eq_model.metrics.post_main_tap_total_energy_ratio,
                     }
                 
                 # Add group delay if available
