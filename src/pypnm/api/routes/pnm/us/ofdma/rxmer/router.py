@@ -814,16 +814,44 @@ class UsOfdmaRxMerRouter:
                 return {item['oid']: item['value']
                         for item in raw if isinstance(item, dict) and 'oid' in item}
 
-            def _parse_chids(val_str: str):
-                """Parse channel ID list: "1,2,3,4,25,26" or hex "01 02 03 04 19 1A"."""
-                s = val_str.strip().strip('"')
+            def _parse_chids(val):
+                """Parse ChannelList (OCTET STRING) into a frozenset of integer channel IDs.
+
+                The agent may return:
+                  bytes  b'\\x01\\x02\\x03\\x04\\x19\\x1a'  ← raw octet string (most common)
+                  str    '1,2,3,4,25,26'                    ← comma-separated (some agents)
+                  str    '01 02 03 04 19 1a'                ← hex-spaced
+                  str    '0x0102...'                        ← 0x-prefixed hex
+                """
+                if isinstance(val, (bytes, bytearray)):
+                    return frozenset(val)
+                s = str(val).strip().strip('"')
+                # Raw Python repr of bytes: starts with b' or b"
+                if s.startswith("b'") or s.startswith('b"'):
+                    try:
+                        return frozenset(c for c in eval(s))  # safe: only byte literals
+                    except Exception:
+                        pass
+                # Escape sequences like \x01\x02 in a plain string
+                if '\\x' in s:
+                    try:
+                        return frozenset(c for c in bytes.fromhex(s.replace('\\x', '')))
+                    except Exception:
+                        pass
+                # Comma-separated integers: "1,2,3,4,25,26"
                 if ',' in s:
                     return frozenset(int(x.strip()) for x in s.split(',') if x.strip().isdigit())
+                # Space-separated hex bytes: "01 02 03 04 19 1a"
                 if ' ' in s or s.startswith('0x'):
                     try:
                         return frozenset(int(b, 16) for b in s.replace('0x', '').split())
                     except ValueError:
-                        return frozenset()
+                        pass
+                # Single printable chars that are control chars (raw octet string as str)
+                if s and all(ord(c) < 256 for c in s):
+                    ids = frozenset(ord(c) for c in s)
+                    if ids:
+                        return ids
                 return frozenset()
 
             # ── Step 1: (mdIfIndex, chIfIndex) → chId ──────────────────────
@@ -922,7 +950,7 @@ class UsOfdmaRxMerRouter:
                 parts = oid[len(pfx2):].split('.')
                 if len(parts) != 2:
                     continue
-                chids = _parse_chids(str(val))
+                chids = _parse_chids(val)   # pass raw value, not str(val)
                 if chids:
                     chset_chids[(int(parts[0]), int(parts[1]))] = chids
                 elif not _parse_warn_done:
