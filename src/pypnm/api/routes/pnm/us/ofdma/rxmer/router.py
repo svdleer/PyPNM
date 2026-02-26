@@ -950,30 +950,37 @@ class UsOfdmaRxMerRouter:
                     desc = str(raw_val).strip().strip('"')
                     lower = desc.lower()
                     # Vendor OFDMA detection (SC-QAM variants are excluded):
-                    # Commscope OFDMA:  "cable-us-ofdma 1/ofd/32.0"
+                    # Commscope E6000:  "cable-us-ofdma 1/ofd/32.0"
+                    # Commscope EVO:    "RPHY OFDMA Upstream 5:0/0.0/0"
                     # Commscope SC-QAM: "cable-upstream 1/scq/7", "1/nd/7", "1/0/7" → excluded (no 'us-ofdma')
                     # Cisco OFDMA:      "Cable1/0/0-upstream0"  (capital C + hyphen-upstream)
-                    # Casa OFDMA:       "Logical Upstream Channel 0/0.0-0"
+                    # Casa OFDMA:       "OFDMA Upstream 0/6.0" (where modems actually register)
+                    # Casa Logical:     "Logical Upstream Channel 0/0.0/0" (deprecated, excluded)
                     # Casa SC-QAM:      "Upstream Physical Interface 0/0.0" → excluded
                     is_commscope_ofdma = 'us-ofdma' in lower
+                    is_commscope_evo   = lower.startswith('rphy ofdma upstream')
                     is_cisco_ofdma     = desc.startswith('Cable') and '-upstream' in lower
-                    is_casa_ofdma      = lower.startswith('logical') and 'upstream' in lower
-                    if not (is_commscope_ofdma or is_cisco_ofdma or is_casa_ofdma):
+                    is_casa_ofdma      = lower.startswith('ofdma upstream')
+                    if not (is_commscope_ofdma or is_commscope_evo or is_cisco_ofdma or is_casa_ofdma):
                         continue
                     try:
                         ifindex = int(str(oid).rsplit('.', 1)[-1])
                     except ValueError:
                         continue
                     # Fallback MAC-domain grouping (used when DOCS-IF3-MIB unavailable):
-                    # Commscope: "cable-us-ofdma 1/ofd/32.0" → "cable-mac 1"
-                    # Cisco:     "Cable1/0/0-upstream0"        → "Cable1/0/0"
-                    # Casa:      "Logical Upstream Channel 0/0.0-0" → "LogicalUS-0/0"
+                    # Commscope E6000: "cable-us-ofdma 1/ofd/32.0" → "cable-mac 1"
+                    # Commscope EVO:   "RPHY OFDMA Upstream 5:0/0.0/0" → "RPD-5:0"
+                    # Cisco:           "Cable1/0/0-upstream0"        → "Cable1/0/0"
+                    # Casa:            "OFDMA Upstream 0/6.0" → "OFDMA-0"
                     m_arris = _re.match(r'cable-us-ofdma\s+(\d+)/', desc, _re.IGNORECASE)
-                    m_casa  = _re.match(r'Logical\s+Upstream\s+Channel\s+(\d+/\d+)', desc, _re.IGNORECASE)
+                    m_evo   = _re.match(r'RPHY\s+OFDMA\s+Upstream\s+(\d+:\d+)/', desc, _re.IGNORECASE)
+                    m_casa  = _re.match(r'OFDMA\s+Upstream\s+(\d+)/', desc, _re.IGNORECASE)
                     if m_arris:
                         fallback_md = f"cable-mac {m_arris.group(1)}"
+                    elif m_evo:
+                        fallback_md = f"RPD-{m_evo.group(1)}"
                     elif m_casa:
-                        fallback_md = f"LogicalUS-{m_casa.group(1)}"
+                        fallback_md = f"OFDMA-{m_casa.group(1)}"
                     elif _re.search(r'[-_]upstream', desc, _re.IGNORECASE):
                         fallback_md = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
                     else:
