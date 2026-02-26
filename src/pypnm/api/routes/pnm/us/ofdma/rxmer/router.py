@@ -1009,16 +1009,25 @@ class UsOfdmaRxMerRouter:
                 modem_counts: dict = {ch['ifindex']: 0 for ch in channels}
                 try:
                     cm_walk = await service._snmp_walk(OID_CM_US_IFINDEX, timeout=30)
+                    self.logger.info(f"CM walk: success={cm_walk.get('success') if isinstance(cm_walk, dict) else False}, "
+                                     f"results={len(cm_walk.get('results', [])) if isinstance(cm_walk, dict) else 0}")
                     if isinstance(cm_walk, dict) and cm_walk.get('success'):
                         cm_raw = cm_walk.get('results') or []
+                        matched = 0
+                        seen_ifidx: set = set()
                         for item in cm_raw:
                             if isinstance(item, dict) and 'value' in item:
                                 try:
                                     ifidx = int(str(item['value']).split()[-1])
+                                    seen_ifidx.add(ifidx)
                                     if ifidx in modem_counts:
                                         modem_counts[ifidx] += 1
+                                        matched += 1
                                 except (ValueError, IndexError):
                                     pass
+                        self.logger.info(f"CM walk matched {matched}/{len(cm_raw)} entries, "
+                                         f"ofdma_ifidx sample: {list(modem_counts.keys())[:3]}, "
+                                         f"cm_ifidx sample: {list(seen_ifidx)[:5]}")
                 except Exception as _cm_err:
                     self.logger.warning(f"Modem count walk failed: {_cm_err}")
 
