@@ -57,7 +57,7 @@ class CmtsUsOfdmaRxMerService:
     
     # Pre-equalization data (ATDMA upstream)
     # OID: docsIf3CmtsCmUsStatusEqData.{cm_index}.{us_ifindex} → OCTET STRING (coefficients)
-    OID_CM_US_EQ_DATA = "1.3.6.1.4.1.4491.2.1.20.1.4.2.1.5"  # docsIf3CmtsCmUsStatusEqData
+    OID_CM_US_EQ_DATA = "1.3.6.1.4.1.4491.2.1.20.1.4.1.6"  # docsIf3CmtsCmUsStatusEqData
     
     # US OFDMA RxMER Table (docsPnmCmtsUsOfdmaRxMerTable)
     # OID base: 1.3.6.1.4.1.4491.2.1.27.1.3.7.1
