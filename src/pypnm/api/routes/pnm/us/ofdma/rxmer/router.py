@@ -796,23 +796,37 @@ class UsOfdmaRxMerRouter:
                 if not isinstance(walk, dict) or not walk.get('success'):
                     return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "channels": [], "fiber_nodes": []}
 
-                # _snmp_walk returns {'success':True, 'result':{oid:val,...}, 'count':n}
-                oid_map = walk.get('result') or {}
+                # _snmp_walk returns {'success': True, 'results': {oid: val, ...}}
+                oid_map = walk.get('results') or {}
                 if not isinstance(oid_map, dict):
                     oid_map = {}
 
                 channels = []
                 for oid, raw_val in oid_map.items():
                     desc = str(raw_val).strip().strip('"')
-                    # Cisco: "Cable1/0/0-upstream0"  NSN/E6000: "Upstream-channel xxx"
-                    if not any(k in desc.lower() for k in ('upstream', 'ofdma')):
+                    lower = desc.lower()
+                    # Commscope/Arris OFDMA: "cable-us-ofdma 1/ofd/32.0"
+                    # Cisco/Casa OFDMA:     "Cable1/0/0-upstream0"  (no /ofd/ in name)
+                    # Exclude: SC-QAM "cable-upstream 1/ofd/7" (has /ofd/ but not us-ofdma)
+                    is_commscope_ofdma = 'us-ofdma' in lower
+                    is_cisco_upstream  = 'upstream' in lower and '/ofd/' not in lower and 'cable-mac' not in lower
+                    if not (is_commscope_ofdma or is_cisco_upstream):
                         continue
                     try:
                         ifindex = int(str(oid).rsplit('.', 1)[-1])
                     except ValueError:
                         continue
-                    mac_domain   = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
-                    suggested_fn = "FN-" + mac_domain.replace('/', '-').replace(' ', '-')
+                    # Extract MAC domain (= fiber node group) per vendor format:
+                    # Commscope: "cable-us-ofdma 1/ofd/32.0" → "cable-mac 1"
+                    # Cisco/Casa: "Cable1/0/0-upstream0" → "Cable1/0/0"
+                    m_arris = _re.match(r'cable-us-ofdma\s+(\d+)/', desc, _re.IGNORECASE)
+                    if m_arris:
+                        mac_domain = f"cable-mac {m_arris.group(1)}"
+                    elif _re.search(r'[-_]upstream', desc, _re.IGNORECASE):
+                        mac_domain = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
+                    else:
+                        mac_domain = desc
+                    suggested_fn = "FN-" + mac_domain.replace('/', '-').replace(' ', '-').strip('-')
                     channels.append({
                         "ifindex":      ifindex,
                         "description":  desc,
@@ -870,8 +884,8 @@ class UsOfdmaRxMerRouter:
                 if not isinstance(walk, dict) or not walk.get('success'):
                     return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "modems": []}
 
-                # _snmp_walk returns {'success':True, 'result':{oid:val,...}, 'count':n}
-                oid_map = walk.get('result') or {}
+                # _snmp_walk returns {'success': True, 'results': {oid: val, ...}}
+                oid_map = walk.get('results') or {}
                 if not isinstance(oid_map, dict):
                     oid_map = {}
 
