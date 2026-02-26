@@ -863,7 +863,7 @@ class CmtsUsOfdmaRxMerService:
         self,
         tftp_ip: str,
         port: int = 69,
-        local_store: bool = True,
+        local_store: bool = False,
         dest_index: Optional[int] = None
     ) -> dict[str, Any]:
         """
@@ -929,6 +929,9 @@ class CmtsUsOfdmaRxMerService:
 
             # IP address (4-byte OctetString, e.g. "ac100884")
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
+
+            # LocalStore: false(2) = upload to TFTP only, true(1) = also store on CMTS
+            await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
 
             # Only set BaseUri for Cisco cBR-8, skip for Arris/CommScope
             if hasattr(self, 'cmts_vendor') and self.cmts_vendor and self.cmts_vendor.lower() == 'cisco':
