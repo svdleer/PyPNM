@@ -774,6 +774,135 @@ class UsOfdmaRxMerRouter:
                 self.logger.error(f"fiberNode/plot error: {e}")
                 return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
 
+        # ------------------------------------------------------------------
+        # DOCS-IF3-MIB fiber node name resolution
+        # Chain: chIfIndex → (mdIfIndex, chId) → chSetId → mUSsgId → fnName
+        #
+        # OIDs (DOCS-IF3-MIB, 1.3.6.1.4.1.4491.2.1.20):
+        #   docsIf3MdChCfgChId       .1.10.1.3  (mdIfIndex, chIfIndex) → chId
+        #   docsIf3UsChSetChList      .1.11.1.1  (mdIfIndex, chSetId)  → "chId,chId,..."
+        #   docsIf3MdUsSgStatusChSetId.1.17.1.1  (mdIfIndex, mUSsgId)  → chSetId
+        #   docsIf3MdNodeStatusMdUsSgId.1.19.1.3 (mdIfIndex, fnNameStr, mCmSgId) → mUSsgId
+        # ------------------------------------------------------------------
+
+        async def _resolve_fn_names(svc, ofdma_ifindex_set: set) -> dict:
+            """
+            Try to resolve real FN names from DOCS-IF3-MIB.
+            Returns {chIfIndex: fnName} or {} when the tables are not available.
+            Works on: Commscope E6000 (I-CCAP / C-CCAP), Cisco cBR-8,
+                      Casa 100G, Commscope EVO (all support DOCS-IF3-MIB).
+            """
+            BASE  = "1.3.6.1.4.1.4491.2.1.20"
+            OID_CHID   = f"{BASE}.1.10.1.3"   # docsIf3MdChCfgChId
+            OID_CHLIST = f"{BASE}.1.11.1.1"   # docsIf3UsChSetChList
+            OID_SGSET  = f"{BASE}.1.17.1.1"   # docsIf3MdUsSgStatusChSetId
+            OID_FNSG   = f"{BASE}.1.19.1.3"   # docsIf3MdNodeStatusMdUsSgId
+
+            def _to_dict(walk_result):
+                if not isinstance(walk_result, dict) or not walk_result.get('success'):
+                    return None
+                raw = walk_result.get('results') or []
+                return {item['oid']: item['value']
+                        for item in raw if isinstance(item, dict) and 'oid' in item}
+
+            # ── Step 1: (mdIfIndex, chIfIndex) → chId ──────────────────────
+            w1 = await svc._snmp_walk(OID_CHID, timeout=30)
+            d1 = _to_dict(w1)
+            if not d1:
+                return {}
+
+            ifidx_to_md_chid: dict = {}   # chIfIndex → (mdIfIndex, chId)
+            pfx1 = OID_CHID + "."
+            for oid, val in d1.items():
+                if not oid.startswith(pfx1):
+                    continue
+                parts = oid[len(pfx1):].split('.')
+                if len(parts) != 2:
+                    continue
+                md_if = int(parts[0]);  ch_if = int(parts[1])
+                if ch_if in ofdma_ifindex_set:
+                    ifidx_to_md_chid[ch_if] = (md_if, int(str(val).strip()))
+
+            if not ifidx_to_md_chid:
+                return {}
+
+            # ── Step 2: (mdIfIndex, chSetId) → set of chIds ────────────────
+            w2 = await svc._snmp_walk(OID_CHLIST, timeout=30)
+            d2 = _to_dict(w2)
+            if not d2:
+                return {}
+
+            chset_chids: dict = {}   # (mdIfIndex, chSetId) → frozenset of chIds
+            pfx2 = OID_CHLIST + "."
+            for oid, val in d2.items():
+                if not oid.startswith(pfx2):
+                    continue
+                parts = oid[len(pfx2):].split('.')
+                if len(parts) != 2:
+                    continue
+                md_if = int(parts[0]);  chset_id = int(parts[1])
+                chids = frozenset(int(x.strip()) for x in str(val).split(',') if x.strip().isdigit())
+                # keep only the first (canonical) chSetId per mUSsgId direction
+                chset_chids[(md_if, chset_id)] = chids
+
+            # ── Step 3: (mdIfIndex, mUSsgId) → chSetId ─────────────────────
+            w3 = await svc._snmp_walk(OID_SGSET, timeout=30)
+            d3 = _to_dict(w3)
+            if not d3:
+                return {}
+
+            ussg_to_chset: dict = {}   # (mdIfIndex, mUSsgId) → chSetId
+            pfx3 = OID_SGSET + "."
+            for oid, val in d3.items():
+                if not oid.startswith(pfx3):
+                    continue
+                parts = oid[len(pfx3):].split('.')
+                if len(parts) != 2:
+                    continue
+                md_if = int(parts[0]);  m_us_sg = int(parts[1])
+                ussg_to_chset[(md_if, m_us_sg)] = int(str(val).strip())
+
+            # Build reverse: (mdIfIndex, chSetId) → mUSsgId
+            chset_to_ussg = {(md, csid): ussgid
+                             for (md, ussgid), csid in ussg_to_chset.items()}
+
+            # ── Step 4: OID-string-indexed table → (mdIfIndex, mUSsgId) : fnName
+            # OID suffix: {mdIfIndex}.{strLen}.{byte0}...{byteN-1}.{mCmSgId} = mUSsgId
+            w4 = await svc._snmp_walk(OID_FNSG, timeout=30)
+            d4 = _to_dict(w4)
+            if not d4:
+                return {}
+
+            ussg_to_fn: dict = {}   # (mdIfIndex, mUSsgId) → fnName  (first seen wins)
+            pfx4 = OID_FNSG + "."
+            for oid, val in d4.items():
+                if not oid.startswith(pfx4):
+                    continue
+                parts = oid[len(pfx4):].split('.')
+                if len(parts) < 3:
+                    continue
+                md_if   = int(parts[0])
+                str_len = int(parts[1])
+                if len(parts) < 2 + str_len + 1:
+                    continue
+                fn_name  = ''.join(chr(int(b)) for b in parts[2:2 + str_len])
+                m_us_sg  = int(str(val).strip())   # value IS the mUSsgId
+                ussg_to_fn.setdefault((md_if, m_us_sg), fn_name)
+
+            # ── Compose: chIfIndex → fnName ─────────────────────────────────
+            result: dict = {}
+            for ch_if, (md_if, ch_id) in ifidx_to_md_chid.items():
+                # Find which mUSsgId's channel set contains this chId
+                for (md2, ussg_id), chset_id in ussg_to_chset.items():
+                    if md2 != md_if:
+                        continue
+                    if ch_id in chset_chids.get((md_if, chset_id), frozenset()):
+                        fn_name = ussg_to_fn.get((md_if, ussg_id))
+                        if fn_name:
+                            result[ch_if] = fn_name
+                        break
+            return result
+
         @self.router.get(
             "/channel/list",
             summary="List all OFDMA upstream channels on a CMTS",
@@ -783,8 +912,10 @@ class UsOfdmaRxMerRouter:
             community: str = "public",
         ):
             """
-            Walk ifDescr via SNMP and return all OFDMA upstream interfaces,
-            grouped by MAC domain as suggested fiber nodes.
+            Walk ifDescr + DOCS-IF3-MIB fiber node tables to return all OFDMA
+            upstream interfaces grouped by real fiber node name.
+            Falls back to ifDescr-derived grouping when DOCS-IF3-MIB tables
+            are unavailable (non-standard vendors).
             """
             import re as _re
             service = CmtsUsOfdmaRxMerService(
@@ -796,7 +927,7 @@ class UsOfdmaRxMerRouter:
                 if not isinstance(walk, dict) or not walk.get('success'):
                     return {"success": False, "error": walk.get('error', 'SNMP walk failed'), "channels": [], "fiber_nodes": []}
 
-                # agent returns {'results': [{oid, value, type}, ...]} (list)
+                # agent returns {'results': [{oid, value, type}, ...]}
                 raw = walk.get('results') or []
                 if isinstance(raw, list):
                     oid_map = {item['oid']: item['value'] for item in raw if isinstance(item, dict) and 'oid' in item}
@@ -809,12 +940,12 @@ class UsOfdmaRxMerRouter:
                 for oid, raw_val in oid_map.items():
                     desc = str(raw_val).strip().strip('"')
                     lower = desc.lower()
-                    # Vendor OFDMA channel detection (all others → skip):
-                    # Commscope OFDMA:    "cable-us-ofdma 1/ofd/32.0"
-                    # Commscope SC-QAM:   "cable-upstream 1/scq/7"  "cable-upstream 1/nd/7"  "cable-upstream 1/0/7" → exclude (lowercase 'cable-upstream')
-                    # Cisco OFDMA:        "Cable1/0/0-upstream0"    (capital C, hyphen before 'upstream')
-                    # Casa OFDMA:         "Logical Upstream Channel 0/0.0-0"
-                    # Casa SC-QAM:        "Upstream Physical Interface 0/0.0" → exclude
+                    # Vendor OFDMA detection (SC-QAM variants are excluded):
+                    # Commscope OFDMA:  "cable-us-ofdma 1/ofd/32.0"
+                    # Commscope SC-QAM: "cable-upstream 1/scq/7", "1/nd/7", "1/0/7" → excluded (no 'us-ofdma')
+                    # Cisco OFDMA:      "Cable1/0/0-upstream0"  (capital C + hyphen-upstream)
+                    # Casa OFDMA:       "Logical Upstream Channel 0/0.0-0"
+                    # Casa SC-QAM:      "Upstream Physical Interface 0/0.0" → excluded
                     is_commscope_ofdma = 'us-ofdma' in lower
                     is_cisco_ofdma     = desc.startswith('Cable') and '-upstream' in lower
                     is_casa_ofdma      = lower.startswith('logical') and 'upstream' in lower
@@ -824,27 +955,44 @@ class UsOfdmaRxMerRouter:
                         ifindex = int(str(oid).rsplit('.', 1)[-1])
                     except ValueError:
                         continue
-                    # Extract MAC domain (= fiber node group) per vendor:
-                    # Commscope: "cable-us-ofdma 1/ofd/32.0"       → "cable-mac 1"
-                    # Cisco:     "Cable1/0/0-upstream0"             → "Cable1/0/0"
-                    # Casa:      "Logical Upstream Channel 0/0.0-0" → "LogicalUS-0/0" (grouped by slot/port)
+                    # Fallback MAC-domain grouping (used when DOCS-IF3-MIB unavailable):
+                    # Commscope: "cable-us-ofdma 1/ofd/32.0" → "cable-mac 1"
+                    # Cisco:     "Cable1/0/0-upstream0"        → "Cable1/0/0"
+                    # Casa:      "Logical Upstream Channel 0/0.0-0" → "LogicalUS-0/0"
                     m_arris = _re.match(r'cable-us-ofdma\s+(\d+)/', desc, _re.IGNORECASE)
                     m_casa  = _re.match(r'Logical\s+Upstream\s+Channel\s+(\d+/\d+)', desc, _re.IGNORECASE)
                     if m_arris:
-                        mac_domain = f"cable-mac {m_arris.group(1)}"
+                        fallback_md = f"cable-mac {m_arris.group(1)}"
                     elif m_casa:
-                        mac_domain = f"LogicalUS-{m_casa.group(1)}"
+                        fallback_md = f"LogicalUS-{m_casa.group(1)}"
                     elif _re.search(r'[-_]upstream', desc, _re.IGNORECASE):
-                        mac_domain = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
+                        fallback_md = _re.split(r'[-_]upstream', desc, flags=_re.IGNORECASE)[0].strip()
                     else:
-                        mac_domain = desc
-                    suggested_fn = "FN-" + mac_domain.replace('/', '-').replace(' ', '-').strip('-')
+                        fallback_md = desc
                     channels.append({
                         "ifindex":      ifindex,
                         "description":  desc,
-                        "mac_domain":   mac_domain,
-                        "suggested_fn": suggested_fn,
+                        "mac_domain":   fallback_md,
+                        "suggested_fn": "FN-" + fallback_md.replace('/', '-').replace(' ', '-').strip('-'),
                     })
+
+                if not channels:
+                    return {"success": True, "channels": [], "fiber_nodes": []}
+
+                # ── Try DOCS-IF3-MIB fiber node resolution ──────────────────
+                ofdma_set = {ch['ifindex'] for ch in channels}
+                try:
+                    fn_map = await _resolve_fn_names(service, ofdma_set)
+                except Exception as _fn_err:
+                    self.logger.warning(f"FN resolution failed, using fallback: {_fn_err}")
+                    fn_map = {}
+
+                # Apply real FN names where available
+                for ch in channels:
+                    real_fn = fn_map.get(ch['ifindex'])
+                    if real_fn:
+                        ch['mac_domain']   = real_fn
+                        ch['suggested_fn'] = real_fn
 
                 channels.sort(key=lambda c: c['description'])
                 seen: dict = {}
