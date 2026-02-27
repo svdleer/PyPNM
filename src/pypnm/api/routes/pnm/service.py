@@ -603,7 +603,8 @@ class PNMDiagnosticsService:
             # Step 1: Set TFTP/Bulk destination
             self.logger.info(f"Setting TFTP server: {tftp_server}")
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')  # IPv4
-            await self._snmp_set(self.OID_BULK_IP_ADDR, tftp_server, 'a')  # IpAddress type
+            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')  # OctetString hex
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
             
             # Step 2: Configure spectrum parameters
@@ -890,7 +891,8 @@ class PNMDiagnosticsService:
         try:
             # Step 1: Set TFTP server (same bulk-destination OIDs as spectrum)
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
-            await self._snmp_set(self.OID_BULK_IP_ADDR, tftp_server, 'a')  # IpAddress type
+            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')  # OctetString hex
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
 
             # Step 2: Walk OFDM channel table to discover ifIndexes
@@ -1063,7 +1065,8 @@ class PNMDiagnosticsService:
 
             # Step 1: Set TFTP bulk destination
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
-            await self._snmp_set(self.OID_BULK_IP_ADDR, tftp_server, 'a')  # IpAddress type
+            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')  # OctetString hex
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
 
             # Step 2: Walk OFDM downstream channel table
@@ -1125,20 +1128,24 @@ class PNMDiagnosticsService:
                         except (ValueError, IndexError):
                             pass
                     self.logger.info(f"ChanEst status ifindex={ifindex}: {val} (elapsed={elapsed}s)")
-                    if val in (2, 3):  # inactive or busy — modem is processing
+                    if val in (2, 3):  # inactive or busy — modem is processing the new trigger
                         seen_busy.add(ifindex)
-                    if val == 4 and (ifindex in seen_busy or elapsed > poll_interval):
-                        # Only accept sampleReady after having seen busy, or
-                        # after the first interval (fresh trigger, fast modem)
+                    if val == 4 and ifindex in seen_busy:
+                        # Accept sampleReady ONLY after having seen the modem go busy/inactive,
+                        # which confirms this is a fresh result (not a stale pre-trigger value)
                         completed.add(ifindex)
                     elif val == 4 and ifindex not in seen_busy:
-                        # Stale sampleReady from before our trigger — keep waiting
+                        # Stale sampleReady still leftover from before our trigger — keep waiting
                         self.logger.info(f"ChanEst ifindex={ifindex}: ignoring stale sampleReady(4)")
                     elif val in TERMINAL_STATUSES:
                         failed_ifindexes[ifindex] = val
                         self.logger.warning(f"ChanEst ifindex={ifindex} terminal status {val} — skipping")
 
-            # Step 5: Parse binary files from TFTP mount
+            # Step 5: Parse binary files from TFTP mount.
+            # Wait briefly for in-flight TFTP uploads to land on disk before
+            # scanning the directory (modem uploads asynchronously after
+            # sampleReady is set).
+            await asyncio.sleep(5)
             from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
             import time as _time
 
