@@ -1155,14 +1155,22 @@ class PNMDiagnosticsService:
             from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
             import time as _time
 
-            tftp_dir       = self.TFTP_LOCAL_PATH
-            wall_trigger   = _time.time()
+            tftp_dir        = self.TFTP_LOCAL_PATH
             parsed_channels = []
             first_filename  = None
+            RECENCY_SECS    = 1800   # accept any file written in the last 30 min
+
+            # Pre-collect PNMChEstCoef_{MAC}* files that have no ifindex in the
+            # filename; sort oldest→newest so they map in channel order.
+            # Each successive ifindex pops the next file from the list.
+            pnm_coef_pool = sorted(
+                [f for f in glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*'))
+                 if abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS],
+                key=os.path.getmtime
+            )
 
             for ifindex in ofdm_ifindexes:
                 if ifindex in failed_ifindexes:
-                    # Skip entirely — modem reported RESOURCE_UNAVAILABLE / ERROR
                     self.logger.info(f"ChanEst ifindex={ifindex} skipped (status={failed_ifindexes[ifindex]})")
                     continue
 
@@ -1173,22 +1181,24 @@ class PNMDiagnosticsService:
                     bin_path = bin_path + '.bin'
 
                 if not os.path.exists(bin_path):
-                    # Modem may use its own naming scheme — look for the most
-                    # recently modified file matching PNMChEstCoef_{MAC_UPPER}*
-                    # or the old explicit-name glob, written AFTER our trigger
+                    # Build candidate list — try ifindex-specific patterns first
                     candidates = []
                     for pattern in [
-                        os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*'),
-                        os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_*'),
+                        # Explicit ifindex in filename (most reliable)
+                        os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_{ifindex}_*'),
                         os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*'),
                         os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin'),
                     ]:
                         candidates += glob.glob(pattern)
-                    # Keep only files written within 5 minutes of our trigger
+
                     recent = [f for f in candidates
-                              if os.path.exists(f) and abs(_time.time() - os.path.getmtime(f)) < 300]
+                              if os.path.exists(f) and abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS]
+
                     if recent:
                         bin_path = max(recent, key=os.path.getmtime)
+                    elif pnm_coef_pool:
+                        # PNMChEstCoef_ files have no ifindex — assign one per channel
+                        bin_path = pnm_coef_pool.pop(0)
 
                 self.logger.info(f"ChanEst ifindex={ifindex} file: {bin_path}")
 
