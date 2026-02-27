@@ -1079,6 +1079,7 @@ class PNMDiagnosticsService:
             filenames  = {}
 
             for ifindex in ofdm_ifindexes:
+                fname = f"chan_est_{mac_clean}_{ifindex}_{timestamp}"
                 filenames[ifindex] = fname
                 await self._snmp_set(f"{self.OID_CHAN_EST_FILE_NAME}.{ifindex}", fname, 's')
                 await self._snmp_set(f"{self.OID_CHAN_EST_TRIG_ENABLE}.{ifindex}", 1, 'i')
