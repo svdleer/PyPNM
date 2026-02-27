@@ -603,8 +603,7 @@ class PNMDiagnosticsService:
             # Step 1: Set TFTP/Bulk destination
             self.logger.info(f"Setting TFTP server: {tftp_server}")
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')  # IPv4
-            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
-            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')
+            await self._snmp_set(self.OID_BULK_IP_ADDR, tftp_server, 'a')  # IpAddress type
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
             
             # Step 2: Configure spectrum parameters
@@ -891,8 +890,7 @@ class PNMDiagnosticsService:
         try:
             # Step 1: Set TFTP server (same bulk-destination OIDs as spectrum)
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
-            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
-            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')
+            await self._snmp_set(self.OID_BULK_IP_ADDR, tftp_server, 'a')  # IpAddress type
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
 
             # Step 2: Walk OFDM channel table to discover ifIndexes
@@ -1065,8 +1063,7 @@ class PNMDiagnosticsService:
 
             # Step 1: Set TFTP bulk destination
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
-            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
-            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')
+            await self._snmp_set(self.OID_BULK_IP_ADDR, tftp_server, 'a')  # IpAddress type
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
 
             # Step 2: Walk OFDM downstream channel table
