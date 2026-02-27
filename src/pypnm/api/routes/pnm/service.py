@@ -1074,26 +1074,29 @@ class PNMDiagnosticsService:
 
             # Step 3: Set filename and trigger for each ifIndex
             mac_clean = (self.mac_address or '').replace(':', '').lower()
+            mac_upper = (self.mac_address or '').replace(':', '').upper()
             timestamp  = datetime.now().strftime('%Y%m%d_%H%M%S')
             filenames  = {}
 
             for ifindex in ofdm_ifindexes:
-                fname = f"chan_est_{mac_clean}_{ifindex}_{timestamp}"
                 filenames[ifindex] = fname
                 await self._snmp_set(f"{self.OID_CHAN_EST_FILE_NAME}.{ifindex}", fname, 's')
                 await self._snmp_set(f"{self.OID_CHAN_EST_TRIG_ENABLE}.{ifindex}", 1, 'i')
 
-            # Step 4: Poll measStatus (value 4 = complete) up to 60 s
+            # Step 4: Poll measStatus until 4 (SAMPLE_READY), 5 (ERROR), or
+            # 6 (RESOURCE_UNAVAILABLE) — any of those are terminal
+            TERMINAL_STATUSES = {4, 5, 6, 7}
             max_wait     = 60
             poll_interval = 3
             elapsed      = 0
             completed    = set()
+            failed_ifindexes: dict = {}
 
-            while elapsed < max_wait and len(completed) < len(ofdm_ifindexes):
+            while elapsed < max_wait and len(completed) + len(failed_ifindexes) < len(ofdm_ifindexes):
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
                 for ifindex in ofdm_ifindexes:
-                    if ifindex in completed:
+                    if ifindex in completed or ifindex in failed_ifindexes:
                         continue
                     status = await self._snmp_get(f"{self.OID_CHAN_EST_MEAS_STATUS}.{ifindex}")
                     val = None
@@ -1105,31 +1108,47 @@ class PNMDiagnosticsService:
                     self.logger.info(f"ChanEst status ifindex={ifindex}: {val} (elapsed={elapsed}s)")
                     if val == 4:
                         completed.add(ifindex)
+                    elif val in TERMINAL_STATUSES:
+                        failed_ifindexes[ifindex] = val
+                        self.logger.warning(f"ChanEst ifindex={ifindex} terminal status {val} — skipping")
 
             # Step 5: Parse binary files from TFTP mount
             from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
+            import time as _time
 
             tftp_dir       = self.TFTP_LOCAL_PATH
+            wall_trigger   = _time.time()
             parsed_channels = []
             first_filename  = None
 
             for ifindex in ofdm_ifindexes:
+                if ifindex in failed_ifindexes:
+                    # Skip entirely — modem reported RESOURCE_UNAVAILABLE / ERROR
+                    self.logger.info(f"ChanEst ifindex={ifindex} skipped (status={failed_ifindexes[ifindex]})")
+                    continue
+
                 fname    = filenames[ifindex]
                 bin_path = os.path.join(tftp_dir, fname)
 
-                # Also try with .bin suffix in case the modem appends it
                 if not os.path.exists(bin_path):
-                    bin_path_bin = bin_path + '.bin'
-                    if os.path.exists(bin_path_bin):
-                        bin_path = bin_path_bin
-                    else:
-                        # Fallback: glob newest matching file
-                        matches = sorted(
-                            glob.glob(os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin')) +
-                            glob.glob(os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*')),
-                            key=os.path.getmtime, reverse=True
-                        )
-                        bin_path = matches[0] if matches else bin_path
+                    bin_path = bin_path + '.bin'
+
+                if not os.path.exists(bin_path):
+                    # Modem may use its own naming scheme — look for the most
+                    # recently modified file matching PNMChEstCoef_{MAC_UPPER}*
+                    # or the old explicit-name glob, written AFTER our trigger
+                    candidates = []
+                    for pattern in [
+                        os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*'),
+                        os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*'),
+                        os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin'),
+                    ]:
+                        candidates += glob.glob(pattern)
+                    # Keep only files written in the last ~5 minutes
+                    recent = [f for f in candidates
+                              if os.path.exists(f) and (wall_trigger - os.path.getmtime(f)) < 300]
+                    if recent:
+                        bin_path = max(recent, key=os.path.getmtime)
 
                 self.logger.info(f"ChanEst ifindex={ifindex} file: {bin_path}")
 
