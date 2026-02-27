@@ -76,10 +76,10 @@ class PNMDiagnosticsService:
                     'community': self.community,
                     'timeout': 10
                 },
-                timeout=30
+                timeout=120
             )
             
-            result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)
+            result = await self.agent_manager.wait_for_task_async(task_id, timeout=120)
             
             if result and result.get('result', {}).get('success'):
                 return result.get('result', {})
@@ -113,10 +113,10 @@ class PNMDiagnosticsService:
                     'community': self.community,
                     'timeout': 10
                 },
-                timeout=30
+                timeout=120
             )
             
-            result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)
+            result = await self.agent_manager.wait_for_task_async(task_id, timeout=120)
             
             if result and result.get('result', {}).get('success'):
                 return result.get('result', {})
@@ -152,10 +152,10 @@ class PNMDiagnosticsService:
                     'community': self.write_community,
                     'timeout': 10
                 },
-                timeout=30
+                timeout=120
             )
             
-            result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)
+            result = await self.agent_manager.wait_for_task_async(task_id, timeout=120)
             
             if result and result.get('result', {}).get('success'):
                 return result.get('result', {})
@@ -1107,7 +1107,7 @@ class PNMDiagnosticsService:
             # observe a fresh completion.
             await asyncio.sleep(2)
             TERMINAL_STATUSES = {4, 5, 6, 7}
-            max_wait      = 60
+            max_wait      = 180  # 3 min — covers agent queue delay + measurement time
             poll_interval = 1   # 1 s — fast enough to catch busy(3) on quick modems
             elapsed       = 2   # already spent 2s above
             completed     = set()
