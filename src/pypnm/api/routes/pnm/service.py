@@ -1052,6 +1052,17 @@ class PNMDiagnosticsService:
         self.logger.info(f"Triggering channel estimation for modem {self.modem_ip}")
 
         try:
+            # Step 0: Tear down any lingering bulk-upload state so the modem
+            #         does not silently skip the new trigger (stale sampleReady).
+            #         - idle the upload ctrl  (docsPnmBulkDestUploadCtrl = 1)
+            #         - clear per-channel trigger enables before we re-arm
+            # Ignore errors — OIDs may not exist on all firmware versions.
+            try:
+                await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 1, 'i')  # idle
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
             # Step 1: Set TFTP bulk destination
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
             ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
@@ -1079,19 +1090,29 @@ class PNMDiagnosticsService:
             filenames  = {}
 
             for ifindex in ofdm_ifindexes:
+                # Reset the trigger first (0 → 1 edge is required to re-arm)
+                try:
+                    await self._snmp_set(f"{self.OID_CHAN_EST_TRIG_ENABLE}.{ifindex}", 0, 'i')
+                except Exception:
+                    pass
                 fname = f"chan_est_{mac_clean}_{ifindex}_{timestamp}"
                 filenames[ifindex] = fname
                 await self._snmp_set(f"{self.OID_CHAN_EST_FILE_NAME}.{ifindex}", fname, 's')
                 await self._snmp_set(f"{self.OID_CHAN_EST_TRIG_ENABLE}.{ifindex}", 1, 'i')
 
             # Step 4: Poll measStatus until 4 (SAMPLE_READY), 5 (ERROR), or
-            # 6 (RESOURCE_UNAVAILABLE) — any of those are terminal
+            # 6 (RESOURCE_UNAVAILABLE) — any of those are terminal.
+            # Wait 2 s first so the modem can transition away from a stale
+            # sampleReady(4) left over from a previous measurement before we
+            # observe a fresh completion.
+            await asyncio.sleep(2)
             TERMINAL_STATUSES = {4, 5, 6, 7}
             max_wait     = 60
             poll_interval = 3
-            elapsed      = 0
+            elapsed      = 2  # already spent 2s above
             completed    = set()
             failed_ifindexes: dict = {}
+            seen_busy: set = set()  # track ifindexes that went busy(3) or inactive(2)
 
             while elapsed < max_wait and len(completed) + len(failed_ifindexes) < len(ofdm_ifindexes):
                 await asyncio.sleep(poll_interval)
@@ -1107,8 +1128,15 @@ class PNMDiagnosticsService:
                         except (ValueError, IndexError):
                             pass
                     self.logger.info(f"ChanEst status ifindex={ifindex}: {val} (elapsed={elapsed}s)")
-                    if val == 4:
+                    if val in (2, 3):  # inactive or busy — modem is processing
+                        seen_busy.add(ifindex)
+                    if val == 4 and (ifindex in seen_busy or elapsed > poll_interval):
+                        # Only accept sampleReady after having seen busy, or
+                        # after the first interval (fresh trigger, fast modem)
                         completed.add(ifindex)
+                    elif val == 4 and ifindex not in seen_busy:
+                        # Stale sampleReady from before our trigger — keep waiting
+                        self.logger.info(f"ChanEst ifindex={ifindex}: ignoring stale sampleReady(4)")
                     elif val in TERMINAL_STATUSES:
                         failed_ifindexes[ifindex] = val
                         self.logger.warning(f"ChanEst ifindex={ifindex} terminal status {val} — skipping")
