@@ -1166,6 +1166,10 @@ class UsOfdmaRxMerRouter:
                 # This is the DOCSIS 3.1 OFDMA-specific table (not the D3.0 SC-QAM table!)
                 OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
                 modem_counts: dict = {ch['ifindex']: 0 for ch in channels}
+                # Track unique cm_index per mac_domain to avoid double-counting
+                # modems that appear on multiple channels of the same fiber node.
+                ifidx_to_domain = {ch['ifindex']: ch['mac_domain'] for ch in channels}
+                domain_unique_cms: dict = {}   # mac_domain -> set of cm_index
                 try:
                     cm_walk = await service._snmp_walk(OID_CM_OFDMA_STATUS, timeout=30)
                     self.logger.info(f"CM OFDMA walk: success={cm_walk.get('success') if isinstance(cm_walk, dict) else False}, "
@@ -1180,11 +1184,16 @@ class UsOfdmaRxMerRouter:
                                     # OID ends with cm_index.ofdma_ifindex
                                     oid = str(item['oid'])
                                     parts = oid.rstrip('.').split('.')
-                                    ifidx = int(parts[-1])  # last element is ofdma_ifindex
+                                    ifidx    = int(parts[-1])   # last element is ofdma_ifindex
+                                    cm_index = int(parts[-2])   # second-to-last is cm_index
                                     seen_ifidx.add(ifidx)
                                     if ifidx in modem_counts:
                                         modem_counts[ifidx] += 1
                                         matched += 1
+                                    # Track unique cm per fiber node (mac_domain)
+                                    domain = ifidx_to_domain.get(ifidx)
+                                    if domain is not None:
+                                        domain_unique_cms.setdefault(domain, set()).add(cm_index)
                                 except (ValueError, IndexError):
                                     pass
                         self.logger.info(f"CM OFDMA walk matched {matched}/{len(cm_raw)} entries, "
@@ -1204,7 +1213,9 @@ class UsOfdmaRxMerRouter:
                     if md not in seen:
                         seen[md] = {"name": ch['suggested_fn'], "mac_domain": md, "channels": [], "modem_count": 0}
                     seen[md]['channels'].append({"ifindex": ch['ifindex'], "description": ch['description'], "modem_count": ch['modem_count']})
-                    seen[md]['modem_count'] += ch['modem_count']
+                # Use unique-modem count per fiber node (not per-channel sum)
+                for md, fn_data in seen.items():
+                    fn_data['modem_count'] = len(domain_unique_cms.get(md, set()))
 
                 return {
                     "success":     True,
