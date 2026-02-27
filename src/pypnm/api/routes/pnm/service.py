@@ -1141,13 +1141,14 @@ class PNMDiagnosticsService:
                     candidates = []
                     for pattern in [
                         os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*'),
+                        os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_*'),
                         os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*'),
                         os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin'),
                     ]:
                         candidates += glob.glob(pattern)
-                    # Keep only files written in the last ~5 minutes
+                    # Keep only files written within 5 minutes of our trigger
                     recent = [f for f in candidates
-                              if os.path.exists(f) and (wall_trigger - os.path.getmtime(f)) < 300]
+                              if os.path.exists(f) and abs(_time.time() - os.path.getmtime(f)) < 300]
                     if recent:
                         bin_path = max(recent, key=os.path.getmtime)
 
