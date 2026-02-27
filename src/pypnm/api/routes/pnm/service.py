@@ -1107,12 +1107,16 @@ class PNMDiagnosticsService:
             # observe a fresh completion.
             await asyncio.sleep(2)
             TERMINAL_STATUSES = {4, 5, 6, 7}
-            max_wait     = 60
-            poll_interval = 3
-            elapsed      = 2  # already spent 2s above
-            completed    = set()
+            max_wait      = 60
+            poll_interval = 1   # 1 s — fast enough to catch busy(3) on quick modems
+            elapsed       = 2   # already spent 2s above
+            completed     = set()
             failed_ifindexes: dict = {}
             seen_busy: set = set()  # track ifindexes that went busy(3) or inactive(2)
+            # Stale-guard: any sampleReady(4) seen ≥ STALE_GUARD seconds after
+            # the trigger MUST be a fresh result — the modem cannot be in the
+            # old state that long after we armed it.
+            STALE_GUARD = 10  # seconds; > worst-case measurement round-trip
 
             while elapsed < max_wait and len(completed) + len(failed_ifindexes) < len(ofdm_ifindexes):
                 await asyncio.sleep(poll_interval)
@@ -1130,13 +1134,15 @@ class PNMDiagnosticsService:
                     self.logger.info(f"ChanEst status ifindex={ifindex}: {val} (elapsed={elapsed}s)")
                     if val in (2, 3):  # inactive or busy — modem is processing the new trigger
                         seen_busy.add(ifindex)
-                    if val == 4 and ifindex in seen_busy:
-                        # Accept sampleReady ONLY after having seen the modem go busy/inactive,
-                        # which confirms this is a fresh result (not a stale pre-trigger value)
+                    if val == 4 and (ifindex in seen_busy or elapsed >= STALE_GUARD):
+                        # Accept sampleReady if we saw busy (caught the transition) OR
+                        # enough time has elapsed that this cannot be a pre-trigger stale state.
+                        if ifindex not in seen_busy:
+                            self.logger.info(f"ChanEst ifindex={ifindex}: accepting sampleReady(4) via time-guard ({elapsed}s >= {STALE_GUARD}s)")
                         completed.add(ifindex)
-                    elif val == 4 and ifindex not in seen_busy:
-                        # Stale sampleReady still leftover from before our trigger — keep waiting
-                        self.logger.info(f"ChanEst ifindex={ifindex}: ignoring stale sampleReady(4)")
+                    elif val == 4:
+                        # Too soon after trigger and never saw busy — still stale
+                        self.logger.info(f"ChanEst ifindex={ifindex}: ignoring stale sampleReady(4) (elapsed={elapsed}s < {STALE_GUARD}s, not yet seen busy)")
                     elif val in TERMINAL_STATUSES:
                         failed_ifindexes[ifindex] = val
                         self.logger.warning(f"ChanEst ifindex={ifindex} terminal status {val} — skipping")
