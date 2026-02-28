@@ -140,27 +140,34 @@ class AgentManager:
     def _handle_response(self, data: dict):
         """Handle task response from agent."""
         request_id = data.get('request_id')
-        
+
         if request_id not in self.pending_tasks:
-            self.logger.warning(f"Response for unknown task: {request_id}")
+            self.logger.warning(f"Response for unknown/expired task: {request_id} — task may have timed out before agent responded")
             return
-        
+
         task = self.pending_tasks[request_id]
         task.completed = True
         task.result = data.get('result')
         task.error = data.get('error')
-        
+
+        in_sync  = request_id in self._task_queues
+        in_async = request_id in self._async_task_queues
+        self.logger.debug(f"Task {request_id} response received — sync_waiter={in_sync} async_waiter={in_async}")
+
         # Put in queue if waiting
-        if request_id in self._task_queues:
+        if in_sync:
             self._task_queues[request_id].put(data)
-        
+
         # Put in async queue if waiting
-        if request_id in self._async_task_queues:
+        if in_async:
             try:
                 self._async_task_queues[request_id].put_nowait(data)
             except asyncio.QueueFull:
                 self.logger.error(f"Async queue full for task: {request_id}")
-        
+
+        if not in_sync and not in_async:
+            self.logger.warning(f"Task {request_id} has no waiters — response dropped (caller already timed out)")
+
         self.logger.info(f"Task completed: {request_id}")
     
     def _handle_pong(self, websocket: WebSocket):
@@ -219,11 +226,14 @@ class AgentManager:
         # Prefer exact capability match
         for agent in self.agents.values():
             if agent.authenticated and capability in agent.capabilities:
+                self.logger.debug(f"Routing '{capability}' task → agent '{agent.agent_id}' (capability match)")
                 return agent.agent_id
         # Fallback: any authenticated agent
         for agent in self.agents.values():
             if agent.authenticated:
+                self.logger.debug(f"Routing '{capability}' task → agent '{agent.agent_id}' (fallback — capability not advertised)")
                 return agent.agent_id
+        self.logger.warning(f"No agent available for capability '{capability}'")
         return None
     
     async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0) -> str:
@@ -257,9 +267,9 @@ class AgentManager:
         
         try:
             await agent.websocket.send_text(msg)
-            self.logger.info(f"Sent task {task_id} ({command}) to {agent_id}")
+            self.logger.info(f"Sent task {task_id} ({command}) to agent '{agent_id}'")
         except Exception as e:
-            self.logger.error(f"Failed to send task: {e}")
+            self.logger.error(f"Failed to send task {task_id} to '{agent_id}': {e}")
             del self.pending_tasks[task_id]
             del self._task_queues[task_id]
             raise
@@ -296,7 +306,7 @@ class AgentManager:
             )
             return result
         except asyncio.TimeoutError:
-            self.logger.error(f"Timeout waiting for task: {task_id}")
+            self.logger.error(f"Timeout ({timeout}s) waiting for task {task_id} — agent is still running; increase timeout or reduce SNMP repetitions")
             return None
         finally:
             if task_id in self._task_queues:
