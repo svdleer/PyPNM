@@ -47,6 +47,14 @@ COPY tools/ /app/tools/
 COPY mibs/ /app/mibs/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 
+# Ensure settings/system.json exists before pip install bundles the package.
+# Falls back to the template if the file was accidentally deleted from the repo.
+RUN if [ ! -f /app/src/pypnm/settings/system.json ]; then \
+      echo "WARNING: src/pypnm/settings/system.json missing — seeding from template"; \
+      mkdir -p /app/src/pypnm/settings && \
+      cp /app/deploy/config/system.json.template /app/src/pypnm/settings/system.json; \
+    fi
+
 # Install your package into the venv (no --break-system-packages)
 RUN pip install --upgrade pip \
  && pip install . \
