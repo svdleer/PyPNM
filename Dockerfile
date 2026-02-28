@@ -53,13 +53,12 @@ RUN pip install --upgrade pip \
  && pip install . \
  && pip install pysnmp-mibs
 
-# Ensure config exists (copy from template if missing)
 RUN mkdir -p /app/deploy/config \
- && if [ -f /app/deploy/config/system.json.template ] && \
-       [ ! -f /app/deploy/config/system.json ]; then \
-        cp /app/deploy/config/system.json.template \
-           /app/deploy/config/system.json; \
-    fi
+ && if [ -f /app/deploy/config/system.json.template ]; then \
+      cp -n /app/deploy/config/system.json.template \
+            /app/deploy/config/system.json; \
+    fi \
+ && ls -l /app/deploy/config
 
 # Set config path explicitly
 ENV PYPNM_CONFIG=/app/deploy/config/system.json
@@ -74,6 +73,6 @@ EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -f http://localhost:8000/docs || exit 1
-  
+
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python3.12", "-m", "uvicorn", "pypnm.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
