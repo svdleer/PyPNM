@@ -209,6 +209,22 @@ class AgentManager:
             if agent.authenticated and capability in agent.capabilities:
                 return agent
         return None
+
+    def get_agent_id_for_capability(self, capability: str) -> Optional[str]:
+        """
+        Return agent_id of the first agent advertising *capability*.
+        Falls back to the first authenticated agent so single-agent deployments
+        keep working even when the agent doesn't advertise fine-grained caps.
+        """
+        # Prefer exact capability match
+        for agent in self.agents.values():
+            if agent.authenticated and capability in agent.capabilities:
+                return agent.agent_id
+        # Fallback: any authenticated agent
+        for agent in self.agents.values():
+            if agent.authenticated:
+                return agent.agent_id
+        return None
     
     async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0) -> str:
         """Send task to agent. Returns task_id."""

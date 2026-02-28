@@ -54,6 +54,10 @@ class PNMDiagnosticsService:
         self.logger = logging.getLogger("PNMDiagnosticsService")
         self.agent_manager = get_agent_manager()
     
+    def _get_cm_agent_id(self) -> Optional[str]:
+        """Return agent_id best suited for CM (modem) SNMP tasks."""
+        return self.agent_manager.get_agent_id_for_capability('cm_reachable')
+
     async def _snmp_walk(self, oid: str) -> Dict[str, Any]:
         """Execute SNMP walk via agent."""
         if not self.agent_manager:
@@ -62,10 +66,9 @@ class PNMDiagnosticsService:
         agents = self.agent_manager.get_available_agents()
         if not agents:
             return {'success': False, 'error': 'No agents available'}
-        
-        agent = agents[0]
-        agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
-        
+
+        agent_id = self._get_cm_agent_id()
+
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id,
@@ -99,10 +102,9 @@ class PNMDiagnosticsService:
         agents = self.agent_manager.get_available_agents()
         if not agents:
             return {'success': False, 'error': 'No agents available'}
-        
-        agent = agents[0]
-        agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
-        
+
+        agent_id = self._get_cm_agent_id()
+
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id,
@@ -136,10 +138,9 @@ class PNMDiagnosticsService:
         agents = self.agent_manager.get_available_agents()
         if not agents:
             return {'success': False, 'error': 'No agents available'}
-        
-        agent = agents[0]
-        agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
-        
+
+        agent_id = self._get_cm_agent_id()
+
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id,
@@ -175,10 +176,9 @@ class PNMDiagnosticsService:
         agents = self.agent_manager.get_available_agents()
         if not agents:
             return {'success': False, 'error': 'No agents available'}
-        
-        agent = agents[0]
-        agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
-        
+
+        agent_id = self._get_cm_agent_id()
+
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id,
@@ -213,8 +213,7 @@ class PNMDiagnosticsService:
         if not agents:
             return {'success': False, 'error': 'No agents available'}
         
-        agent = agents[0]
-        agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
+        agent_id = self._get_cm_agent_id()
         
         try:
             task_id = await self.agent_manager.send_task(
@@ -1309,8 +1308,7 @@ class USRxMERService:
         if not agents:
             return {'success': False, 'error': 'No agents available'}
         
-        agent = agents[0]
-        agent_id = agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
+        agent_id = self._get_cm_agent_id()
         
         try:
             task_id = await self.agent_manager.send_task(

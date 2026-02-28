@@ -137,7 +137,9 @@ class ChannelStatsRouter:
             if not agents:
                 raise HTTPException(status_code=503, detail="No agents available")
             
-            agent_id = agents[0].get("agent_id")
+            # Prefer agent that can reach CMs; fall back to first available
+            agent_id = (agent_manager.get_agent_id_for_capability('cm_reachable')
+                        or agents[0].get("agent_id"))
             if not agent_id:
                 raise HTTPException(status_code=503, detail="No valid agent found")
             
