@@ -708,7 +708,24 @@ class UsOfdmaRxMerRouter:
                 )
                 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%+.0f"))
                 ax.grid(True, which="major", linestyle="--", alpha=0.3)
-                ax.set_ylim(bottom=-55, top=3)
+                # Center 0 dB in the middle of the Y-axis: compute symmetric range
+                # from the actual data so the main tap (0 dB) is always at mid-height.
+                all_dB_vals = [
+                    v
+                    for mp in mod_preeq
+                    for _, dB_rel, _, _ in [mac_profile.get(mp.mac, ([], [], None, None))]
+                    for v in dB_rel
+                    if v is not None
+                ]
+                if fn_dB:
+                    all_dB_vals += [v for v in fn_dB if v is not None]
+                if all_dB_vals:
+                    max_abs = max(abs(min(all_dB_vals)), abs(max(all_dB_vals)))
+                    pad = max(2.0, max_abs * 0.08)
+                    _symmetric = max_abs + pad
+                    ax.set_ylim(bottom=-_symmetric, top=_symmetric)
+                else:
+                    ax.set_ylim(bottom=-55, top=3)
 
                 # Small in-plot legend for verdict line-styles only
                 from matplotlib.lines import Line2D
