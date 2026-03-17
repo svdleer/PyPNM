@@ -28,9 +28,19 @@
 
 PyPNM is a DOCSIS 3.x/4.0 Proactive Network Maintenance toolkit for engineers who want repeatable, scriptable visibility into modem health. It can run purely as a Python library or as a FastAPI web service for real-time dashboards and offline analysis workflows.
 
+## Acknowledgments
+
+This fork builds on the original PyPNM work by Maurice Garcia.
+
+Thank you, Maurice, for creating the foundation that made this continuation possible.
+
+- Upstream author: Maurice Garcia
+- Last upstream commit preserved in this fork: [`3876c0e`](https://github.com/svdleer/PyPNM/commit/3876c0e)
+
 ## Table of contents
 
 - [Choose your path](#choose-your-path)
+- [Acknowledgments](#acknowledgments)
 - [Kubernetes | Docker](#kubernetes--docker)
   - [Docker](#docker-deploy)
   - [Kubernetes (kind)](#k8s-deploy)
