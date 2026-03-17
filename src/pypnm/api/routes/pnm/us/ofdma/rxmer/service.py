@@ -17,6 +17,7 @@ OIDs used (from DOCS-PNM-MIB):
 from __future__ import annotations
 
 import logging
+import re
 from enum import IntEnum
 from typing import Any, Dict, Optional
 
@@ -112,14 +113,10 @@ class CmtsUsOfdmaRxMerService:
     # ============================================
     
     def _get_agent_id(self) -> Optional[str]:
-        """Get first available agent ID."""
+        """Get cmts-agent ID (cmts_reachable capability). Returns None if no such agent connected."""
         if not self.agent_manager:
             return None
-        agents = self.agent_manager.get_available_agents()
-        if not agents:
-            return None
-        agent = agents[0]
-        return agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
+        return self.agent_manager.get_agent_id_for_capability('cmts_reachable')
     
     async def _snmp_get(self, oid: str) -> Dict[str, Any]:
         """Execute SNMP GET via agent."""
@@ -630,7 +627,8 @@ class CmtsUsOfdmaRxMerService:
         pre_eq: bool = True,
         num_averages: int = 1,
         destination_index: int = 0,
-        tftp_server: Optional[str] = None
+        tftp_server: Optional[str] = None,
+        dest_path: str = "./"
     ) -> dict[str, Any]:
         """
         Start Upstream OFDMA RxMER measurement.
@@ -666,7 +664,7 @@ class CmtsUsOfdmaRxMerService:
             if tftp_server and destination_index == 0:
                 try:
                     dest_result = await self.create_bulk_destination(
-                        tftp_ip=tftp_server, dest_index=1
+                        tftp_ip=tftp_server, dest_index=1, dest_path=dest_path
                     )
                     destination_index = dest_result.get("destination_index", 1)
                 except Exception as e:
@@ -928,8 +926,9 @@ class CmtsUsOfdmaRxMerService:
                                         # Suspend row to notInService(2) before modifying columns.
                                         # Many CMTSes (Arris/CommScope) return inconsistentValue
                                         # if DestBaseUri is SET while the row is active(1).
-                                        _norm_path = dest_path.lstrip('./').lstrip('/')
-                                        _norm_path = (_norm_path + '/') if _norm_path and not _norm_path.endswith('/') else _norm_path
+                                        _norm_path = re.sub(r'^(\./)+'  , '', dest_path).lstrip('/')
+                                        if _norm_path and not _norm_path.endswith('/'):
+                                            _norm_path += '/'
                                         try:
                                             await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 2, 'i')  # notInService
                                             await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{idx}", _norm_path, 's')
@@ -969,8 +968,49 @@ class CmtsUsOfdmaRxMerService:
             ip_hex = "".join([f"{int(p):02x}" for p in ip_parts])
 
             # Normalise dest_path once for use below
-            _path = dest_path.lstrip('./').lstrip('/')
-            _path = (_path + '/') if _path and not _path.endswith('/') else _path
+            _path = re.sub(r'^(\./)+'  , '', dest_path).lstrip('/')
+            if _path and not _path.endswith('/'):
+                _path += '/'
+
+            # Check if the row at dest_index already exists (active=1).
+            # This handles the case where dest_index was explicitly supplied — the
+            # auto-scan loop above is skipped, so we must guard here too.
+            # Arris/CommScope returns wrongValue if createAndWait(5) is SET on an
+            # already-active row.
+            try:
+                _rs_result = await self._snmp_get(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}")
+                _rs_val = self._parse_get_value(_rs_result)
+                _row_active = _rs_val and int(_rs_val) == 1
+            except Exception:
+                _row_active = False
+
+            if _row_active:
+                # Row already active — update via notInService(2) transition
+                self.logger.info(f"Bulk dest index {dest_index} already active — updating via notInService")
+                _norm_path = _path
+                try:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 2, 'i')  # notInService
+                    await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
+                    await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
+                    await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
+                    if _norm_path:
+                        await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _norm_path, 's')
+                    await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')  # active
+                except Exception as _e:
+                    self.logger.warning(f"Failed to update existing bulk dest {dest_index}: {_e} — attempting destroy+recreate")
+                    try:
+                        await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 6, 'i')  # destroy
+                    except Exception:
+                        pass
+                    _row_active = False  # fall through to createAndWait below
+
+                if _row_active:
+                    return {
+                        "success": True,
+                        "destination_index": dest_index,
+                        "message": f"Updated existing destination {dest_index} for {tftp_ip}",
+                        "created": False
+                    }
 
             # Use createAndWait(5) so all columns can be set while the row is
             # notReady/notInService, then activate with active(1) at the end.

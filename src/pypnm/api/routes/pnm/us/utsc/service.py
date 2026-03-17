@@ -157,14 +157,10 @@ class CmtsUtscService:
     # ============================================
     
     def _get_agent_id(self) -> Optional[str]:
-        """Get first available agent ID."""
+        """Get cmts-agent ID (cmts_reachable capability). Returns None if no such agent connected."""
         if not self.agent_manager:
             return None
-        agents = self.agent_manager.get_available_agents()
-        if not agents:
-            return None
-        agent = agents[0]
-        return agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
+        return self.agent_manager.get_agent_id_for_capability('cmts_reachable')
     
     async def _snmp_get(self, oid: str) -> Dict[str, Any]:
         """Execute SNMP GET via agent."""
@@ -316,7 +312,39 @@ class CmtsUtscService:
             ip_obj = ipaddress.ip_address(dest_ip)
             ip_hex = ip_obj.packed.hex()
             ip_hex_formatted = ' '.join([ip_hex[i:i+2] for i in range(0, len(ip_hex), 2)]).upper()
-            
+
+            # Calculate selector before any SETs
+            byte0 = 0x00
+            byte1 = 0x00
+            for t in (pnm_types or ['utsc']):
+                t = t.lower()
+                if t in ('utsc', 'both'):
+                    byte1 |= 0x80  # bit8
+                if t in ('rxmer', 'both'):
+                    byte0 |= 0x04  # bit5
+            selector_hex = f"{byte0:02X} {byte1:02X}"
+
+            # Read current DestIpAddr to check if already configured correctly.
+            # Casa CMTS rejects SET on active rows → skip if already set to same values.
+            existing_ip = await self._snmp_get(f"{self.OID_BULK_DATA_DEST_IP}.{index}")
+            existing_path = await self._snmp_get(f"{self.OID_BULK_DATA_DEST_PATH}.{index}")
+            existing_selector = await self._snmp_get(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}")
+
+            def _normalize(v):
+                if v and isinstance(v, dict):
+                    v = v.get('value', '')
+                return str(v or '').strip().upper().replace(' ', '').replace('0X', '')
+
+            already_set = (
+                _normalize(existing_ip) == ip_hex.upper() and
+                str(existing_path.get('value', '') if isinstance(existing_path, dict) else existing_path or '').strip() == dest_path and
+                _normalize(existing_selector) == selector_hex.replace(' ', '')
+            )
+
+            if already_set:
+                self.logger.info(f"Bulk data control already configured correctly for index {index}, skipping SETs")
+                return {"success": True, "index": index, "dest_ip": dest_ip, "pnm_test_selector_hex": selector_hex, "skipped": True}
+
             # 1. Set DestIpAddrType = ipv4(1)
             await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
             
@@ -329,19 +357,7 @@ class CmtsUtscService:
             # 4. Set UploadControl = autoUpload(3)
             await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')
             
-            # 5. Set PnmTestSelector BITS value based on requested pnm_types
-            # BITS encoding (MSB first):
-            #   bit5 = usOfdmaRxMerPerSubcarrier -> byte0 |= 0x04
-            #   bit8 = usTriggeredSpectrumCapture -> byte1 |= 0x80
-            byte0 = 0x00
-            byte1 = 0x00
-            for t in pnm_types:
-                t = t.lower()
-                if t in ('utsc', 'both'):
-                    byte1 |= 0x80  # bit8
-                if t in ('rxmer', 'both'):
-                    byte0 |= 0x04  # bit5
-            selector_hex = f"{byte0:02X} {byte1:02X}"
+            # 5. Set PnmTestSelector
             await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", selector_hex, 'x')
 
             self.logger.info(f"Bulk data control configured: selector={selector_hex}")

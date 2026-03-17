@@ -132,16 +132,10 @@ class ChannelStatsRouter:
             if not agent_manager:
                 raise HTTPException(status_code=503, detail="Agent manager not initialized")
             
-            # Find an available agent
-            agents = agent_manager.get_available_agents()
-            if not agents:
-                raise HTTPException(status_code=503, detail="No agents available")
-            
-            # Prefer agent that can reach CMs; fall back to first available
-            agent_id = (agent_manager.get_agent_id_for_capability('cm_reachable')
-                        or agents[0].get("agent_id"))
+            # Find a CM-reachable agent
+            agent_id = agent_manager.get_agent_id_for_capability('cm_reachable')
             if not agent_id:
-                raise HTTPException(status_code=503, detail="No valid agent found")
+                raise HTTPException(status_code=503, detail="No cm_reachable agent available")
             
             self.logger.info(f"Getting channel stats for {request.modem_ip} via agent {agent_id}")
             

@@ -125,6 +125,10 @@ class UtscConfigureRequest(BaseModel):
     filename: str = Field(default="utsc_capture", description="Output filename")
     destination_index: int = Field(default=1, ge=0, description="Bulk transfer destination index (1=TFTP upload, 0=local only)")
 
+    # Bulk destination — configure docsPnmCcapBulkDataControlTable row before starting
+    tftp_server: Optional[str] = Field(None, description="TFTP server IP for bulk upload (configures bulk dest row). None = skip bulk dest config.")
+    dest_path: Optional[str] = Field(None, description="Destination path on TFTP server (default: './')")
+
 
 class UtscConfigureResponse(BaseModel):
     """Response from configuring UTSC."""

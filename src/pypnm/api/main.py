@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import pathlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +26,18 @@ if project_root.name == "src" and str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 StartUp.initialize()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Increase the asyncio default thread pool for blocking I/O (FTP, TFTP, SFTP)
+    # Tunable via PYPNM_THREADPOOL_SIZE env var (default 32)
+    pool_size = int(os.environ.get('PYPNM_THREADPOOL_SIZE', 32))
+    executor = ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix='pypnm-worker')
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(executor)
+    yield
+    executor.shutdown(wait=False)
 
 fast_api_description = """
 **Proactive Network Maintenance (PNM) FastAPI For DOCSIS 3.x/4.0**
@@ -52,6 +68,7 @@ app = FastAPI(
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 

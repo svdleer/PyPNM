@@ -117,12 +117,11 @@ class CableModemServicePreCheck:
         return get_agent_manager()
 
     def _get_snmp_agent(self):
-        """Return the first authenticated agent that has snmp_get capability."""
+        """Return the agent manager and first authenticated agent with cm_reachable capability."""
         mgr = self._get_agent_manager()
         if not mgr:
             return None, None
-        # Prefer agent that can reach CMs directly; fall back to any snmp_get agent
-        agent = mgr.get_agent_for_capability('cm_reachable') or mgr.get_agent_for_capability('snmp_get')
+        agent = mgr.get_agent_for_capability('cm_reachable')
         return mgr, agent
 
     # ------------------------------------------------------------------

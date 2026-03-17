@@ -58,12 +58,9 @@ class CMTSModemService:
         if not agent_manager:
             raise Exception("Agent manager not available")
 
-        agents = agent_manager.get_available_agents()
-        if not agents:
-            raise Exception("No agents available")
-
-        # Prefer agent that can reach the CMTS; fall back to first available
-        agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable') or agents[0]['agent_id']
+        agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable')
+        if not agent_id:
+            raise Exception("No cmts_reachable agent available")
 
         task_id = await agent_manager.send_task(
             agent_id=agent_id,
@@ -86,12 +83,9 @@ class CMTSModemService:
         if not agent_manager:
             raise Exception("Agent manager not available")
 
-        agents = agent_manager.get_available_agents()
-        if not agents:
-            raise Exception("No agents available")
-
-        # Prefer agent that can reach modems directly; fall back to first available
-        agent_id = agent_manager.get_agent_id_for_capability('cm_reachable') or agents[0]['agent_id']
+        agent_id = agent_manager.get_agent_id_for_capability('cm_reachable')
+        if not agent_id:
+            raise Exception("No cm_reachable agent available")
 
         task_id = await agent_manager.send_task(
             agent_id=agent_id,
@@ -180,7 +174,7 @@ class CMTSModemService:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
             
-            if cached.get('enriched') and age < 300:  # enriched data < 5 min old
+            if cached.get('enriched') and age < 7200:  # enriched data valid for 2 hours
                 self.logger.info(f"Returning cached enriched data for {cmts_ip} (age={age:.0f}s)")
                 return {
                     'success': True,
@@ -192,7 +186,7 @@ class CMTSModemService:
                     'cached': True,
                 }
             
-            if cached.get('enriching') and age < 600:  # enrichment still in progress
+            if cached.get('enriching') and age < 1800:  # enrichment still in progress (30 min max)
                 # Return whatever we have so far (base modems) with enriching=True
                 self.logger.info(f"Enrichment in progress for {cmts_ip} (age={age:.0f}s)")
                 return {
@@ -232,6 +226,20 @@ class CMTSModemService:
 
             # ── Step 3: Enrichment ───────────────────────────────────────
             if enrich and modems:
+                # Guard: don't start a second enrichment if one is already running
+                existing = _enrichment_cache.get(cmts_ip, {})
+                if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800:
+                    self.logger.info(f"Enrichment already in progress for {cmts_ip}, skipping new launch")
+                    return {
+                        'success': True,
+                        'modems': existing.get('modems', modems),
+                        'count': len(existing.get('modems', modems)),
+                        'cmts_ip': cmts_ip,
+                        'enriched': False,
+                        'enriching': True,
+                        'enrich_progress': existing.get('enrich_progress', {'completed': 0, 'total': len(modems)}),
+                    }
+
                 # Store base modems in cache and kick off background enrichment
                 _enrichment_cache[cmts_ip] = {
                     'modems': modems,
@@ -311,8 +319,16 @@ class CMTSModemService:
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
         except Exception as e:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
+            # Mark as enriched=True with whatever partial data we have so that polls
+            # stop retrying and don't trigger an infinite walk→fail→walk cycle.
             if cmts_ip in _enrichment_cache:
-                _enrichment_cache[cmts_ip]['enriching'] = False
+                _enrichment_cache[cmts_ip] = {
+                    'modems': _enrichment_cache[cmts_ip].get('modems', modems),
+                    'enriched': True,   # best-effort: stop the retry loop
+                    'enriching': False,
+                    'timestamp': time.time(),
+                    'partial': True,    # flag so callers can tell data is incomplete
+                }
 
     # ── correlation logic (moved from agent._async_cmts_get_modems) ─────
 
@@ -489,7 +505,20 @@ class CMTSModemService:
             if limit and len(modems) >= limit:
                 break
 
+        # Sort by CMTS table index (numeric) so the modem order is always
+        # deterministic and matches the SNMP registration order regardless of
+        # dict insertion quirks or OID string vs. numeric ordering differences.
+        modems.sort(key=self._sort_key_cmts_index)
+
         return modems
+
+    @staticmethod
+    def _sort_key_cmts_index(modem: dict):
+        """Sort key: numeric cmts_index so modem order matches SNMP registration order."""
+        try:
+            return int(modem.get('cmts_index') or 0)
+        except (ValueError, TypeError):
+            return 0
 
     async def _enrich_cmts_interfaces(self, modems: list) -> dict:
         """Enrich modems with cable-mac and OFDMA upstream interfaces from CMTS SNMP walks."""
@@ -697,7 +726,7 @@ class CMTSModemService:
                          and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses]
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (batch=200, max_concurrent=15, community={modem_community})")
+        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (batch=200, max_concurrent={MAX_CONCURRENT}, community={modem_community})")
         if not online_modems:
             return modems
 

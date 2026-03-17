@@ -134,7 +134,7 @@ class CommonMeasureService(CommonMessagingService):
         self.config_mgr:ConfigManager               = ConfigManager()
         self.log_prefix:str                         = f"MAC: {self.cm.get_mac_address} - INET: {self.cm.get_inet_address}"
         self.pnm_dir                                = PnmConfigManager.get_save_dir()
-        self.pnm_local_dir                          = SystemConfigSettings.pnm_dir
+        self.pnm_local_dir                          = SystemConfigSettings.pnm_dir()
         self._capture_parameter:SpecAnCapturePara   = SpecAnCapturePara()
 
         # Initialize default spectrum capture parameters
@@ -538,6 +538,8 @@ class CommonMeasureService(CommonMessagingService):
                 return self._handle_ftp_fetch(pnm_file_name)
             elif method == "sftp":
                 return self._handle_sftp_fetch(pnm_file_name)
+            elif method == "agent":
+                return await self._handle_agent_file_fetch(pnm_file_name)
             elif method == "http":
                 return self._handle_http_fetch(pnm_file_name)
             elif method == "https":
@@ -766,10 +768,15 @@ class CommonMeasureService(CommonMessagingService):
                 self.logger.error(f"{self.log_prefix} - Device reported ERROR for file upload '{filename}'.")
                 return ServiceStatusCode.TFTP_PNM_FILE_UPLOAD_FAILURE
 
+            status_name = status.name if status is not None else "None"
             self.logger.debug(
                 f"{self.log_prefix} - Waiting for file '{filename}' to upload "
-                f"(status={status.name}, wait_count={wait_count})"
+                f"(status={status_name}, wait_count={wait_count})"
             )
+            if status is None:
+                self.logger.warning(
+                    f"{self.log_prefix} - getBulkFileUploadStatus returned None for '{filename}', treating as in-progress"
+                )
 
             await asyncio.sleep(1)
             wait_count += 1
@@ -914,6 +921,74 @@ class CommonMeasureService(CommonMessagingService):
             self.logger.info(f'{self.log_prefix} - Waiting for Amplitude Data ({now} of {timeout_seconds})')
 
             await asyncio.sleep(1)
+
+    async def _handle_agent_file_fetch(self, pnm_file_name: str) -> ServiceStatusCode:
+        """
+        Fetch a PNM file from the agent's local TFTP root via the WebSocket
+        agent manager.  Used when PNM_RETRIEVAL_METHOD=agent.
+
+        The agent reads the file (glob-matching timestamp suffixes) and returns
+        it as base64.  This method writes it to self.pnm_dir.
+        """
+        import base64
+        try:
+            from pypnm.api.agent.manager import get_agent_manager
+        except ImportError:
+            self.logger.error(f"{self.log_prefix} - AgentManager import failed")
+            return ServiceStatusCode.LOCAL_FETCH_FAILURE
+
+        agent_manager = get_agent_manager()
+        if not agent_manager:
+            self.logger.error(f"{self.log_prefix} - No agent manager available")
+            return ServiceStatusCode.LOCAL_FETCH_FAILURE
+
+        # pnm_file_get is only announced by agents whose TFTP root is readable,
+        # ensuring we never accidentally route to ctms-agent which has no PNM files.
+        agent = agent_manager.get_agent_for_capability('pnm_file_get')
+        if not agent:
+            self.logger.warning(
+                f"{self.log_prefix} - No agent with pnm_file_get capability; "
+                "falling back to local fetch"
+            )
+            return await self._handle_local_fetch(pnm_file_name)
+
+        try:
+            task_id = await agent_manager.send_task(
+                agent_id=agent.agent_id,
+                command='file_get',
+                params={'filename': pnm_file_name, 'glob': True},
+                timeout=30.0,
+            )
+            result = await agent_manager.wait_for_task_async(task_id, timeout=30.0)
+        except Exception as e:
+            self.logger.error(f"{self.log_prefix} - Agent file_get failed: {e}")
+            return ServiceStatusCode.LOCAL_FETCH_FAILURE
+
+        # wait_for_task_async returns the full WS message wrapper;
+        # the actual handler result is nested under 'result'.
+        result_inner = (result or {}).get('result') or result or {}
+
+        if not result_inner or not result_inner.get('success'):
+            err = result_inner.get('error', 'unknown')
+            self.logger.error(
+                f"{self.log_prefix} - Agent could not fetch '{pnm_file_name}': {err}"
+            )
+            return ServiceStatusCode.LOCAL_FETCH_FAILURE
+
+        try:
+            content = base64.b64decode(result_inner['content_base64'])
+            dest = os.path.join(self.pnm_dir, result_inner.get('filename', pnm_file_name))
+            os.makedirs(self.pnm_dir, exist_ok=True)
+            with open(dest, 'wb') as fh:
+                fh.write(content)
+            self.logger.info(
+                f"{self.log_prefix} - Agent fetched '{pnm_file_name}' "
+                f"({len(content)} bytes) -> {dest}"
+            )
+            return ServiceStatusCode.SUCCESS
+        except Exception as e:
+            self.logger.error(f"{self.log_prefix} - Failed to write fetched file: {e}")
+            return ServiceStatusCode.LOCAL_FETCH_FAILURE
 
     async def _handle_local_fetch(self, pnm_file_name: str) -> ServiceStatusCode:
         """
@@ -1111,27 +1186,40 @@ class CommonMeasureService(CommonMessagingService):
 
             self.logger.debug(
                 f"{self.log_prefix} - Connecting to FTP server "
-                f"{sys_config.ftp_host}:{sys_config.ftp_port}"
+                f"{sys_config.ftp_host()}:{sys_config.ftp_port()}"
             )
             if not connector.connect():
                 self.logger.error(f"{self.log_prefix} - FTP connection failed")
                 return ServiceStatusCode.FTP_PNM_FILE_FETCH_ERROR
 
             # Build remote and local paths
-            remote_base = sys_config.ftp_remote_dir.rstrip("/") if sys_config.ftp_remote_dir else ""
+            remote_base = sys_config.ftp_remote_dir().rstrip("/") if sys_config.ftp_remote_dir() else ""
             remote_path = f"{remote_base}/{pnm_file_name}" if remote_base else pnm_file_name
 
             local_path = os.path.join(self.pnm_local_dir, pnm_file_name)
 
-            self.logger.debug(
-                f"{self.log_prefix} - Downloading '{remote_path}' to '{local_path}'"
-            )
-            success = connector.download_file(remote_path, local_path)
+            # Retry loop: modem reports UPLOAD_COMPLETED slightly before the file
+            # lands on the FTP server — wait up to 5s for it to appear.
+            max_ftp_retries = 5
+            success = False
+            for attempt in range(1, max_ftp_retries + 1):
+                self.logger.debug(
+                    f"{self.log_prefix} - Downloading '{remote_path}' to '{local_path}' (attempt {attempt}/{max_ftp_retries})"
+                )
+                success = connector.download_file(remote_path, local_path)
+                if success:
+                    break
+                if attempt < max_ftp_retries:
+                    self.logger.warning(
+                        f"{self.log_prefix} - FTP download failed for '{remote_path}', retrying in 1s..."
+                    )
+                    time.sleep(1)
+
             connector.disconnect()
 
             if not success:
                 self.logger.error(
-                    f"{self.log_prefix} - FTP download failed for '{remote_path}'"
+                    f"{self.log_prefix} - FTP download failed for '{remote_path}' after {max_ftp_retries} attempts"
                 )
                 return ServiceStatusCode.FTP_PNM_FILE_FETCH_ERROR
 

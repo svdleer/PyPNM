@@ -55,6 +55,10 @@ class UsOfdmaRxMerStartRequest(BaseModel):
         default=None,
         description="TFTP server IP for bulk upload. Required on Cisco cBR-8 to trigger measurement."
     )
+    dest_path: str = Field(
+        default="./",
+        description="Upload path on TFTP server (e.g. 'access/pnmupload/'). Empty/'./' = TFTP root."
+    )
 
 
 class UsOfdmaRxMerStartResponse(BaseModel):

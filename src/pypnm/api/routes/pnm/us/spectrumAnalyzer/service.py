@@ -53,14 +53,10 @@ class CmtsUtscService:
         self.cfg_idx = 1  # Use index .1 which exists on this CMTS
     
     def _get_agent_id(self) -> Optional[str]:
-        """Get first available agent ID."""
+        """Get cmts-agent ID (cmts_reachable capability)."""
         if not self.agent_manager:
             return None
-        agents = self.agent_manager.get_available_agents()
-        if not agents:
-            return None
-        agent = agents[0]
-        return agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
+        return self.agent_manager.get_agent_id_for_capability('cmts_reachable')
     
     async def _safe_snmp_set(self, oid: str, value: Any, value_type: str, description: str = "") -> bool:
         """Safe SNMP SET via agent with error handling.
@@ -658,11 +654,7 @@ class UtscRfPortDiscoveryService:
     def _get_agent_id(self):
         if not self.agent_manager:
             return None
-        agents = self.agent_manager.get_available_agents()
-        if not agents:
-            return None
-        agent = agents[0]
-        return agent.get('agent_id') if isinstance(agent, dict) else agent.agent_id
+        return self.agent_manager.get_agent_id_for_capability('cmts_reachable')
     
     async def _snmp_walk(self, oid: str, timeout: int = 30):
         agent_id = self._get_agent_id()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import cast
 
@@ -629,9 +630,12 @@ class SystemConfigSettings:
 
     @classmethod
     def retrieval_method(cls) -> str:
+        # Environment variable takes precedence over system.json
+        env_val = os.environ.get('PNM_FILE_SOURCE', '').strip().lower()
+        if env_val:
+            return env_val
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "method")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "method")
-
         return cls._get_str_fallback("", primary, legacy)
 
     # Local method
@@ -669,6 +673,9 @@ class SystemConfigSettings:
     # FTP method
     @classmethod
     def ftp_host(cls) -> str:
+        env_val = os.environ.get('FTP_SERVER_IP', '').strip()
+        if env_val:
+            return env_val
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "host")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "host")
         return cls._get_str_fallback("", primary, legacy)
@@ -693,12 +700,18 @@ class SystemConfigSettings:
 
     @classmethod
     def ftp_user(cls) -> str:
+        env_val = os.environ.get('FTP_USER', '').strip()
+        if env_val:
+            return env_val
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "user")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "user")
         return cls._get_str_fallback("", primary, legacy)
 
     @classmethod
     def ftp_password(cls) -> str:
+        env_val = os.environ.get('FTP_PASSWORD', '').strip()
+        if env_val:
+            return env_val
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "ftp")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "ftp")
         return cls._get_password_value_fallback(
@@ -709,6 +722,9 @@ class SystemConfigSettings:
 
     @classmethod
     def ftp_remote_dir(cls) -> str:
+        env_val = os.environ.get('FTP_TFTPBOOT_DIR', '').strip()
+        if env_val:
+            return env_val
         primary = ("PnmFileRetrieval", cls._PRIMARY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "remote_dir")
         legacy  = ("PnmFileRetrieval", cls._LEGACY_RETRIEVAL_METHOD_KEY, "methods", "ftp", "remote_dir")
         return cls._get_str_fallback_allow_empty("", primary, legacy)

@@ -153,8 +153,25 @@ class UtscRouter:
                 community=request.cmts.community,
                 write_community=request.cmts.write_community
             )
-            
+
             try:
+                # Configure bulk data destination (TFTP upload target) if provided
+                if request.tftp_server and request.destination_index > 0:
+                    bulk_result = await service.configure_bulk_data_control(
+                        dest_ip=request.tftp_server,
+                        dest_path=request.dest_path or "./",
+                        index=request.destination_index,
+                        pnm_types=['utsc'],
+                    )
+                    if not bulk_result.get('success'):
+                        self.logger.warning(
+                            f"Bulk dest config failed (continuing): {bulk_result.get('error')}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"Bulk dest configured: {request.tftp_server}:{request.dest_path or './'}"
+                        )
+
                 result = await service.configure(
                     rf_port_ifindex=request.rf_port_ifindex,
                     cfg_index=request.cfg_index,

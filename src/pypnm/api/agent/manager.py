@@ -220,20 +220,18 @@ class AgentManager:
     def get_agent_id_for_capability(self, capability: str) -> Optional[str]:
         """
         Return agent_id of the first agent advertising *capability*.
-        Falls back to the first authenticated agent so single-agent deployments
-        keep working even when the agent doesn't advertise fine-grained caps.
+
+        Routing rules:
+        - CM task  → agent that advertises the required CM capability
+        - CMTS task → agent that advertises the required CMTS capability
+        - An agent advertising both will match either
+        - No fallback to unrelated agents
         """
-        # Prefer exact capability match
         for agent in self.agents.values():
             if agent.authenticated and capability in agent.capabilities:
-                self.logger.debug(f"Routing '{capability}' task → agent '{agent.agent_id}' (capability match)")
+                self.logger.debug(f"Routing '{capability}' task → agent '{agent.agent_id}'")
                 return agent.agent_id
-        # Fallback: any authenticated agent
-        for agent in self.agents.values():
-            if agent.authenticated:
-                self.logger.debug(f"Routing '{capability}' task → agent '{agent.agent_id}' (fallback — capability not advertised)")
-                return agent.agent_id
-        self.logger.warning(f"No agent available for capability '{capability}'")
+        self.logger.warning(f"No agent available for capability '{capability}' — connected agents: {list(self.agents.keys())}")
         return None
     
     async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0, priority: str = 'interactive') -> str:

@@ -24,11 +24,19 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import Response
+
+from pypnm.lib.pnm_file_source import (
+    fetch_pnm_files as _fetch_pnm_files,
+    delete_pnm_files as _delete_pnm_files,
+    local_pnm_dir as _local_pnm_dir,
+    is_ftp_mode as _is_ftp_mode,
+)
 
 from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
     UsOfdmaRxMerDiscoverRequest,
@@ -865,7 +873,8 @@ class UsOfdmaRxMerRouter:
                     pre_eq=request.pre_eq,
                     num_averages=request.num_averages,
                     destination_index=request.destination_index,
-                    tftp_server=request.tftp_server
+                    tftp_server=request.tftp_server,
+                    dest_path=request.dest_path
                 )
                 return UsOfdmaRxMerStartResponse(**result)
             finally:
@@ -932,15 +941,21 @@ class UsOfdmaRxMerRouter:
             import glob
             
             # Build file path - CMTS adds timestamp, so use glob to find latest
-            tftp_dir = Path(request.tftp_path)
+            # In ftp mode always use local cache dir regardless of what tftp_path was sent
+            tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
 
             # Strip leading '/' — Cisco/E6000 SNMP returns e.g. /pnm/mer/usrxmer_xxx
             # which Python's Path join treats as absolute, discarding tftp_dir entirely.
             filename = request.filename.lstrip('/')
 
+            # In ftp mode, pre-fetch matching files from FTP server into local cache
+            basename = Path(filename).name
+            if _is_ftp_mode():
+                _fetch_pnm_files(basename)
+
             # First try exact filename
             filepath = tftp_dir / filename
-            
+
             if not filepath.exists():
                 # CMTS may add a path prefix (e.g. /pnm/mer/) and/or a timestamp suffix.
                 # Try in order:
@@ -969,6 +984,9 @@ class UsOfdmaRxMerRouter:
             try:
                 # Read and parse file
                 data = filepath.read_bytes()
+                # Housekeeping: file in memory — delete from FTP + local cache
+                if _is_ftp_mode():
+                    _delete_pnm_files(basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
                 
@@ -1066,8 +1084,11 @@ class UsOfdmaRxMerRouter:
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
             import glob
 
-            tftp_dir = Path(request.tftp_path)
+            tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
             filename = request.filename.lstrip('/')
+            basename = Path(filename).name
+            if _is_ftp_mode():
+                _fetch_pnm_files(basename)
             filepath = tftp_dir / filename
 
             if not filepath.exists():
@@ -1089,6 +1110,9 @@ class UsOfdmaRxMerRouter:
 
             try:
                 data = filepath.read_bytes()
+                # Housekeeping: file in memory — delete from FTP + local cache
+                if _is_ftp_mode():
+                    _delete_pnm_files(basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
 
