@@ -34,6 +34,7 @@ license-files = ["LICENSE", "NOTICE"]
 dependencies = [
   "fastapi==0.115.12",
   "uvicorn[standard]==0.34.2",
+  "websockets<16",  # 16.0 enables permessage-deflate by default, breaks websocket-client agents
   "python-multipart>=0.0.20",
   "numpy==2.2.6",
   "scipy==1.15.1",

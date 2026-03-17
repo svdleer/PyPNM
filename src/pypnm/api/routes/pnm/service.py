@@ -76,10 +76,10 @@ class PNMDiagnosticsService:
                     'community': self.community,
                     'timeout': 10
                 },
-                timeout=30
+                timeout=120
             )
             
-            result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)
+            result = await self.agent_manager.wait_for_task_async(task_id, timeout=120)
             
             if result and result.get('result', {}).get('success'):
                 return result.get('result', {})
@@ -113,10 +113,10 @@ class PNMDiagnosticsService:
                     'community': self.community,
                     'timeout': 10
                 },
-                timeout=30
+                timeout=120
             )
             
-            result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)
+            result = await self.agent_manager.wait_for_task_async(task_id, timeout=120)
             
             if result and result.get('result', {}).get('success'):
                 return result.get('result', {})
@@ -152,10 +152,10 @@ class PNMDiagnosticsService:
                     'community': self.write_community,
                     'timeout': 10
                 },
-                timeout=30
+                timeout=120
             )
             
-            result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)
+            result = await self.agent_manager.wait_for_task_async(task_id, timeout=120)
             
             if result and result.get('result', {}).get('success'):
                 return result.get('result', {})
@@ -604,7 +604,7 @@ class PNMDiagnosticsService:
             self.logger.info(f"Setting TFTP server: {tftp_server}")
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')  # IPv4
             ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
-            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')  # OctetString hex
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
             
             # Step 2: Configure spectrum parameters
@@ -863,6 +863,11 @@ class PNMDiagnosticsService:
     OID_MOD_PROF_MEAS_STATUS = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.2'
     OID_MOD_PROF_FILE_NAME   = '1.3.6.1.4.1.4491.2.1.27.1.2.11.1.3'
 
+    # Channel estimation coefficients (test type 4 / DS_OFDM_CHAN_EST_COEF)
+    OID_CHAN_EST_TRIG_ENABLE = '1.3.6.1.4.1.4491.2.1.27.1.2.3.1.1'
+    OID_CHAN_EST_FILE_NAME   = '1.3.6.1.4.1.4491.2.1.27.1.2.3.1.8'
+    OID_CHAN_EST_MEAS_STATUS = '1.3.6.1.4.1.4491.2.1.27.1.2.3.1.7'
+
     TFTP_LOCAL_PATH = '/var/lib/tftpboot'
 
     async def trigger_modulation_profile(
@@ -887,7 +892,7 @@ class PNMDiagnosticsService:
             # Step 1: Set TFTP server (same bulk-destination OIDs as spectrum)
             await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
             ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
-            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')  # OctetString hex
             await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
 
             # Step 2: Walk OFDM channel table to discover ifIndexes
@@ -1024,6 +1029,231 @@ class PNMDiagnosticsService:
             self.logger.exception(f"Modulation profile error: {e}")
             return {'success': False, 'error': str(e)}
 
+    async def trigger_channel_estimation(
+        self,
+        tftp_server: str = '172.22.147.18',
+        channel_ids: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        """
+        Trigger DS OFDM channel estimation coefficient capture via raw SNMP.
+
+        Flow:
+          1. Set TFTP/bulk destination on modem
+          2. Walk OFDM channel table to find ifIndexes
+          3. For each ifIndex: set filename + trigger enable
+          4. Poll docsPnmCmOfdmChEstCoefMeasStatus until 4 (complete) or timeout
+          5. Parse binary from TFTP mount; return magnitudes + center frequency
+        """
+        import asyncio
+        import glob
+        import math
+        import os
+
+        self.logger.info(f"Triggering channel estimation for modem {self.modem_ip}")
+
+        try:
+            # Step 0: Tear down any lingering bulk-upload state so the modem
+            #         does not silently skip the new trigger (stale sampleReady).
+            #         - idle the upload ctrl  (docsPnmBulkDestUploadCtrl = 1)
+            #         - clear per-channel trigger enables before we re-arm
+            # Ignore errors — OIDs may not exist on all firmware versions.
+            try:
+                await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 1, 'i')  # idle
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+            # Step 1: Set TFTP bulk destination
+            await self._snmp_set(self.OID_BULK_IP_TYPE, 1, 'i')   # IPv4
+            ip_hex = ''.join([f'{int(p):02x}' for p in tftp_server.split('.')])
+            await self._snmp_set(self.OID_BULK_IP_ADDR, ip_hex, 'x')  # OctetString hex
+            await self._snmp_set(self.OID_BULK_UPLOAD_CTRL, 3, 'i')  # AUTO_UPLOAD
+
+            # Step 2: Walk OFDM downstream channel table
+            walk_result = await self._snmp_walk(self.OID_DS_OFDM_CHAN_ID)
+            ofdm_ifindexes = []
+            if walk_result.get('success'):
+                for entry in walk_result.get('results', []):
+                    oid_str = entry.get('oid', '')
+                    ifindex = int(oid_str.split('.')[-1])
+                    chan_id = entry.get('value')
+                    if channel_ids is None or chan_id in channel_ids:
+                        ofdm_ifindexes.append(ifindex)
+
+            if not ofdm_ifindexes:
+                return {'success': False, 'error': 'No OFDM channels found on modem'}
+
+            # Step 3: Set filename and trigger for each ifIndex
+            mac_clean = (self.mac_address or '').replace(':', '').lower()
+            mac_upper = (self.mac_address or '').replace(':', '').upper()
+            timestamp  = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filenames  = {}
+
+            for ifindex in ofdm_ifindexes:
+                # Reset the trigger first (0 → 1 edge is required to re-arm)
+                try:
+                    await self._snmp_set(f"{self.OID_CHAN_EST_TRIG_ENABLE}.{ifindex}", 0, 'i')
+                except Exception:
+                    pass
+                fname = f"chan_est_{mac_clean}_{ifindex}_{timestamp}"
+                filenames[ifindex] = fname
+                await self._snmp_set(f"{self.OID_CHAN_EST_FILE_NAME}.{ifindex}", fname, 's')
+                await self._snmp_set(f"{self.OID_CHAN_EST_TRIG_ENABLE}.{ifindex}", 1, 'i')
+
+            # Step 4: Poll measStatus until 4 (SAMPLE_READY), 5 (ERROR), or
+            # 6 (RESOURCE_UNAVAILABLE) — any of those are terminal.
+            # Wait 2 s first so the modem can transition away from a stale
+            # sampleReady(4) left over from a previous measurement before we
+            # observe a fresh completion.
+            await asyncio.sleep(2)
+            TERMINAL_STATUSES = {4, 5, 6, 7}
+            max_wait      = 180  # 3 min — covers agent queue delay + measurement time
+            poll_interval = 1   # 1 s — fast enough to catch busy(3) on quick modems
+            elapsed       = 2   # already spent 2s above
+            completed     = set()
+            failed_ifindexes: dict = {}
+            seen_busy: set = set()  # track ifindexes that went busy(3) or inactive(2)
+            # Stale-guard: any sampleReady(4) seen ≥ STALE_GUARD seconds after
+            # the trigger MUST be a fresh result — the modem cannot be in the
+            # old state that long after we armed it.
+            STALE_GUARD = 10  # seconds; > worst-case measurement round-trip
+
+            while elapsed < max_wait and len(completed) + len(failed_ifindexes) < len(ofdm_ifindexes):
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                for ifindex in ofdm_ifindexes:
+                    if ifindex in completed or ifindex in failed_ifindexes:
+                        continue
+                    status = await self._snmp_get(f"{self.OID_CHAN_EST_MEAS_STATUS}.{ifindex}")
+                    val = None
+                    if status.get('success') and status.get('output'):
+                        try:
+                            val = int(status['output'].split('=')[-1].strip())
+                        except (ValueError, IndexError):
+                            pass
+                    self.logger.info(f"ChanEst status ifindex={ifindex}: {val} (elapsed={elapsed}s)")
+                    if val in (2, 3):  # inactive or busy — modem is processing the new trigger
+                        seen_busy.add(ifindex)
+                    if val == 4 and (ifindex in seen_busy or elapsed >= STALE_GUARD):
+                        # Accept sampleReady if we saw busy (caught the transition) OR
+                        # enough time has elapsed that this cannot be a pre-trigger stale state.
+                        if ifindex not in seen_busy:
+                            self.logger.info(f"ChanEst ifindex={ifindex}: accepting sampleReady(4) via time-guard ({elapsed}s >= {STALE_GUARD}s)")
+                        completed.add(ifindex)
+                    elif val == 4:
+                        # Too soon after trigger and never saw busy — still stale
+                        self.logger.info(f"ChanEst ifindex={ifindex}: ignoring stale sampleReady(4) (elapsed={elapsed}s < {STALE_GUARD}s, not yet seen busy)")
+                    elif val in TERMINAL_STATUSES:
+                        failed_ifindexes[ifindex] = val
+                        self.logger.warning(f"ChanEst ifindex={ifindex} terminal status {val} — skipping")
+
+            # Step 5: Parse binary files from TFTP mount.
+            # Wait briefly for in-flight TFTP uploads to land on disk before
+            # scanning the directory (modem uploads asynchronously after
+            # sampleReady is set).
+            await asyncio.sleep(5)
+            from pypnm.pnm.parser.CmDsOfdmChanEstimateCoef import CmDsOfdmChanEstimateCoef
+            import time as _time
+
+            tftp_dir        = self.TFTP_LOCAL_PATH
+            parsed_channels = []
+            first_filename  = None
+            RECENCY_SECS    = 1800   # accept any file written in the last 30 min
+
+            # Pre-collect PNMChEstCoef_{MAC}* files that have no ifindex in the
+            # filename; sort oldest→newest so they map in channel order.
+            # Each successive ifindex pops the next file from the list.
+            pnm_coef_pool = sorted(
+                [f for f in glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*'))
+                 if abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS],
+                key=os.path.getmtime
+            )
+
+            for ifindex in ofdm_ifindexes:
+                if ifindex in failed_ifindexes:
+                    self.logger.info(f"ChanEst ifindex={ifindex} skipped (status={failed_ifindexes[ifindex]})")
+                    continue
+
+                fname    = filenames[ifindex]
+                bin_path = os.path.join(tftp_dir, fname)
+
+                if not os.path.exists(bin_path):
+                    bin_path = bin_path + '.bin'
+
+                if not os.path.exists(bin_path):
+                    # Build candidate list — try ifindex-specific patterns first
+                    candidates = []
+                    for pattern in [
+                        # Explicit ifindex in filename (most reliable)
+                        os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_{ifindex}_*'),
+                        os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*'),
+                        os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin'),
+                    ]:
+                        candidates += glob.glob(pattern)
+
+                    recent = [f for f in candidates
+                              if os.path.exists(f) and abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS]
+
+                    if recent:
+                        bin_path = max(recent, key=os.path.getmtime)
+                    elif pnm_coef_pool:
+                        # PNMChEstCoef_ files have no ifindex — assign one per channel
+                        bin_path = pnm_coef_pool.pop(0)
+
+                self.logger.info(f"ChanEst ifindex={ifindex} file: {bin_path}")
+
+                coefficients   = []
+                center_freq_mhz = None
+
+                if os.path.exists(bin_path):
+                    if first_filename is None:
+                        first_filename = os.path.basename(bin_path)
+                    try:
+                        raw    = open(bin_path, 'rb').read()
+                        parser = CmDsOfdmChanEstimateCoef(raw)
+                        model  = parser.to_model()
+
+                        # magnitudes from complex [real, imag] pairs
+                        coefficients = [round(math.sqrt(r ** 2 + i ** 2), 6)
+                                        for r, i in model.values]
+
+                        # Compute centre frequency from header metadata
+                        sz_hz   = model.subcarrier_zero_frequency
+                        sp_hz   = model.subcarrier_spacing
+                        fa_idx  = model.first_active_subcarrier_index
+                        n_coef  = len(coefficients)
+                        if sz_hz and sp_hz and n_coef:
+                            center_freq_hz  = sz_hz + (fa_idx + n_coef / 2) * sp_hz
+                            center_freq_mhz = round(center_freq_hz / 1_000_000, 3)
+
+                        self.logger.info(
+                            f"ChanEst parsed: {n_coef} subcarriers, "
+                            f"center={center_freq_mhz} MHz, spacing={sp_hz} Hz"
+                        )
+                    except Exception as parse_err:
+                        self.logger.error(f"ChanEst parse error {bin_path}: {parse_err}", exc_info=True)
+
+                parsed_channels.append({
+                    'channel_id':      ifindex,
+                    'coefficients':    coefficients,
+                    'frequency_mhz':   center_freq_mhz,
+                })
+
+            success = any(ch['coefficients'] for ch in parsed_channels)
+            return {
+                'success':     success,
+                'mac_address': self.mac_address,
+                'modem_ip':    self.modem_ip,
+                'timestamp':   datetime.now().isoformat(),
+                'channels':    parsed_channels,
+                'filename':    first_filename,
+                'error':       None if success else 'No coefficient data parsed from TFTP files',
+            }
+
+        except Exception as e:
+            self.logger.exception(f"Channel estimation error: {e}")
+            return {'success': False, 'error': str(e)}
+
     async def trigger_pnm_measurement(
         self,
         test_type: int,
@@ -1033,11 +1263,16 @@ class PNMDiagnosticsService:
         """
         Trigger a PNM measurement on the cable modem.
 
-        test_type 10 (ModulationProfile) is handled directly via SNMP primitives.
-        Other test types (4, 5, 8) are dispatched to the agent as named commands
-        once those handlers are implemented.
+        test_type 4  (DS_OFDM_CHAN_EST_COEF)    → trigger_channel_estimation
+        test_type 10 (DS_OFDM_MODULATION_PROFILE) → trigger_modulation_profile
         """
         self.logger.info(f"Triggering PNM measurement type {test_type} for modem {self.modem_ip}")
+
+        if test_type == 4:
+            return await self.trigger_channel_estimation(
+                tftp_server=tftp_server,
+                channel_ids=channel_ids
+            )
 
         if test_type == 10:
             return await self.trigger_modulation_profile(
@@ -1045,7 +1280,6 @@ class PNMDiagnosticsService:
                 channel_ids=channel_ids
             )
 
-        # Other test types not yet migrated to direct SNMP
         return {
             'success': False,
             'error': f'PNM test type {test_type} not yet implemented via direct SNMP'

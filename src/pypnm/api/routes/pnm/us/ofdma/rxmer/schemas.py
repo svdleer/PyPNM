@@ -236,6 +236,7 @@ class RxMerCapture(BaseModel):
     cm_mac_address: str
     preeq_enabled: bool
     filename: Optional[str] = None
+    ofdma_ifindex: Optional[int] = None   # upstream channel ifIndex this capture came from
     values: List[float] = []
     frequencies_mhz: List[float] = []
     rxmer_avg_db: Optional[float] = None
@@ -305,6 +306,7 @@ class FiberNodeCaptureEntry(BaseModel):
     cm_mac_address: str
     filename: str
     preeq_enabled: bool = Field(default=True)
+    ofdma_ifindex: Optional[int] = None   # which upstream channel this capture came from
 
 
 class FiberNodeAnalysisRequest(BaseModel):

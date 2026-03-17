@@ -475,7 +475,8 @@ class UsOfdmaRxMerRouter:
         # Shared analysis engine (used by all comparison + fiber node routes)
         # ------------------------------------------------------------------
 
-        def _load_rxmer_capture(filename: str, tftp_path: str, preeq_enabled: bool, cm_mac: str = None) -> RxMerCapture:
+        def _load_rxmer_capture(filename: str, tftp_path: str, preeq_enabled: bool,
+                                cm_mac: str = None, ofdma_ifindex: int = None) -> RxMerCapture:
             """Parse one RxMER file into a RxMerCapture model."""
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
             import glob, statistics as _stat
@@ -510,6 +511,7 @@ class UsOfdmaRxMerRouter:
                 cm_mac_address=cm_mac or model.cm_mac_address,
                 preeq_enabled=preeq_enabled,
                 filename=str(fp.name),
+                ofdma_ifindex=ofdma_ifindex,
                 values=[round(v, 2) for v in vals],
                 frequencies_mhz=freqs,
                 rxmer_avg_db=round(stats.mean, 2),
@@ -605,13 +607,39 @@ class UsOfdmaRxMerRouter:
 
             modem_assessments: list[ModemAssessment] = []
             for mac, mac_captures in by_mac.items():
-                # Split by pre-eq flag
+                # Group captures by ifindex so multi-channel modems get
+                # per-channel pre-EQ comparison before the results are merged.
+                by_ifidx: dict = {}
+                for c in mac_captures:
+                    by_ifidx.setdefault(c.ofdma_ifindex, []).append(c)
+
+                # Per-channel: collect rxmer_avg and pre-EQ delta
+                ch_rxmer: list[float] = []
+                all_delta_vals: list[float] = []
+                all_improved: int = 0
+
+                for ifidx_caps in by_ifidx.values():
+                    ch_on  = [c for c in ifidx_caps if c.preeq_enabled]
+                    ch_off = [c for c in ifidx_caps if not c.preeq_enabled]
+                    ch_rep = ch_on[0] if ch_on else ifidx_caps[0]
+                    if ch_rep.rxmer_avg_db is not None:
+                        ch_rxmer.append(ch_rep.rxmer_avg_db)
+                    # Pre-EQ comparison — only valid within the same channel
+                    if ch_on and ch_off:
+                        n_ch = min(len(ch_on[0].values), len(ch_off[0].values))
+                        dvs = [ch_on[0].values[i] - ch_off[0].values[i]
+                               for i in range(n_ch)
+                               if ch_on[0].values[i] < 63.5 and ch_off[0].values[i] < 63.5]
+                        all_delta_vals.extend(dvs)
+                        all_improved += sum(1 for d in dvs if d > 0.5)
+
+                # Merged representative capture (prefer preeq_on, else first)
                 on_list  = [c for c in mac_captures if c.preeq_enabled]
                 off_list = [c for c in mac_captures if not c.preeq_enabled]
-                # Representative capture: prefer preeq_on, else first
                 rep = on_list[0] if on_list else mac_captures[0]
 
-                mac_avg = rep.rxmer_avg_db or 0.0
+                # rxmer_avg = mean across all channels this modem was scanned on
+                mac_avg = round(_stat.mean(ch_rxmer), 2) if ch_rxmer else (rep.rxmer_avg_db or 0.0)
                 delta_from_group = round(mac_avg - group_avg, 2)
 
                 # Outlier score based on band-grouped subcarrier stats
@@ -636,29 +664,23 @@ class UsOfdmaRxMerRouter:
                 else:
                     assessment = "clean" if mac_avg >= 35 else ("outlier" if mac_avg < 28 else "inconclusive")
 
-                # Pre-eq comparison (ON vs OFF for same MAC — always on same channel)
+                # Pre-EQ comparison — merged deltas across all channels
                 preeq_delta_avg = preeq_num_improved = preeq_assessment = None
-                if on_list and off_list:
-                    n_mac = min(len(on_list[0].values), len(off_list[0].values))
-                    vals_on  = on_list[0].values[:n_mac]
-                    vals_off = off_list[0].values[:n_mac]
-                    delta_vals = [vals_on[i] - vals_off[i] for i in range(n_mac)
-                                  if vals_on[i] < 63.5 and vals_off[i] < 63.5]
-                    if delta_vals:
-                        preeq_delta_avg = round(_stat.mean(delta_vals), 2)
-                        preeq_num_improved = sum(1 for d in delta_vals if d > 0.5)
-                        pct_improved = preeq_num_improved / len(delta_vals)
-                        if preeq_delta_avg > 2.0 and pct_improved > 0.5:
-                            preeq_assessment = "in-home"
-                        elif preeq_delta_avg < -1.0:
-                            preeq_assessment = "network"
-                        elif abs(preeq_delta_avg) <= 1.0:
-                            preeq_assessment = "clean"
-                        else:
-                            preeq_assessment = "inconclusive"
-                        # Override group assessment with pre-eq result when available
-                        if num_caps <= 2:
-                            assessment = preeq_assessment or assessment
+                if all_delta_vals:
+                    preeq_delta_avg  = round(_stat.mean(all_delta_vals), 2)
+                    preeq_num_improved = all_improved
+                    pct_improved = all_improved / len(all_delta_vals)
+                    if preeq_delta_avg > 2.0 and pct_improved > 0.5:
+                        preeq_assessment = "in-home"
+                    elif preeq_delta_avg < -1.0:
+                        preeq_assessment = "network"
+                    elif abs(preeq_delta_avg) <= 1.0:
+                        preeq_assessment = "clean"
+                    else:
+                        preeq_assessment = "inconclusive"
+                    # Override group assessment with pre-eq result when available
+                    if num_caps <= 2:
+                        assessment = preeq_assessment or assessment
 
                 modem_assessments.append(ModemAssessment(
                     cm_mac_address=mac,
@@ -872,7 +894,7 @@ class UsOfdmaRxMerRouter:
                 captures = []
                 for e in request.captures:
                     try:
-                        captures.append(_load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address))
+                        captures.append(_load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address, e.ofdma_ifindex))
                     except FileNotFoundError as fnf:
                         self.logger.warning(f"fiberNode/analyze: skipping missing capture {fnf}")
                 if not captures:
@@ -898,7 +920,7 @@ class UsOfdmaRxMerRouter:
                 captures = []
                 for e in request.captures:
                     try:
-                        captures.append(_load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address))
+                        captures.append(_load_rxmer_capture(e.filename, request.tftp_path, e.preeq_enabled, e.cm_mac_address, e.ofdma_ifindex))
                     except FileNotFoundError as fnf:
                         self.logger.warning(f"fiberNode/plot: skipping missing capture {fnf}")
                 if not captures:
@@ -1144,6 +1166,10 @@ class UsOfdmaRxMerRouter:
                 # This is the DOCSIS 3.1 OFDMA-specific table (not the D3.0 SC-QAM table!)
                 OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
                 modem_counts: dict = {ch['ifindex']: 0 for ch in channels}
+                # Track unique cm_index per mac_domain to avoid double-counting
+                # modems that appear on multiple channels of the same fiber node.
+                ifidx_to_domain = {ch['ifindex']: ch['mac_domain'] for ch in channels}
+                domain_unique_cms: dict = {}   # mac_domain -> set of cm_index
                 try:
                     cm_walk = await service._snmp_walk(OID_CM_OFDMA_STATUS, timeout=30)
                     self.logger.info(f"CM OFDMA walk: success={cm_walk.get('success') if isinstance(cm_walk, dict) else False}, "
@@ -1158,11 +1184,16 @@ class UsOfdmaRxMerRouter:
                                     # OID ends with cm_index.ofdma_ifindex
                                     oid = str(item['oid'])
                                     parts = oid.rstrip('.').split('.')
-                                    ifidx = int(parts[-1])  # last element is ofdma_ifindex
+                                    ifidx    = int(parts[-1])   # last element is ofdma_ifindex
+                                    cm_index = int(parts[-2])   # second-to-last is cm_index
                                     seen_ifidx.add(ifidx)
                                     if ifidx in modem_counts:
                                         modem_counts[ifidx] += 1
                                         matched += 1
+                                    # Track unique cm per fiber node (mac_domain)
+                                    domain = ifidx_to_domain.get(ifidx)
+                                    if domain is not None:
+                                        domain_unique_cms.setdefault(domain, set()).add(cm_index)
                                 except (ValueError, IndexError):
                                     pass
                         self.logger.info(f"CM OFDMA walk matched {matched}/{len(cm_raw)} entries, "
@@ -1182,7 +1213,9 @@ class UsOfdmaRxMerRouter:
                     if md not in seen:
                         seen[md] = {"name": ch['suggested_fn'], "mac_domain": md, "channels": [], "modem_count": 0}
                     seen[md]['channels'].append({"ifindex": ch['ifindex'], "description": ch['description'], "modem_count": ch['modem_count']})
-                    seen[md]['modem_count'] += ch['modem_count']
+                # Use unique-modem count per fiber node (not per-channel sum)
+                for md, fn_data in seen.items():
+                    fn_data['modem_count'] = len(domain_unique_cms.get(md, set()))
 
                 return {
                     "success":     True,
