@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -584,7 +585,7 @@ class PNMDiagnosticsService:
     OID_SPEC_FILENAME = '1.3.6.1.4.1.4491.2.1.20.1.34.12.0'
     OID_SPEC_ENABLE = '1.3.6.1.4.1.4491.2.1.20.1.34.1.0'
 
-    async def trigger_spectrum(self, tftp_server: str = '172.22.147.18') -> Dict[str, Any]:
+    async def trigger_spectrum(self, tftp_server: str = '') -> Dict[str, Any]:
         """
         Trigger DS OFDM spectrum analyzer capture via raw SNMP.
         
@@ -596,6 +597,8 @@ class PNMDiagnosticsService:
         import asyncio
         from datetime import datetime
         
+        if not tftp_server:
+            tftp_server = os.environ.get('TFTP_IPV4_ALT') or os.environ.get('TFTP_IPV4', '')
         self.logger.info(f"Triggering spectrum capture for modem {self.modem_ip}")
         
         try:
@@ -871,7 +874,7 @@ class PNMDiagnosticsService:
 
     async def trigger_modulation_profile(
         self,
-        tftp_server: str = '172.22.147.18',
+        tftp_server: str = '',
         channel_ids: Optional[List[int]] = None
     ) -> Dict[str, Any]:
         """
@@ -885,6 +888,8 @@ class PNMDiagnosticsService:
         """
         import asyncio
 
+        if not tftp_server:
+            tftp_server = os.environ.get('TFTP_IPV4_ALT') or os.environ.get('TFTP_IPV4', '')
         self.logger.info(f"Triggering modulation profile for modem {self.modem_ip}")
 
         try:
@@ -1030,7 +1035,7 @@ class PNMDiagnosticsService:
 
     async def trigger_channel_estimation(
         self,
-        tftp_server: str = '172.22.147.18',
+        tftp_server: str = '',
         channel_ids: Optional[List[int]] = None
     ) -> Dict[str, Any]:
         """
@@ -1049,6 +1054,8 @@ class PNMDiagnosticsService:
         import os
         from pypnm.lib.pnm_file_source import fetch_pnm_files as _fetch_pnm_files, get_cache_dir as _get_cache_dir
 
+        if not tftp_server:
+            tftp_server = os.environ.get('TFTP_IPV4_ALT') or os.environ.get('TFTP_IPV4', '')
         self.logger.info(f"Triggering channel estimation for modem {self.modem_ip}")
 
         try:
@@ -1341,7 +1348,7 @@ class PNMDiagnosticsService:
     async def trigger_pnm_measurement(
         self,
         test_type: int,
-        tftp_server: str = '172.22.147.18',
+        tftp_server: str = '',
         channel_ids: Optional[List[int]] = None
     ) -> Dict[str, Any]:
         """
@@ -1350,6 +1357,8 @@ class PNMDiagnosticsService:
         test_type 4  (DS_OFDM_CHAN_EST_COEF)    → trigger_channel_estimation
         test_type 10 (DS_OFDM_MODULATION_PROFILE) → trigger_modulation_profile
         """
+        if not tftp_server:
+            tftp_server = os.environ.get('TFTP_IPV4_ALT') or os.environ.get('TFTP_IPV4', '')
         self.logger.info(f"Triggering PNM measurement type {test_type} for modem {self.modem_ip}")
 
         if test_type == 4:

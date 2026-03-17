@@ -30,7 +30,7 @@ Environment:
     SNMP_READ   — read community  (default: public)
     SNMP_WRITE  — write community (default: private)
     TFTP_IP     — TFTP server IP  (default: 172.16.6.101)
-    TFTP_IP_CCAP  — CCAP (Casa/Cisco) TFTP IP (default: 172.22.147.18)
+    TFTP_IP_CCAP  — CCAP (Casa/Cisco) TFTP IP (default: 127.0.0.1)
 """
 
 import os
@@ -53,7 +53,7 @@ CM_MAC    = sys.argv[3]          # aa:bb:cc:dd:ee:ff
 SNMP_READ  = os.environ.get("SNMP_READ",  "public")
 SNMP_WRITE = os.environ.get("SNMP_WRITE", "private")
 TFTP_IP    = os.environ.get("TFTP_IP",    "172.16.6.101")
-TFTP_IP_CCAP  = os.environ.get("TFTP_IP_CCAP",  "172.22.147.18")
+TFTP_IP_CCAP  = os.environ.get("TFTP_IP_CCAP",  "127.0.0.1")
 TFTP_PATH  = "./"
 
 # RxMER parameters

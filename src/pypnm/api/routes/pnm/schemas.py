@@ -6,6 +6,12 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
+import os
+
+
+def _default_cm_tftp() -> str:
+    """Modem-reachable TFTP IP from env (TFTP_IPV4_ALT)."""
+    return os.environ.get('TFTP_IPV4_ALT') or os.environ.get('TFTP_IPV4', '')
 
 
 # ============================================
@@ -258,7 +264,7 @@ class ChannelEstimationRequest(BaseModel):
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
     community: str = Field(default="private", description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
-    tftp_server: Optional[str] = Field(default="172.22.147.18", description="TFTP server IP")
+    tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
 
 class ChannelEstimationCoeff(BaseModel):
@@ -289,7 +295,7 @@ class ModulationProfileRequest(BaseModel):
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
     community: str = Field(default="private", description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
-    tftp_server: Optional[str] = Field(default="172.22.147.18", description="TFTP server IP")
+    tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
 
 class ModulationProfileData(BaseModel):
@@ -321,7 +327,7 @@ class HistogramRequest(BaseModel):
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
     community: str = Field(default="private", description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
-    tftp_server: Optional[str] = Field(default="172.22.147.18", description="TFTP server IP")
+    tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
 
 class HistogramData(BaseModel):
@@ -353,7 +359,7 @@ class ConstellationRequest(BaseModel):
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
     community: str = Field(default="private", description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
-    tftp_server: Optional[str] = Field(default="172.22.147.18", description="TFTP server IP")
+    tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
 
 class ConstellationPoint(BaseModel):

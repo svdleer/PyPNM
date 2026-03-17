@@ -167,6 +167,7 @@ class BulkDestinationRouter:
                     local_store=False,
                     dest_index=request.index,
                     dest_path=request.dest_path,
+                    vendor=vendor,
                 )
                 if not std_result.get('success'):
                     self.logger.warning(f"Standard dest table failed: {std_result.get('error')}")

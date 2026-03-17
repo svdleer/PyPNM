@@ -365,11 +365,12 @@ class CmtsUtscService:
             # standard docsPnmBulkDataTransferCfgTable with destroy+recreate.
             probe = await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
             if not probe.get('success') and 'notWritable' in str(probe.get('error', '')):
+                vendor = await self.detect_vendor()
                 self.logger.info(
                     f"CCAP bulk data table is notWritable — using standard BDT table "
-                    f"(docsPnmBulkDataTransferCfgTable) with destroy+recreate"
+                    f"(docsPnmBulkDataTransferCfgTable) with destroy+recreate (vendor={vendor})"
                 )
-                return await self._configure_bdt_standard(dest_ip, dest_path, index)
+                return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
 
             # CCAP table is writable (Casa) — direct SETs on columns.
             # Casa CCAP table has NO RowStatus — just overwrite columns directly.
@@ -393,58 +394,38 @@ class CmtsUtscService:
         self,
         dest_ip: str,
         dest_path: str = "./",
-        index: int = 1
+        index: int = 1,
+        vendor: str = ''
     ) -> dict[str, Any]:
-        """Configure standard docsPnmBulkDataTransferCfgTable (Cisco cBR-8 / E6000).
+        """Configure standard docsPnmBulkDataTransferCfgTable.
 
-        Correct Cisco sequence (from field-verified notes):
-          1. destroy(6)     — clear any stale row
-          2. createAndGo(4) — allocate the row
-          3. SET IpAddrType, IpAddress, DestBaseUri
-        Row becomes active automatically after createAndGo + field SETs.
-        DestBaseUri must be the full URI: tftp://<ip>/
+        Delegates to CmtsUsOfdmaRxMerService.create_bulk_destination() —
+        single vendor-aware implementation for all PNM types.
         """
-        import asyncio
-        import ipaddress
+        from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 
-        ip_packed = ipaddress.ip_address(dest_ip).packed
-        ip_hex    = ' '.join(f'{b:02X}' for b in ip_packed)   # "AC 10 08 84" format
-        base_uri  = f"tftp://{dest_ip}/"
-
-        self.logger.info(
-            f"BDT standard table: destroy → createAndGo → SET fields "
-            f"for {dest_ip} (DestBaseUri={base_uri}) row={index}"
+        rxmer_svc = CmtsUsOfdmaRxMerService(
+            cmts_ip=self.cmts_ip,
+            community=self.community,
+            write_community=self.write_community,
         )
-
-        # Step 1: destroy existing row (ignore errors — row may not exist)
-        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 6, 'i')
-        await asyncio.sleep(1)
-
-        # Step 2: createAndGo — allocates the row
-        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 4, 'i')
-
-        # Wait for the cBR-8 to transition the row out of notReady before
-        # setting columns — otherwise field SETs return inconsistentValue.
-        await asyncio.sleep(1)
-
-        # Step 3: set fields
-        await self._snmp_set(f"{self.OID_BDT_IP_TYPE}.{index}", 1, 'i')          # ipv4(1)
-        await self._snmp_set(f"{self.OID_BDT_IP_ADDR}.{index}", ip_hex, 'x')     # hex octets
-        await self._snmp_set(f"{self.OID_BDT_BASE_URI}.{index}", base_uri, 's')  # tftp://<ip>/
-
-        # Poll RowStatus until active(1) — cBR-8 commits asynchronously
-        for _attempt in range(5):
-            await asyncio.sleep(1)
-            probe = await self._snmp_get(f"{self.OID_BDT_ROW_STATUS}.{index}")
-            raw = str(probe.get('output', '') or '')
-            val = raw.split('=', 1)[-1].strip() if '=' in raw else raw.strip()
-            if val in ('1', 'active'):
-                self.logger.info(f"BDT row {index} confirmed active after {_attempt + 1}s")
-                break
-            self.logger.debug(f"BDT row {index} RowStatus={val!r}, retrying...")
-        else:
-            self.logger.warning(f"BDT row {index} did not confirm active after 5s — proceeding anyway")
-        return {"success": True, "index": index, "dest_ip": dest_ip, "table": "standard"}
+        try:
+            result = await rxmer_svc.create_bulk_destination(
+                tftp_ip=dest_ip,
+                port=69,
+                local_store=False,
+                dest_index=index,
+                dest_path=dest_path,
+                vendor=vendor,
+            )
+            return {
+                "success": result.get("success", False),
+                "index": result.get("destination_index", index),
+                "dest_ip": dest_ip,
+                "table": "standard",
+            }
+        finally:
+            rxmer_svc.close()
     
     async def detect_vendor(self) -> str:
         """
@@ -1432,12 +1413,12 @@ class CmtsUtscService:
         self.logger.info(f"Stopping UTSC for RF port {rf_port_ifindex}")
         
         try:
-            # Set InitiateTest to false
-            # Cisco uses 0 to stop, standard MIB uses 2 (TruthValue false)
-            # Try 0 first (Cisco), fallback to 2
-            result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 0, 'i')
+            # Standard MIB: InitiateTest is TruthValue — use 2 (false) to stop.
+            # Arris E6000 rejects 0 (wrongValue). Try 2 first, fallback to 0 for
+            # any vendor that maps the field differently.
+            result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 2, 'i')
             if not result.get('success'):
-                result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 2, 'i')
+                result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 0, 'i')
             
             if not result.get('success'):
                 return {"success": False, "error": result.get('error', 'Failed to stop UTSC')}

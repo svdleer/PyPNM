@@ -331,17 +331,23 @@ class ChannelStatsRouter:
                                 },
                                 timeout=cmts_task_timeout,
                             )
-                        # New: partial service reason codes scoped to this CM (rows ~ n_ofdm_channels)
+                        # Partial service reason codes.
+                        # When cm_index is already known, walk only this modem's rows (tiny).
+                        # Otherwise walk the full col-1 subtree; the parser will filter by
+                        # the cm_index that gets resolved later from the MAC walk.
                         if cached_cm_index is not None:
-                            cmts_partial_reason_task_id = await agent_manager.send_task(
-                                cmts_agent_id, "snmp_walk",
-                                {
-                                    "target_ip": request.cmts_ip,
-                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.7.1.1.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
-                                },
-                                timeout=cmts_task_timeout,
-                            )
+                            _partial_oid = f'1.3.6.1.4.1.4491.2.1.28.1.7.1.1.{cached_cm_index}'
+                        else:
+                            _partial_oid = '1.3.6.1.4.1.4491.2.1.28.1.7.1.1'
+                        cmts_partial_reason_task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": _partial_oid,
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
                         # New: US OFDMA IUC stats (per-channel aggregate, small table)
                         cmts_us_iuc_stats_task_id = await agent_manager.send_task(
                             cmts_agent_id, "snmp_walk",
@@ -699,6 +705,7 @@ class ChannelStatsRouter:
                         cmts_profile_result=cmts_profile_result,
                         # CM-side DS profile stats already in parsed
                         cm_ds_ofdm_channels=parsed.get('downstream', {}).get('ofdm', {}).get('channels', []),
+                        cm_us_ofdma_channels=parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
                     )
 
                 if parsed.get("success"):

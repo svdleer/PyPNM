@@ -711,15 +711,25 @@ class CmtsUsOfdmaRxMerService:
                 destination_index = bdt_row
             else:
                 # E6000/Cisco: docsPnmBulkDataTransferCfgTable (createAndGo/createAndWait)
-                if tftp_server and destination_index == 0:
+                # Reuse an explicitly supplied destination_index (e.g. fiber-node scan
+                # primes BDT once before looping over many captures). Reprovision only
+                # when caller did not provide an index.
+                if tftp_server and destination_index <= 0:
                     try:
+                        _dest_idx = 1
                         dest_result = await self.create_bulk_destination(
-                            tftp_ip=tftp_server, dest_index=1, dest_path=dest_path
+                            tftp_ip=tftp_server, dest_index=_dest_idx, dest_path=dest_path,
+                            vendor=vendor
                         )
-                        destination_index = dest_result.get("destination_index", 1)
+                        destination_index = dest_result.get("destination_index", _dest_idx)
                     except Exception as e:
                         self.logger.warning(f"Bulk dest setup failed (continuing): {e}")
-                        destination_index = 1
+                        if destination_index == 0:
+                            destination_index = 1
+                elif destination_index > 0:
+                    self.logger.info(
+                        f"Reusing preconfigured bulk destination index {destination_index} (no reprovision)"
+                    )
 
             # 2. Set CM MAC address (CMTS uses this to identify the modem)
             mac_hex = self.mac_to_hex_string(cm_mac)
@@ -941,6 +951,7 @@ class CmtsUsOfdmaRxMerService:
         local_store: bool = False,
         dest_index: Optional[int] = None,
         dest_path: str = "./",
+        vendor: str = '',
     ) -> dict[str, Any]:
         """
         Create or update a bulk data transfer destination for TFTP uploads.
@@ -1018,8 +1029,25 @@ class CmtsUsOfdmaRxMerService:
                 if dest_index is None:
                     dest_index = 1  # Default to index 1
             
-            self.logger.info(f"Creating bulk destination at index {dest_index} for TFTP {tftp_ip}:{port}")
-            
+            # Auto-detect vendor when not supplied
+            if not vendor:
+                try:
+                    raw = await self._snmp_get('1.3.6.1.2.1.1.1.0')
+                    descr = str(raw.get('output', '') if isinstance(raw, dict) else raw).upper()
+                    if 'CISCO' in descr:
+                        vendor = 'cisco'
+                    elif 'ARRIS' in descr or 'COMMSCOPE' in descr:
+                        vendor = 'arris'
+                    elif 'CASA' in descr:
+                        vendor = 'casa'
+                    self.logger.info(f"BDT auto-detected vendor: {vendor}")
+                except Exception:
+                    pass
+
+            self.logger.info(f"Creating bulk destination at index {dest_index} for TFTP {tftp_ip}:{port} vendor={vendor}")
+
+            import asyncio
+
             # Convert IP to hex bytes for OctetString SET
             ip_parts = tftp_ip.split(".")
             ip_hex = "".join([f"{int(p):02x}" for p in ip_parts])
@@ -1028,63 +1056,68 @@ class CmtsUsOfdmaRxMerService:
             _path = re.sub(r'^(\./)+'  , '', dest_path).lstrip('/')
             if _path and not _path.endswith('/'):
                 _path += '/'
-            # Full URI required by Cisco cBR-8: tftp://ip/path
-            # Even when path is empty, tftp://ip/ satisfies the mandatory URI check.
+
+            # DestBaseUri value depends on vendor:
+            # - Cisco cBR-8: full URI  tftp://ip/path
+            # - Arris/CommScope: path only  e.g. "access/pnmupload/"
             _full_uri = f"tftp://{tftp_ip}/{_path}"
+            _uri_value = _full_uri if vendor == 'cisco' else (_path or _full_uri)
 
-            # Check if the row at dest_index already exists (active=1).
-            # This handles the case where dest_index was explicitly supplied — the
-            # auto-scan loop above is skipped, so we must guard here too.
-            # Arris/CommScope returns wrongValue if createAndWait(5) is SET on an
-            # already-active row.
+            # Step 1: destroy existing row (ignore errors — row may not exist)
             try:
-                _rs_result = await self._snmp_get(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}")
-                _rs_val = self._parse_get_value(_rs_result)
-                _row_active = _rs_val and int(_rs_val) == 1
-            except Exception:
-                _row_active = False
-
-            if _row_active:
-                # Always destroy and recreate — matches Cisco script behaviour and avoids
-                # silent notInService failures on cBR-8.
-                self.logger.info(f"Bulk dest {dest_index} active — destroying and recreating")
-                try:
-                    await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 6, 'i')  # destroy
-                except Exception:
-                    pass
-                _row_active = False  # fall through to createAndWait
-
-            # Use createAndWait(5) so all columns can be set while the row is
-            # notReady/notInService, then activate with active(1) at the end.
-            # createAndGo(4) activates immediately and some CMTSes (Arris/CommScope)
-            # return inconsistentValue when writing DestBaseUri to an active row.
-            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 5, 'i')  # createAndWait
-
-            # IP address type (1=IPv4)
-            await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
-
-            # IP address (4-byte OctetString, e.g. "ac100884")
-            await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
-
-            # LocalStore: read-only on Cisco (notWritable) — wrap so it never aborts
-            try:
-                await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
+                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 6, 'i')
             except Exception:
                 pass
+            await asyncio.sleep(1)
 
-            # Set DestBaseUri as full tftp://ip/path URI.
-            # Cisco cBR-8 REQUIRES both IP and URI before a row can become active.
-            # Without URI the row stays notReady and active(1) returns inconsistentValue,
-            # causing PNM_INVALID_BDT_CFG when capture is triggered.
-            try:
-                await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _full_uri, 's')
-                self.logger.info(f"Set BaseUri for destination {dest_index}: '{_full_uri}'")
-            except Exception as _uri_err:
-                self.logger.warning(f"Could not set BaseUri (vendor may not support it): {_uri_err}")
+            # Step 2: vendor-aware row creation
+            if vendor == 'cisco':
+                # Cisco cBR-8: createAndGo(4), then SET columns on active row
+                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 4, 'i')
+                await asyncio.sleep(1)
 
-            # Activate the row
-            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')  # active
-            
+                await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
+                await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
+                if _uri_value:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _uri_value, 's')
+                    self.logger.info(f"Set BaseUri for destination {dest_index}: '{_uri_value}'")
+                # Protocol NOT set — Cisco defaults to tftp, explicit SET causes genError
+                # LocalStore: read-only on Cisco (notWritable)
+            else:
+                # Arris/CommScope/Casa: createAndWait(5), SET columns, then activate
+                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 5, 'i')
+
+                await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
+                await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
+                # Protocol = tftp(1) — E6000/Arris requires explicit SET
+                try:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_PROTOCOL}.{dest_index}", 1, 'i')
+                except Exception:
+                    pass
+                if _uri_value:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _uri_value, 's')
+                    self.logger.info(f"Set BaseUri for destination {dest_index}: '{_uri_value}'")
+                # LocalStore: not always writable — wrap
+                try:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
+                except Exception:
+                    pass
+                # Activate
+                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')
+
+            # Poll RowStatus until active(1)
+            for _attempt in range(5):
+                await asyncio.sleep(1)
+                probe = await self._snmp_get(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}")
+                raw_rs = str(probe.get('output', '') or '')
+                val = raw_rs.split('=', 1)[-1].strip() if '=' in raw_rs else raw_rs.strip()
+                if val in ('1', 'active'):
+                    self.logger.info(f"BDT row {dest_index} confirmed active after {_attempt + 1}s")
+                    break
+                self.logger.debug(f"BDT row {dest_index} RowStatus={val!r}, retrying...")
+            else:
+                self.logger.warning(f"BDT row {dest_index} did not confirm active after 5s — proceeding anyway")
+
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             
             return {

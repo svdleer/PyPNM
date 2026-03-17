@@ -180,7 +180,7 @@ class CmtsUtscService:
         idx = f".{dest_index}"
         base = self.BULK_DEST_CFG_BASE
 
-        # Convert IP to 4-byte hex string for InetAddress (e.g. "172.22.147.18" → 0xAC169312)
+        # Convert IP to 4-byte hex string for InetAddress (e.g. "127.0.0.1" → 0xAC169312)
         try:
             ip_parts = [int(x) for x in tftp_ip.split('.')]
             ip_hex = ''.join(f'{b:02x}' for b in ip_parts)

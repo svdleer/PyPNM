@@ -239,7 +239,12 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
     
     # Build OFDM downstream
     ds_ofdm_channels = []
+    # docsIf31CmDsOfdmChanTable can be CMTS-wide on some platforms.
+    # docsIf31RxChStatusTable is modem-scoped; use those indices when present.
+    ds_ofdm_valid_idx = set(ds_rx_status.keys()) if ds_rx_status else None
     for idx in sorted(ds_ofdm.keys()):
+        if ds_ofdm_valid_idx is not None and idx not in ds_ofdm_valid_idx:
+            continue
         ofdm = ds_ofdm.get(idx, {})
         channel_id = ofdm.get('channelId')
         if not channel_id:
@@ -323,7 +328,12 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
     
     # Build ATDMA upstream
     us_atdma_channels = []
+    # docsIfUpChannelTable can contain all CMTS channels on some platforms.
+    # docsIf3CmStatusUsTable is modem-scoped, so use its indices as the modem filter.
+    us_atdma_valid_idx = set(us_status.keys()) if us_status else None
     for idx in sorted(us_up.keys()):
+        if us_atdma_valid_idx is not None and idx not in us_atdma_valid_idx:
+            continue
         up = us_up.get(idx, {})
         status = us_status.get(idx, {})
         
@@ -352,7 +362,12 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
     
     # Build OFDMA upstream
     us_ofdma_channels = []
+    # Same issue for OFDMA: channel table may be CMTS-wide while
+    # docsIf31CmStatusOfdmaUsTable is modem-scoped.
+    us_ofdma_valid_idx = set(us_ofdma_status.keys()) if us_ofdma_status else None
     for idx in sorted(us_ofdma.keys()):
+        if us_ofdma_valid_idx is not None and idx not in us_ofdma_valid_idx:
+            continue
         ofdma = us_ofdma.get(idx, {})
         channel_id = ofdma.get('channelId')
         if not channel_id:
@@ -474,6 +489,7 @@ def parse_ofdm_stats_raw(
     ds_ofdm_speed_result,
     ds_subcarrier_result,
     cm_ds_ofdm_channels: list,
+    cm_us_ofdma_channels: list | None = None,
     ifname_result=None,
     cmts_profile_result=None,
 ) -> dict:
@@ -512,7 +528,7 @@ def parse_ofdm_stats_raw(
             if len(parts) == 3:
                 try:
                     entry_cm_index = int(parts[0])
-                    if cm_index is None or entry_cm_index == cm_index:
+                    if cm_index is not None and entry_cm_index == cm_index:
                         valid_us_ifindices.add(int(parts[1]))
                 except (ValueError, TypeError):
                     pass
@@ -530,7 +546,7 @@ def parse_ofdm_stats_raw(
                 if len(parts) == 3:
                     try:
                         entry_cm_index = int(parts[0])
-                        if cm_index is None or entry_cm_index == cm_index:
+                        if cm_index is not None and entry_cm_index == cm_index:
                             valid_ds_ifindices.add(int(parts[1]))
                     except (ValueError, TypeError):
                         pass
@@ -609,6 +625,10 @@ def parse_ofdm_stats_raw(
                 # parts: [cm_index, ifIndex, profileId]
                 if len(parts) == 3:
                     try:
+                        entry_cm_index = int(parts[0])
+                        # Filter to this modem's rows when cm_index is known
+                        if cm_index is not None and entry_cm_index != cm_index:
+                            continue
                         target_map.setdefault(int(parts[1]), {})[int(parts[2])] = int(e.get('value') or 0)
                     except (ValueError, TypeError):
                         pass
@@ -646,10 +666,13 @@ def parse_ofdm_stats_raw(
                         pass
 
     us_iuc_channels = []
-    for ifidx in sorted(iuc_stats_map.keys()):
-        # Skip channels not belonging to this modem when scoping info is available
-        if valid_us_ifindices and ifidx not in valid_us_ifindices:
-            continue
+    n_us_ch = len(cm_us_ofdma_channels or [])
+    all_us_ifindices = sorted(iuc_stats_map.keys())
+    if valid_us_ifindices:
+        selected_us_ifindices = sorted(valid_us_ifindices & iuc_stats_map.keys())
+    else:
+        selected_us_ifindices = all_us_ifindices[:n_us_ch] if n_us_ch else all_us_ifindices
+    for ifidx in selected_us_ifindices:
         iucs = []
         for iuc in sorted(iuc_stats_map[ifidx].keys()):
             row = iuc_stats_map[ifidx][iuc]
@@ -685,10 +708,12 @@ def parse_ofdm_stats_raw(
                     pass
 
     ds_subcarrier = []
-    for ifidx in sorted(subcarrier_map.keys()):
-        # Skip DS channels not belonging to this modem when scoping info is available
-        if valid_ds_ifindices and ifidx not in valid_ds_ifindices:
-            continue
+    all_ds_ifindices = sorted(subcarrier_map.keys())
+    if valid_ds_ifindices:
+        selected_ds_ifindices = sorted(valid_ds_ifindices & subcarrier_map.keys())
+    else:
+        selected_ds_ifindices = all_ds_ifindices[:n_ds_ch] if n_ds_ch else all_ds_ifindices
+    for ifidx in selected_ds_ifindices:
         ranges = []
         for ridx in sorted(subcarrier_map[ifidx].keys()):
             code = subcarrier_map[ifidx][ridx]
