@@ -72,7 +72,7 @@ USER pypnm
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -f http://localhost:8000/docs || exit 1
+  CMD wget -q -O /dev/null http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3.12", "-m", "uvicorn", "pypnm.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3.12", "-m", "uvicorn", "pypnm.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "67108864"]

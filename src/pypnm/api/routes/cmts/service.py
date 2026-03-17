@@ -53,25 +53,50 @@ class CMTSModemService:
         self.community = community
     
     async def _send_agent_command(self, command: str, params: dict, timeout: float = 60) -> dict:
-        """Send command to agent via agent manager."""
+        """Send command to CMTS-reachable agent."""
         agent_manager = get_agent_manager()
         if not agent_manager:
             raise Exception("Agent manager not available")
-        
+
         agents = agent_manager.get_available_agents()
         if not agents:
             raise Exception("No agents available")
 
         # Prefer agent that can reach the CMTS; fall back to first available
         agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable') or agents[0]['agent_id']
-        
+
         task_id = await agent_manager.send_task(
             agent_id=agent_id,
             command=command,
             params=params,
             timeout=timeout
         )
-        
+
+        result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
+        if result and 'result' in result:
+            return result['result']
+        return {}
+
+    async def _send_cm_agent_command(self, command: str, params: dict, timeout: float = 30) -> dict:
+        """Send command to CM-reachable agent (for direct modem SNMP)."""
+        agent_manager = get_agent_manager()
+        if not agent_manager:
+            raise Exception("Agent manager not available")
+
+        agents = agent_manager.get_available_agents()
+        if not agents:
+            raise Exception("No agents available")
+
+        # Prefer agent that can reach modems directly; fall back to first available
+        agent_id = agent_manager.get_agent_id_for_capability('cm_reachable') or agents[0]['agent_id']
+
+        task_id = await agent_manager.send_task(
+            agent_id=agent_id,
+            command=command,
+            params=params,
+            timeout=timeout
+        )
+
         result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
         if result and 'result' in result:
             return result['result']
@@ -150,7 +175,7 @@ class CMTSModemService:
                     'cached': True,
                 }
             
-            if cached.get('enriching') and age < 120:  # enrichment still in progress
+            if cached.get('enriching') and age < 600:  # enrichment still in progress
                 # Return whatever we have so far (base modems) with enriching=True
                 self.logger.info(f"Enrichment in progress for {cmts_ip} (age={age:.0f}s)")
                 return {
@@ -161,6 +186,7 @@ class CMTSModemService:
                     'enriched': False,
                     'enriching': True,
                     'cached': True,
+                    'enrich_progress': cached.get('enrich_progress', {'completed': 0, 'total': 0}),
                 }
         
         try:
@@ -173,8 +199,8 @@ class CMTSModemService:
             walk_result = await self._send_agent_command(
                 'snmp_parallel_walk',
                 {'ip': cmts_ip, 'oids': walk_oids,
-                 'community': community, 'timeout': 30},
-                timeout=120,
+                 'community': community, 'timeout': 5},  # 5s per PDU × 24 PDUs = 120s max per tree
+                timeout=300,  # 300s server wait — 9 concurrent trees each up to 120s
             )
             if not walk_result.get('success'):
                 return {'success': False,
@@ -195,6 +221,7 @@ class CMTSModemService:
                     'enriched': False,
                     'enriching': True,
                     'timestamp': time.time(),
+                    'enrich_progress': {'completed': 0, 'total': 0},
                 }
                 
                 # Fire-and-forget background enrichment
@@ -231,7 +258,7 @@ class CMTSModemService:
         global _enrichment_cache
         try:
             self.logger.info(f"Background enrichment started for {cmts_ip} ({len(modems)} modems)")
-            enriched_modems = await self._enrich_modems_direct(modems, modem_community)
+            enriched_modems = await self._enrich_modems_direct(modems, modem_community, cmts_ip=cmts_ip)
             await self._enrich_cmts_interfaces(enriched_modems)
             
             _enrichment_cache[cmts_ip] = {
@@ -326,12 +353,16 @@ class CMTSModemService:
                     # Only 3,4,5 indicate actual partial service
                     partial_svc_map[idx] = val >= 3
                 elif isinstance(val, str) and val:
-                    # BITS encoded as string — check if any byte is non-zero
+                    # BITS/INTEGER encoded as string — try decimal first, then hex
                     try:
-                        partial_svc_map[idx] = int(val, 16) != 0
+                        int_val = int(val)  # decimal string e.g. "2" (none) or "3" (partial)
+                        partial_svc_map[idx] = int_val >= 3
                     except ValueError:
-                        # Raw bytes that decoded as UTF-8 (e.g. '\x00', '@')
-                        partial_svc_map[idx] = any(ord(c) != 0 for c in val)
+                        try:
+                            partial_svc_map[idx] = int(val, 16) != 0  # hex OctetString e.g. "80"
+                        except ValueError:
+                            # Raw bytes decoded as UTF-8 (e.g. '\x00', '@')
+                            partial_svc_map[idx] = any(ord(c) != 0 for c in val)
                 else:
                     partial_svc_map[idx] = False
             except (ValueError, TypeError):
@@ -391,11 +422,12 @@ class CMTSModemService:
             if mac in mac_to_firmware:
                 modem['firmware'] = mac_to_firmware[mac]
 
-            # DOCSIS version → filled during per-modem enrichment
-            modem['docsis_version'] = 'Unknown'
-
             if index in partial_svc_map:
                 modem['partial_service'] = partial_svc_map[index]
+                # docsIf31CmtsCmRegStatusTable is D3.1-only → modem is DOCSIS 3.1
+                modem['docsis_version'] = 'DOCSIS 3.1'
+            else:
+                modem['docsis_version'] = 'Unknown'
 
             # Upstream interface resolution
             us_ifindex = mac_to_us_ch_if.get(mac) or us_ch_map.get(index)
@@ -441,30 +473,43 @@ class CMTSModemService:
         OID_CM_OFDMA_TIMING = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'  # OFDMA timing offset
         OID_IF_DESCR = '1.3.6.1.2.1.2.2.1.2'  # IF-MIB::ifDescr
         
-        # Run all bulk walks via agent
+        # Single parallel_walk for all 3 OIDs — same as modem discovery.
+        # max_repetitions=500 → 8756 rows / 500 = ~18 PDUs total, completes in <5s on LAN.
+        walk_oids = [OID_MD_IF_INDEX, OID_IF_NAME, OID_CM_OFDMA_TIMING]
         try:
-            md_if_result = await self._send_agent_command('snmp_walk', {'target_ip': self.cmts_ip, 'oid': OID_MD_IF_INDEX, 'community': self.community}, 30)
-            if_name_result = await self._send_agent_command('snmp_walk', {'target_ip': self.cmts_ip, 'oid': OID_IF_NAME, 'community': self.community}, 30) 
-            ofdma_result = await self._send_agent_command('snmp_walk', {'target_ip': self.cmts_ip, 'oid': OID_CM_OFDMA_TIMING, 'community': self.community}, 30)
+            walk_result = await self._send_agent_command(
+                'snmp_parallel_walk',
+                {'ip': self.cmts_ip, 'oids': walk_oids, 'community': self.community,
+                 'timeout': 5, 'max_repetitions': 500},
+                timeout=120,
+            )
         except Exception as e:
-            self.logger.exception(f"SNMP walks failed: {e}")
+            self.logger.exception(f"Interface parallel_walk failed: {e}")
             return {'success': False, 'enriched_count': 0, 'total_count': len(modems)}
-        
-        # Parse results into (index, value) tuples like agent does
-        def parse_snmp_results(result, base_oid):
-            parsed = []
-            if result and result.get('success'):
-                for item in result.get('results', []):
-                    oid = item.get('oid', '')
-                    value = item.get('value')
-                    if oid.startswith(base_oid):
-                        index = oid[len(base_oid)+1:]  # Remove base OID and dot
-                        parsed.append((index, value))
-            return parsed
-        
-        md_if_results = parse_snmp_results(md_if_result, OID_MD_IF_INDEX)
-        if_name_results = parse_snmp_results(if_name_result, OID_IF_NAME)
-        ofdma_results = parse_snmp_results(ofdma_result, OID_CM_OFDMA_TIMING)
+
+        if not walk_result.get('success'):
+            self.logger.warning(f"Interface parallel_walk returned no data: {walk_result.get('error')}")
+            return {'success': False, 'enriched_count': 0, 'total_count': len(modems)}
+
+        raw = walk_result.get('results', {})
+        self.logger.info(
+            f"Interface parallel_walk raw keys: {list(raw.keys())} "
+            f"sizes: md_if={len(raw.get(OID_MD_IF_INDEX, []))} "
+            f"if_name={len(raw.get(OID_IF_NAME, []))} "
+            f"ofdma={len(raw.get(OID_CM_OFDMA_TIMING, []))}"
+        )
+
+        # Parse (index, value) pairs from parallel_walk result dict
+        def parse_oid(base_oid):
+            return [
+                (item['oid'][len(base_oid) + 1:], item['value'])
+                for item in raw.get(base_oid, [])
+                if item.get('oid', '').startswith(base_oid + '.')
+            ]
+
+        md_if_results   = parse_oid(OID_MD_IF_INDEX)
+        if_name_results = parse_oid(OID_IF_NAME)
+        ofdma_results   = parse_oid(OID_CM_OFDMA_TIMING)
         
         # Parse MD-IF-INDEX: modem_index -> md_if_index (COPY-PASTE from agent)
         md_if_map = {}
@@ -518,17 +563,25 @@ class CMTSModemService:
         ofdma_descr_map = {}
         if ofdma_ifindexes:
             try:
-                if_descr_result = await self._send_agent_command('snmp_walk', {'target_ip': self.cmts_ip, 'oid': OID_IF_DESCR, 'community': self.community}, 30)
-                if_descr_results = parse_snmp_results(if_descr_result, OID_IF_DESCR)
-                for index, value in if_descr_results:
-                    try:
-                        ifidx = int(index)
-                        if ifidx in ofdma_ifindexes:
-                            descr = str(value)
-                            if descr and 'No Such' not in descr:
-                                ofdma_descr_map[ifidx] = descr
-                    except:
-                        pass
+                descr_walk = await self._send_agent_command(
+                    'snmp_parallel_walk',
+                    {'ip': self.cmts_ip, 'oids': [OID_IF_DESCR], 'community': self.community,
+                     'timeout': 5, 'max_repetitions': 500},
+                    timeout=60,
+                )
+                if descr_walk.get('success'):
+                    for item in descr_walk.get('results', {}).get(OID_IF_DESCR, []):
+                        raw_oid = item.get('oid', '')
+                        if not raw_oid.startswith(OID_IF_DESCR + '.'):
+                            continue
+                        try:
+                            ifidx = int(raw_oid[len(OID_IF_DESCR) + 1:])
+                            if ifidx in ofdma_ifindexes:
+                                descr = str(item.get('value', ''))
+                                if descr and 'No Such' not in descr:
+                                    ofdma_descr_map[ifidx] = descr
+                        except:
+                            pass
                 self.logger.info(f"Resolved {len(ofdma_descr_map)} OFDMA interface descriptions")
             except Exception as e:
                 self.logger.debug(f"Failed to get OFDMA descriptions: {e}")
@@ -553,6 +606,10 @@ class CMTSModemService:
                 ofdma_ifidx = ofdma_if_map[idx]
                 modem['ofdma_ifindex'] = ofdma_ifidx
                 modem['ofdma_enabled'] = True
+                # OFDMA upstream ⟹ DOCSIS 3.1 ⟹ OFDM downstream is present
+                modem['ofdm_enabled'] = True
+                if not modem.get('docsis_version') or modem.get('docsis_version') in ('Unknown', ''):
+                    modem['docsis_version'] = 'DOCSIS 3.1'
                 if ofdma_ifidx in ofdma_descr_map:
                     descr = ofdma_descr_map[ofdma_ifidx]
                     # Ensure 'ofdma' appears in the interface name so the GUI
@@ -568,11 +625,10 @@ class CMTSModemService:
                 if us_ifidx and us_ifidx in if_name_map:
                     modem['upstream_interface'] = if_name_map[us_ifidx]
                     us_ch_resolved += 1
-            
-            # Add OFDM flag (assume DOCSIS 3.1+ has OFDM downstream)
-            docsis = modem.get('docsis_version', '')
-            modem['ofdm_enabled'] = '3.1' in docsis or '4.0' in docsis
-        
+                # Non-OFDMA: derive ofdm_enabled from docsis_version (sysDescr enrichment)
+                docsis = modem.get('docsis_version', '')
+                modem['ofdm_enabled'] = '3.1' in docsis or '4.0' in docsis
+
         self.logger.info(f"Enriched {enriched_count} modems with cable-mac, {len(ofdma_if_map)} with OFDMA")
         
         return {
@@ -581,7 +637,7 @@ class CMTSModemService:
             'total_count': len(modems)
         }
 
-    async def _enrich_modems_direct(self, modems: list, modem_community: str = 'private') -> list:
+    async def _enrich_modems_direct(self, modems: list, modem_community: str = 'private', cmts_ip: str = None) -> list:
         """
         Query each modem directly via agent SNMP to get sysDescr + DOCSIS cap.
         Uses snmp_bulk_get (all OIDs per modem in one call) and asyncio.gather
@@ -600,20 +656,27 @@ class CMTSModemService:
                          if m.get('ip_address') and m.get('ip_address') != 'N/A'
                          and m.get('ip_address') != '0.0.0.0'
                          and not m.get('ip_address', '').startswith(skip_prefixes)
-                         and m.get('status') in online_statuses][:200]
+                         and m.get('status') in online_statuses][:500]
 
         self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, max_concurrent=15, community={modem_community})")
         if not online_modems:
             return modems
 
+        # Initialise progress in cache so polling clients can track it
+        if cmts_ip and cmts_ip in _enrichment_cache:
+            _enrichment_cache[cmts_ip]['enrich_progress'] = {'completed': 0, 'total': len(online_modems)}
+
         enriched_count = 0
+        completed_count = 0  # modems attempted (success + failure)
+        _first_failure_logged = False
+        _first_success_logged = False
 
         async def _enrich_one(modem: dict):
             """Enrich a single modem using snmp_bulk_get (1 agent call for 3 OIDs)."""
-            nonlocal enriched_count
+            nonlocal enriched_count, completed_count, _first_failure_logged, _first_success_logged
             ip = modem.get('ip_address')
             try:
-                result = await self._send_agent_command(
+                result = await self._send_cm_agent_command(
                     command='snmp_bulk_get',
                     params={
                         'target_ip': ip,
@@ -625,6 +688,13 @@ class CMTSModemService:
                     timeout=30,
                 )
                 if not result or not result.get('success'):
+                    if not _first_failure_logged:
+                        _first_failure_logged = True
+                        self.logger.warning(
+                            f"Direct enrichment snmp_bulk_get failed for first sample modem {ip}: "
+                            f"{result.get('error') if result else 'no result/timeout'} "
+                            f"(community={modem_community})"
+                        )
                     return
 
                 oid_results = result.get('results', {})
@@ -643,6 +713,9 @@ class CMTSModemService:
                         if info.get('vendor'):
                             modem['vendor'] = info['vendor']
                         enriched_count += 1
+                        if not _first_success_logged:
+                            _first_success_logged = True
+                            self.logger.info(f"Enrichment sample: {ip} → model={modem['model']} vendor={modem.get('vendor')} sw={modem.get('software_version')}")
 
                 # ── DOCSIS capability (try 3.1 first, fallback 3.0) ──
                 docsis_version = None
@@ -659,7 +732,15 @@ class CMTSModemService:
                     modem['docsis_version'] = docsis_version
 
             except Exception as e:
+                if not _first_failure_logged:
+                    _first_failure_logged = True
+                    self.logger.warning(f"Direct enrichment exception for first sample modem {ip}: {e}")
                 self.logger.debug(f"Failed to enrich modem {ip}: {e}")
+            finally:
+                # Always count this modem as done so the progress bar advances
+                completed_count += 1
+                if cmts_ip and cmts_ip in _enrichment_cache:
+                    _enrichment_cache[cmts_ip]['enrich_progress']['completed'] = completed_count
 
         # ── Send tasks with bounded concurrency ─────────────────────────
         # Limit to 15 in-flight at once: agent processes them quickly enough

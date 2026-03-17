@@ -92,6 +92,7 @@ async def get_cmts_modems(
             enriched=enriched,
             cached=result.get('cached', False),
             enriching=result.get('enriching', False),
+            enrichment_progress=result.get('enrich_progress'),
         )
         
     except Exception as e:

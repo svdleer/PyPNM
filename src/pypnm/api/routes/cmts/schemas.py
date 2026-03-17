@@ -46,6 +46,7 @@ class CMTSModemResponse(BaseModel):
     enriched: bool = Field(default=False, description="Whether modems have been enriched")
     cached: bool = Field(default=False, description="Whether result came from cache")
     enriching: bool = Field(default=False, description="Whether enrichment is in progress")
+    enrichment_progress: Optional[Dict[str, int]] = Field(default=None, description="Live enrichment progress: {completed, total}")
 
 
 class EnrichModemRequest(BaseModel):
