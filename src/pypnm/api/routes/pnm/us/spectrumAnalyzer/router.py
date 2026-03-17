@@ -488,7 +488,7 @@ async def _stream_spectrum_data(
                                     'bins': bins_data,
                                     'collected_at': current_time
                                 })
-                                logger.debug(f"Buffered {len(bins_data)} bins from {os.path.basename(filepath)} \u2014 Buffer: {len(file_buffer)}")
+                                logger.debug(f"Buffered {len(bins_data)} bins from {os.path.basename(filepath)} — Buffer: {len(file_buffer)}")
                     except Exception as e:
                         logger.error(f"Error parsing {filepath}: {e}")
                 
