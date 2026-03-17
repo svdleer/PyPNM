@@ -324,6 +324,7 @@ class FiberNodeCaptureEntry(BaseModel):
 class ModemPreeqChannelInput(BaseModel):
     """Pre-eq channel data as provided by the /preeq endpoint for one modem channel."""
     us_ifindex: int
+    main_tap_location: Optional[int] = Field(None, description="Main tap index (0-based)")
     taps: List[TapCoefficient] = Field(default_factory=list)
     metrics: Optional[PreEqChannelMetrics] = None
     group_delay: Optional[PreEqGroupDelay] = None
@@ -347,6 +348,12 @@ class ModemPlantVerdict(BaseModel):
     unique_bad_subcarrier_count: int = Field(0, description="Subcarriers bad on THIS modem but <60% of others")
     shared_bad_subcarrier_count: int = Field(0, description="Subcarriers bad on >60% of all modems (plant)")
     evidence: List[str] = Field(default_factory=list, description="Human-readable evidence bullets")
+    # Tap distance profile ────────────────────────────────────────────────────
+    main_tap_location: Optional[int] = Field(None, description="Main tap index (0-based) within tap array")
+    tap_offsets: List[int] = Field(default_factory=list, description="Offset of each tap from main tap (negative=pre-cursor, positive=post-cursor)")
+    tap_dB_relative_to_main: List[Optional[float]] = Field(default_factory=list, description="Tap magnitude in dB relative to main tap (main=0 dB, None when magnitude=0)")
+    tap_cable_ft: List[Optional[float]] = Field(default_factory=list, description="One-way cable distance equivalent per tap (ft); None for the main tap")
+    sample_period_us: Optional[float] = Field(None, description="Tap sample period (µs); multiply by tap offset for delay")
 
 
 class FnPlantStats(BaseModel):
@@ -354,7 +361,13 @@ class FnPlantStats(BaseModel):
     modem_count: int
     fn_median_gd_pp_us: Optional[float] = None
     fn_median_nmter_dB: Optional[float] = None
-    fn_tap_signature: List[float] = Field(default_factory=list, description="FN median normalized tap magnitudes")
+    fn_tap_signature: List[float] = Field(default_factory=list, description="FN median normalized tap magnitudes (max-normalized)")
+    # FN median tap distance profile (same x-axis as per-modem)
+    fn_tap_offsets: List[int] = Field(default_factory=list, description="Tap offsets relative to main tap (shared x-axis for all modems)")
+    fn_tap_dB_relative_to_main: List[Optional[float]] = Field(default_factory=list, description="FN median tap profile in dB relative to main tap")
+    fn_tap_cable_ft: List[Optional[float]] = Field(default_factory=list, description="FN median one-way cable ft per tap offset")
+    fn_main_tap_location: Optional[int] = Field(None, description="Modal main tap location across all modems")
+    fn_sample_period_us: Optional[float] = Field(None, description="Median tap sample period (µs) across modems")
     shared_impaired_subcarrier_indices: List[int] = Field(default_factory=list, description="Subcarrier indices bad on >60% of modems")
     shared_impaired_frequencies_mhz: List[float] = Field(default_factory=list)
     plant_issue_detected: bool = False

@@ -75,7 +75,10 @@ class CMTSModemService:
         result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
         if result and 'result' in result:
             return result['result']
-        return {}
+        # Propagate timeout/error from manager
+        if result and not result.get('success'):
+            return result
+        return {'success': False, 'error': 'No result from agent'}
 
     async def _send_cm_agent_command(self, command: str, params: dict, timeout: float = 30) -> dict:
         """Send command to CM-reachable agent (for direct modem SNMP)."""
@@ -94,13 +97,17 @@ class CMTSModemService:
             agent_id=agent_id,
             command=command,
             params=params,
-            timeout=timeout
+            timeout=timeout,
+            priority='bulk',   # enrichment — goes to the 5-worker bulk pool
         )
 
         result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
         if result and 'result' in result:
             return result['result']
-        return {}
+        # Propagate timeout/error from manager
+        if result and not result.get('success'):
+            return result
+        return {'success': False, 'error': 'No result from agent'}
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -688,9 +695,9 @@ class CMTSModemService:
                          if m.get('ip_address') and m.get('ip_address') != 'N/A'
                          and m.get('ip_address') != '0.0.0.0'
                          and not m.get('ip_address', '').startswith(skip_prefixes)
-                         and m.get('status') in online_statuses][:500]
+                         and m.get('status') in online_statuses]
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (parallel, max_concurrent=15, community={modem_community})")
+        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (batch=200, max_concurrent=15, community={modem_community})")
         if not online_modems:
             return modems
 
@@ -774,21 +781,38 @@ class CMTSModemService:
                 if cmts_ip and cmts_ip in _enrichment_cache:
                     _enrichment_cache[cmts_ip]['enrich_progress']['completed'] = completed_count
 
-        # ── Send tasks with bounded concurrency ─────────────────────────
-        # Limit to 15 in-flight at once: agent processes them quickly enough
-        # that later tasks don't time out waiting in the queue.
-        MAX_CONCURRENT = 15
+        # ── Process in batches of 200, flushing results to cache after each ──
+        # This lets the GUI display enriched data for the first 200 modems
+        # within ~30s, then progressively fills in the rest.
+        BATCH_SIZE = 200
+        MAX_CONCURRENT = 5  # matches the 5-worker bulk pool on the agent
         sem = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def _enrich_one_sem(modem: dict):
             async with sem:
                 await _enrich_one(modem)
 
-        await asyncio.gather(*[_enrich_one_sem(m) for m in online_modems])
+        for batch_start in range(0, len(online_modems), BATCH_SIZE):
+            batch = online_modems[batch_start:batch_start + BATCH_SIZE]
+            await asyncio.gather(*[_enrich_one_sem(m) for m in batch])
+
+            # Flush partial results to cache after each batch so GUI updates
+            if cmts_ip and cmts_ip in _enrichment_cache:
+                enriched_map = {m['mac_address']: m for m in online_modems[:batch_start + BATCH_SIZE]}
+                for modem in modems:
+                    if modem['mac_address'] in enriched_map:
+                        modem.update(enriched_map[modem['mac_address']])
+                _enrichment_cache[cmts_ip]['modems'] = modems
+                _enrichment_cache[cmts_ip]['timestamp'] = time.time()
+            self.logger.info(
+                f"Direct enrichment batch {batch_start // BATCH_SIZE + 1}/"
+                f"{-(-len(online_modems) // BATCH_SIZE)}: "
+                f"{enriched_count}/{completed_count} enriched so far"
+            )
 
         self.logger.info(f"Direct enrichment done: {enriched_count}/{len(online_modems)} modems enriched")
 
-        # Merge enriched modems back
+        # Final merge
         enriched_map = {m['mac_address']: m for m in online_modems}
         for modem in modems:
             if modem['mac_address'] in enriched_map:

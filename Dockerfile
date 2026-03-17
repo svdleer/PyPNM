@@ -71,6 +71,15 @@ USER pypnm
 
 EXPOSE 8000
 
+# Clear proxy env vars set during build — prevents wget/curl inside the running
+# container from routing healthcheck requests through the build-time proxy
+ENV http_proxy="" \
+    https_proxy="" \
+    HTTP_PROXY="" \
+    HTTPS_PROXY="" \
+    no_proxy="localhost,127.0.0.1,.oss.local" \
+    NO_PROXY="localhost,127.0.0.1,.oss.local"
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -q -O /dev/null http://localhost:8000/health || exit 1
 

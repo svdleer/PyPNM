@@ -1071,6 +1071,7 @@ class PNMDiagnosticsService:
             # Step 2: Walk OFDM downstream channel table
             walk_result = await self._snmp_walk(self.OID_DS_OFDM_CHAN_ID)
             ofdm_ifindexes = []
+            ifindex_to_chanid: dict = {}   # SNMP ifIndex → modem channel_id
             if walk_result.get('success'):
                 for entry in walk_result.get('results', []):
                     oid_str = entry.get('oid', '')
@@ -1078,6 +1079,11 @@ class PNMDiagnosticsService:
                     chan_id = entry.get('value')
                     if channel_ids is None or chan_id in channel_ids:
                         ofdm_ifindexes.append(ifindex)
+                        if chan_id is not None:
+                            try:
+                                ifindex_to_chanid[ifindex] = int(chan_id)
+                            except (TypeError, ValueError):
+                                pass
 
             if not ofdm_ifindexes:
                 return {'success': False, 'error': 'No OFDM channels found on modem'}
@@ -1162,8 +1168,13 @@ class PNMDiagnosticsService:
             # Pre-collect PNMChEstCoef_{MAC}* files that have no ifindex in the
             # filename; sort oldest→newest so they map in channel order.
             # Each successive ifindex pops the next file from the list.
+            # Modems write these with lowercase MAC — search both cases.
+            _coef_candidates = set(
+                glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*')) +
+                glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_clean}*'))
+            )
             pnm_coef_pool = sorted(
-                [f for f in glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*'))
+                [f for f in _coef_candidates
                  if abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS],
                 key=os.path.getmtime
             )
@@ -1180,15 +1191,32 @@ class PNMDiagnosticsService:
                     bin_path = bin_path + '.bin'
 
                 if not os.path.exists(bin_path):
-                    # Build candidate list — try ifindex-specific patterns first
+                    # Build candidate list.
+                    # Modems write the file using their internal channel_id
+                    # (small integer from the OID value), NOT the SNMP ifIndex
+                    # (large OID-suffix number).  Search both.
+                    chan_id = ifindex_to_chanid.get(ifindex)
                     candidates = []
                     for pattern in [
-                        # Explicit ifindex in filename (most reliable)
+                        # ifindex-based (some vendors match this)
                         os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_{ifindex}_*'),
                         os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*'),
                         os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin'),
                     ]:
                         candidates += glob.glob(pattern)
+                    # channel_id-based (most modems: Technicolor, Netgear, etc.)
+                    if chan_id is not None and not candidates:
+                        for pattern in [
+                            os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_{chan_id}_*'),
+                            os.path.join(tftp_dir, f'chan_est_{mac_clean}_{chan_id}_*'),
+                        ]:
+                            candidates += glob.glob(pattern)
+                    # MAC-only wildcard fallback — pick N most-recent files for N channels
+                    if not candidates:
+                        candidates = sorted(
+                            glob.glob(os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_*')),
+                            key=os.path.getmtime,
+                        )
 
                     recent = [f for f in candidates
                               if os.path.exists(f) and abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS]

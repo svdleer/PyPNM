@@ -236,7 +236,7 @@ class AgentManager:
         self.logger.warning(f"No agent available for capability '{capability}'")
         return None
     
-    async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0) -> str:
+    async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0, priority: str = 'interactive') -> str:
         """Send task to agent. Returns task_id."""
         if agent_id not in self.agents:
             raise ValueError(f"Agent not connected: {agent_id}")
@@ -262,7 +262,8 @@ class AgentManager:
             'type': 'command',
             'request_id': task_id,
             'command': command,
-            'params': params
+            'params': params,
+            'priority': priority,
         })
         
         try:
@@ -307,7 +308,7 @@ class AgentManager:
             return result
         except asyncio.TimeoutError:
             self.logger.error(f"Timeout ({timeout}s) waiting for task {task_id} — agent is still running; increase timeout or reduce SNMP repetitions")
-            return None
+            return {'success': False, 'error': f'Agent task timeout after {timeout}s'}
         finally:
             if task_id in self._task_queues:
                 del self._task_queues[task_id]

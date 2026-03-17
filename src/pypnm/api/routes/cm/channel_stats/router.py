@@ -297,13 +297,25 @@ class ChannelStatsRouter:
                         error="Agent task timed out"
                     )
 
-                # Extract raw SNMP walk results
-                agent_result = result.get("result", {})
-                if not agent_result.get("success"):
+                # Handle top-level error/timeout from manager (no 'result' envelope)
+                if 'result' not in result:
                     return ChannelStatsResponse(
                         success=False,
                         status=-1,
-                        error=agent_result.get("error") or "SNMP walk failed"
+                        error=result.get('error', 'Agent returned no result')
+                    )
+
+                # Extract raw SNMP walk results
+                agent_result = result.get("result", {})
+                walk_warnings = agent_result.get("warnings", [])
+                if not agent_result.get("success"):
+                    err = agent_result.get("error") or "SNMP walk failed — all OID trees empty (wrong community or modem offline)"
+                    if walk_warnings:
+                        err = f"{err} | warnings: {'; '.join(walk_warnings[:3])}"
+                    return ChannelStatsResponse(
+                        success=False,
+                        status=-1,
+                        error=err
                     )
 
                 raw_results = agent_result.get("results", {})

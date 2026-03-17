@@ -620,35 +620,72 @@ class UsOfdmaRxMerRouter:
                     else:
                         mac_verdict[mp.mac] = "clean"   # coarse — plant needs sc_stats
 
-                # ── Figure ────────────────────────────────────────────────────────────
-                fig, ax = plt.subplots(figsize=(13, 5))
+                # ── Assign a unique colour per modem from tab20 / tab20b cycle ────
+                _CMAP_NAMES = ["tab20", "tab20b", "tab20c"]
+                _all_colours: list = []
+                for _cn in _CMAP_NAMES:
+                    _cm = plt.get_cmap(_cn)
+                    _all_colours.extend([_cm(i) for i in range(_cm.N)])
+                # linestyle encodes verdict so colour encodes identity
+                VERDICT_LS = {
+                    "clean":   ("solid",  1.3),
+                    "in-home": ("dashed", 1.6),
+                    "plant":   ((0, (3, 1, 1, 1)), 2.0),  # dash-dot
+                    "unknown": ("dotted", 1.0),
+                }
+
+                # ── Figure: main plot + legend table below ────────────────────────
+                # Reserve extra height for the legend table
+                n_cols_leg    = 3
+                legend_rows   = max(1, -(-n_modems // n_cols_leg))   # ceil div
+                leg_height_in = legend_rows * 0.26 + 0.5
+                fig_height    = 5.5 + leg_height_in
+
+                fig = plt.figure(figsize=(14, fig_height))
                 fig.patch.set_facecolor("#f8f9fa")
+
+                # GridSpec: top = plot, bottom = legend area
+                import matplotlib.gridspec as gridspec
+                gs = gridspec.GridSpec(
+                    2, 1,
+                    height_ratios=[5.5, leg_height_in],
+                    hspace=0.35,
+                    figure=fig,
+                )
+                ax     = fig.add_subplot(gs[0])
+                ax_leg = fig.add_subplot(gs[1])
+                ax_leg.axis("off")
                 ax.set_facecolor("#ffffff")
 
-                plotted = []
+                plotted      = []   # list of (mac, colour, linestyle, verdict)
+                colour_cycle = iter(_all_colours)
                 for mp in mod_preeq:
                     mac  = mp.mac
                     prof = mac_profile.get(mac)
                     if not prof:
                         continue
                     offsets, dB_rel, _, _ = prof
-                    colour  = VERDICT_COLOUR.get(mac_verdict.get(mac, "unknown"), "#aaaaaa")
+                    verdict = mac_verdict.get(mac, "unknown")
+                    ls, lw  = VERDICT_LS.get(verdict, ("dotted", 1.0))
+                    colour  = next(colour_cycle, "#aaaaaa")
                     ys      = [v if v is not None else float("nan") for v in dB_rel]
-                    label   = f"{mac[-8:]}  ({mac_verdict.get(mac, '?')})"
-                    ax.plot(offsets, ys, color=colour, alpha=0.55, linewidth=1.0, label=label)
-                    plotted.append(mac)
+                    ax.plot(offsets, ys, color=colour, linestyle=ls,
+                            alpha=0.80, linewidth=lw)
+                    plotted.append((mac, colour, ls, verdict))
 
                 # FN median overlay
                 if fn_dB and fn_offsets:
                     fn_ys = [v if v is not None else float("nan") for v in fn_dB]
                     ax.plot(fn_offsets, fn_ys,
-                            color="black", linewidth=2.2, linestyle="--",
+                            color="black", linewidth=2.5, linestyle="--",
                             label="FN median", zorder=5)
 
                 # Reference lines
-                ax.axvline(0, color="#cc0000", linewidth=1.5, linestyle="-", zorder=3, alpha=0.7)
+                ax.axvline(0, color="#cc0000", linewidth=1.5, linestyle="-",
+                           zorder=3, alpha=0.7, label="Main tap")
                 for ref_dB in (-20, -30, -40):
-                    ax.axhline(ref_dB, color="#aaaaaa", linewidth=0.7, linestyle=":", zorder=1)
+                    ax.axhline(ref_dB, color="#aaaaaa", linewidth=0.7,
+                               linestyle=":", zorder=1)
                     ax.text(ax.get_xlim()[0] if ax.get_xlim()[0] != 0 else -1,
                             ref_dB + 0.5, f"{ref_dB} dB",
                             fontsize=7, color="#888888", va="bottom")
@@ -664,6 +701,20 @@ class UsOfdmaRxMerRouter:
                 ax.grid(True, which="major", linestyle="--", alpha=0.3)
                 ax.set_ylim(bottom=-55, top=3)
 
+                # Small in-plot legend for verdict line-styles only
+                from matplotlib.lines import Line2D
+                style_handles = [
+                    Line2D([0], [0], color="grey", linestyle=ls, linewidth=lw,
+                           label=v.capitalize())
+                    for v, (ls, lw) in VERDICT_LS.items()
+                ] + [
+                    Line2D([0], [0], color="black",  linestyle="--", linewidth=2.5, label="FN median"),
+                    Line2D([0], [0], color="#cc0000", linestyle="-",  linewidth=1.5, label="Main tap"),
+                ]
+                ax.legend(handles=style_handles, loc="lower right",
+                          fontsize=8, framealpha=0.85,
+                          title="Line style = verdict", title_fontsize=7)
+
                 # Twin top x-axis in cable ft (when sample_period_us known)
                 if fn_sp_us and fn_sp_us > 0:
                     ax2 = ax.twiny()
@@ -671,35 +722,86 @@ class UsOfdmaRxMerRouter:
                     def tap_to_ft(x):
                         delay_s = abs(x) * fn_sp_us * 1e-6
                         return delay_s * _COAX_VEL / 2.0 * _M_TO_FT
-                    xlim = ax.get_xlim()
-                    max_off = max(abs(xlim[0]), abs(xlim[1]))
                     tick_offs = sorted(set(
-                        [o for o in fn_offsets if o != 0] or [int(max_off * 0.5)]
+                        [o for o in fn_offsets if o != 0] or [1]
                     ), key=abs)
-                    # show at most 8 ticks
-                    step = max(1, len(tick_offs) // 8)
+                    step  = max(1, len(tick_offs) // 8)
                     shown = [0] + tick_offs[::step]
                     ax2.set_xticks(shown)
                     ax2.set_xticklabels(
-                        ["main" if t == 0 else f"{tap_to_ft(t):.0f} ft" for t in shown],
+                        ["main" if t == 0 else f"{tap_to_ft(t):.0f} ft"
+                         for t in shown],
                         fontsize=8,
                     )
-                    ax2.set_xlabel("Estimated one-way reflection distance (ft, VOP 0.85)", fontsize=9)
+                    ax2.set_xlabel(
+                        "Estimated one-way reflection distance (ft, VOP 0.85)",
+                        fontsize=9,
+                    )
 
-                # Legend — keep manageable
-                handles, labels = ax.get_legend_handles_labels()
-                max_legend = 20
-                if len(handles) > max_legend:
-                    handles = handles[:max_legend]
-                    labels  = labels[:max_legend]
-                    labels[-1] += f" … +{len(plotted) - max_legend + 1} more"
-                ax.legend(handles, labels,
-                          loc="lower right",
-                          fontsize=7,
-                          ncol=max(1, len(handles) // 10),
-                          framealpha=0.7)
+                # ── Legend table below the plot ───────────────────────────────────
+                # Columns: colour swatch | MAC address | verdict badge
+                VERDICT_BG = {
+                    "clean":   "#d4edda", "in-home": "#fff3cd",
+                    "plant":   "#f8d7da", "unknown": "#e2e3e5",
+                }
+                col_w   = 1.0 / n_cols_leg
+                row_h   = 1.0 / max(legend_rows + 1, 2)
+                # Header row
+                for ci, hdr in enumerate(["MAC address", "Verdict"] * n_cols_leg):
+                    pass   # skip — use coloured patches as header implicitly
 
-                plt.tight_layout()
+                for idx, (mac, colour, ls, verdict) in enumerate(plotted):
+                    row = idx // n_cols_leg
+                    col = idx %  n_cols_leg
+                    x0  = col * col_w
+                    y0  = 1.0 - (row + 1) * row_h
+
+                    # Coloured rectangle (modem colour)
+                    swatch_w = col_w * 0.06
+                    rect = plt.matplotlib.patches.FancyBboxPatch(
+                        (x0 + 0.005, y0 + row_h * 0.15),
+                        swatch_w, row_h * 0.65,
+                        boxstyle="round,pad=0.01",
+                        facecolor=colour, edgecolor="none",
+                        clip_on=False,
+                    )
+                    rect.set_transform(ax_leg.transAxes)
+                    ax_leg.add_patch(rect)
+
+                    # MAC address
+                    ax_leg.text(
+                        x0 + swatch_w + 0.015, y0 + row_h * 0.5,
+                        mac,
+                        transform=ax_leg.transAxes,
+                        fontsize=7.5, fontfamily="monospace",
+                        va="center", ha="left",
+                        color="#222222",
+                    )
+
+                    # Verdict badge (right of MAC)
+                    badge_x = x0 + col_w * 0.62
+                    bg = VERDICT_BG.get(verdict, "#e2e3e5")
+                    badge_rect = plt.matplotlib.patches.FancyBboxPatch(
+                        (badge_x, y0 + row_h * 0.2),
+                        col_w * 0.34, row_h * 0.6,
+                        boxstyle="round,pad=0.01",
+                        facecolor=bg, edgecolor="#aaaaaa", linewidth=0.5,
+                        clip_on=False,
+                    )
+                    badge_rect.set_transform(ax_leg.transAxes)
+                    ax_leg.add_patch(badge_rect)
+                    ax_leg.text(
+                        badge_x + col_w * 0.17, y0 + row_h * 0.5,
+                        verdict,
+                        transform=ax_leg.transAxes,
+                        fontsize=7, va="center", ha="center",
+                        color="#333333", fontweight="bold",
+                    )
+
+                # Thin separator line between plot and legend
+                ax_leg.plot([0, 1], [1.0, 1.0], color="#cccccc", linewidth=0.8,
+                            transform=ax_leg.transAxes, clip_on=False)
+
                 buf = _io.BytesIO()
                 fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
                 plt.close(fig)
