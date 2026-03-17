@@ -30,39 +30,98 @@ logger = logging.getLogger(__name__)
 # Store active WebSocket connections for spectrum streaming
 _spectrum_connections: list[WebSocket] = []
 
-# TFTP base path for UTSC files
-TFTP_BASE = "/var/lib/tftpboot"
+# Local cache dir for UTSC files fetched via FTP
+_CACHE_DIR = os.environ.get('PNM_CACHE_DIR', '/app/data/pnm_cache')
+TFTP_BASE = os.environ.get('TFTPBOOT_DIR', '/var/lib/tftpboot')
 
-# FTP credentials for file cleanup (TFTP dir is read-only in container)
-FTP_SERVER = "127.0.0.1"
-FTP_USER = "ftpaccess"
-FTP_PASS = "ftpaccessftp"
+# FTP config from environment
+FTP_SERVER = os.environ.get('FTP_SERVER_IP') or os.environ.get('TFTP_IPV4', '127.0.0.1')
+FTP_USER = os.environ.get('FTP_USER', 'ftpaccess')
+FTP_PASS = os.environ.get('FTP_PASSWORD', 'ftpaccessftp')
+FTP_DIR = os.environ.get('FTP_TFTPBOOT_DIR', '/var/lib/tftpboot')
+_USE_FTP = os.environ.get('PNM_FILE_SOURCE', 'local').lower() in ('ftp', 'agent') or os.environ.get('CMTS_TFTP', '').lower() == 'ftp'
 
 
-def _delete_utsc_files_via_ftp(filenames: list[str]) -> int:
-    """Delete UTSC files from TFTP directory via FTP."""
-    if not filenames:
-        return 0
-    deleted = 0
+def _get_utsc_base() -> str:
+    """Return the directory to read UTSC files from (local mount or FTP cache)."""
+    if _USE_FTP:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        return _CACHE_DIR
+    return TFTP_BASE
+
+
+def _ftp_fetch_utsc_files() -> list[str]:
+    """Fetch all UTSC files from FTP server into local cache. Returns list of local paths."""
+    if not _USE_FTP:
+        return []
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    fetched = []
     try:
         ftp = FTP()
         ftp.connect(FTP_SERVER, 21, timeout=10)
         ftp.login(FTP_USER, FTP_PASS)
         try:
-            ftp.cwd('/var/lib/tftpboot')
+            ftp.cwd(FTP_DIR)
         except Exception as e:
-            logger.warning(f"FTP: Could not cd to /var/lib/tftpboot: {e}")
+            logger.warning(f"FTP: Could not cd to {FTP_DIR}: {e}")
             ftp.quit()
-            return 0
-        for filename in filenames:
-            try:
-                ftp.delete(filename)
-                deleted += 1
-            except Exception:
-                pass
+            return []
+        try:
+            all_files = ftp.nlst()
+        except Exception:
+            all_files = []
+        matching = [f for f in all_files if os.path.basename(f).startswith('utsc_') or os.path.basename(f).startswith('PNMCcapUsSpecAn_')]
+        for remote_file in matching:
+            basename = os.path.basename(remote_file)
+            local_path = os.path.join(_CACHE_DIR, basename)
+            if not os.path.exists(local_path):
+                try:
+                    with open(local_path, 'wb') as fp:
+                        ftp.retrbinary(f'RETR {basename}', fp.write)
+                    fetched.append(local_path)
+                except Exception as e:
+                    logger.debug(f"FTP fetch {basename} failed: {e}")
         ftp.quit()
     except Exception as e:
-        logger.error(f"FTP cleanup failed: {e}")
+        logger.debug(f"FTP fetch error: {e}")
+    return fetched
+
+
+def _delete_utsc_files_via_ftp(filenames: list[str]) -> int:
+    """Delete UTSC files from FTP server and local cache."""
+    if not filenames:
+        return 0
+    deleted = 0
+    # Delete from local cache
+    base = _get_utsc_base()
+    for fn in filenames:
+        local = os.path.join(base, os.path.basename(fn))
+        try:
+            if os.path.exists(local):
+                os.remove(local)
+                deleted += 1
+        except OSError:
+            pass
+    # Delete from FTP server
+    if _USE_FTP:
+        try:
+            ftp = FTP()
+            ftp.connect(FTP_SERVER, 21, timeout=10)
+            ftp.login(FTP_USER, FTP_PASS)
+            try:
+                ftp.cwd(FTP_DIR)
+            except Exception as e:
+                logger.warning(f"FTP: Could not cd to {FTP_DIR}: {e}")
+                ftp.quit()
+                return deleted
+            for filename in filenames:
+                try:
+                    ftp.delete(os.path.basename(filename))
+                except Exception:
+                    pass
+            ftp.quit()
+        except Exception as e:
+            logger.debug(f"FTP cleanup failed: {e}")
     return deleted
 
 
@@ -344,15 +403,12 @@ async def _stream_spectrum_data(
     )
     
     try:
-        # Clean all old UTSC files before starting a new capture (E6000: utsc_*, Casa: PNMCcapUsSpecAn_*)
-        old_files = glob.glob(f"{TFTP_BASE}/utsc_*") + glob.glob(f"{TFTP_BASE}/PNMCcapUsSpecAn_*")
+        # Clean all old UTSC files before starting a new capture
+        utsc_base = _get_utsc_base()
+        old_files = glob.glob(f"{utsc_base}/utsc_*") + glob.glob(f"{utsc_base}/PNMCcapUsSpecAn_*")
         if old_files:
-            for f in old_files:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-            logger.info(f"Cleaned {len(old_files)} old UTSC/Casa files from {TFTP_BASE}")
+            _delete_utsc_files_via_ftp([os.path.basename(f) for f in old_files])
+            logger.info(f"Cleaned {len(old_files)} old UTSC files")
         
         await websocket.send_json({
             "type": "connected",
@@ -403,9 +459,12 @@ async def _stream_spectrum_data(
                 break
             
             try:
-                # Look for UTSC files in TFTP directory — E6000: utsc_*, Casa: PNMCcapUsSpecAn_*
+                # Fetch files from FTP if needed, then find local copies
+                if _USE_FTP:
+                    _ftp_fetch_utsc_files()
+                utsc_base = _get_utsc_base()
                 files = sorted(
-                    glob.glob(f"{TFTP_BASE}/utsc_*") + glob.glob(f"{TFTP_BASE}/PNMCcapUsSpecAn_*"),
+                    glob.glob(f"{utsc_base}/utsc_*") + glob.glob(f"{utsc_base}/PNMCcapUsSpecAn_*"),
                     key=os.path.getmtime
                 )  # Oldest first
                 

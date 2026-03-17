@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 
 from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
 from pypnm.api.routes.cmts.schemas import CMTSModemResponse
-from pypnm.api.routes.cmts.service import CMTSModemService
+from pypnm.api.routes.cmts.service import CMTSModemService, cancel_enrichment
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +103,10 @@ async def get_cmts_modems(
             count=0,
             error=str(e)
         )
+
+
+@router.post("/enrich/cancel")
+async def cancel_enrich(cmts_ip: str):
+    """Cancel an in-progress background enrichment for the given CMTS."""
+    cancelled = cancel_enrichment(cmts_ip)
+    return {"status": "cancelled" if cancelled else "not_running", "cmts_ip": cmts_ip}

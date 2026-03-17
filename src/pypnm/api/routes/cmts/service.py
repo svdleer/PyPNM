@@ -12,9 +12,20 @@ from pypnm.api.agent.manager import get_agent_manager
 
 
 # ── In-memory enrichment cache ──────────────────────────────────────────────
-# Keyed by cmts_ip → {modems, enriched, enriching, timestamp}
+# Keyed by cmts_ip → {modems, enriched, enriching, timestamp, cancelled}
 _enrichment_cache: Dict[str, Dict[str, Any]] = {}
 _enrichment_lock = asyncio.Lock()
+
+
+def cancel_enrichment(cmts_ip: str) -> bool:
+    """Signal a running background enrichment to stop. Returns True if one was running."""
+    entry = _enrichment_cache.get(cmts_ip)
+    if entry and entry.get('enriching'):
+        entry['cancelled'] = True
+        entry['enriching'] = False
+        entry['enriched'] = True   # stop polling loop on GUI side
+        return True
+    return False
 
 # ── CMTS SNMP OIDs ──────────────────────────────────────────────────────────
 # DOCSIS 3.1 registration table
@@ -174,9 +185,17 @@ class CMTSModemService:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
             cached_count = len(cached.get('modems', []))
-            cache_satisfies_limit = (not limit) or (cached_count >= int(limit))
+            cached_req_limit = cached.get('requested_limit') or 0
+            # Cache satisfies the request if we have enough modems, OR if the
+            # walk was done with at least the same limit (meaning the CMTS
+            # simply doesn't have that many modems — all of them are cached).
+            cache_sufficient = (
+                not limit
+                or cached_count >= int(limit)
+                or (cached_req_limit and cached_req_limit >= int(limit))
+            )
             
-            if cached.get('enriched') and age < 7200 and cache_satisfies_limit:  # enriched data valid for 2 hours
+            if cached.get('enriched') and age < 7200 and cache_sufficient:  # enriched data valid for 2 hours
                 self.logger.info(f"Returning cached enriched data for {cmts_ip} (age={age:.0f}s)")
                 return {
                     'success': True,
@@ -188,7 +207,7 @@ class CMTSModemService:
                     'cached': True,
                 }
             
-            if cached.get('enriching') and age < 1800 and cache_satisfies_limit:  # enrichment still in progress (30 min max)
+            if cached.get('enriching') and age < 1800 and cache_sufficient:  # enrichment still in progress (30 min max)
                 # Return whatever we have so far (base modems) with enriching=True
                 self.logger.info(f"Enrichment in progress for {cmts_ip} (age={age:.0f}s)")
                 return {
@@ -230,9 +249,13 @@ class CMTSModemService:
             if enrich and modems:
                 # Guard: don't start a second enrichment if one is already running
                 existing = _enrichment_cache.get(cmts_ip, {})
-                existing_count = len(existing.get('modems', []))
-                existing_satisfies_limit = (not limit) or (existing_count >= int(limit))
-                if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800 and existing_satisfies_limit:
+                existing_req_limit = existing.get('requested_limit') or 0
+                existing_sufficient = (
+                    not limit
+                    or len(existing.get('modems', [])) >= int(limit)
+                    or (existing_req_limit and existing_req_limit >= int(limit))
+                )
+                if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800 and existing_sufficient:
                     self.logger.info(f"Enrichment already in progress for {cmts_ip}, skipping new launch")
                     return {
                         'success': True,
@@ -301,12 +324,15 @@ class CMTSModemService:
             # ── Step 1: CMTS-level interface enrichment (fast, ~seconds) ──────
             # Works on the modems list in-place; sets ofdma_enabled, cable_mac etc.
             await self._enrich_cmts_interfaces(modems)
-            # Push to cache immediately so polls see OFDMA badges right away
+            # Push to cache immediately so polls see OFDMA badges right away.
+            # Preserve requested_limit so cache_sufficient stays True on next poll.
+            _existing_req_limit = _enrichment_cache.get(cmts_ip, {}).get('requested_limit')
             _enrichment_cache[cmts_ip] = {
                 'modems': modems,
                 'enriched': False,
                 'enriching': True,
                 'timestamp': time.time(),
+                'requested_limit': _existing_req_limit,
                 'enrich_progress': {'completed': 0, 'total': len(modems)},
             }
             self.logger.info(f"CMTS interface enrichment done for {cmts_ip} — OFDMA/cable-mac visible")
@@ -731,10 +757,10 @@ class CMTSModemService:
                          and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses]
 
-        BATCH_SIZE = 200
-        MAX_CONCURRENT = 5  # matches the 5-worker bulk pool on the agent
+        MAX_CONCURRENT = 10  # 2 agents × 10 bulk threads; = 5 in-flight per agent, no queuing
+        FLUSH_EVERY = 20      # flush enriched data to cache every N completions
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (batch={BATCH_SIZE}, max_concurrent={MAX_CONCURRENT}, community={modem_community})")
+        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, community={modem_community})")
         if not online_modems:
             return modems
 
@@ -750,6 +776,9 @@ class CMTSModemService:
         async def _enrich_one(modem: dict):
             """Enrich a single modem using snmp_bulk_get (1 agent call for 3 OIDs)."""
             nonlocal enriched_count, completed_count, _first_failure_logged, _first_success_logged
+            # Honour cancel signal — skip SNMP call entirely
+            if cmts_ip and _enrichment_cache.get(cmts_ip, {}).get('cancelled'):
+                return
             ip = modem.get('ip_address')
             try:
                 result = await self._send_cm_agent_command(
@@ -758,10 +787,11 @@ class CMTSModemService:
                         'target_ip': ip,
                         'oids': ALL_OIDS,
                         'community': modem_community,
-                        'timeout': 5,
+                        'timeout': 3,   # fail-fast: offline modems clear in 3s, no retries
+                        'retries': 0,   # enrichment — don't retry; skip and move on
                         'max_concurrent': 3,
                     },
-                    timeout=30,
+                    timeout=15,
                 )
                 if not result or not result.get('success'):
                     if not _first_failure_logged:
@@ -816,43 +846,36 @@ class CMTSModemService:
                 # Always count this modem as done so the progress bar advances
                 completed_count += 1
                 if cmts_ip and cmts_ip in _enrichment_cache:
-                    _enrichment_cache[cmts_ip]['enrich_progress']['completed'] = completed_count
+                    cache_entry = _enrichment_cache[cmts_ip]
+                    if not cache_entry.get('cancelled'):
+                        progress = cache_entry.setdefault(
+                            'enrich_progress',
+                            {'completed': 0, 'total': len(online_modems)}
+                        )
+                        progress['completed'] = completed_count
+                        # Flush enriched modem data every FLUSH_EVERY completions
+                        # so the GUI poll sees continuously updated vendor/model fields
+                        if completed_count % FLUSH_EVERY == 0:
+                            cache_entry['timestamp'] = time.time()
 
-        # ── Process in batches of 200, flushing results to cache after each ──
-        # This lets the GUI display enriched data for the first 200 modems
-        # within ~30s, then progressively fills in the rest.
+        # ── Process ALL modems at once — semaphore caps concurrency ──────────
         sem = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def _enrich_one_sem(modem: dict):
             async with sem:
                 await _enrich_one(modem)
 
-        for batch_start in range(0, len(online_modems), BATCH_SIZE):
-            batch = online_modems[batch_start:batch_start + BATCH_SIZE]
-            await asyncio.gather(*[_enrich_one_sem(m) for m in batch])
+        await asyncio.gather(*[_enrich_one_sem(m) for m in online_modems])
 
-            # Flush partial results to cache after each batch so GUI updates
-            if cmts_ip and cmts_ip in _enrichment_cache:
-                enriched_map = {m['mac_address']: m for m in online_modems[:batch_start + BATCH_SIZE]}
-                for modem in modems:
-                    if modem['mac_address'] in enriched_map:
-                        modem.update(enriched_map[modem['mac_address']])
-                _enrichment_cache[cmts_ip]['modems'] = modems
-                _enrichment_cache[cmts_ip]['timestamp'] = time.time()
-            self.logger.info(
-                f"Direct enrichment batch {batch_start // BATCH_SIZE + 1}/"
-                f"{-(-len(online_modems) // BATCH_SIZE)}: "
-                f"{enriched_count}/{completed_count} enriched so far"
-            )
+        # Final timestamp flush
+        if cmts_ip and cmts_ip in _enrichment_cache:
+            _enrichment_cache[cmts_ip]['timestamp'] = time.time()
 
-        self.logger.info(f"Direct enrichment done: {enriched_count}/{len(online_modems)} modems enriched")
-
-        # Final merge
-        enriched_map = {m['mac_address']: m for m in online_modems}
-        for modem in modems:
-            if modem['mac_address'] in enriched_map:
-                modem.update(enriched_map[modem['mac_address']])
-
+        cancelled = cmts_ip and _enrichment_cache.get(cmts_ip, {}).get('cancelled')
+        self.logger.info(
+            f"Direct enrichment {'cancelled' if cancelled else 'done'}: "
+            f"{enriched_count}/{len(online_modems)} modems enriched"
+        )
         return modems
 
     def _parse_sys_descr(self, sys_descr: str) -> dict:

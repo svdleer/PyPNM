@@ -79,7 +79,7 @@ AGENT_CMD  = os.environ.get("AGENT_CMD",  "docker exec pypnm-agent-lab")
 
 # Capture defaults (overridden per vendor below)
 TRIGGER_MODE     = 2        # freeRunning
-CENTER_FREQ      = 45000000 # 45 MHz — span/2=40MHz, so lower edge=5MHz (valid for DOCSIS US)
+CENTER_FREQ      = 50000000 # 50 MHz — must be multiple of 50 kHz; Wideband max 204 MHz
 SPAN             = 80000000 # 80 MHz
 NUM_BINS         = 800   # E6000 non-TimeIQ valid: 200/400/800/1600/3200
 OUTPUT_FORMAT    = 2        # fftPower — safe default for all vendors
@@ -87,10 +87,10 @@ WINDOW           = 2        # rectangular
 REPEAT_PERIOD    = 100000   # 100 ms (µs)
 FREERUN_DURATION = 120000   # 120 s (ms)
 TRIGGER_COUNT    = 1
-# E6000: set to "" so E6000 uses default naming with timestamp appended.
-# Per MIB docs: must be "", "/pnm/utsc/filename", or "filename" (no directories).
+# E6000: must be non-empty — E6000 rejects InitiateTest if filename is "".
+# Per MIB docs: must be "", "/pnm/utsc/filename", or "filename" (no dirs).
 # E6000 appends: <filename>_YYYY-MM-DD_HH.MM.SS.mmm
-FILENAME         = ""
+FILENAME         = "utsc"
 BDT_ROW          = 1
 
 TFTP_HEX = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))
@@ -360,7 +360,7 @@ def configure_bdt_cisco(row: int):
     fields = [
         (f"{OID_BDT_E6000}.3.{row}", "i", 1,       "DestHostIpAddrType = ipv4(1)"),
         (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex, f"DestHostIpAddress  = {tftp}"),
-        (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{tftp}/", f"DestBaseUri        = tftp://{tftp}/"),
+        (f"{OID_BDT_E6000}.6.{row}", "s", TFTP_PATH, f"DestBaseUri        = {TFTP_PATH}"),
         # Protocol: NOT set on Cisco — createAndGo defaults it; explicit SET causes genError
     ]
     for oid, t, v, desc in fields:
@@ -388,7 +388,7 @@ def configure_bdt_e6000(row: int):
     fields = [
         (f"{OID_BDT_E6000}.3.{row}", "i", 1,        "DestHostIpAddrType = ipv4(1)"),
         (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX, f"DestHostIpAddress  = {TFTP_IP}"),
-        (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{TFTP_IP}/", f"DestBaseUri        = tftp://{TFTP_IP}/"),
+        (f"{OID_BDT_E6000}.6.{row}", "s", TFTP_PATH,  f"DestBaseUri        = {TFTP_PATH}"),
         (f"{OID_BDT_E6000}.7.{row}", "i", 1,        "Protocol           = tftp(1)"),
     ]
     for oid, t, v, desc in fields:

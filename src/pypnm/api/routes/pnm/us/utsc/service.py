@@ -103,7 +103,7 @@ class CmtsUtscService:
     OID_UTSC_CFG_NUM_AVGS = f"{OID_UTSC_CFG_TABLE}.25"        # NumAvgs
     
     # Bulk Data Control Table (docsPnmCcapBulkDataControl) - 1.3.6.1.4.1.4491.2.1.27.1.1.1.5.1
-    # Standard DOCS-PNM-MIB - required for UTSC file upload
+    # Casa-specific CCAP table — used on Casa 100G for UTSC file upload
     # OIDs verified via: snmptranslate -On DOCS-PNM-MIB::docsPnmCcapBulkDataControl*
     OID_BULK_DATA_CTRL_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.1.1.5.1"
     OID_BULK_DATA_DEST_IP_TYPE = f"{OID_BULK_DATA_CTRL_TABLE}.2"     # DestIpAddrType
@@ -111,6 +111,15 @@ class CmtsUtscService:
     OID_BULK_DATA_DEST_PATH = f"{OID_BULK_DATA_CTRL_TABLE}.4"         # DestPath
     OID_BULK_DATA_UPLOAD_CTRL = f"{OID_BULK_DATA_CTRL_TABLE}.5"       # UploadControl
     OID_BULK_DATA_TEST_SELECTOR = f"{OID_BULK_DATA_CTRL_TABLE}.6"     # PnmTestSelector
+
+    # Standard Bulk Data Transfer Config Table (docsPnmBulkDataTransferCfgTable)
+    # Used by E6000/Cisco — fallback when CCAP table is notWritable
+    OID_BDT_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.1.3.1.1"
+    OID_BDT_IP_TYPE   = f"{OID_BDT_TABLE}.3"    # DestHostIpAddrType
+    OID_BDT_IP_ADDR   = f"{OID_BDT_TABLE}.4"    # DestHostIpAddress
+    OID_BDT_BASE_URI  = f"{OID_BDT_TABLE}.6"    # DestBaseUri
+    OID_BDT_PROTOCOL  = f"{OID_BDT_TABLE}.7"    # Protocol (1=tftp)
+    OID_BDT_ROW_STATUS = f"{OID_BDT_TABLE}.9"   # RowStatus
     
     # UTSC Capability Table - 1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1
     OID_UTSC_CAPAB_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1"
@@ -250,6 +259,12 @@ class CmtsUtscService:
                 return result['result']
             else:
                 error = result.get('result', {}).get('error', 'SNMP set failed') if result else 'Timeout'
+                # notWritable means the CMTS already has this configured and
+                # won't allow overwriting — log at DEBUG to avoid alarm fatigue.
+                if 'notWritable' in str(error):
+                    self.logger.debug(f"SNMP SET notWritable oid={oid} (CMTS pre-configured)")
+                else:
+                    self.logger.warning(f"SNMP SET failed oid={oid} value={value!r} type={value_type} error={error}")
                 return {'success': False, 'error': error}
         except Exception as e:
             self.logger.exception(f"SNMP SET error: {e}")
@@ -345,19 +360,21 @@ class CmtsUtscService:
                 self.logger.info(f"Bulk data control already configured correctly for index {index}, skipping SETs")
                 return {"success": True, "index": index, "dest_ip": dest_ip, "pnm_test_selector_hex": selector_hex, "skipped": True}
 
-            # 1. Set DestIpAddrType = ipv4(1)
-            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
-            
-            # 2. Set DestIpAddr (hex string)
+            # Probe with the first SET.  If the CMTS returns notWritable the
+            # CCAP table is read-only (E6000/Cisco) — fall through to the
+            # standard docsPnmBulkDataTransferCfgTable with destroy+recreate.
+            probe = await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
+            if not probe.get('success') and 'notWritable' in str(probe.get('error', '')):
+                self.logger.info(
+                    f"CCAP bulk data table is notWritable — using standard BDT table "
+                    f"(docsPnmBulkDataTransferCfgTable) with destroy+recreate"
+                )
+                return await self._configure_bdt_standard(dest_ip, dest_path, index)
+
+            # CCAP table is writable (Casa) — set the remaining columns.
             await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP}.{index}", ip_hex_formatted, 'x')
-            
-            # 3. Set DestPath
             await self._snmp_set(f"{self.OID_BULK_DATA_DEST_PATH}.{index}", dest_path, 's')
-            
-            # 4. Set UploadControl = autoUpload(3)
             await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')
-            
-            # 5. Set PnmTestSelector
             await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", selector_hex, 'x')
 
             self.logger.info(f"Bulk data control configured: selector={selector_hex}")
@@ -366,6 +383,40 @@ class CmtsUtscService:
         except Exception as e:
             self.logger.error(f"Failed to configure bulk data control: {e}")
             return {"success": False, "error": str(e)}
+
+    async def _configure_bdt_standard(
+        self,
+        dest_ip: str,
+        dest_path: str = "./",
+        index: int = 1
+    ) -> dict[str, Any]:
+        """Configure standard docsPnmBulkDataTransferCfgTable.
+
+        Destroy existing row, then write fields directly (no createAndGo/Wait).
+        The CMTS implicitly recreates the row when columns are SET.
+        """
+        import asyncio
+        import ipaddress
+
+        ip_hex = ipaddress.ip_address(dest_ip).packed.hex().upper()
+
+        self.logger.info(f"BDT standard table: destroy row {index}, then SET fields for {dest_ip}:{dest_path}")
+
+        # Destroy existing row
+        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 6, 'i')  # destroy
+        await asyncio.sleep(1)
+
+        # Set fields directly — no createAndGo/createAndWait
+        await self._snmp_set(f"{self.OID_BDT_IP_TYPE}.{index}", 1, 'i')         # ipv4
+        await self._snmp_set(f"{self.OID_BDT_IP_ADDR}.{index}", ip_hex, 'x')    # IP as hex
+        await self._snmp_set(f"{self.OID_BDT_BASE_URI}.{index}", dest_path, 's') # path only
+        await self._snmp_set(f"{self.OID_BDT_PROTOCOL}.{index}", 1, 'i')         # tftp
+
+        # Activate
+        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 1, 'i')  # active
+
+        self.logger.info(f"BDT standard table configured: row {index} → {dest_ip}:{dest_path}")
+        return {"success": True, "index": index, "dest_ip": dest_ip, "table": "standard"}
     
     async def detect_vendor(self) -> str:
         """
@@ -668,15 +719,15 @@ class CmtsUtscService:
         trigger_mode: int = 2,
         cm_mac_address: Optional[str] = None,
         logical_ch_ifindex: Optional[int] = None,
-        center_freq_hz: int = 30000000,
+        center_freq_hz: int = 50000000,
         span_hz: int = 80000000,
         num_bins: int = 800,
         output_format: Optional[int] = None,  # None = auto-detect
         window_function: int = 2,
         repeat_period_us: int = 100000,
         freerun_duration_ms: int = 0,  # 0 = auto-calculate
-        trigger_count: int = 10,
-        filename: str = "utsc_capture",
+        trigger_count: int = 1,
+        filename: str = "utsc",
         destination_index: int = 1,
         auto_clear: bool = True
     ) -> dict[str, Any]:
@@ -780,10 +831,32 @@ class CmtsUtscService:
             # Casa docsPnmCcapBulkDataControlTable) is now handled by the caller via
             # POST /pnm/us/bulk-destination before calling configure.
 
-            # Auto-detect output format if not specified
+            # Auto-detect output format if not specified.
+            # E6000/Cisco: use fftPower(2) as safe default (docs + field behavior).
+            # Casa/EVO: keep fftAmplitude(5) default.
             if output_format is None or output_format == 0:
-                self.logger.info("Auto-detecting supported output format - trying FFT_AMPLITUDE(5) first")
-                output_format = 5
+                if is_arris or is_cisco:
+                    self.logger.info("Auto-detecting output format: using fftPower(2) for E6000/Cisco")
+                    output_format = 2
+                elif is_casa or is_evo:
+                    self.logger.info("Auto-detecting output format: using fftAmplitude(5) for Casa/EVO")
+                    output_format = 5
+                else:
+                    self.logger.info("Auto-detecting output format: using safe fallback fftPower(2)")
+                    output_format = 2
+
+            # Pre-clamp before first SET to avoid inconsistentValue on strict vendors.
+            if is_arris and output_format not in (1, 2, 4):
+                self.logger.warning(f"E6000 output_format {output_format} not supported, clamping to 2")
+                output_format = 2
+            if is_cisco and output_format not in (1, 2, 4):
+                self.logger.warning(f"Cisco output_format {output_format} not supported, clamping to 2")
+                output_format = 2
+            if (is_arris or is_cisco) and 0 < repeat_period_us < 50000 and output_format != 2:
+                self.logger.warning(
+                    f"repeat_period_us={repeat_period_us} requires fftPower(2) on E6000/Cisco, clamping output_format"
+                )
+                output_format = 2
 
             if is_cisco:
                 # Cisco cBR-8: rows are NOT pre-provisioned per port.
@@ -869,15 +942,9 @@ class CmtsUtscService:
 
                 if not row_found:
                     # No pre-provisioned row — create one.
-                    # Arris E6000 rejects createAndGo(4); use createAndWait(5) instead.
-                    # WARNING: defense-in-depth added 2026-03-08. On Arris I-CCAP, rows
-                    # are pre-provisioned by cable-upstreamRfPort ifindex — if we reach
-                    # this branch it likely means rf_port_ifindex is wrong (e.g. a
-                    # cable-upstream logical ifindex instead of cable-upstreamRfPort).
-                    # Both createAndGo and createAndWait will fail with inconsistentValue
-                    # in that case. Fix the discovery (discoverRfPort) first.
-                    create_value = 5 if is_arris else 4
-                    create_label = "createAndWait" if is_arris else "createAndGo"
+                    # All vendors: destroy + createAndGo(4) — proven flow from provision_utsc.py.
+                    create_value = 4
+                    create_label = "createAndGo"
                     self.logger.warning(
                         f"{vendor}: no row found for TriggerMode={trigger_mode} "
                         f"— destroy+{create_label} at cfg_index={target_idx}"
@@ -887,14 +954,12 @@ class CmtsUtscService:
                     r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", create_value, 'i')
                     self.logger.info(f"{vendor} {create_label} result: {r}")
                     if not r.get('success'):
-                        # Fallback: try the other creation method
-                        alt_value = 4 if is_arris else 5
-                        alt_label = "createAndGo" if is_arris else "createAndWait"
+                        # Fallback: try createAndWait(5)
                         self.logger.warning(
-                            f"{create_label} failed, trying {alt_label} as fallback"
+                            f"{create_label} failed, trying createAndWait as fallback"
                         )
-                        r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", alt_value, 'i')
-                        self.logger.info(f"{vendor} {alt_label} fallback result: {r}")
+                        r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 5, 'i')
+                        self.logger.info(f"{vendor} createAndWait fallback result: {r}")
                         if not r.get('success'):
                             raise RuntimeError(
                                 f"Row creation failed on {vendor} cfg_index={target_idx}: {r.get('error', r)}"
@@ -905,10 +970,41 @@ class CmtsUtscService:
 
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
-            # 0. LogicalChIfIndex (.2) — mandatory on Casa even for freeRunning (0 = any channel)
-            await self._snmp_set(
-                f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_ch_ifindex or 0, 'i'
-            )
+            # 0. LogicalChIfIndex (.2)
+            # Per UTSC behavior notes: only needed for IdleSID/CM-MAC trigger modes.
+            # Skip for freeRunning and other trigger modes to avoid inconsistentValue.
+            needs_logical_ch = trigger_mode in (5, 6, 7)  # 5=idleSid, 6/7=cmMac (vendor-specific)
+            if needs_logical_ch:
+                logical_candidates = []
+                if logical_ch_ifindex:
+                    logical_candidates.append(logical_ch_ifindex)
+                if rf_port_ifindex not in logical_candidates:
+                    logical_candidates.append(rf_port_ifindex)
+                if 0 not in logical_candidates:
+                    logical_candidates.append(0)
+
+                logical_set_ok = False
+                logical_set_error = None
+                for logical_value in logical_candidates:
+                    logical_result = await self._snmp_set(
+                        f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_value, 'i'
+                    )
+                    if logical_result.get('success'):
+                        logical_set_ok = True
+                        break
+
+                    logical_set_error = logical_result.get('error', 'Unknown error')
+                    if 'inconsistentValue' in str(logical_set_error):
+                        self.logger.warning(
+                            f"LogicalChIfIndex rejected value={logical_value} on {vendor}; trying fallback"
+                        )
+                        continue
+                    break
+
+                if not logical_set_ok:
+                    raise RuntimeError(f"Failed to set LogicalChIfIndex: {logical_set_error}")
+            else:
+                self.logger.info(f"Skipping LogicalChIfIndex for trigger_mode={trigger_mode}")
 
             # 1. Trigger mode (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}", trigger_mode, 'i')
@@ -942,12 +1038,15 @@ class CmtsUtscService:
             clamp_warnings = []
 
             # Casa:          1-6 all accepted (empirically verified 2026-02-23 on mnd-gt0002-ccap101)
-            # E6000: 1-5 supported; Cisco cBR-8: only timeIQ(1), fftPower(2), fftIQ(4) accepted; 3/5/6 rejected
+            # E6000/Cisco:   timeIQ(1), fftPower(2), fftIQ(4) only for UTSC output format
             if is_cisco and output_format not in (1, 2, 4):
                 clamp_warnings.append(f"output_format clamped {output_format} -> 2 (Cisco cBR-8 supports timeIQ(1), fftPower(2), fftIQ(4) only — empirically verified 2026-02-23)")
                 output_format = 2
-            if not is_casa and not is_evo and not is_cisco and output_format not in (1, 2, 3, 4, 5):
-                output_format = 2  # safe fallback for E6000
+            if is_arris and output_format not in (1, 2, 4):
+                clamp_warnings.append(f"output_format clamped {output_format} -> 2 (E6000 supports timeIQ(1), fftPower(2), fftIQ(4) for UTSC)")
+                output_format = 2
+            if not is_casa and not is_evo and not is_cisco and not is_arris and output_format not in (1, 2, 3, 4, 5):
+                output_format = 2  # generic safe fallback
             self.logger.info(f"OutputFormat confirmed={output_format}")
             
             # 6. Window function (INTEGER)
@@ -1060,10 +1159,34 @@ class CmtsUtscService:
                     clamp_warnings.append(f"num_bins clamped {num_bins} -> 256 (Cisco cBR-8 minimum 256)")
                     num_bins = 256
 
+                # E6000 CenterFreq: must be multiple of 50 kHz, 0-204 MHz (Wideband) / 0-102 MHz (Narrowband)
+                # E6000 returns inconsistentValue on InitiateTest if CenterFreq is out of range.
+                if is_arris:
+                    if center_freq_hz % 50000 != 0:
+                        snapped = round(center_freq_hz / 50000) * 50000
+                        clamp_warnings.append(f"center_freq_hz snapped {center_freq_hz} -> {snapped} (E6000: must be multiple of 50 kHz)")
+                        center_freq_hz = snapped
+                    max_center = 204000000  # Wideband max; Narrowband is 102 MHz but we use Wideband
+                    if center_freq_hz > max_center:
+                        clamp_warnings.append(f"center_freq_hz clamped {center_freq_hz} -> {max_center} (E6000 Wideband max 204 MHz)")
+                        center_freq_hz = max_center
+
+                # E6000 Span: must match supported values per output format (PDF Tables 1-5)
+                if is_arris:
+                    if output_format == 1:  # TimeIQ — Wideband: 102.4/204.8/409.6 MHz
+                        valid_spans = (102400000, 204800000, 409600000)
+                    else:  # non-TimeIQ — Wideband: 80/160/320 MHz
+                        valid_spans = (80000000, 160000000, 320000000)
+                    if span_hz not in valid_spans:
+                        nearest = min(valid_spans, key=lambda x: abs(x - span_hz))
+                        clamp_warnings.append(f"span_hz snapped {span_hz} -> {nearest} (E6000 supported: {[s // 1000000 for s in valid_spans]} MHz)")
+                        span_hz = nearest
+
             self.logger.info(f"Timing after clamp: repeat={repeat_period_us}µs freerun={freerun_duration_ms}ms num_bins={num_bins} output_format={output_format} warnings={clamp_warnings}")
 
-            # Re-SET num_bins and output_format if they were clamped by vendor rules above
-            # (they were initially SET before vendor detection, so re-apply corrected values)
+            # Re-SET values that may have been clamped by vendor rules above
+            await self._snmp_set(f"{self.OID_UTSC_CFG_CENTER_FREQ}{idx}", center_freq_hz, 'u')
+            await self._snmp_set(f"{self.OID_UTSC_CFG_SPAN}{idx}", span_hz, 'u')
             await self._snmp_set(f"{self.OID_UTSC_CFG_NUM_BINS}{idx}", num_bins, 'u')
             await self._snmp_set(f"{self.OID_UTSC_CFG_OUTPUT_FORMAT}{idx}", output_format, 'i')
 
@@ -1085,14 +1208,13 @@ class CmtsUtscService:
             )
             self.logger.info(f"TriggerCount={trigger_count}")
             
-            # 12. Set filename (OctetString) — E6000 only; notWritable on Casa, not supported on Cisco
-            if is_arris:
-                # CommScope E6000: set to "" so E6000 uses its own default naming.
-                # Per MIB docs: must be "", "/pnm/utsc/filename", or "filename" (no dirs).
-                # E6000 appends timestamp: <filename>_YYYY-MM-DD_HH.MM.SS.mmm
-                await self._snmp_set(
-                    f"{self.OID_UTSC_CFG_FILENAME}{idx}", "", 's'
-                )
+            # 12. Set filename — E6000 rejects InitiateTest if filename is empty
+            # ("Utsc Cfg File name is not specified"). Must be a non-empty string.
+            # E6000 appends timestamp: <filename>_YYYY-MM-DD_HH.MM.SS.mmm
+            # notWritable on Casa (harmless), not supported on Cisco (harmless).
+            await self._snmp_set(
+                f"{self.OID_UTSC_CFG_FILENAME}{idx}", filename or "utsc", 's'
+            )
             
             # 13. Set destination index if > 0 (Unsigned32)
             if destination_index > 0:
@@ -1215,7 +1337,8 @@ class CmtsUtscService:
         async def _try_start_on_idx(target_idx: int) -> dict[str, Any]:
             idx = f".{rf_port_ifindex}.{target_idx}"
 
-            # Casa rows are often createAndWait after configure; try to move to active first.
+            # CMTS returns inconsistentValue on InitiateTest if RowStatus != active(1).
+            # Always check and set active before triggering (matches provision_utsc.py).
             row_status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
             row_status_val = self._parse_get_value(row_status_result)
             try:
@@ -1223,9 +1346,17 @@ class CmtsUtscService:
             except (ValueError, TypeError):
                 row_status_int = None
 
-            if row_status_int is not None and row_status_int != 1:
+            if row_status_int is None:
+                self.logger.warning(f"cfg_index={target_idx} RowStatus unreadable — row may not exist")
+                return {"success": False, "error": f"RowStatus unreadable at cfg_index={target_idx}"}
+
+            if row_status_int != 1:
                 self.logger.info(f"cfg_index={target_idx} RowStatus={row_status_int} -> set active(1)")
-                await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
+                activate_result = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
+                if not activate_result.get('success'):
+                    self.logger.warning(f"RowStatus activate failed: {activate_result.get('error')}")
+                    return activate_result
+                await asyncio.sleep(1)  # give CMTS time to transition row to active
 
             return await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
 

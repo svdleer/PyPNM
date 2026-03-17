@@ -27,6 +27,7 @@ class AgentManager:
         self.auth_token = auth_token
         self._task_queues: dict[str, Queue] = {}
         self._async_task_queues: dict[str, asyncio.Queue] = {}
+        self._rr_counters: dict[str, int] = {}  # round-robin index per capability
         self.logger = logging.getLogger(f'{__name__}.AgentManager')
 
     def _describe_task(self, task_id: str) -> str:
@@ -250,20 +251,25 @@ class AgentManager:
 
     def get_agent_id_for_capability(self, capability: str) -> Optional[str]:
         """
-        Return agent_id of the first agent advertising *capability*.
+        Return agent_id of the next agent advertising *capability*, round-robin.
 
         Routing rules:
         - CM task  → agent that advertises the required CM capability
         - CMTS task → agent that advertises the required CMTS capability
         - An agent advertising both will match either
         - No fallback to unrelated agents
+        - Multiple agents with the same capability are load-balanced round-robin
         """
-        for agent in self.agents.values():
-            if agent.authenticated and capability in agent.capabilities:
-                self.logger.debug(f"Routing '{capability}' task → agent '{agent.agent_id}'")
-                return agent.agent_id
-        self.logger.warning(f"No agent available for capability '{capability}' — connected agents: {list(self.agents.keys())}")
-        return None
+        capable = [a.agent_id for a in self.agents.values()
+                   if a.authenticated and capability in a.capabilities]
+        if not capable:
+            self.logger.warning(f"No agent available for capability '{capability}' — connected agents: {list(self.agents.keys())}")
+            return None
+        idx = self._rr_counters.get(capability, 0) % len(capable)
+        self._rr_counters[capability] = idx + 1
+        agent_id = capable[idx]
+        self.logger.debug(f"Routing '{capability}' task → agent '{agent_id}' (round-robin {idx+1}/{len(capable)})")
+        return agent_id
     
     async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0, priority: str = 'interactive') -> str:
         """Send task to agent. Returns task_id."""
