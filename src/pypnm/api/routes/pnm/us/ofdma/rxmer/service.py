@@ -1059,9 +1059,11 @@ class CmtsUsOfdmaRxMerService:
 
             # DestBaseUri value depends on vendor:
             # - Cisco cBR-8: full URI  tftp://ip/path
-            # - Arris/CommScope: path only  e.g. "access/pnmupload/"
+            # - Arris/CommScope: path only, e.g. "access/pnmupload/" or "/" for root
+            #   E6000 rejects the full tftp:// URI — it only accepts a path string.
+            #   When no sub-path is configured, use "/" so the device accepts the SET.
             _full_uri = f"tftp://{tftp_ip}/{_path}"
-            _uri_value = _full_uri if vendor == 'cisco' else (_path or _full_uri)
+            _uri_value = _full_uri if vendor == 'cisco' else (_path if _path else '/')
 
             # Step 1: destroy existing row (ignore errors — row may not exist)
             try:

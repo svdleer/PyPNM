@@ -55,3 +55,7 @@ site/*
 .coverage
 htmlcov/
 gitleaks-report.json
+
+# Copilot memory artifacts
+memories/
+/memories/
