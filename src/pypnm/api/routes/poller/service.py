@@ -473,43 +473,203 @@ class PollerService:
             )
             r.raise_for_status()
             payload = r.json() if r.content else {}
-            data = payload.get("data") if isinstance(payload, dict) else []
-            return data if isinstance(data, list) else []
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict):
+                for key in ("data", "results", "items"):
+                    val = payload.get(key)
+                    if isinstance(val, list):
+                        return val
+            return []
         except Exception:
             return []
 
-    def _cmts_targets_for_poller(self, poller: Dict[str, Any]) -> List[Dict[str, str]]:
-        scope_type = str(poller.get("scope_type") or "all_cmts").lower()
-        if scope_type == "all_cmts":
-            out = []
-            for c in self._fetch_appdb_cmts():
-                ip = c.get("IPAddress") or c.get("ip") or c.get("ip_address")
+    def _fetch_gui_cmts(self) -> List[Dict[str, Any]]:
+        """Fallback CMTS source used by lab GUI selector.
+
+        Expected payload shape from GUI endpoint:
+        {"status":"success", "cmts_list":[...]}.
+        """
+        base = (os.environ.get("PYPNM_GUI_BASE_URL") or "http://127.0.0.1:5050").rstrip("/")
+        url = f"{base}/api/cmts"
+        try:
+            r = requests.get(url, timeout=20, verify=False)
+            r.raise_for_status()
+            payload = r.json() if r.content else {}
+            if isinstance(payload, dict):
+                lst = payload.get("cmts_list")
+                if isinstance(lst, list):
+                    return lst
+            if isinstance(payload, list):
+                return payload
+            return []
+        except Exception:
+            return []
+
+    def _fetch_inventory_cmts(self) -> List[Dict[str, Any]]:
+        """Fallback CMTS source from previously discovered modem inventory."""
+        try:
+            rows = self._query(
+                "SELECT DISTINCT cmts, cmts_ip FROM modem_inventory_current "
+                "WHERE COALESCE(cmts_ip, '') <> '' LIMIT 2000"
+            )
+            out: List[Dict[str, Any]] = []
+            for r in rows or []:
+                ip = str(r.get("cmts_ip") or "").strip()
                 if not ip:
                     continue
-                out.append({
-                    "name": c.get("HostName") or c.get("hostname") or ip,
-                    "ip": ip,
-                })
+                out.append(
+                    {
+                        "HostName": str(r.get("cmts") or ip).strip(),
+                        "IPAddress": ip,
+                    }
+                )
             return out
+        except Exception:
+            return []
+
+    def _fetch_env_cmts(self) -> List[Dict[str, Any]]:
+        """Fallback CMTS source from env var POLLER_CMTS_TARGETS.
+
+        Accepted formats:
+        - JSON list: ["172.16.6.200", {"name":"cmts1","ip":"172.16.6.201"}]
+        - CSV text: 172.16.6.200,172.16.6.201
+        """
+        raw = (os.environ.get("POLLER_CMTS_TARGETS") or "").strip()
+        if not raw:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _push(name: str, ip: str) -> None:
+            ipn = str(ip or "").strip()
+            if not ipn or ipn in seen:
+                return
+            seen.add(ipn)
+            out.append({"HostName": str(name or ipn).strip(), "IPAddress": ipn})
+
+        parsed: Any
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
+
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str):
+                    _push(item, item)
+                elif isinstance(item, dict):
+                    ip = item.get("ip") or item.get("cmts_ip") or item.get("IPAddress")
+                    name = item.get("name") or item.get("HostName")
+                    if ip:
+                        _push(str(name or ip), str(ip))
+        return out
+
+    def _cmts_targets_for_poller(self, poller: Dict[str, Any]) -> List[Dict[str, str]]:
+        def _norm(s: Any) -> str:
+            return str(s or "").strip()
+
+        def _is_ip_literal(v: str) -> bool:
+            parts = v.split(".")
+            if len(parts) != 4:
+                return False
+            for p in parts:
+                if not p.isdigit():
+                    return False
+                n = int(p)
+                if n < 0 or n > 255:
+                    return False
+            return True
+
+        appdb_rows = self._fetch_appdb_cmts()
+        if not appdb_rows:
+            appdb_rows = self._fetch_gui_cmts()
+        if not appdb_rows:
+            appdb_rows = self._fetch_inventory_cmts()
+        if not appdb_rows:
+            appdb_rows = self._fetch_env_cmts()
+        by_name: Dict[str, str] = {}
+        all_from_appdb: List[Dict[str, str]] = []
+        for c in appdb_rows:
+            ip = _norm(c.get("IPAddress") or c.get("ip") or c.get("ip_address"))
+            if not ip:
+                continue
+            name = _norm(c.get("HostName") or c.get("hostname") or c.get("name") or ip)
+            all_from_appdb.append({"name": name, "ip": ip})
+            by_name[name.lower()] = ip
+
+        scope_type = _norm(poller.get("scope_type") or "all_cmts").lower()
+        if scope_type in {"all_cmts", "all", "all-cmts", "all_cmts_list"}:
+            return all_from_appdb
 
         raw_scope = poller.get("scope_json")
         if not raw_scope:
-            return []
-        try:
-            scope = json.loads(raw_scope) if isinstance(raw_scope, str) else raw_scope
-        except Exception:
-            return []
+            # Safe fallback for misconfigured scope in lab: if appdb has targets, use them.
+            return all_from_appdb
 
-        out = []
+        scope: Any
+        if isinstance(raw_scope, str):
+            text = raw_scope.strip()
+            if not text:
+                return all_from_appdb
+            try:
+                scope = json.loads(text)
+            except Exception:
+                # Accept comma/newline separated scope text as a convenience fallback.
+                scope = [x.strip() for x in text.replace("\n", ",").split(",") if x.strip()]
+        else:
+            scope = raw_scope
+
+        scope_items: List[Any] = []
         if isinstance(scope, list):
-            for item in scope:
-                if isinstance(item, str):
-                    out.append({"name": item, "ip": item})
-                elif isinstance(item, dict):
-                    ip = item.get("ip") or item.get("cmts_ip") or item.get("IPAddress")
-                    if ip:
-                        out.append({"name": item.get("name") or item.get("HostName") or ip, "ip": ip})
-        return out
+            scope_items = scope
+        elif isinstance(scope, dict):
+            for key in ("cmts", "cmts_list", "targets", "items"):
+                val = scope.get(key)
+                if isinstance(val, list):
+                    scope_items = val
+                    break
+            if not scope_items and scope.get("ip"):
+                scope_items = [scope]
+
+        out: List[Dict[str, str]] = []
+        seen: set[str] = set()
+
+        def _push(name: str, ip: str) -> None:
+            ipn = _norm(ip)
+            if not ipn or ipn in seen:
+                return
+            seen.add(ipn)
+            out.append({"name": _norm(name) or ipn, "ip": ipn})
+
+        for item in scope_items:
+            if isinstance(item, str):
+                token = _norm(item)
+                if not token:
+                    continue
+                if _is_ip_literal(token):
+                    _push(token, token)
+                else:
+                    resolved = by_name.get(token.lower())
+                    if resolved:
+                        _push(token, resolved)
+                    else:
+                        # Keep hostname as target_ip if no appdb mapping; downstream may resolve DNS.
+                        _push(token, token)
+            elif isinstance(item, dict):
+                ip = _norm(item.get("ip") or item.get("cmts_ip") or item.get("IPAddress"))
+                name = _norm(item.get("name") or item.get("HostName") or item.get("hostname"))
+                if not ip and name:
+                    ip = by_name.get(name.lower()) or ""
+                if ip:
+                    _push(name or ip, ip)
+
+        if out:
+            return out
+
+        # Final fallback: use all appdb targets if scope parse failed/empty.
+        return all_from_appdb
 
     def _fetch_cmts_modems(self, cmts_ip: str) -> List[Dict[str, Any]]:
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
@@ -963,8 +1123,11 @@ class PollerService:
         params: List[Any] = []
 
         if cmts:
-            where.append(f"cmts={'%s' if self.backend == 'mysql' else '?'}")
-            params.append(cmts)
+            marker = "%s" if self.backend == "mysql" else "?"
+            where.append(
+                f"(LOWER(COALESCE(cmts,'')) = LOWER({marker}) OR LOWER(COALESCE(cmts_ip,'')) = LOWER({marker}))"
+            )
+            params.extend([cmts, cmts])
 
         if search_value:
             sv = f"%{str(search_value).lower()}%"
@@ -974,8 +1137,16 @@ class PollerService:
                 params.append(sv)
             elif search_type == "mac":
                 expr = "LOWER(REPLACE(REPLACE(COALESCE(mac,''),':',''),'-',''))"
+                mac_norm = (
+                    str(search_value)
+                    .lower()
+                    .replace(":", "")
+                    .replace("-", "")
+                    .replace(".", "")
+                    .replace(" ", "")
+                )
                 where.append(f"{expr} LIKE {marker}")
-                params.append(str(search_value).lower().replace(":", "").replace("-", ""))
+                params.append(f"%{mac_norm}%")
             elif search_type == "name":
                 where.append(
                     f"(LOWER(COALESCE(vendor,'')) LIKE {marker} OR LOWER(COALESCE(model,'')) LIKE {marker} OR LOWER(COALESCE(fiber_node,'')) LIKE {marker})"
@@ -1009,6 +1180,20 @@ class PollerService:
         return self._map_inventory_row(rows[0]) if rows else None
 
     def _map_inventory_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        def _to_bool(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            text = str(value).strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off", ""}:
+                return False
+            return bool(value)
+
         return {
             "mac_address": row.get("mac"),
             "ip_address": row.get("ip"),
@@ -1021,9 +1206,9 @@ class PollerService:
             "vendor": row.get("vendor"),
             "model": row.get("model"),
             "upstream_interface": row.get("upstream_interface"),
-            "ofdm_enabled": row.get("ofdm_enabled"),
-            "ofdma_enabled": row.get("ofdma_enabled"),
-            "partial_service": row.get("partial_service"),
+            "ofdm_enabled": _to_bool(row.get("ofdm_enabled")),
+            "ofdma_enabled": _to_bool(row.get("ofdma_enabled")),
+            "partial_service": _to_bool(row.get("partial_service")),
             "updated_at": row.get("updated_at"),
         }
 

@@ -340,11 +340,13 @@ class CMTSModemService:
             # ── Step 2: Per-modem SNMP (slow — model/firmware/docsis) ──────────
             await self._enrich_modems_direct(modems, modem_community, cmts_ip=cmts_ip)
 
+            _existing_req_limit = _enrichment_cache.get(cmts_ip, {}).get('requested_limit')
             _enrichment_cache[cmts_ip] = {
                 'modems': modems,
                 'enriched': True,
                 'enriching': False,
                 'timestamp': time.time(),
+                'requested_limit': _existing_req_limit,
             }
             enriched_count = sum(1 for m in modems if m.get('model'))
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
@@ -358,6 +360,7 @@ class CMTSModemService:
                     'enriched': True,   # best-effort: stop the retry loop
                     'enriching': False,
                     'timestamp': time.time(),
+                    'requested_limit': _enrichment_cache.get(cmts_ip, {}).get('requested_limit'),
                     'partial': True,    # flag so callers can tell data is incomplete
                 }
 
