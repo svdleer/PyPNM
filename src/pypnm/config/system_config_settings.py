@@ -629,8 +629,34 @@ class SystemConfigSettings:
         return cls._get_int(cls._DEFAULT_FILE_RETRIEVAL_RETRIES, "PnmFileRetrieval", "retries")
 
     @classmethod
-    def retrieval_method(cls) -> str:
-        # Environment variable takes precedence over system.json
+    def retrieval_method(cls, scope: str | None = None) -> str:
+        """
+        Return retrieval method with optional scope override.
+
+        Scope-aware environment variables (highest precedence):
+          - scope='cm'   : CM_TFTP or PNM_FILE_SOURCE_CM
+          - scope='cmts' : CMTS_TFTP or PNM_FILE_SOURCE_CMTS
+
+        Backward-compatible fallback:
+          - PNM_FILE_SOURCE
+          - system.json retrieval_method/retrival_method
+        """
+        scope_norm = (scope or '').strip().lower()
+
+        # Scope-specific env overrides first.
+        if scope_norm == 'cm':
+            env_val = os.environ.get('CM_TFTP', '').strip().lower() or \
+                      os.environ.get('PNM_FILE_SOURCE_CM', '').strip().lower()
+            if env_val:
+                return env_val
+
+        if scope_norm == 'cmts':
+            env_val = os.environ.get('CMTS_TFTP', '').strip().lower() or \
+                      os.environ.get('PNM_FILE_SOURCE_CMTS', '').strip().lower()
+            if env_val:
+                return env_val
+
+        # Global env fallback.
         env_val = os.environ.get('PNM_FILE_SOURCE', '').strip().lower()
         if env_val:
             return env_val

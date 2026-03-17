@@ -67,7 +67,7 @@ RUN useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
  && chown -R pypnm:pypnm /app \
  && chown -R pypnm:pypnm /opt/venv
 
-USER pypnm
+USER root
 
 EXPOSE 8000
 

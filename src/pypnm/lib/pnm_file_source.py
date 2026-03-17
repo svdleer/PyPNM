@@ -63,14 +63,23 @@ def local_pnm_dir() -> Path:
     return Path(_env('TFTPBOOT_DIR', '/var/lib/tftpboot'))
 
 
-def fetch_pnm_files(filename_prefix: str, *, ftp_cfg: dict | None = None) -> List[str]:
+def fetch_pnm_files(
+    filename_prefix: str,
+    *,
+    ftp_cfg: dict | None = None,
+    allow_when_local: bool = False,
+) -> List[str]:
     """
     Download every file on the FTP server whose basename starts with
     *filename_prefix* into the local cache directory.
 
-    Returns the list of local file paths downloaded, or [] on error / not ftp mode.
+    Returns the list of local file paths downloaded, or [] on error.
+
+    By default downloads are attempted only in PNM_FILE_SOURCE=ftp mode.
+    Set allow_when_local=True for hybrid deployments where API still needs to
+    pull CMTS capture files from FTP while other flows use local/agent files.
     """
-    if not is_ftp_mode():
+    if not is_ftp_mode() and not allow_when_local:
         return []
 
     if ftp_cfg is None:

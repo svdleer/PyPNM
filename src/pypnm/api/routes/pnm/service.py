@@ -1047,6 +1047,7 @@ class PNMDiagnosticsService:
         import glob
         import math
         import os
+        from pypnm.lib.pnm_file_source import fetch_pnm_files as _fetch_pnm_files, get_cache_dir as _get_cache_dir
 
         self.logger.info(f"Triggering channel estimation for modem {self.modem_ip}")
 
@@ -1161,18 +1162,29 @@ class PNMDiagnosticsService:
             import time as _time
 
             tftp_dir        = self.TFTP_LOCAL_PATH
+            cache_dir       = _get_cache_dir()
+            search_dirs     = [tftp_dir]
+            if cache_dir and cache_dir not in search_dirs:
+                search_dirs.append(cache_dir)
             parsed_channels = []
             first_filename  = None
             RECENCY_SECS    = 1800   # accept any file written in the last 30 min
+
+            def _recent_files(base_dir: str, patterns: list[str]) -> list[str]:
+                out: list[str] = []
+                for pat in patterns:
+                    out += glob.glob(os.path.join(base_dir, pat))
+                now = _time.time()
+                return [f for f in out if os.path.exists(f) and abs(now - os.path.getmtime(f)) < RECENCY_SECS]
 
             # Pre-collect PNMChEstCoef_{MAC}* files that have no ifindex in the
             # filename; sort oldest→newest so they map in channel order.
             # Each successive ifindex pops the next file from the list.
             # Modems write these with lowercase MAC — search both cases.
-            _coef_candidates = set(
-                glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_upper}*')) +
-                glob.glob(os.path.join(tftp_dir, f'PNMChEstCoef_{mac_clean}*'))
-            )
+            _coef_candidates = set()
+            for _dir in search_dirs:
+                _coef_candidates.update(glob.glob(os.path.join(_dir, f'PNMChEstCoef_{mac_upper}*')))
+                _coef_candidates.update(glob.glob(os.path.join(_dir, f'PNMChEstCoef_{mac_clean}*')))
             pnm_coef_pool = sorted(
                 [f for f in _coef_candidates
                  if abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS],
@@ -1184,39 +1196,48 @@ class PNMDiagnosticsService:
                     self.logger.info(f"ChanEst ifindex={ifindex} skipped (status={failed_ifindexes[ifindex]})")
                     continue
 
-                fname    = filenames[ifindex]
-                bin_path = os.path.join(tftp_dir, fname)
+                fname = filenames[ifindex]
+                bin_path = ''
 
-                if not os.path.exists(bin_path):
-                    bin_path = bin_path + '.bin'
+                # 1) Direct filename check across search dirs
+                for _dir in search_dirs:
+                    cand = os.path.join(_dir, fname)
+                    if os.path.exists(cand):
+                        bin_path = cand
+                        break
+                    cand_bin = cand + '.bin'
+                    if os.path.exists(cand_bin):
+                        bin_path = cand_bin
+                        break
 
-                if not os.path.exists(bin_path):
+                # 2) Pattern fallback (ifindex/channel_id/mac wildcards)
+                if not bin_path:
                     # Build candidate list.
                     # Modems write the file using their internal channel_id
                     # (small integer from the OID value), NOT the SNMP ifIndex
                     # (large OID-suffix number).  Search both.
                     chan_id = ifindex_to_chanid.get(ifindex)
                     candidates = []
-                    for pattern in [
-                        # ifindex-based (some vendors match this)
-                        os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_{ifindex}_*'),
-                        os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*'),
-                        os.path.join(tftp_dir, f'chan_est_{mac_clean}_{ifindex}_*.bin'),
-                    ]:
-                        candidates += glob.glob(pattern)
+                    for _dir in search_dirs:
+                        for pattern in [
+                            f'ds_ofdm_chan_est_coef_{mac_clean}_{ifindex}_*',
+                            f'chan_est_{mac_clean}_{ifindex}_*',
+                            f'chan_est_{mac_clean}_{ifindex}_*.bin',
+                        ]:
+                            candidates += glob.glob(os.path.join(_dir, pattern))
                     # channel_id-based (most modems: Technicolor, Netgear, etc.)
                     if chan_id is not None and not candidates:
-                        for pattern in [
-                            os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_{chan_id}_*'),
-                            os.path.join(tftp_dir, f'chan_est_{mac_clean}_{chan_id}_*'),
-                        ]:
-                            candidates += glob.glob(pattern)
+                        for _dir in search_dirs:
+                            for pattern in [
+                                f'ds_ofdm_chan_est_coef_{mac_clean}_{chan_id}_*',
+                                f'chan_est_{mac_clean}_{chan_id}_*',
+                            ]:
+                                candidates += glob.glob(os.path.join(_dir, pattern))
                     # MAC-only wildcard fallback — pick N most-recent files for N channels
                     if not candidates:
-                        candidates = sorted(
-                            glob.glob(os.path.join(tftp_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_*')),
-                            key=os.path.getmtime,
-                        )
+                        for _dir in search_dirs:
+                            candidates += glob.glob(os.path.join(_dir, f'ds_ofdm_chan_est_coef_{mac_clean}_*'))
+                        candidates = sorted(set(candidates), key=os.path.getmtime)
 
                     recent = [f for f in candidates
                               if os.path.exists(f) and abs(_time.time() - os.path.getmtime(f)) < RECENCY_SECS]
@@ -1227,12 +1248,27 @@ class PNMDiagnosticsService:
                         # PNMChEstCoef_ files have no ifindex — assign one per channel
                         bin_path = pnm_coef_pool.pop(0)
 
+                # 3) Final API-side fetch from FTP and re-search in cache
+                if not bin_path:
+                    try:
+                        _fetch_pnm_files(fname, allow_when_local=True)
+                    except Exception as _ftp_err:
+                        self.logger.warning(f"ChanEst FTP prefetch failed for {fname}: {_ftp_err}")
+                    # Retry from cache only (where fetched files land)
+                    recent_cache = _recent_files(cache_dir, [
+                        f'{fname}*',
+                        f'chan_est_{mac_clean}_{ifindex}_*',
+                        f'chan_est_{mac_clean}_{ifindex}_*.bin',
+                    ])
+                    if recent_cache:
+                        bin_path = max(recent_cache, key=os.path.getmtime)
+
                 self.logger.info(f"ChanEst ifindex={ifindex} file: {bin_path}")
 
                 coefficients   = []
                 center_freq_mhz = None
 
-                if os.path.exists(bin_path):
+                if bin_path and os.path.exists(bin_path):
                     if first_filename is None:
                         first_filename = os.path.basename(bin_path)
                     try:
@@ -1259,6 +1295,10 @@ class PNMDiagnosticsService:
                         )
                     except Exception as parse_err:
                         self.logger.error(f"ChanEst parse error {bin_path}: {parse_err}", exc_info=True)
+                else:
+                    self.logger.warning(
+                        f"ChanEst file missing for ifindex={ifindex}; searched dirs={search_dirs}, fname={fname}"
+                    )
 
                 parsed_channels.append({
                     'channel_id':      ifindex,

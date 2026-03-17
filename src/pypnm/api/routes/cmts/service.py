@@ -210,7 +210,7 @@ class CMTSModemService:
             walk_result = await self._send_agent_command(
                 'snmp_parallel_walk',
                 {'ip': cmts_ip, 'oids': walk_oids,
-                 'community': community, 'timeout': 5},  # 5s per PDU × 24 PDUs = 120s max per tree
+                 'community': community, 'timeout': 5, 'limit': limit},  # apply limit at walk source for fast preload
                 timeout=300,  # 300s server wait — 9 concurrent trees each up to 120s
             )
             if not walk_result.get('success'):
@@ -726,7 +726,10 @@ class CMTSModemService:
                          and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses]
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (batch=200, max_concurrent={MAX_CONCURRENT}, community={modem_community})")
+        BATCH_SIZE = 200
+        MAX_CONCURRENT = 5  # matches the 5-worker bulk pool on the agent
+
+        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (batch={BATCH_SIZE}, max_concurrent={MAX_CONCURRENT}, community={modem_community})")
         if not online_modems:
             return modems
 
@@ -813,8 +816,6 @@ class CMTSModemService:
         # ── Process in batches of 200, flushing results to cache after each ──
         # This lets the GUI display enriched data for the first 200 modems
         # within ~30s, then progressively fills in the rest.
-        BATCH_SIZE = 200
-        MAX_CONCURRENT = 5  # matches the 5-worker bulk pool on the agent
         sem = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def _enrich_one_sem(modem: dict):

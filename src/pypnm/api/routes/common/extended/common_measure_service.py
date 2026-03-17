@@ -524,14 +524,31 @@ class CommonMeasureService(CommonMessagingService):
         Returns:
             bool: True if the file was successfully retrieved and moved; False otherwise.
         """
-        method = SystemConfigSettings.retrieval_method()
+        # Docs/common modem measurements should use CM-scoped retrieval policy.
+        method = SystemConfigSettings.retrieval_method('cm')
         print(f"=== Retrieval method: {method} ===", flush=True)
         print(f"=== Config path: {SystemConfigSettings._cfg.get_config_path()} ===", flush=True)
         self.logger.info(f"{self.log_prefix} - Retrieval method: {method}")
 
         try:
             if method == "local":
-                return await self._handle_local_fetch(pnm_file_name)
+                local_status = await self._handle_local_fetch(pnm_file_name)
+                if local_status == ServiceStatusCode.SUCCESS:
+                    return local_status
+
+                # Mixed deployments: keep local as primary, but automatically
+                # fall back to FTP then agent when the local source has no file.
+                self.logger.warning(
+                    f"{self.log_prefix} - Local fetch failed for {pnm_file_name}; trying FTP fallback"
+                )
+                ftp_status = self._handle_ftp_fetch(pnm_file_name)
+                if ftp_status == ServiceStatusCode.SUCCESS:
+                    return ftp_status
+
+                self.logger.warning(
+                    f"{self.log_prefix} - FTP fallback failed for {pnm_file_name}; trying agent fallback"
+                )
+                return await self._handle_agent_file_fetch(pnm_file_name)
             elif method == "tftp":
                 return self._handle_tftp_fetch(pnm_file_name)
             elif method == "ftp":

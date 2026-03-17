@@ -20,8 +20,10 @@ LOG_FILE="${LOG_DIR}/pypnm.log"
 
 DATA_DIR="/app/.data"
 OUTPUT_DIR="/app/output"
+VOLUME_DATA_DIR="/app/data"
+VOLUME_CACHE_DIR="/app/data/pnm_cache"
 
-mkdir -p "${CONFIG_DIR}" "${LOG_DIR}" "${DATA_DIR}" "${OUTPUT_DIR}"
+mkdir -p "${CONFIG_DIR}" "${LOG_DIR}" "${DATA_DIR}" "${OUTPUT_DIR}" "${VOLUME_DATA_DIR}" "${VOLUME_CACHE_DIR}"
 
 # Resolve installed package settings path for system.json
 PKG_SETTINGS_DIR="$(python3.12 - <<'PY'
@@ -62,6 +64,11 @@ fi
 
 chown -R "${APP_UID}:${APP_GID}" "${CONFIG_DIR}" "${LOG_DIR}" "${DATA_DIR}" "${OUTPUT_DIR}" || true
 chmod -R u+rwX,go-rwx "${CONFIG_DIR}" "${LOG_DIR}" "${DATA_DIR}" "${OUTPUT_DIR}" || true
+
+# Ensure volume-backed data directories remain writable even when Docker
+# recreates the volume with host-side ownership that differs from APP_UID.
+chown -R "${APP_UID}:${APP_GID}" "${VOLUME_DATA_DIR}" || true
+chmod -R u+rwX,g+rX "${VOLUME_DATA_DIR}" || true
 # Prepare demo directory if present
 if [ -d "/app/demo" ]; then
   mkdir -p /app/demo/.demo
@@ -69,7 +76,4 @@ if [ -d "/app/demo" ]; then
   chmod -R u+rwX,go-rwx /app/demo || true
 fi
 
-#!/bin/sh
-set -e
-
-exec "$@"  
+exec gosu "${APP_UID}:${APP_GID}" "$@"

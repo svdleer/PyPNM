@@ -35,6 +35,7 @@ from pypnm.lib.pnm_file_source import (
     fetch_pnm_files as _fetch_pnm_files,
     delete_pnm_files as _delete_pnm_files,
     local_pnm_dir as _local_pnm_dir,
+    get_cache_dir as _get_cache_dir,
     is_ftp_mode as _is_ftp_mode,
 )
 
@@ -940,21 +941,27 @@ class UsOfdmaRxMerRouter:
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
             import glob
             
-            # Build file path - CMTS adds timestamp, so use glob to find latest
-            # In ftp mode always use local cache dir regardless of what tftp_path was sent
+            # Build file path - CMTS adds timestamp, so use glob to find latest.
+            # In hybrid deployments (PNM_FILE_SOURCE=agent/local + FTP configured),
+            # still include cache dir lookup for API-side FTP retrieval.
             tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
+            cache_dir = Path(_get_cache_dir())
 
             # Strip leading '/' — Cisco/E6000 SNMP returns e.g. /pnm/mer/usrxmer_xxx
             # which Python's Path join treats as absolute, discarding tftp_dir entirely.
             filename = request.filename.lstrip('/')
 
-            # In ftp mode, pre-fetch matching files from FTP server into local cache
+            # Try API-side FTP prefetch for this capture prefix in both ftp and hybrid modes.
             basename = Path(filename).name
-            if _is_ftp_mode():
-                _fetch_pnm_files(basename)
+            try:
+                _fetch_pnm_files(basename, allow_when_local=True)
+            except Exception as e:
+                self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
 
             # First try exact filename
             filepath = tftp_dir / filename
+            if not filepath.exists():
+                filepath = cache_dir / filename
 
             if not filepath.exists():
                 # CMTS may add a path prefix (e.g. /pnm/mer/) and/or a timestamp suffix.
@@ -966,6 +973,9 @@ class UsOfdmaRxMerRouter:
                     str(tftp_dir / f"{filename}_*"),           # timestamped, same subdir
                     str(tftp_dir / "**" / basename),           # any subdir, exact name
                     str(tftp_dir / "**" / f"{basename}_*"),    # any subdir, timestamped
+                    str(cache_dir / f"{filename}_*"),
+                    str(cache_dir / "**" / basename),
+                    str(cache_dir / "**" / f"{basename}_*"),
                 ]:
                     matching_files = sorted(glob.glob(pattern, recursive=True), reverse=True)
                     if matching_files:
@@ -973,10 +983,10 @@ class UsOfdmaRxMerRouter:
                         self.logger.info(f"Found file via pattern '{pattern}': {filepath}")
                         break
                 else:
-                    self.logger.error(f"File not found: {tftp_dir / filename}")
+                    self.logger.error(f"File not found: tried {tftp_dir / filename} and {cache_dir / filename}")
                     return UsOfdmaRxMerCaptureResponse(
                         success=False,
-                        error=f"File not found: {tftp_dir / basename}"
+                        error=f"File not found: {basename}"
                     )
             
             self.logger.info(f"Loading US RxMER file: {filepath}")
@@ -1085,11 +1095,16 @@ class UsOfdmaRxMerRouter:
             import glob
 
             tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
+            cache_dir = Path(_get_cache_dir())
             filename = request.filename.lstrip('/')
             basename = Path(filename).name
-            if _is_ftp_mode():
-                _fetch_pnm_files(basename)
+            try:
+                _fetch_pnm_files(basename, allow_when_local=True)
+            except Exception as e:
+                self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
             filepath = tftp_dir / filename
+            if not filepath.exists():
+                filepath = cache_dir / filename
 
             if not filepath.exists():
                 basename = Path(filename).name
@@ -1097,6 +1112,9 @@ class UsOfdmaRxMerRouter:
                     str(tftp_dir / f"{filename}_*"),
                     str(tftp_dir / "**" / basename),
                     str(tftp_dir / "**" / f"{basename}_*"),
+                    str(cache_dir / f"{filename}_*"),
+                    str(cache_dir / "**" / basename),
+                    str(cache_dir / "**" / f"{basename}_*"),
                 ]:
                     matching_files = sorted(glob.glob(pattern, recursive=True), reverse=True)
                     if matching_files:
@@ -1105,7 +1123,7 @@ class UsOfdmaRxMerRouter:
                 else:
                     return UsOfdmaRxMerCaptureResponse(
                         success=False,
-                        error=f"File not found: {tftp_dir / Path(filename).name}"
+                        error=f"File not found: {Path(filename).name}"
                     )
 
             try:
@@ -1160,22 +1178,41 @@ class UsOfdmaRxMerRouter:
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
             import glob, statistics as _stat
 
-            tftp_dir = Path(tftp_path)
-            fn = filename.lstrip('/')
-            fp = tftp_dir / fn
-            if not fp.exists():
-                basename = Path(fn).name
+            def _find_capture(base_dir: Path, key: str):
+                if not base_dir:
+                    return None
+                fn_local = key.lstrip('/')
+                fp_local = base_dir / fn_local
+                if fp_local.exists():
+                    return fp_local
+                basename_local = Path(fn_local).name
                 for pat in [
-                    str(tftp_dir / f"{fn}_*"),
-                    str(tftp_dir / "**" / basename),
-                    str(tftp_dir / "**" / f"{basename}_*"),
+                    str(base_dir / f"{fn_local}_*"),
+                    str(base_dir / "**" / basename_local),
+                    str(base_dir / "**" / f"{basename_local}_*"),
                 ]:
                     matches = sorted(glob.glob(pat, recursive=True), reverse=True)
                     if matches:
-                        fp = Path(matches[0])
-                        break
-                else:
-                    raise FileNotFoundError(f"File not found: {Path(fn).name}")
+                        return Path(matches[0])
+                return None
+
+            tftp_dir = Path(tftp_path)
+            fn = filename.lstrip('/')
+            fp = _find_capture(tftp_dir, fn)
+
+            # If missing, always let PyPNM API fetch capture(s) directly from FTP.
+            # CMTS RxMER capture retrieval belongs in API, also for hybrid setups
+            # where other flows remain local/agent-based.
+            if fp is None:
+                try:
+                    _fetch_pnm_files(Path(fn).name, allow_when_local=True)
+                except Exception as e:
+                    self.logger.warning(f"FTP fetch skipped for {Path(fn).name}: {e}")
+                cache_dir = Path(_get_cache_dir())
+                fp = _find_capture(cache_dir, fn)
+
+            if fp is None:
+                raise FileNotFoundError(f"File not found: {Path(fn).name}")
 
             model = CmtsUsOfdmaRxMer(fp.read_bytes()).to_model()
             vals = model.values
