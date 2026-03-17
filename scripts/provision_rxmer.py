@@ -58,7 +58,6 @@ TFTP_PATH  = "./"
 
 # RxMER parameters
 BDT_ROW       = 1
-FILENAME      = "us_rxmer"
 PRE_EQ        = 1    # 1=true (include pre-equalizer coefficients)
 NUM_AVGS      = 1    # number of averages
 
@@ -94,7 +93,6 @@ OID_IF_DESCR  = "1.3.6.1.2.1.2.2.1.2"
 
 # RowStatus values
 RS_ACTIVE        = 1
-RS_DESTROY       = 6
 RS_CREATE_AND_GO = 4
 
 MEAS_STATUS = {
@@ -114,7 +112,10 @@ TFTP_HEX = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))
 # SNMP helpers
 # ============================================================
 
-SNMP_PREFIX = 'ssh access-engineering.nl "docker exec pypnm-agent-lab {cmd}"'
+SNMP_PREFIX = os.environ.get(
+    "SNMP_PREFIX",
+    'ssh access-engineering.nl "docker exec pypnm-agent-lab {cmd}"'
+)
 
 
 def _run(cmd: str) -> str:
@@ -174,20 +175,28 @@ def detect_vendor() -> tuple[str, str]:
 # BDT setup (vendor-specific, same as provision_utsc.py)
 # ============================================================
 
+def _bdt_row_exists(row: int) -> bool:
+    """Return True if docsPnmBulkDataTransferCfgTable row already exists."""
+    raw = snmpget(f"{OID_BDT_E6000}.9.{row}")
+    # RowStatus active(1) or notInService(2) or notReady(3) = row exists
+    return "No Such" not in raw and "noSuchObject" not in raw and raw != ""
+
+
 def configure_bdt_cisco(row: int):
     """Cisco BDT: docsPnmBulkDataTransferCfgTable."""
     tftp = TFTP_IP_CCAP
     tftp_hex = "".join(f"{int(o):02X}" for o in tftp.split("."))
     step(f"BDT row {row} — Cisco (docsPnmBulkDataTransferCfgTable) — TFTP {tftp}")
-    snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_DESTROY)
-    time.sleep(2)
-    print(f"  RowStatus.{row} = createAndGo(4)")
-    r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
-    print(f"    {r}")
-    time.sleep(1)
+    # Only createAndGo if the row does not yet exist
+    if _bdt_row_exists(row):
+        print(f"  RowStatus row {row} already exists — updating existing row")
+    else:
+        print(f"  RowStatus.{row} = createAndGo(4)")
+        r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
+        print(f"    {r}")
     fields = [
-        (f"{OID_BDT_E6000}.3.{row}", "i", 1,        "DestHostIpAddrType = ipv4(1)"),
-        (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex,  f"DestHostIpAddress  = {tftp}"),
+        (f"{OID_BDT_E6000}.3.{row}", "i", 1,                f"DestHostIpAddrType = ipv4(1)"),
+        (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex,          f"DestHostIpAddress  = {tftp}"),
         (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{tftp}/", f"DestBaseUri        = tftp://{tftp}/"),
     ]
     for oid, t, v, desc in fields:
@@ -199,11 +208,16 @@ def configure_bdt_cisco(row: int):
 def configure_bdt_e6000(row: int):
     """E6000 BDT: docsPnmBulkDataTransferCfgTable."""
     step(f"BDT row {row} — E6000 (docsPnmBulkDataTransferCfgTable) — TFTP {TFTP_IP}")
+    # Only createAndGo if the row does not yet exist
+    if _bdt_row_exists(row):
+        print(f"  RowStatus row {row} already exists — updating existing row")
+    else:
+        print(f"  RowStatus         = createAndGo(4)")
+        r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
+        print(f"    {r}")
     fields = [
-        (f"{OID_BDT_E6000}.3.{row}", "i", 1,        "DestHostIpAddrType = ipv4(1)"),
-        (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX,  f"DestHostIpAddress  = {TFTP_IP}"),
-        (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{TFTP_IP}/", f"DestBaseUri        = tftp://{TFTP_IP}/"),
-        (f"{OID_BDT_E6000}.7.{row}", "i", 1,        "Protocol          = tftp(1)"),
+        (f"{OID_BDT_E6000}.3.{row}", "i", 1,       "DestHostIpAddrType = ipv4(1)"),
+        (f"{OID_BDT_E6000}.4.{row}", "x", TFTP_HEX, f"DestHostIpAddress  = {TFTP_IP}"),
     ]
     for oid, t, v, desc in fields:
         print(f"  {desc}")
@@ -256,7 +270,6 @@ def configure_rxmer(ofdma_idx: int, cm_mac: str, dest_index: int, vendor: str):
 
     params = [
         (f"{OID_RXMER_CM_MAC}{idx}",  "x", mac_hex,     f"CmMac            = {cm_mac}"),
-        (f"{OID_RXMER_FILE}{idx}",    "s", FILENAME,     f"FileName         = {FILENAME}"),
         (f"{OID_RXMER_PRE_EQ}{idx}",  "i", PRE_EQ,       f"PreEq            = {PRE_EQ} (1=with pre-eq)"),
         (f"{OID_RXMER_AVGS}{idx}",    "u", NUM_AVGS,      f"NumAvgs          = {NUM_AVGS}"),
     ]
@@ -270,6 +283,13 @@ def configure_rxmer(ofdma_idx: int, cm_mac: str, dest_index: int, vendor: str):
         time.sleep(0.05)
 
     step(f"Enable=1  (trigger)  ofdma_ifindex={ofdma_idx}")
+    # If a previous measurement is still running, stop it first
+    raw = snmpget(f"{OID_RXMER_STATUS}.{ofdma_idx}")
+    s = val(raw)
+    if s == 3:  # busy
+        print(f"  MeasStatus=busy — sending Enable=2 to stop previous measurement")
+        snmpset(f"{OID_RXMER_ENABLE}.{ofdma_idx}", "i", 2)
+        time.sleep(2)
     r = snmpset(f"{OID_RXMER_ENABLE}{idx}", "i", 1)
     print(f"  {r}")
 
