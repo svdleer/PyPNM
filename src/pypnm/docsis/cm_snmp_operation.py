@@ -1983,39 +1983,6 @@ class CmSnmpOperation:
         if spec_ana_cmd.precheck_spectrum_analyzer_settings():
             self.logger.debug(f'SpectrumAnalyzerPara-PreCheck-Changed: {spec_ana_cmd.to_dict()}')
 
-        '''
-            Custom SNMP SET for Spectrum Analyzer
-        '''
-        async def __snmp_set(field_name:str, obj_value:str | int, snmp_type:type) -> bool:
-            """ Helper function to perform SNMP set and verify the result."""
-            base_oid = COMPILED_OIDS.get(field_name)
-            if not base_oid:
-                self.logger.warning(f'OID not found for field "{field_name}", skipping.')
-                return False
-
-            oid = f"{base_oid}.0"
-            self.logger.info(f'SPECTRUM SET: {field_name} -> OID: {oid} -> Value: {obj_value}')
-
-            set_response = await self._snmp.set(oid, obj_value, snmp_type)
-            self.logger.info(f'SPECTRUM SET Response: {field_name} = {set_response}')
-
-            if not set_response:
-                self.logger.error(f'SPECTRUM SET FAILED: {field_name} to ({obj_value}) - No response')
-                return False
-
-            result = Snmp_v2c.snmp_set_result_value(set_response)[0]
-
-            if not result:
-                self.logger.error(f'SPECTRUM SET FAILED: {field_name} to ({obj_value}) - Result empty')
-                return False
-
-            logging.debug(f"Result({result}): {type(result)} -> Value({obj_value}): {type(obj_value)}")
-
-            if str(result) != str(obj_value):
-                logging.error(f'Failed to set {field_name}. Expected ({obj_value}), got ({result})')
-                return False
-            return True
-
         # Need to get Diplex Setting to make sure that the Spec Analyzer setting are within the band
         self.logger.info('Reading diplexer configuration')
         try:
@@ -2032,130 +1999,55 @@ class CmSnmpOperation:
         upper_edge = diplex_dict["docsIf31CmSystemCfgStateDiplexerCfgDsUpperBandEdge"] * 1_000_000
         """
         
-        # Check docsPnmCmCtlStatus and clear any error/active state before starting new measurement
         try:
-            status = await self.getDocsPnmCmCtlMeasStatus()
-            self.logger.info(f'Current PNM measurement status: {status}')
-            
-            # If a test is in progress or in error state, reset it by disabling
-            # According to MIB spec, docsPnmCmCtlStatus must be 'ready' to start new measurement
-            if status in [DocsPnmCmCtlMeasStatus.TEST_IN_PROGRESS, DocsPnmCmCtlMeasStatus.ERROR]:
-                self.logger.info(f'PNM measurement in state {status}, resetting before new measurement...')
-                
-                # Reset by setting both Enable and FileEnable to FALSE
-                # First disable SNMP amplitude data capture
-                disable_response = await self._snmp.set('docsIf3CmSpectrumAnalysisCtrlCmdEnable.0', Snmp_v2c.FALSE, Integer32)
-                if disable_response:
-                    self.logger.debug('Set CmdEnable to FALSE')
-                
-                # Then disable file-based capture
-                disable_response = await self._snmp.set('docsIf3CmSpectrumAnalysisCtrlCmdFileEnable.0', Snmp_v2c.FALSE, Integer32)
-                if disable_response:
-                    self.logger.info(f'Successfully reset spectrum analyzer from {status} state')
-                    # Wait for the modem to process the reset
-                    time.sleep(1)
-                else:
-                    self.logger.warning(f'Failed to reset from {status} state, attempting to proceed anyway')
-            elif status == DocsPnmCmCtlMeasStatus.READY:
-                self.logger.debug('PNM status is READY, proceeding with new measurement')
-            else:
-                self.logger.warning(f'Unexpected PNM status: {status}, attempting to proceed')
-        except Exception as e:
-            self.logger.warning(f'Failed to check/reset measurement status: {e}')
-            # Continue anyway - the modem might support spectrum analyzer despite the error
-        
-        try:
-            field_type_map = {
-                "docsIf3CmSpectrumAnalysisCtrlCmdInactivityTimeout": Integer32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency": Gauge32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency": Gauge32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan": Gauge32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdNumBinsPerSegment": Gauge32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdEquivalentNoiseBandwidth": Gauge32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdWindowFunction": Integer32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdNumberOfAverages": Gauge32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdEnable": Integer32,
-                "docsIf3CmSpectrumAnalysisCtrlCmdFileName": OctetString,
-                "docsIf3CmSpectrumAnalysisCtrlCmdFileEnable": Integer32,
-            }
+            # Ensure FileName is set before building the sequence
+            if not spec_ana_cmd.docsIf3CmSpectrumAnalysisCtrlCmdFileName:
+                spec_ana_cmd.docsIf3CmSpectrumAnalysisCtrlCmdFileName = (
+                    f'snmp-amplitude-get-flag-{Generate.time_stamp()}'
+                )
 
-            '''
-                Note: MUST BE THE LAST 2 AND IN THIS ORDER:
-                    docsIf3CmSpectrumAnalysisCtrlCmdEnable      <- Triggers SNMP AMPLITUDE DATA RETURN
-                    docsIf3CmSpectrumAnalysisCtrlCmdFileEnable  <- Trigger PNM FILE RETURN, OVERRIDES SNMP AMPLITUDE DATA RETURN
-            '''
+            file_enable_val = (
+                str(Snmp_v2c.TRUE)
+                if spectrum_retrieval_type == SpectrumRetrievalType.FILE
+                else str(Snmp_v2c.FALSE)
+            )
 
-            # Iterating through the fields and setting their values via SNMP
-            for field_name, snmp_type in field_type_map.items():
-                obj_value = getattr(spec_ana_cmd, field_name)
+            # Build the full SET sequence as a single agent task.
+            # Order is mandatory per DOCSIS spec:
+            #   1–8  configuration fields
+            #   9–10 Enable toggle (FALSE→sleep 1 s→TRUE) triggers SNMP amplitude capture
+            #   11   FileName
+            #   12   FileEnable (TRUE overrides to PNM-file capture)
+            def _v(field_name: str) -> str:
+                v = getattr(spec_ana_cmd, field_name)
+                return str(v.value) if isinstance(v, Enum) else str(v)
 
-                self.logger.debug(f'Field-Name: {field_name} -> SNMP-Type: {snmp_type}')
+            sequence = [
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdInactivityTimeout.0',         'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdInactivityTimeout'),         'type': 'i'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency.0','value': _v('docsIf3CmSpectrumAnalysisCtrlCmdFirstSegmentCenterFrequency'),'type': 'g'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency.0', 'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdLastSegmentCenterFrequency'), 'type': 'g'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan.0',       'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdSegmentFrequencySpan'),       'type': 'g'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdNumBinsPerSegment.0',          'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdNumBinsPerSegment'),          'type': 'g'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdEquivalentNoiseBandwidth.0',   'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdEquivalentNoiseBandwidth'),   'type': 'g'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdWindowFunction.0',             'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdWindowFunction'),             'type': 'i'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdNumberOfAverages.0',           'value': _v('docsIf3CmSpectrumAnalysisCtrlCmdNumberOfAverages'),           'type': 'g'},
+                # Toggle Enable FALSE → TRUE (sleep_after=1 between them)
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdEnable.0', 'value': str(Snmp_v2c.FALSE), 'type': 'i', 'sleep_after': 1},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdEnable.0', 'value': str(Snmp_v2c.TRUE),  'type': 'i'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdFileName.0',   'value': spec_ana_cmd.docsIf3CmSpectrumAnalysisCtrlCmdFileName, 'type': 's'},
+                {'oid': 'docsIf3CmSpectrumAnalysisCtrlCmdFileEnable.0', 'value': file_enable_val,  'type': 'i'},
+            ]
 
-                ##############################################################
-                # OVERRIDE SECTION TO MAKE SURE WE FOLLOW THE SPEC-ANA RULES #
-                ##############################################################
+            self.logger.info(f'SPECTRUM SET SEQUENCE: {len(sequence)} SETs to {self._inet} as single agent task')
+            result = await self._snmp.set_sequence(sequence)
 
-                if field_name == "docsIf3CmSpectrumAnalysisCtrlCmdFileName":
-                    file_name = getattr(spec_ana_cmd, field_name)
+            if not result or not result.get('success'):
+                failed = (result or {}).get('failed_oid', 'unknown')
+                err    = (result or {}).get('error', 'no response')
+                self.logger.error(f'SPECTRUM SET SEQUENCE FAILED at OID {failed}: {err}')
+                return False
 
-                    if not file_name:
-                        setattr(spec_ana_cmd, field_name,f'snmp-amplitude-get-flag-{Generate.time_stamp()}')
-
-                    await __snmp_set(field_name, getattr(spec_ana_cmd, field_name) , snmp_type)
-
-                    continue
-
-                #######################################################################################
-                #                                                                                     #
-                #                   START SPECTRUM ANALYZER MEASURING PROCESS                         #
-                #                                                                                     #
-                # This OID Triggers the start of the Spectrum Analysis for SNMP-AMPLITUDE-DATA RETURN #
-                #######################################################################################
-                elif field_name == "docsIf3CmSpectrumAnalysisCtrlCmdEnable":
-
-                    obj_value = Snmp_v2c.TRUE
-                    self.logger.debug(f'Field-Name: {field_name} -> SNMP-Type: {snmp_type}')
-
-                    # Need to toggle ? -> FALSE -> TRUE
-                    if not await __snmp_set(field_name, Snmp_v2c.FALSE, snmp_type):
-                        self.logger.error(f'Fail to set {field_name} to {Snmp_v2c.FALSE}')
-                        return False
-
-                    time.sleep(1)
-
-                    if not await __snmp_set(field_name, Snmp_v2c.TRUE, snmp_type):
-                        self.logger.error(f'Fail to set {field_name} to {Snmp_v2c.TRUE}')
-                        return False
-
-                    continue
-
-                ######################################################################################
-                #
-                #                   CHECK SPECTRUM ANALYZER MEASURING PROCESS
-                #                           FOR PNM FILE RETRIVAL
-                #
-                # This OID Triggers the start of the Spectrum Analysis for PNM-FILE RETURN
-                # Override SNMP-AMPLITUDE-DATA RETURN
-                ######################################################################################
-                elif field_name == "docsIf3CmSpectrumAnalysisCtrlCmdFileEnable":
-                    obj_value = Snmp_v2c.TRUE if spectrum_retrieval_type == SpectrumRetrievalType.FILE else Snmp_v2c.FALSE
-                    self.logger.debug(f'Setting File Retrival, Set-And-Go({set_and_go}) -> Value: {obj_value}')
-
-                ###############################################
-                # Set Field setting not change by above rules #
-                ###############################################
-                if isinstance(obj_value, Enum):
-                    obj_value = str(obj_value.value)
-                    self.logger.debug(f'ENUM Found: Set Value Type: {obj_value} -> {type(obj_value)}')
-                else:
-                    obj_value = str(obj_value)
-
-                self.logger.debug(f'{field_name} -> Set Value Type: {obj_value} -> {type(obj_value)}')
-
-                if not await __snmp_set(field_name, obj_value, snmp_type):
-                    self.logger.error(f'Fail to set {field_name} to {obj_value}')
-                    return False
-
+            self.logger.info('SPECTRUM SET SEQUENCE: all SETs completed successfully')
             return True
 
         except Exception:

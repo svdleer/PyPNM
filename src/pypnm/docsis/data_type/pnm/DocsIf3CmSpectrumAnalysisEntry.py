@@ -111,9 +111,39 @@ class DocsIf3CmSpectrumAnalysisEntry(BaseModel):
             ).items() if v is None
         }
         if missing:
-            raise ValueError(
-                f"SpectrumAnalysis idx={index}: missing required fields: {', '.join(missing.keys())}"
+            log.warning(
+                "SpectrumAnalysis idx=%s: missing fields %s — substituting defaults",
+                index, ', '.join(missing.keys())
             )
+            # Substitute safe defaults so downstream processing can continue.
+            # These OIDs are write-only on some firmware and cannot be read back
+            # immediately after a SET (notReadable / noSuchObject).
+            defaults = dict(
+                enable=False, timeout=0, first_cf=0, last_cf=0,
+                span_hz=0, num_bins=0, enbw=0, window_fn=0,
+                num_avg=0, file_enable=False, meas_status_i=0, file_name='',
+            )
+            for k in missing:
+                locals_snapshot = {
+                    'enable': enable, 'timeout': timeout, 'first_cf': first_cf,
+                    'last_cf': last_cf, 'span_hz': span_hz, 'num_bins': num_bins,
+                    'enbw': enbw, 'window_fn': window_fn, 'num_avg': num_avg,
+                    'file_enable': file_enable, 'meas_status_i': meas_status_i,
+                    'file_name': file_name,
+                }
+                # reassign via the name→local mapping
+                if k == 'enable':        enable        = defaults[k]
+                elif k == 'timeout':     timeout       = defaults[k]
+                elif k == 'first_cf':    first_cf      = defaults[k]
+                elif k == 'last_cf':     last_cf       = defaults[k]
+                elif k == 'span_hz':     span_hz       = defaults[k]
+                elif k == 'num_bins':    num_bins      = defaults[k]
+                elif k == 'enbw':        enbw          = defaults[k]
+                elif k == 'window_fn':   window_fn     = defaults[k]
+                elif k == 'num_avg':     num_avg       = defaults[k]
+                elif k == 'file_enable': file_enable   = defaults[k]
+                elif k == 'meas_status_i': meas_status_i = defaults[k]
+                elif k == 'file_name':   file_name     = defaults[k]
 
         try:
             meas_status_s = str(MeasStatusType(meas_status_i))

@@ -336,6 +336,11 @@ class AgentSnmpTransport:
         task_id = await mgr.send_task(
             agent.agent_id, command, params, timeout=timeout,
         )
+        # send_task may have bumped the timeout (e.g. LONG_COMMANDS → 90s).
+        # Always wait as long as the task itself is configured for.
+        actual_timeout = mgr.pending_tasks.get(task_id)
+        if actual_timeout is not None:
+            timeout = actual_timeout.timeout
         result = await mgr.wait_for_task_async(task_id, timeout=timeout)
         if not result:
             return None
@@ -647,6 +652,63 @@ class AgentSnmpTransport:
         
         # If no parseable output, return a synthetic varbind with the set value
         return [AgentVarBind(resolved, OctetString(str(value)))]
+
+    async def set_sequence(
+        self,
+        items: list[dict],
+        timeout: float | None = None,
+    ) -> dict | None:
+        """Execute a sequence of SNMP SETs as a single agent task.
+
+        Each item is ``{'oid': str, 'value': Any, 'type': str, 'sleep_after': float}``.
+        ``sleep_after`` is optional seconds to pause between SETs (e.g. toggle delay).
+
+        Returns the agent result dict, or None on timeout/error.
+        """
+        t = timeout if timeout is not None else self._timeout
+
+        # Convert pysnmp type classes to string codes and normalise values
+        type_map = {
+            'Integer32': 'i', 'OctetString': 's', 'Unsigned32': 'u',
+            'Counter32': 'c', 'Counter64': 'C', 'Gauge32': 'g',
+            'TimeTicks': 't', 'IpAddress': 'a',
+        }
+        normalised = []
+        for item in items:
+            vtype = item.get('type', 'i')
+            if isinstance(vtype, type):
+                vtype = type_map.get(vtype.__name__, 's')
+            val = item['value']
+            if isinstance(val, bytes):
+                val = val.hex()
+                vtype = 'x'
+            elif hasattr(val, 'asOctets'):
+                raw = val.asOctets()
+                if any(b > 127 or b < 32 for b in raw):
+                    val = raw.hex()
+                    vtype = 'x'
+                else:
+                    val = str(val)
+            else:
+                val = str(val)
+            normalised.append({
+                'oid': _resolve_oid(item['oid']),
+                'value': val,
+                'type': vtype,
+                'sleep_after': item.get('sleep_after', 0),
+            })
+
+        data = await self._send_and_wait(
+            'snmp_set_sequence', 'snmp_set_sequence',
+            {
+                'target_ip': self._host,
+                'community': self._write_community,
+                'sets': normalised,
+                'timeout': t,
+            },
+            timeout=t,
+        )
+        return data
 
     def close(self) -> None:
         """Close transport (no-op for agent transport)."""

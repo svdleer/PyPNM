@@ -30,6 +30,10 @@ class ConnectedAgent:
     last_seen: float = field(default_factory=time.time)
     authenticated: bool = False
     
+    def is_alive(self, max_silence_s: float = 90.0) -> bool:
+        """True if the agent sent a message within the last *max_silence_s* seconds."""
+        return (time.time() - self.last_seen) < max_silence_s
+
     def to_dict(self) -> dict:
         """Convert to dictionary for API responses."""
         return {
@@ -38,5 +42,5 @@ class ConnectedAgent:
             'connected_at': self.connected_at,
             'last_seen': self.last_seen,
             'authenticated': self.authenticated,
-            'is_alive': (time.time() - self.last_seen) < 90
+            'is_alive': self.is_alive()
         }

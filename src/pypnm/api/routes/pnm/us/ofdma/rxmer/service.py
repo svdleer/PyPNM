@@ -197,7 +197,7 @@ class CmtsUsOfdmaRxMerService:
                     'target_ip': self.cmts_ip,
                     'oid': oid,
                     'community': self.community,
-                    'timeout': 15
+                    'timeout': 30,   # SNMP PDU timeout; outer timeout governs total walk
                 },
                 timeout=timeout
             )
@@ -515,8 +515,8 @@ class CmtsUsOfdmaRxMerService:
         self.logger.info(f"Getting pre-EQ data for CM index {cm_index}")
         
         try:
-            # Walk pre-EQ data for this CM index
-            result = await self._snmp_walk(self.OID_CM_US_EQ_DATA, timeout=30)
+            # Walk pre-EQ data for this CM index — full table across all modems, allow 120 s
+            result = await self._snmp_walk(self.OID_CM_US_EQ_DATA, timeout=120)
             
             if not result.get('success') or not result.get('results'):
                 self.logger.warning("No pre-EQ data found on CMTS")
@@ -995,31 +995,15 @@ class CmtsUsOfdmaRxMerService:
                                             dest_index = idx
                                             break
 
-                                        self.logger.info(f"Found existing TFTP destination at index {idx}")
-                                        # Suspend row to notInService(2) before modifying columns.
-                                        # Many CMTSes (Arris/CommScope) return inconsistentValue
-                                        # if DestBaseUri is SET while the row is active(1).
-                                        _norm_path = re.sub(r'^(\./)+'  , '', dest_path).lstrip('/')
-                                        if _norm_path and not _norm_path.endswith('/'):
-                                            _norm_path += '/'
+                                        # Always destroy and recreate — avoids silent
+                                        # notInService failures on Cisco cBR-8.
+                                        self.logger.info(f"Existing TFTP dest {idx} matches — destroying and recreating")
                                         try:
-                                            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 2, 'i')  # notInService
-                                            await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{idx}", _norm_path, 's')
-                                            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 1, 'i')  # active
-                                            self.logger.info(f"Updated base URI for destination {idx}: '{_norm_path}'")
-                                        except Exception as _e:
-                                            self.logger.warning(f"Could not update base URI on existing dest {idx}: {_e}")
-                                            # Ensure row is left active even if URI update failed
-                                            try:
-                                                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 1, 'i')
-                                            except Exception:
-                                                pass
-                                        return {
-                                            "success": True,
-                                            "destination_index": idx,
-                                            "message": f"Using existing destination {idx} for {tftp_ip}",
-                                            "created": False
-                                        }
+                                            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 6, 'i')  # destroy
+                                        except Exception:
+                                            pass
+                                        dest_index = idx
+                                        break
                             # Row doesn't exist or is empty
                             if row_status in (0, 2, 6):  # notInService, destroy, notReady
                                 dest_index = idx
@@ -1044,6 +1028,9 @@ class CmtsUsOfdmaRxMerService:
             _path = re.sub(r'^(\./)+'  , '', dest_path).lstrip('/')
             if _path and not _path.endswith('/'):
                 _path += '/'
+            # Full URI required by Cisco cBR-8: tftp://ip/path
+            # Even when path is empty, tftp://ip/ satisfies the mandatory URI check.
+            _full_uri = f"tftp://{tftp_ip}/{_path}"
 
             # Check if the row at dest_index already exists (active=1).
             # This handles the case where dest_index was explicitly supplied — the
@@ -1058,32 +1045,14 @@ class CmtsUsOfdmaRxMerService:
                 _row_active = False
 
             if _row_active:
-                # Row already active — update via notInService(2) transition
-                self.logger.info(f"Bulk dest index {dest_index} already active — updating via notInService")
-                _norm_path = _path
+                # Always destroy and recreate — matches Cisco script behaviour and avoids
+                # silent notInService failures on cBR-8.
+                self.logger.info(f"Bulk dest {dest_index} active — destroying and recreating")
                 try:
-                    await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 2, 'i')  # notInService
-                    await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
-                    await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
-                    await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
-                    if _norm_path:
-                        await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _norm_path, 's')
-                    await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')  # active
-                except Exception as _e:
-                    self.logger.warning(f"Failed to update existing bulk dest {dest_index}: {_e} — attempting destroy+recreate")
-                    try:
-                        await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 6, 'i')  # destroy
-                    except Exception:
-                        pass
-                    _row_active = False  # fall through to createAndWait below
-
-                if _row_active:
-                    return {
-                        "success": True,
-                        "destination_index": dest_index,
-                        "message": f"Updated existing destination {dest_index} for {tftp_ip}",
-                        "created": False
-                    }
+                    await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 6, 'i')  # destroy
+                except Exception:
+                    pass
+                _row_active = False  # fall through to createAndWait
 
             # Use createAndWait(5) so all columns can be set while the row is
             # notReady/notInService, then activate with active(1) at the end.
@@ -1097,17 +1066,21 @@ class CmtsUsOfdmaRxMerService:
             # IP address (4-byte OctetString, e.g. "ac100884")
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
 
-            # LocalStore: false(2) = upload to TFTP only, true(1) = also store on CMTS
-            await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
+            # LocalStore: read-only on Cisco (notWritable) — wrap so it never aborts
+            try:
+                await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
+            except Exception:
+                pass
 
-            # Set DestBaseUri (path only — e.g. "access/pnm/") while row is notInService.
-            # Wrap in try/except so a vendor that doesn't support this OID doesn't abort.
-            if _path:
-                try:
-                    await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _path, 's')
-                    self.logger.info(f"Set base URI for destination {dest_index}: '{_path}'")
-                except Exception as _uri_err:
-                    self.logger.warning(f"Could not set base URI (vendor may not support it): {_uri_err}")
+            # Set DestBaseUri as full tftp://ip/path URI.
+            # Cisco cBR-8 REQUIRES both IP and URI before a row can become active.
+            # Without URI the row stays notReady and active(1) returns inconsistentValue,
+            # causing PNM_INVALID_BDT_CFG when capture is triggered.
+            try:
+                await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _full_uri, 's')
+                self.logger.info(f"Set BaseUri for destination {dest_index}: '{_full_uri}'")
+            except Exception as _uri_err:
+                self.logger.warning(f"Could not set BaseUri (vendor may not support it): {_uri_err}")
 
             # Activate the row
             await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')  # active

@@ -141,3 +141,32 @@ async def ping_agent(agent_id: str):
             return {"status": "timeout", "message": "Agent did not respond"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@router.delete("/{agent_id}")
+async def disconnect_agent(agent_id: str):
+    """
+    Disconnect and remove an agent from the pool.
+
+    The agent's WebSocket is closed and it is removed from the available pool.
+    The agent process itself is not stopped — it will reconnect unless stopped manually.
+    """
+    agent_manager = get_agent_manager()
+    if not agent_manager:
+        raise HTTPException(status_code=503, detail="Agent manager not initialized")
+
+    agent = agent_manager.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+    try:
+        await agent.websocket.close(code=1001, reason="Disconnected by admin")
+    except Exception:
+        pass  # already closed
+
+    agent_manager.agents.pop(agent_id, None)
+    agent_manager._agent_timeouts.pop(agent_id, None)
+    agent_manager._agent_quarantine.pop(agent_id, None)
+    logger.info(f"Agent '{agent_id}' disconnected and removed from pool by admin request")
+
+    return {"status": "disconnected", "agent_id": agent_id}

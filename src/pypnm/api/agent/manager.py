@@ -37,7 +37,7 @@ class AgentManager:
         # These get a higher default timeout and are routed to the agent's
         # dedicated long-running thread pool so they never starve SNMP workers.
         self.LONG_COMMANDS: frozenset[str] = frozenset({
-            'file_get', 'pnm_file_get',
+            'file_get', 'pnm_file_get', 'snmp_set_sequence',
         })
         self.LONG_TASK_TIMEOUT: float = 90.0   # default timeout for long commands
 
@@ -284,16 +284,16 @@ class AgentManager:
         return self.agents.get(agent_id)
     
     def get_agent_for_capability(self, capability: str) -> Optional[ConnectedAgent]:
-        """Find agent with required capability."""
-        for agent in self.agents.values():
-            if agent.authenticated and capability in agent.capabilities:
-                return agent
+        """Find agent with required capability, round-robin across all alive agents."""
+        agent_id = self.get_agent_id_for_capability(capability)
+        if agent_id:
+            return self.agents.get(agent_id)
         return None
 
     def get_all_agent_ids_for_capability(self, capability: str) -> list[str]:
         """Return all agent IDs advertising *capability* (round-robin ordered, skipping quarantined)."""
         capable = [a.agent_id for a in self.agents.values()
-                   if a.authenticated and capability in a.capabilities]
+                   if a.authenticated and a.is_alive() and capability in a.capabilities]
         healthy = [aid for aid in capable if not self._is_quarantined(aid)]
         pool = healthy if healthy else capable
         # Rotate list to start from next round-robin position
@@ -314,7 +314,7 @@ class AgentManager:
         - Multiple agents with the same capability are load-balanced round-robin
         """
         capable = [a.agent_id for a in self.agents.values()
-                   if a.authenticated and capability in a.capabilities]
+                   if a.authenticated and a.is_alive() and capability in a.capabilities]
         if not capable:
             self.logger.warning(f"No agent available for capability '{capability}' — connected agents: {list(self.agents.keys())}")
             return None

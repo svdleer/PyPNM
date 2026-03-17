@@ -183,26 +183,42 @@ def _bdt_row_exists(row: int) -> bool:
 
 
 def configure_bdt_cisco(row: int):
-    """Cisco BDT: docsPnmBulkDataTransferCfgTable."""
+    """Cisco BDT: docsPnmBulkDataTransferCfgTable.
+
+    Cisco rejects field SETs on an active row (inconsistentValue).
+    Always destroy the existing row first, then createAndGo(4), then set fields.
+    Protocol and LocalStore are read-only on Cisco — not set here.
+    """
     tftp = TFTP_IP_CCAP
     tftp_hex = "".join(f"{int(o):02X}" for o in tftp.split("."))
+    # Build full URI — Cisco requires tftp://ip/path; a bare path gives PNM_INVALID_BDT_CFG
+    _norm = TFTP_PATH.lstrip('./').lstrip('/')
+    _uri  = f"tftp://{tftp}/{_norm}"
     step(f"BDT row {row} — Cisco (docsPnmBulkDataTransferCfgTable) — TFTP {tftp}")
-    # Only createAndGo if the row does not yet exist
-    if _bdt_row_exists(row):
-        print(f"  RowStatus row {row} already exists — updating existing row")
-    else:
-        print(f"  RowStatus.{row} = createAndGo(4)")
-        r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
-        print(f"    {r}")
+    # Always destroy first so the new createAndGo starts from a clean state.
+    # Fields cannot be SET on an active Cisco row without a notInService transition.
+    print(f"  RowStatus.{row} = destroy(6)")
+    snmpset(f"{OID_BDT_E6000}.9.{row}", "i", 6)   # 6 = destroy
+    time.sleep(2)
+    print(f"  RowStatus.{row} = createAndGo(4)")
+    r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
+    print(f"    {r}")
+    time.sleep(1)    # Cisco needs ~1 s before fields can be written post createAndGo
     fields = [
-        (f"{OID_BDT_E6000}.3.{row}", "i", 1,                f"DestHostIpAddrType = ipv4(1)"),
-        (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex,          f"DestHostIpAddress  = {tftp}"),
-        (f"{OID_BDT_E6000}.6.{row}", "s", f"tftp://{tftp}/", f"DestBaseUri        = tftp://{tftp}/"),
+        (f"{OID_BDT_E6000}.3.{row}", "i", 1,        f"DestHostIpAddrType = ipv4(1)"),
+        (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex, f"DestHostIpAddress  = {tftp}"),
+        (f"{OID_BDT_E6000}.6.{row}", "s", _uri,     f"DestBaseUri        = {_uri}"),
+        # Protocol/LocalStore: read-only on Cisco — NOT set here
     ]
     for oid, t, v, desc in fields:
         print(f"  {desc}")
         r = snmpset(oid, t, v)
         print(f"    {r}")
+    # Confirm row is active — arms the Cisco guestshell auto-upload service.
+    # Without this, the guestshell PNM daemon may not pick up the destination.
+    print(f"  RowStatus.{row} = active(1)")
+    r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_ACTIVE)
+    print(f"    {r}")
 
 
 def configure_bdt_e6000(row: int):

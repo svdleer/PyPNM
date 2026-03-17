@@ -395,32 +395,55 @@ class CmtsUtscService:
         dest_path: str = "./",
         index: int = 1
     ) -> dict[str, Any]:
-        """Configure standard docsPnmBulkDataTransferCfgTable.
+        """Configure standard docsPnmBulkDataTransferCfgTable (Cisco cBR-8 / E6000).
 
-        Destroy existing row, then write fields directly (no createAndGo/Wait).
-        The CMTS implicitly recreates the row when columns are SET.
+        Correct Cisco sequence (from field-verified notes):
+          1. destroy(6)     — clear any stale row
+          2. createAndGo(4) — allocate the row
+          3. SET IpAddrType, IpAddress, DestBaseUri
+        Row becomes active automatically after createAndGo + field SETs.
+        DestBaseUri must be the full URI: tftp://<ip>/
         """
         import asyncio
         import ipaddress
 
-        ip_hex = ipaddress.ip_address(dest_ip).packed.hex().upper()
+        ip_packed = ipaddress.ip_address(dest_ip).packed
+        ip_hex    = ' '.join(f'{b:02X}' for b in ip_packed)   # "AC 10 08 84" format
+        base_uri  = f"tftp://{dest_ip}/"
 
-        self.logger.info(f"BDT standard table: destroy row {index}, then SET fields for {dest_ip}:{dest_path}")
+        self.logger.info(
+            f"BDT standard table: destroy → createAndGo → SET fields "
+            f"for {dest_ip} (DestBaseUri={base_uri}) row={index}"
+        )
 
-        # Destroy existing row
-        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 6, 'i')  # destroy
+        # Step 1: destroy existing row (ignore errors — row may not exist)
+        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 6, 'i')
         await asyncio.sleep(1)
 
-        # Set fields directly — no createAndGo/createAndWait
-        await self._snmp_set(f"{self.OID_BDT_IP_TYPE}.{index}", 1, 'i')         # ipv4
-        await self._snmp_set(f"{self.OID_BDT_IP_ADDR}.{index}", ip_hex, 'x')    # IP as hex
-        await self._snmp_set(f"{self.OID_BDT_BASE_URI}.{index}", dest_path, 's') # path only
-        await self._snmp_set(f"{self.OID_BDT_PROTOCOL}.{index}", 1, 'i')         # tftp
+        # Step 2: createAndGo — allocates the row
+        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 4, 'i')
 
-        # Activate
-        await self._snmp_set(f"{self.OID_BDT_ROW_STATUS}.{index}", 1, 'i')  # active
+        # Wait for the cBR-8 to transition the row out of notReady before
+        # setting columns — otherwise field SETs return inconsistentValue.
+        await asyncio.sleep(1)
 
-        self.logger.info(f"BDT standard table configured: row {index} → {dest_ip}:{dest_path}")
+        # Step 3: set fields
+        await self._snmp_set(f"{self.OID_BDT_IP_TYPE}.{index}", 1, 'i')          # ipv4(1)
+        await self._snmp_set(f"{self.OID_BDT_IP_ADDR}.{index}", ip_hex, 'x')     # hex octets
+        await self._snmp_set(f"{self.OID_BDT_BASE_URI}.{index}", base_uri, 's')  # tftp://<ip>/
+
+        # Poll RowStatus until active(1) — cBR-8 commits asynchronously
+        for _attempt in range(5):
+            await asyncio.sleep(1)
+            probe = await self._snmp_get(f"{self.OID_BDT_ROW_STATUS}.{index}")
+            raw = str(probe.get('output', '') or '')
+            val = raw.split('=', 1)[-1].strip() if '=' in raw else raw.strip()
+            if val in ('1', 'active'):
+                self.logger.info(f"BDT row {index} confirmed active after {_attempt + 1}s")
+                break
+            self.logger.debug(f"BDT row {index} RowStatus={val!r}, retrying...")
+        else:
+            self.logger.warning(f"BDT row {index} did not confirm active after 5s — proceeding anyway")
         return {"success": True, "index": index, "dest_ip": dest_ip, "table": "standard"}
     
     async def detect_vendor(self) -> str:

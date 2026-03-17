@@ -357,19 +357,24 @@ def configure_bdt_cisco(row: int):
     r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_CREATE_AND_GO)
     print(f"    {r}")
     time.sleep(1)
+    # Build full TFTP URI — Cisco cBR-8 requires tftp://ip/path format.
+    # A bare path (e.g. "./") results in a notReady row and PNM_INVALID_BDT_CFG.
+    _norm = TFTP_PATH.lstrip('./').lstrip('/')
+    _uri  = f"tftp://{tftp}/{_norm}"
     fields = [
         (f"{OID_BDT_E6000}.3.{row}", "i", 1,       "DestHostIpAddrType = ipv4(1)"),
         (f"{OID_BDT_E6000}.4.{row}", "x", tftp_hex, f"DestHostIpAddress  = {tftp}"),
-        (f"{OID_BDT_E6000}.6.{row}", "s", TFTP_PATH, f"DestBaseUri        = {TFTP_PATH}"),
-        # Protocol: NOT set on Cisco — createAndGo defaults it; explicit SET causes genError
+        (f"{OID_BDT_E6000}.6.{row}", "s", _uri,     f"DestBaseUri        = {_uri}"),
+        # Protocol: NOT set — createAndGo defaults to tftp; explicit SET causes genError on Cisco
     ]
     for oid, t, v, desc in fields:
         print(f"  {desc}")
         r = snmpset(oid, t, v)
         print(f"    {r}")
-
-
-def configure_bdt_e6000(row: int):
+    # Confirm row is active — arms the guestshell auto-upload service
+    print(f"  RowStatus.{row} = active(1)")
+    r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_ACTIVE)
+    print(f"    {r}")(row: int):
     """E6000 BDT: docsPnmBulkDataTransferCfgTable.
 
     Row may already be active from a previous run — don't destroy it first.
@@ -441,11 +446,7 @@ def configure_utsc(
     idx = f".{rf_port}.{cfg_index}"
     step(f"UTSC configure  rf_port={rf_port}  cfg_index={cfg_index}  vendor={vendor}")
 
-    # LogicalChIfIndex: Cisco sets it to the rf_port ifindex itself;
-    # Casa/E6000 set it to 0 (any channel)
-    logical_ch = rf_port if vendor == "cisco" else 0
     params = [
-        (f"{OID_UTSC_CFG}.2{idx}",  "i", logical_ch,   f"LogicalChIfIndex   = {logical_ch}"),
         (f"{OID_UTSC_CFG}.3{idx}",  "i", TRIGGER_MODE,  f"TriggerMode        = {TRIGGER_MODE} (freeRunning)"),
         (f"{OID_UTSC_CFG}.8{idx}",  "u", CENTER_FREQ,   f"CenterFreq         = {CENTER_FREQ // 1_000_000} MHz"),
         (f"{OID_UTSC_CFG}.9{idx}",  "u", SPAN,          f"Span               = {SPAN // 1_000_000} MHz"),
