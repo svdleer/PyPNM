@@ -83,6 +83,14 @@ class CmtsUsOfdmaRxMerService:
     OID_BULK_CFG_PROTOCOL = f"{OID_BULK_CFG_TABLE}.7"    # Protocol (1=tftp)
     OID_BULK_CFG_LOCAL_STORE = f"{OID_BULK_CFG_TABLE}.8" # LocalStore
     OID_BULK_CFG_ROW_STATUS = f"{OID_BULK_CFG_TABLE}.9"  # RowStatus
+
+    # Casa CCAP Bulk Data Control Table (docsPnmCcapBulkDataControlTable)
+    OID_CCAP_BDT_TABLE = "1.3.6.1.4.1.4491.2.1.27.1.1.1.5.1"
+    OID_CCAP_BDT_IP_TYPE = f"{OID_CCAP_BDT_TABLE}.2"       # DestIpAddrType
+    OID_CCAP_BDT_IP_ADDR = f"{OID_CCAP_BDT_TABLE}.3"       # DestIpAddr
+    OID_CCAP_BDT_DEST_PATH = f"{OID_CCAP_BDT_TABLE}.4"     # DestPath
+    OID_CCAP_BDT_UPLOAD_CTRL = f"{OID_CCAP_BDT_TABLE}.5"   # UploadControl
+    OID_CCAP_BDT_TEST_SELECTOR = f"{OID_CCAP_BDT_TABLE}.6" # PnmTestSelector
     
     def __init__(
         self,
@@ -107,6 +115,34 @@ class CmtsUsOfdmaRxMerService:
     def close(self):
         """No-op for agent-based service (no persistent connection)."""
         pass
+
+    async def detect_vendor(self) -> str:
+        """Detect CMTS vendor via sysDescr.
+
+        Returns: 'casa' | 'e6000' | 'cisco' | 'evo' | 'unknown'
+        """
+        try:
+            result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
+            raw = str(result.get('output', ''))
+            val = raw.split(' = ', 1)[1].strip() if ' = ' in raw else raw.strip()
+            if val.upper().startswith('0X'):
+                try:
+                    val = bytes.fromhex(val[2:]).decode('utf-8', errors='replace')
+                except Exception:
+                    pass
+            low = val.lower()
+            if 'cisco' in low or 'cbr' in low:
+                return 'cisco'
+            if 'casa' in low:
+                return 'casa'
+            if 'arris' in low or 'cer_v' in low or 'commscope' in low:
+                return 'e6000'
+            if 'evo' in low or 'vcmts' in low:
+                return 'evo'
+            return 'unknown'
+        except Exception as e:
+            self.logger.warning(f"Vendor detection failed: {e}")
+            return 'unknown'
     
     # ============================================
     # Agent SNMP helpers (same pattern as UTSC)
@@ -659,17 +695,31 @@ class CmtsUsOfdmaRxMerService:
         )
 
         try:
-            # 1. Set up bulk destination row — Cisco requires DestinationIndex to
-            #    point at an active row; without it the Enable SET is silently ignored.
-            if tftp_server and destination_index == 0:
-                try:
-                    dest_result = await self.create_bulk_destination(
-                        tftp_ip=tftp_server, dest_index=1, dest_path=dest_path
-                    )
-                    destination_index = dest_result.get("destination_index", 1)
-                except Exception as e:
-                    self.logger.warning(f"Bulk dest setup failed (continuing): {e}")
-                    destination_index = 1
+            # 0. Detect vendor for BDT routing
+            vendor = await self.detect_vendor()
+            self.logger.info(f"Detected vendor: {vendor}")
+
+            # 1. Set up bulk destination — vendor-specific
+            if vendor == 'casa':
+                # Casa uses docsPnmCcapBulkDataControlTable (direct SETs)
+                # DestinationIndex is read-only on Casa — read it back
+                dest_idx_result = await self._snmp_get(f"{self.OID_US_RXMER_DEST_INDEX}.{ofdma_ifindex}")
+                dest_idx_val = self._parse_get_value(dest_idx_result)
+                bdt_row = int(dest_idx_val) if dest_idx_val and int(dest_idx_val) > 0 else 1
+                self.logger.info(f"Casa DestinationIndex (readback) = {bdt_row}")
+                await self._configure_bdt_casa(bdt_row, tftp_server or '', dest_path)
+                destination_index = bdt_row
+            else:
+                # E6000/Cisco: docsPnmBulkDataTransferCfgTable (createAndGo/createAndWait)
+                if tftp_server and destination_index == 0:
+                    try:
+                        dest_result = await self.create_bulk_destination(
+                            tftp_ip=tftp_server, dest_index=1, dest_path=dest_path
+                        )
+                        destination_index = dest_result.get("destination_index", 1)
+                    except Exception as e:
+                        self.logger.warning(f"Bulk dest setup failed (continuing): {e}")
+                        destination_index = 1
 
             # 2. Set CM MAC address (CMTS uses this to identify the modem)
             mac_hex = self.mac_to_hex_string(cm_mac)
@@ -686,7 +736,9 @@ class CmtsUsOfdmaRxMerService:
             await self._snmp_set(f"{self.OID_US_RXMER_NUM_AVGS}{idx}", num_averages, 'g')
 
             # 6. Set DestinationIndex — Unsigned32 ('u') required by Cisco cBR-8
-            await self._snmp_set(f"{self.OID_US_RXMER_DEST_INDEX}{idx}", destination_index, 'u')
+            #    Casa manages this internally (read-only) — skip
+            if vendor != 'casa':
+                await self._snmp_set(f"{self.OID_US_RXMER_DEST_INDEX}{idx}", destination_index, 'u')
 
             # 7. Enable measurement (triggers capture)
             await self._snmp_set(f"{self.OID_US_RXMER_ENABLE}{idx}", 1, 'i')
@@ -860,6 +912,27 @@ class CmtsUsOfdmaRxMerService:
         except Exception as e:
             self.logger.error(f"Failed to get bulk destinations: {e}")
             return {"success": False, "error": str(e), "destinations": []}
+
+    async def _configure_bdt_casa(self, row: int, tftp_ip: str, dest_path: str = "./"):
+        """Configure Casa CCAP BDT (docsPnmCcapBulkDataControlTable).
+
+        Casa CCAP table has NO RowStatus — just SET columns directly.
+        PnmTestSelector bit5 (0x0400) = usOfdmaRxMer.
+        """
+        import ipaddress
+        ip_hex = ipaddress.ip_address(tftp_ip).packed.hex().upper()
+        ip_hex_formatted = ' '.join([ip_hex[i:i+2] for i in range(0, len(ip_hex), 2)])
+
+        self.logger.info(f"Casa CCAP BDT row {row}: TFTP {tftp_ip}, path={dest_path}")
+
+        await self._snmp_set(f"{self.OID_CCAP_BDT_IP_TYPE}.{row}", 1, 'i')          # ipv4
+        await self._snmp_set(f"{self.OID_CCAP_BDT_IP_ADDR}.{row}", ip_hex_formatted, 'x')
+        await self._snmp_set(f"{self.OID_CCAP_BDT_DEST_PATH}.{row}", dest_path, 's')
+        await self._snmp_set(f"{self.OID_CCAP_BDT_UPLOAD_CTRL}.{row}", 3, 'i')      # autoUpload
+        # PnmTestSelector: bit5 = usOfdmaRxMer (0x04 0x00)
+        await self._snmp_set(f"{self.OID_CCAP_BDT_TEST_SELECTOR}.{row}", "04 00", 'x')
+
+        self.logger.info(f"Casa CCAP BDT row {row} configured for US RxMER")
 
     async def create_bulk_destination(
         self,

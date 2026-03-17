@@ -431,3 +431,280 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
             },
         },
     }
+
+
+# ── Partial channel reason code descriptions ──────────────────────────────────
+_PARTIAL_REASON = {
+    0:  'No partial service',
+    1:  'T4 timeout',
+    2:  'T3 timeout',
+    3:  'Ranging abort',
+    4:  'Invalid configuration',
+    5:  'MAC error',
+    6:  'Ranging failure',
+    7:  'DS signal degraded',
+    8:  'US signal degraded',
+    9:  'Service flow removed',
+    10: 'Modem requested',
+    11: 'CMTS initiated',
+}
+
+# Main modulation codes (docsIf31CmtsDsOfdmSubcarrierStatusMainModulation)
+_MODULATION_CODE = {
+    0: 'unknown', 1: 'zeroValued', 2: 'qam16', 3: 'qam32', 4: 'qam64',
+    5: 'qam128', 6: 'qam256', 7: 'qam512', 8: 'qam1024', 9: 'qam2048',
+    10: 'qam4096', 11: 'qam8192', 12: 'qam16384',
+}
+
+
+def _extract_result_entries(task_result) -> list:
+    """Safely pull the results list from an agent task response."""
+    if not task_result:
+        return []
+    r = task_result.get('result', {})
+    if not r or not r.get('success'):
+        return []
+    return r.get('results', []) or []
+
+
+def parse_ofdm_stats_raw(
+    cm_index,
+    partial_reason_result,
+    us_iuc_stats_result,
+    ds_ofdm_speed_result,
+    ds_subcarrier_result,
+    cm_ds_ofdm_channels: list,
+    ifname_result=None,
+    cmts_profile_result=None,
+) -> dict:
+    """
+    Parse CMTS-side OFDM/OFDMA statistics into a structured dict for the GUI.
+
+    Returns a dict with:
+      ds_profiles   - per DS-channel, per-profile: codewords (CM) + speed (CMTS) + partial reason
+      us_iuc_stats  - per US-OFDMA channel ifIndex, per IUC: total/corrected/unreliable codewords
+      ds_subcarrier - per DS-channel ifIndex, per range: main modulation
+    """
+
+    # ── 0. Build ifIndex → ifName map from CMTS ifXTable walk ──
+    ifname_base = '1.3.6.1.2.1.31.1.1.1.1'
+    ifname_map = {}  # {ifindex: name}
+    for e in _extract_result_entries(ifname_result):
+        oid = e.get('oid', '')
+        if oid.startswith(ifname_base + '.'):
+            try:
+                ifidx = int(oid[len(ifname_base) + 1:])
+                name = e.get('value', '')
+                if name:
+                    ifname_map[ifidx] = str(name)
+            except (ValueError, TypeError):
+                pass
+
+    # ── 0b. Resolve valid ifIndices for this modem from scoped CMTS walks ──
+    # US OFDMA: from cmts_profile_result (walked as .5.1.1.{cm_index}) —
+    #   OID suffix: {cm_index}.{ofdma_ifindex}.{iuc_id}
+    prof_base = '1.3.6.1.4.1.4491.2.1.28.1.5.1.1'
+    valid_us_ifindices: set = set()
+    for e in _extract_result_entries(cmts_profile_result):
+        oid = e.get('oid', '')
+        if oid.startswith(prof_base + '.'):
+            parts = oid[len(prof_base) + 1:].split('.')
+            if len(parts) == 3:
+                try:
+                    entry_cm_index = int(parts[0])
+                    if cm_index is None or entry_cm_index == cm_index:
+                        valid_us_ifindices.add(int(parts[1]))
+                except (ValueError, TypeError):
+                    pass
+
+    # DS OFDM: from partial_reason_result (walked as .7.1.1.{cm_index}) —
+    #   OID suffix after col: {cm_index}.{ds_ifindex}.{profile_id}
+    _partial_base = '1.3.6.1.4.1.4491.2.1.28.1.7.1'
+    valid_ds_ifindices: set = set()
+    for e in _extract_result_entries(partial_reason_result):
+        oid = e.get('oid', '')
+        for col in ('1', '3'):
+            prefix = f'{_partial_base}.{col}.'
+            if oid.startswith(prefix):
+                parts = oid[len(prefix):].split('.')
+                if len(parts) == 3:
+                    try:
+                        entry_cm_index = int(parts[0])
+                        if cm_index is None or entry_cm_index == cm_index:
+                            valid_ds_ifindices.add(int(parts[1]))
+                    except (ValueError, TypeError):
+                        pass
+
+    # ── 1. DS profile stats — already parsed from CM walk (in cm_ds_ofdm_channels) ──
+    ds_profiles = []
+    for ch in cm_ds_ofdm_channels:
+        entry = {
+            'channel_id': ch.get('channel_id'),
+            'plc_freq_mhz': ch.get('plc_freq_mhz'),
+            'profiles': [],
+        }
+        for ps in ch.get('profile_stats', []):
+            total     = ps.get('total_codewords', 0)
+            corrected = ps.get('corrected_codewords', 0)
+            uncorr    = ps.get('uncorrectable_codewords', 0)
+            corr_pct   = round(corrected / total * 100, 4) if total else 0
+            uncorr_pct = round(uncorr / total * 100, 6) if total else 0
+            entry['profiles'].append({
+                'profile_id':             ps.get('profile_id'),
+                'total_codewords':        total,
+                'corrected':              corrected,
+                'corrected_pct':          corr_pct,
+                'uncorrectable':          uncorr,
+                'uncorrectable_pct':      uncorr_pct,
+                'full_channel_speed_bps': None,
+                'partial_reason_code':    None,
+                'partial_reason_text':    None,
+                'last_partial_reason_code': None,
+                'last_partial_reason_text': None,
+            })
+        ds_profiles.append(entry)
+
+    # ── 2. Inject CMTS DS OFDM profile full channel speed ──
+    #    OID: 1.3.6.1.4.1.4491.2.1.28.1.20.1.3.{ifIndex}.{profileId}
+    speed_base = '1.3.6.1.4.1.4491.2.1.28.1.20.1.3'
+    speed_map = {}  # {ifIndex: {profileId: speed_bps}}
+    for e in _extract_result_entries(ds_ofdm_speed_result):
+        oid = e.get('oid', '')
+        if oid.startswith(speed_base + '.'):
+            parts = oid[len(speed_base) + 1:].split('.')
+            if len(parts) == 2:
+                try:
+                    speed_map.setdefault(int(parts[0]), {})[int(parts[1])] = int(e.get('value') or 0)
+                except (ValueError, TypeError):
+                    pass
+
+    # Constrain to only the DS ifIndices this modem is registered on (from partial_reason
+    # scoped walk); fall back to positional limit by CM channel count if unknown.
+    n_ds_ch = len(cm_ds_ofdm_channels)
+    all_speed_ifindices = sorted(speed_map.keys())
+    if valid_ds_ifindices:
+        sorted_speed_ifindices = sorted(valid_ds_ifindices & speed_map.keys())
+    else:
+        sorted_speed_ifindices = all_speed_ifindices[:n_ds_ch] if n_ds_ch else all_speed_ifindices
+    for i, ch_entry in enumerate(sorted(ds_profiles, key=lambda c: c.get('channel_id') or 0)):
+        if i < len(sorted_speed_ifindices):
+            ifidx = sorted_speed_ifindices[i]
+            for prof in ch_entry['profiles']:
+                pid = prof['profile_id']
+                if pid in speed_map.get(ifidx, {}):
+                    prof['full_channel_speed_bps'] = speed_map[ifidx][pid]
+
+    # ── 3. Inject CMTS partial channel reason codes (scoped to cm_index) ──
+    #    OID: 1.3.6.1.4.1.4491.2.1.28.1.7.1.{col}.{cm_index}.{ifIndex}.{profileId}
+    #    col 1 = PartialChanReasonCode, col 3 = LastPartialChanReasonCode
+    partial_base = '1.3.6.1.4.1.4491.2.1.28.1.7.1'
+    partial_map      = {}  # {ifIndex: {profileId: code}}
+    last_partial_map = {}
+    for e in _extract_result_entries(partial_reason_result):
+        oid = e.get('oid', '')
+        for col, target_map in [('1', partial_map), ('3', last_partial_map)]:
+            prefix = f'{partial_base}.{col}.'
+            if oid.startswith(prefix):
+                parts = oid[len(prefix):].split('.')
+                # parts: [cm_index, ifIndex, profileId]
+                if len(parts) == 3:
+                    try:
+                        target_map.setdefault(int(parts[1]), {})[int(parts[2])] = int(e.get('value') or 0)
+                    except (ValueError, TypeError):
+                        pass
+
+    for i, ch_entry in enumerate(sorted(ds_profiles, key=lambda c: c.get('channel_id') or 0)):
+        if i < len(sorted_speed_ifindices):
+            ifidx = sorted_speed_ifindices[i]
+            for prof in ch_entry['profiles']:
+                pid = prof['profile_id']
+                code = partial_map.get(ifidx, {}).get(pid)
+                if code is not None:
+                    prof['partial_reason_code'] = code
+                    prof['partial_reason_text'] = _PARTIAL_REASON.get(code, f'code {code}')
+                last_code = last_partial_map.get(ifidx, {}).get(pid)
+                if last_code is not None:
+                    prof['last_partial_reason_code'] = last_code
+                    prof['last_partial_reason_text'] = _PARTIAL_REASON.get(last_code, f'code {last_code}')
+
+    # ── 4. US OFDMA IUC data stats ──
+    #    OID: 1.3.6.1.4.1.4491.2.1.28.1.24.1.{col}.{ifIndex}.{iuc}
+    #    col 4=total, 5=corrected, 6=unreliable
+    iuc_base = '1.3.6.1.4.1.4491.2.1.28.1.24.1'
+    col_field = {'4': 'total', '5': 'corrected', '6': 'unreliable'}
+    iuc_stats_map = {}  # {ifIndex: {iuc: {field: val}}}
+    for e in _extract_result_entries(us_iuc_stats_result):
+        oid = e.get('oid', '')
+        for col, field in col_field.items():
+            prefix = f'{iuc_base}.{col}.'
+            if oid.startswith(prefix):
+                parts = oid[len(prefix):].split('.')
+                if len(parts) == 2:
+                    try:
+                        iuc_stats_map.setdefault(int(parts[0]), {}).setdefault(int(parts[1]), {})[field] = int(e.get('value') or 0)
+                    except (ValueError, TypeError):
+                        pass
+
+    us_iuc_channels = []
+    for ifidx in sorted(iuc_stats_map.keys()):
+        # Skip channels not belonging to this modem when scoping info is available
+        if valid_us_ifindices and ifidx not in valid_us_ifindices:
+            continue
+        iucs = []
+        for iuc in sorted(iuc_stats_map[ifidx].keys()):
+            row = iuc_stats_map[ifidx][iuc]
+            total   = row.get('total', 0)
+            corr    = row.get('corrected', 0)
+            unrelia = row.get('unreliable', 0)
+            iucs.append({
+                'iuc':             iuc,
+                'total':           total,
+                'corrected':       corr,
+                'corrected_pct':   round(corr / total * 100, 4) if total else 0,
+                'unreliable':      unrelia,
+                'unreliable_pct':  round(unrelia / total * 100, 6) if total else 0,
+            })
+        us_iuc_channels.append({
+            'ifindex':  ifidx,
+            'ifname':   ifname_map.get(ifidx),
+            'iuc_stats': iucs,
+        })
+
+    # ── 5. DS subcarrier status (main modulation per range) ──
+    #    OID: 1.3.6.1.4.1.4491.2.1.28.1.21.1.3.{ifIndex}.{rangeIndex}
+    subcarrier_base = '1.3.6.1.4.1.4491.2.1.28.1.21.1.3'
+    subcarrier_map = {}  # {ifIndex: {rangeIndex: code}}
+    for e in _extract_result_entries(ds_subcarrier_result):
+        oid = e.get('oid', '')
+        if oid.startswith(subcarrier_base + '.'):
+            parts = oid[len(subcarrier_base) + 1:].split('.')
+            if len(parts) == 2:
+                try:
+                    subcarrier_map.setdefault(int(parts[0]), {})[int(parts[1])] = int(e.get('value') or 0)
+                except (ValueError, TypeError):
+                    pass
+
+    ds_subcarrier = []
+    for ifidx in sorted(subcarrier_map.keys()):
+        # Skip DS channels not belonging to this modem when scoping info is available
+        if valid_ds_ifindices and ifidx not in valid_ds_ifindices:
+            continue
+        ranges = []
+        for ridx in sorted(subcarrier_map[ifidx].keys()):
+            code = subcarrier_map[ifidx][ridx]
+            ranges.append({
+                'range_index':     ridx,
+                'modulation_code': code,
+                'modulation':      _MODULATION_CODE.get(code, f'code {code}'),
+            })
+        ds_subcarrier.append({
+            'ifindex': ifidx,
+            'ifname':  ifname_map.get(ifidx),
+            'ranges':  ranges,
+        })
+
+    return {
+        'ds_profiles':   ds_profiles,
+        'us_iuc_stats':  us_iuc_channels,
+        'ds_subcarrier': ds_subcarrier,
+    }

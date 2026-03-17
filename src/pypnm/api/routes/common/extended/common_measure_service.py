@@ -960,42 +960,73 @@ class CommonMeasureService(CommonMessagingService):
             return ServiceStatusCode.LOCAL_FETCH_FAILURE
 
         # pnm_file_get is only announced by agents whose local capture root is
-        # readable, so simple capability routing is sufficient here.
-        agent = agent_manager.get_agent_for_capability('pnm_file_get')
+        # readable.  Scatter-gather: ask ALL agents in parallel, take the first
+        # success.  Scales to many file-agents without sequential timeout cost.
+        candidate_ids = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
 
-        if not agent:
+        if not candidate_ids:
             self.logger.warning(
                 f"{self.log_prefix} - No agent with pnm_file_get capability; "
                 "falling back to local fetch"
             )
             return await self._handle_local_fetch(pnm_file_name)
 
+        self.logger.info(
+            f"{self.log_prefix} - Requesting '{pnm_file_name}' from "
+            f"{len(candidate_ids)} file-agent(s) in parallel"
+        )
+
+        async def _try_agent(aid: str) -> tuple[str, dict | None]:
+            """Send file_get to one agent and return (agent_id, result)."""
+            try:
+                # Timeout is auto-upgraded to LONG_TASK_TIMEOUT (90 s) by AgentManager
+                # for file_get commands — no need to hardcode a value here.
+                tid = await agent_manager.send_task(
+                    agent_id=aid, command='file_get',
+                    params={'filename': pnm_file_name, 'glob': True},
+                )
+                res = await agent_manager.wait_for_task_async(
+                    tid, timeout=agent_manager.LONG_TASK_TIMEOUT,
+                )
+                return aid, res
+            except Exception as exc:
+                self.logger.debug(f"{self.log_prefix} - Agent '{aid}' file_get error: {exc}")
+                return aid, None
+
+        # Launch all requests concurrently, finish when first succeeds
+        pending = {asyncio.ensure_future(_try_agent(aid)): aid for aid in candidate_ids}
+        winner_result = None
+        winner_agent = None
+
         try:
-            task_id = await agent_manager.send_task(
-                agent_id=agent.agent_id,
-                command='file_get',
-                params={'filename': pnm_file_name, 'glob': True},
-                timeout=30.0,
-            )
-            result = await agent_manager.wait_for_task_async(task_id, timeout=30.0)
-        except Exception as e:
-            self.logger.error(f"{self.log_prefix} - Agent file_get failed: {e}")
-            return ServiceStatusCode.LOCAL_FETCH_FAILURE
+            while pending:
+                done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    aid, result = fut.result()
+                    pending.pop(fut, None)
+                    result_inner = (result or {}).get('result') or result or {}
+                    if result_inner and result_inner.get('success'):
+                        winner_result = result_inner
+                        winner_agent = aid
+                        break
+                if winner_result:
+                    break
+        finally:
+            # Cancel remaining in-flight requests
+            for fut in pending:
+                fut.cancel()
 
-        # wait_for_task_async returns the full WS message wrapper;
-        # the actual handler result is nested under 'result'.
-        result_inner = (result or {}).get('result') or result or {}
-
-        if not result_inner or not result_inner.get('success'):
-            err = result_inner.get('error', 'unknown')
+        if not winner_result:
             self.logger.error(
-                f"{self.log_prefix} - Agent could not fetch '{pnm_file_name}': {err}"
+                f"{self.log_prefix} - No agent could fetch '{pnm_file_name}' "
+                f"({len(candidate_ids)} tried)"
             )
             return ServiceStatusCode.LOCAL_FETCH_FAILURE
 
+        self.logger.info(f"{self.log_prefix} - File fetched via agent '{winner_agent}'")
         try:
-            content = base64.b64decode(result_inner['content_base64'])
-            dest = os.path.join(self.pnm_dir, result_inner.get('filename', pnm_file_name))
+            content = base64.b64decode(winner_result['content_base64'])
+            dest = os.path.join(self.pnm_dir, winner_result.get('filename', pnm_file_name))
             os.makedirs(self.pnm_dir, exist_ok=True)
             with open(dest, 'wb') as fh:
                 fh.write(content)

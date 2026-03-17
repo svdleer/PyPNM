@@ -2023,9 +2023,9 @@ class CmSnmpOperation:
             cscs.to_dict()[0]
             self.logger.info('Diplexer configuration read successfully')
         except Exception as e:
-            print(f'=== FAILED to read diplexer configuration: {e} ===', flush=True)
-            self.logger.error(f'Failed to read diplexer configuration: {e}')
-            return False
+            # Diplexer read is informational only — validation is not yet implemented (TODO).
+            # Do not abort the spectrum capture when this optional read fails (e.g. agent busy).
+            self.logger.warning(f'Failed to read diplexer configuration (non-fatal, proceeding): {e}')
 
         """ TODO: Will need to validate the Spec Analyzer Settings against the Diplex Settings
         lower_edge = int(diplex_dict["docsIf31CmSystemCfgStateDiplexerCfgDsLowerBandEdge"]) * 1_000_000

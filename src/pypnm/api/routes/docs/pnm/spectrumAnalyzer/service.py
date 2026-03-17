@@ -240,7 +240,7 @@ class DsOfdmChannelSpectrumAnalyzer(CommonSpectrumChannelAnalyzer):
         num_bins_per_segment    = rbw_settings[1]
         number_of_averages      = self._number_of_averages
         spectrum_retrieval_type = self._spectrum_retrieval_type
-        inactivity_timeout      = 30
+        inactivity_timeout      = 60
         noise_bw                = 150
         segment_freq_span       = rbw_settings[2]
 

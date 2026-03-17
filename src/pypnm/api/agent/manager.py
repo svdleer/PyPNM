@@ -28,7 +28,18 @@ class AgentManager:
         self._task_queues: dict[str, Queue] = {}
         self._async_task_queues: dict[str, asyncio.Queue] = {}
         self._rr_counters: dict[str, int] = {}  # round-robin index per capability
+        self._agent_timeouts: dict[str, int] = {}  # consecutive timeout count per agent
+        self._agent_quarantine: dict[str, float] = {}  # agent_id → quarantine-until timestamp
+        self.QUARANTINE_AFTER = 3   # consecutive timeouts before quarantine
+        self.QUARANTINE_SECS = 60   # seconds to skip a quarantined agent
         self.logger = logging.getLogger(f'{__name__}.AgentManager')
+        # Commands that involve large file transfers or long SNMP captures.
+        # These get a higher default timeout and are routed to the agent's
+        # dedicated long-running thread pool so they never starve SNMP workers.
+        self.LONG_COMMANDS: frozenset[str] = frozenset({
+            'file_get', 'pnm_file_get',
+        })
+        self.LONG_TASK_TIMEOUT: float = 90.0   # default timeout for long commands
 
     def _describe_task(self, task_id: str) -> str:
         """Build a concise task description for timeout/error diagnostics."""
@@ -48,6 +59,36 @@ class AgentManager:
 
         agent_id = self._task_agent_ids.get(task_id, '-')
         return f"agent={agent_id} command={task.command} target={target_ip} {oid_desc}"
+
+    def _record_agent_success(self, agent_id: str):
+        """Reset timeout counter on successful result."""
+        if agent_id in self._agent_timeouts:
+            del self._agent_timeouts[agent_id]
+
+    def _record_agent_timeout(self, agent_id: str):
+        """Track consecutive timeout; quarantine after threshold."""
+        count = self._agent_timeouts.get(agent_id, 0) + 1
+        self._agent_timeouts[agent_id] = count
+        if count >= self.QUARANTINE_AFTER:
+            until = time.time() + self.QUARANTINE_SECS
+            self._agent_quarantine[agent_id] = until
+            self.logger.warning(
+                f"Agent '{agent_id}' quarantined for {self.QUARANTINE_SECS}s "
+                f"after {count} consecutive timeouts"
+            )
+
+    def _is_quarantined(self, agent_id: str) -> bool:
+        """Check if agent is currently quarantined."""
+        until = self._agent_quarantine.get(agent_id)
+        if until is None:
+            return False
+        if time.time() >= until:
+            # Quarantine expired — give it another chance
+            del self._agent_quarantine[agent_id]
+            self._agent_timeouts.pop(agent_id, None)
+            self.logger.info(f"Agent '{agent_id}' quarantine expired, re-enabling")
+            return False
+        return True
 
     def _cleanup_task(self, task_id: str):
         """Cleanup all task bookkeeping structures."""
@@ -249,6 +290,18 @@ class AgentManager:
                 return agent
         return None
 
+    def get_all_agent_ids_for_capability(self, capability: str) -> list[str]:
+        """Return all agent IDs advertising *capability* (round-robin ordered, skipping quarantined)."""
+        capable = [a.agent_id for a in self.agents.values()
+                   if a.authenticated and capability in a.capabilities]
+        healthy = [aid for aid in capable if not self._is_quarantined(aid)]
+        pool = healthy if healthy else capable
+        # Rotate list to start from next round-robin position
+        if pool:
+            idx = self._rr_counters.get(capability, 0) % len(pool)
+            pool = pool[idx:] + pool[:idx]
+        return pool
+
     def get_agent_id_for_capability(self, capability: str) -> Optional[str]:
         """
         Return agent_id of the next agent advertising *capability*, round-robin.
@@ -265,14 +318,32 @@ class AgentManager:
         if not capable:
             self.logger.warning(f"No agent available for capability '{capability}' — connected agents: {list(self.agents.keys())}")
             return None
-        idx = self._rr_counters.get(capability, 0) % len(capable)
+        # Filter out quarantined agents (but keep at least one)
+        healthy = [aid for aid in capable if not self._is_quarantined(aid)]
+        pool = healthy if healthy else capable
+        if len(healthy) < len(capable):
+            quarantined = [aid for aid in capable if aid not in healthy]
+            self.logger.debug(f"Skipping quarantined agents {quarantined} for '{capability}'")
+        idx = self._rr_counters.get(capability, 0) % len(pool)
         self._rr_counters[capability] = idx + 1
-        agent_id = capable[idx]
-        self.logger.debug(f"Routing '{capability}' task → agent '{agent_id}' (round-robin {idx+1}/{len(capable)})")
+        agent_id = pool[idx]
+        self.logger.debug(f"Routing '{capability}' task → agent '{agent_id}' (round-robin {idx+1}/{len(pool)})")
         return agent_id
     
     async def send_task(self, agent_id: str, command: str, params: dict, timeout: float = 30.0, priority: str = 'interactive') -> str:
-        """Send task to agent. Returns task_id."""
+        """Send task to agent. Returns task_id.
+
+        For commands in LONG_COMMANDS (file_get, pnm_file_get) the timeout is
+        automatically raised to LONG_TASK_TIMEOUT and priority set to 'long'
+        so the agent routes them to its dedicated long-running thread pool.
+        The caller may still pass an explicit timeout > LONG_TASK_TIMEOUT to
+        override further.
+        """
+        if command in self.LONG_COMMANDS:
+            if timeout < self.LONG_TASK_TIMEOUT:
+                timeout = self.LONG_TASK_TIMEOUT
+            if priority == 'interactive':
+                priority = 'long'
         if agent_id not in self.agents:
             raise ValueError(f"Agent not connected: {agent_id}")
         
@@ -337,9 +408,17 @@ class AgentManager:
                 self._async_task_queues[task_id].get(),
                 timeout=timeout
             )
+            # Success — reset timeout counter for this agent
+            agent_id = self._task_agent_ids.get(task_id)
+            if agent_id:
+                self._record_agent_success(agent_id)
             return result
         except asyncio.TimeoutError:
             task_desc = self._describe_task(task_id)
+            # Record timeout for quarantine tracking
+            agent_id = self._task_agent_ids.get(task_id)
+            if agent_id:
+                self._record_agent_timeout(agent_id)
             self.logger.error(
                 f"Timeout ({timeout}s) waiting for task {task_id} — {task_desc}; "
                 "agent is still running; increase timeout or reduce SNMP repetitions"

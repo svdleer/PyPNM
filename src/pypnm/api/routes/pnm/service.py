@@ -1250,16 +1250,33 @@ class PNMDiagnosticsService:
 
                 # 3) Final API-side fetch from FTP and re-search in cache
                 if not bin_path:
-                    try:
-                        _fetch_pnm_files(fname, allow_when_local=True)
-                    except Exception as _ftp_err:
-                        self.logger.warning(f"ChanEst FTP prefetch failed for {fname}: {_ftp_err}")
-                    # Retry from cache only (where fetched files land)
-                    recent_cache = _recent_files(cache_dir, [
+                    # Modems write files with vendor-specific prefixes that
+                    # differ from the filename we SET.  Try all known patterns.
+                    fetch_prefixes = [
+                        fname,
+                        f'ds_ofdm_chan_est_coef_{mac_clean}',
+                        f'PNMChEstCoef_{mac_upper}',
+                        f'PNMChEstCoef_{mac_clean}',
+                    ]
+                    for fp in fetch_prefixes:
+                        try:
+                            _fetch_pnm_files(fp, allow_when_local=True)
+                        except Exception as _ftp_err:
+                            self.logger.warning(f"ChanEst FTP prefetch failed for {fp}: {_ftp_err}")
+                    # Retry from cache with all known filename patterns
+                    chan_id_fb = ifindex_to_chanid.get(ifindex)
+                    cache_patterns = [
                         f'{fname}*',
                         f'chan_est_{mac_clean}_{ifindex}_*',
                         f'chan_est_{mac_clean}_{ifindex}_*.bin',
-                    ])
+                        f'ds_ofdm_chan_est_coef_{mac_clean}_{ifindex}_*',
+                        f'ds_ofdm_chan_est_coef_{mac_clean}_*',
+                        f'PNMChEstCoef_{mac_upper}_*',
+                        f'PNMChEstCoef_{mac_clean}_*',
+                    ]
+                    if chan_id_fb is not None:
+                        cache_patterns.append(f'ds_ofdm_chan_est_coef_{mac_clean}_{chan_id_fb}_*')
+                    recent_cache = _recent_files(cache_dir, cache_patterns)
                     if recent_cache:
                         bin_path = max(recent_cache, key=os.path.getmtime)
 

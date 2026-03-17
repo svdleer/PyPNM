@@ -571,10 +571,11 @@ class CMTSModemService:
         OID_IF_NAME = '1.3.6.1.2.1.31.1.1.1.1'  # IF-MIB::ifName
         OID_CM_OFDMA_TIMING = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'  # OFDMA timing offset
         OID_IF_DESCR = '1.3.6.1.2.1.2.2.1.2'  # IF-MIB::ifDescr
+        OID_MD_NODE_DS_SG = '1.3.6.1.4.1.4491.2.1.20.1.12.1.3'  # docsIf3MdNodeStatusMdDsSgId
         
-        # Single parallel_walk for all 3 OIDs — same as modem discovery.
+        # Single parallel_walk for all 4 OIDs — same as modem discovery.
         # max_repetitions=500 → 8756 rows / 500 = ~18 PDUs total, completes in <5s on LAN.
-        walk_oids = [OID_MD_IF_INDEX, OID_IF_NAME, OID_CM_OFDMA_TIMING]
+        walk_oids = [OID_MD_IF_INDEX, OID_IF_NAME, OID_CM_OFDMA_TIMING, OID_MD_NODE_DS_SG]
         try:
             walk_result = await self._send_agent_command(
                 'snmp_parallel_walk',
@@ -595,7 +596,8 @@ class CMTSModemService:
             f"Interface parallel_walk raw keys: {list(raw.keys())} "
             f"sizes: md_if={len(raw.get(OID_MD_IF_INDEX, []))} "
             f"if_name={len(raw.get(OID_IF_NAME, []))} "
-            f"ofdma={len(raw.get(OID_CM_OFDMA_TIMING, []))}"
+            f"ofdma={len(raw.get(OID_CM_OFDMA_TIMING, []))} "
+            f"fn_node={len(raw.get(OID_MD_NODE_DS_SG, []))}"
         )
 
         # Parse (index, value) pairs from parallel_walk result dict
@@ -609,6 +611,7 @@ class CMTSModemService:
         md_if_results   = parse_oid(OID_MD_IF_INDEX)
         if_name_results = parse_oid(OID_IF_NAME)
         ofdma_results   = parse_oid(OID_CM_OFDMA_TIMING)
+        fn_node_results = raw.get(OID_MD_NODE_DS_SG, [])
         
         # Parse MD-IF-INDEX: modem_index -> md_if_index (COPY-PASTE from agent)
         md_if_map = {}
@@ -629,7 +632,31 @@ class CMTSModemService:
                 except:
                     pass
         
-        self.logger.info(f"Resolved {len(md_if_map)} MD-IF-INDEX, {len(if_name_map)} interface names")
+        # Parse docsIf3MdNodeStatusMdDsSgId: mdIfIndex → fiber_node_name
+        # OID index format: {mdIfIndex}.{strLen}.{char0}...{charN}.{mCmSgId}
+        md_if_to_fn = {}  # mdIfIndex (int) → fiber_node_name (str)
+        for item in fn_node_results:
+            oid = item.get('oid', '')
+            if not oid.startswith(OID_MD_NODE_DS_SG + '.'):
+                continue
+            suffix = oid[len(OID_MD_NODE_DS_SG) + 1:]
+            parts = suffix.split('.')
+            if len(parts) < 4:
+                continue
+            try:
+                fn_md_if = int(parts[0])
+                str_len = int(parts[1])
+                if len(parts) < 2 + str_len + 1:
+                    continue
+                ascii_vals = [int(p) for p in parts[2:2 + str_len]]
+                if all(32 <= v <= 126 for v in ascii_vals):
+                    fn_name = ''.join(chr(v) for v in ascii_vals)
+                    if fn_md_if not in md_if_to_fn:
+                        md_if_to_fn[fn_md_if] = fn_name
+            except (ValueError, IndexError):
+                pass
+
+        self.logger.info(f"Resolved {len(md_if_map)} MD-IF-INDEX, {len(if_name_map)} interface names, {len(md_if_to_fn)} fiber nodes")
         
         # Parse OFDMA: modem_index -> ofdma_ifindex
         # Uses vendor-agnostic timing offset check (0 = no OFDMA, >0 = active OFDMA)
@@ -693,12 +720,14 @@ class CMTSModemService:
             if not idx:
                 continue
             
-            # Add cable_mac from MD-IF-INDEX -> ifName
+            # Add cable_mac and fiber_node from MD-IF-INDEX -> ifName / fnName
             if idx in md_if_map:
                 md_if_idx = md_if_map[idx]
                 if md_if_idx in if_name_map:
                     modem['cable_mac'] = if_name_map[md_if_idx]
                     enriched_count += 1
+                if md_if_idx in md_if_to_fn:
+                    modem['fiber_node'] = md_if_to_fn[md_if_idx]
             
             # Add OFDMA upstream interface if discovered 
             if idx in ofdma_if_map:

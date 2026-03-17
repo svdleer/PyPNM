@@ -371,10 +371,15 @@ class CmtsUtscService:
                 )
                 return await self._configure_bdt_standard(dest_ip, dest_path, index)
 
-            # CCAP table is writable (Casa) — set the remaining columns.
+            # CCAP table is writable (Casa) — direct SETs on columns.
+            # Casa CCAP table has NO RowStatus — just overwrite columns directly.
+            import asyncio
+
+            self.logger.info(f"CCAP bulk data: direct SET for {dest_ip}:{dest_path}")
+            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')  # ipv4
             await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP}.{index}", ip_hex_formatted, 'x')
             await self._snmp_set(f"{self.OID_BULK_DATA_DEST_PATH}.{index}", dest_path, 's')
-            await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')
+            await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')  # autoUpload
             await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", selector_hex, 'x')
 
             self.logger.info(f"Bulk data control configured: selector={selector_hex}")

@@ -84,6 +84,7 @@ class ChannelStatsResponse(BaseModel):
     timing: Optional[dict] = None
     downstream: Optional[dict] = None
     upstream: Optional[dict] = None
+    ofdm_stats: Optional[dict] = None
     error: Optional[str] = None
 
 
@@ -237,6 +238,11 @@ class ChannelStatsRouter:
                 cmts_chanid_task_id = None
                 cmts_profile_task_id = None
                 fiber_node_sg_task_id = None
+                cmts_partial_reason_task_id = None
+                cmts_us_iuc_stats_task_id = None
+                cmts_ds_ofdm_speed_task_id = None
+                cmts_ds_subcarrier_task_id = None
+                cmts_ifname_task_id = None
                 cached_cm_index = None
                 if request.cmts_ip and request.mac_address and cmts_agent_id:
                     if request.cm_index is not None:
@@ -325,6 +331,57 @@ class ChannelStatsRouter:
                                 },
                                 timeout=cmts_task_timeout,
                             )
+                        # New: partial service reason codes scoped to this CM (rows ~ n_ofdm_channels)
+                        if cached_cm_index is not None:
+                            cmts_partial_reason_task_id = await agent_manager.send_task(
+                                cmts_agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.7.1.1.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=cmts_task_timeout,
+                            )
+                        # New: US OFDMA IUC stats (per-channel aggregate, small table)
+                        cmts_us_iuc_stats_task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.24',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
+                        # New: DS OFDM profile speed per channel+profile
+                        cmts_ds_ofdm_speed_task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.20',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
+                        # New: DS OFDM subcarrier status (modulation per range)
+                        cmts_ds_subcarrier_task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.4.1.4491.2.1.28.1.21',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
+                        # ifName table — maps ifIndex → interface name (e.g. Cable8/0/0)
+                        cmts_ifname_task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_walk",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.2.1.31.1.1.1.1',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
                     except Exception as e:
                         self.logger.warning(f"Failed to send CMTS OFDMA task: {e}")
 
@@ -404,11 +461,21 @@ class ChannelStatsRouter:
                     cmts_cmindex_result,
                     cmts_rxmer_result,
                     cmts_profile_result,
+                    cmts_partial_reason_result,
+                    cmts_us_iuc_stats_result,
+                    cmts_ds_ofdm_speed_result,
+                    cmts_ds_subcarrier_result,
+                    cmts_ifname_result,
                 ) = await asyncio.gather(
                     _safe_wait_task(cmts_ofdma_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_cmindex_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_rxmer_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_profile_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_partial_reason_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_us_iuc_stats_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_ds_ofdm_speed_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_ds_subcarrier_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_ifname_task_id, cmts_task_timeout),
                 )
 
                 cmts_cmindex_timed_out = bool(
@@ -617,6 +684,23 @@ class ChannelStatsRouter:
                     except Exception as fn_err:
                         self.logger.debug(f'Fiber node lookup failed: {fn_err}')
 
+                # Build ofdm_stats from new CMTS walks (always run when CM walk succeeded,
+                # so DS profile codewords from modem show even if CMTS tasks timed out)
+                ofdm_stats = None
+                if parsed.get('success'):
+                    from .parser import parse_ofdm_stats_raw
+                    ofdm_stats = parse_ofdm_stats_raw(
+                        cm_index=cm_index,
+                        partial_reason_result=cmts_partial_reason_result,
+                        us_iuc_stats_result=cmts_us_iuc_stats_result,
+                        ds_ofdm_speed_result=cmts_ds_ofdm_speed_result,
+                        ds_subcarrier_result=cmts_ds_subcarrier_result,
+                        ifname_result=cmts_ifname_result,
+                        cmts_profile_result=cmts_profile_result,
+                        # CM-side DS profile stats already in parsed
+                        cm_ds_ofdm_channels=parsed.get('downstream', {}).get('ofdm', {}).get('channels', []),
+                    )
+
                 if parsed.get("success"):
                     return ChannelStatsResponse(
                         success=True,
@@ -628,6 +712,7 @@ class ChannelStatsRouter:
                         timing=parsed.get("timing"),
                         downstream=parsed.get("downstream"),
                         upstream=parsed.get("upstream"),
+                        ofdm_stats=ofdm_stats,
                     )
                 else:
                     return ChannelStatsResponse(

@@ -1766,7 +1766,9 @@ class UsOfdmaRxMerRouter:
 
             # ── Compose: chIfIndex → fnName ─────────────────────────────────
             result: dict = {}
+            _unresolved = []
             for ch_if, (md_if, ch_id) in ifidx_to_md_chid.items():
+                found = False
                 for (md2, m_us_sg), chset_id in ussg_to_chset.items():
                     if md2 != md_if:
                         continue
@@ -1775,7 +1777,19 @@ class UsOfdmaRxMerRouter:
                     fn_name = ussg_to_fn.get((md_if, m_us_sg))
                     if fn_name:
                         result[ch_if] = fn_name
+                    found = True
                     break
+                if not found:
+                    _unresolved.append((ch_if, md_if, ch_id))
+
+            if _unresolved:
+                self.logger.warning(
+                    f"FN-resolve: {len(_unresolved)}/{len(ifidx_to_md_chid)} channels unresolved. "
+                    f"Sample: {_unresolved[:5]}. "
+                    f"ussg_to_chset keys(sample): {list(ussg_to_chset.keys())[:5]}, "
+                    f"chset_chids keys(sample): {list(chset_chids.keys())[:5]}"
+                )
+            self.logger.info(f"FN-resolve: mapped {len(result)}/{len(ifidx_to_md_chid)} channels to FN names")
             return result
 
         @self.router.get(
@@ -1936,7 +1950,8 @@ class UsOfdmaRxMerRouter:
                 return {
                     "success":     True,
                     "channels":    channels,
-                    "fiber_nodes": sorted(seen.values(), key=lambda f: f['mac_domain']),
+                    "fiber_nodes": sorted([f for f in seen.values() if f['modem_count'] > 0],
+                                          key=lambda f: f['mac_domain']),
                 }
             except Exception as e:
                 self.logger.error(f"channel/list error: {e}")
