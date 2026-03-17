@@ -164,7 +164,7 @@ class BulkDestinationRouter:
                 std_result = await rxmer_svc.create_bulk_destination(
                     tftp_ip=request.dest_ip,
                     port=69,
-                    local_store=True,
+                    local_store=False,
                     dest_index=request.index
                 )
                 if not std_result.get('success'):

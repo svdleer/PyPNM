@@ -120,6 +120,73 @@ class BulkDestinationsResponse(BaseModel):
     error: Optional[str] = None
 
 
+# ============================================================
+# Pre-Equalization / Group Delay schemas
+# ============================================================
+
+class PreEqChannelMetrics(BaseModel):
+    """Pre-equalization key metrics for one upstream channel."""
+    main_tap_ratio: Optional[float] = None
+    tap_energy_ratio: Optional[float] = None
+    mtc_dB: Optional[float] = Field(None, description="Main Tap to Composite ratio (dB)")
+    nmter_dB: Optional[float] = Field(None, description="Non Main Tap Energy Ratio (dB)")
+    pcter: Optional[float] = Field(None, description="Pre/Post Cursor Tap Energy Ratio")
+    pre_main_tap_energy_ratio: Optional[float] = None
+    post_main_tap_energy_ratio: Optional[float] = None
+
+
+class PreEqGroupDelay(BaseModel):
+    """Group delay metrics from pre-equalization taps."""
+    channel_width_hz: int = Field(..., description="ATDMA channel width in Hz")
+    symbol_rate: float = Field(..., description="Symbol rate (sym/s)")
+    symbol_time_us: float = Field(..., description="Symbol period (µs)")
+    sample_period_us: float = Field(..., description="Tap sample period (µs)")
+    fft_size: int = Field(..., description="FFT size used for frequency domain analysis")
+    delay_us: List[float] = Field(default_factory=list, description="Group delay per FFT bin (µs), truncated")
+    delay_min_us: float = Field(..., description="Minimum group delay (µs)")
+    delay_max_us: float = Field(..., description="Maximum group delay (µs)")
+    delay_pp_us: float = Field(..., description="Peak-to-peak group delay variation (µs)")
+    delay_rms_us: float = Field(..., description="RMS group delay variation (µs)")
+
+
+class PreEqTapDelaySummary(BaseModel):
+    """Tap delay summary with cable length equivalents."""
+    main_tap_index: int
+    max_pre_main_delay_us: Optional[float] = None
+    max_post_main_delay_us: Optional[float] = None
+    pre_main_cable_ft: Optional[float] = Field(None, description="Cable length equivalent (feet) for pre-main reflection")
+    post_main_cable_ft: Optional[float] = Field(None, description="Cable length equivalent (feet) for post-main reflection")
+
+
+class PreEqChannelData(BaseModel):
+    """Pre-equalization data for one upstream channel."""
+    us_ifindex: int = Field(..., description="Upstream channel ifIndex")
+    num_taps: int = Field(..., description="Number of equalizer taps")
+    main_tap_location: int = Field(..., description="Main tap index")
+    taps_per_symbol: int = Field(..., description="Taps per symbol from header")
+    metrics: Optional[PreEqChannelMetrics] = None
+    group_delay: Optional[PreEqGroupDelay] = None
+    tap_delay_summary: Optional[PreEqTapDelaySummary] = None
+
+
+class PreEqDataRequest(BaseModel):
+    """Request to get pre-equalization data for a cable modem."""
+    cmts: CmtsSnmpConfig
+    cm_mac_address: str = Field(..., description="Cable modem MAC address")
+    cm_index: Optional[int] = Field(None, description="CM registration index (if already known)")
+    channel_width_hz: int = Field(default=6_400_000, description="ATDMA channel width in Hz (default 6.4 MHz)")
+
+
+class PreEqDataResponse(BaseModel):
+    """Response with pre-equalization data and group delay."""
+    success: bool
+    cm_mac_address: str
+    cm_index: Optional[int] = None
+    num_channels: int = 0
+    channels: List[PreEqChannelData] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
 class CreateBulkDestinationRequest(BaseModel):
     """Request to create or configure a bulk transfer destination."""
     cmts: CmtsSnmpConfig

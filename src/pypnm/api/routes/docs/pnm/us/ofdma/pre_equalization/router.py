@@ -2,6 +2,10 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Maurice Garcia
+
+# Skip auto-registration — use /pnm/us/ofdma/preEqualization instead of /docs/pnm/...
+__skip_autoregister__ = True
+
 import logging
 from typing import Any, cast
 

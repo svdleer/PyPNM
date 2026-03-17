@@ -24,6 +24,11 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from pypnm.api.routes.common.service.fiber_node_utils import (
+    OID_MD_NODE_STATUS_MD_DS_SG_ID,
+    parse_fn_name_from_oid_by_sg_id,
+)
+
 # In-process cache: (cmts_ip, mac) -> (cm_index, expires_at)
 _CM_INDEX_CACHE: dict = {}
 _CM_INDEX_TTL = 3600  # 1 hour
@@ -580,54 +585,24 @@ class ChannelStatsRouter:
                 return None
             
             # Walk the full fiber node table and match by SG ID directly
-            # This approach works for both E6000 and Cisco without needing US/DS ifIndex mapping
-            # OID format: ...1.12.1.3.{mdIfIndex}.{length}.{ASCII bytes of FN name}.{sgId} = Gauge32: {dsSgId}
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.12.1.3'  # docsIf3MdNodeStatusMdDsSgId
-            self.logger.info(f"Walking full fiber node table to find SG ID {cm_sg_id}: {oid}")
-            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
+            # Uses shared fiber_node_utils for OID parsing (unified with rxmer/router.py)
+            self.logger.info(f"Walking full fiber node table to find SG ID {cm_sg_id}: {OID_MD_NODE_STATUS_MD_DS_SG_ID}")
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": OID_MD_NODE_STATUS_MD_DS_SG_ID, "community": community}, timeout=10.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
             
             if result and result.get("result", {}).get("success"):
                 results = result.get("result", {}).get("results", [])
                 self.logger.info(f"Fiber node table has {len(results)} entries, searching for SG ID {cm_sg_id}")
                 
-                # Find fiber node by matching SG ID in the OID index
-                # OID format: ...1.12.1.3.{mdIfIndex}.{length}.{ASCII bytes of FN name}.{sgId}
+                # Find fiber node by matching SG ID using shared utility
                 for entry in results:
                     oid_str = entry.get("oid", "")
-                    
-                    # Check if OID ends with our SG ID
-                    if oid_str.endswith(f".{cm_sg_id}"):
-                        # Parse fiber node name from OID
-                        # Format: ...{mdIfIndex}.{length}.{ASCII bytes}.{sgId}
-                        parts = oid_str.split('.')
-                        try:
-                            # Find the length field (should be after mdIfIndex)
-                            # Walk backwards from sgId to find the name
-                            sg_id_pos = len(parts) - 1
-                            
-                            # The structure before sgId is: mdIfIndex.length.char1.char2...charN
-                            # We need to find the length to know how many chars to read
-                            # Try to find it by looking for a small number (name length) followed by ASCII values
-                            for i in range(sg_id_pos - 1, 1, -1):
-                                potential_length = int(parts[i])
-                                if 1 <= potential_length <= 50:  # Reasonable name length
-                                    # Check if next N parts are valid ASCII
-                                    ascii_parts = parts[i+1:i+1+potential_length]
-                                    if len(ascii_parts) == potential_length:
-                                        try:
-                                            ascii_values = [int(p) for p in ascii_parts]
-                                            if all(32 <= v <= 126 for v in ascii_values):  # Printable ASCII
-                                                fiber_node = ''.join(chr(v) for v in ascii_values)
-                                                self.logger.info(f"Found fiber node for {mac_address}: {fiber_node} (SG ID: {cm_sg_id})")
-                                                return fiber_node
-                                        except ValueError:
-                                            continue
-                            
-                            self.logger.warning(f"Could not parse fiber node name from OID {oid_str}")
-                        except (ValueError, IndexError) as e:
-                            self.logger.warning(f"Failed to parse fiber node from OID {oid_str}: {e}")
-                            continue
+                    fn_name = parse_fn_name_from_oid_by_sg_id(
+                        oid_str, OID_MD_NODE_STATUS_MD_DS_SG_ID, int(cm_sg_id)
+                    )
+                    if fn_name:
+                        self.logger.info(f"Found fiber node for {mac_address}: {fn_name} (SG ID: {cm_sg_id})")
+                        return fn_name
                 
                 self.logger.warning(f"No fiber node found matching SG ID {cm_sg_id}")
             else:
