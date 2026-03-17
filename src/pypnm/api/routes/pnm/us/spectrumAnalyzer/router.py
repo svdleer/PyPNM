@@ -599,7 +599,8 @@ async def _configure_utsc(
     svc = CmtsUtscService(
         cmts_ip=cmts_ip,
         rf_port_ifindex=rf_port_ifindex,
-        community=write_community
+        community=community,
+        write_community=write_community
     )
     result = await svc.configure_row(
         center_freq_hz=center_freq_hz,
@@ -708,7 +709,8 @@ async def get_utsc_capture(request: UtscRequest) -> UtscResponse:
         service = CmtsUtscService(
             cmts_ip=Inet(request.cmts.cmts_ip),
             rf_port_ifindex=request.cmts.rf_port_ifindex,
-            community=request.cmts.community
+            community=request.cmts.community,
+            write_community=getattr(request.cmts, 'write_community', None)
         )
         
         # Step 1: Reset port to clean state (stop any active capture, wait for ready)

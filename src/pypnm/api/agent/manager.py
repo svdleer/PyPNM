@@ -23,10 +23,41 @@ class AgentManager:
     def __init__(self, auth_token: str = 'dev-token-change-me'):
         self.agents: dict[str, ConnectedAgent] = {}
         self.pending_tasks: dict[str, PendingTask] = {}
+        self._task_agent_ids: dict[str, str] = {}
         self.auth_token = auth_token
         self._task_queues: dict[str, Queue] = {}
         self._async_task_queues: dict[str, asyncio.Queue] = {}
         self.logger = logging.getLogger(f'{__name__}.AgentManager')
+
+    def _describe_task(self, task_id: str) -> str:
+        """Build a concise task description for timeout/error diagnostics."""
+        task = self.pending_tasks.get(task_id)
+        if not task:
+            return "unknown task"
+
+        params = task.params or {}
+        target_ip = params.get('target_ip') or params.get('ip') or params.get('cmts_ip') or '-'
+        if 'oid' in params:
+            oid_desc = f"oid={params.get('oid')}"
+        elif 'oids' in params:
+            oids = params.get('oids') or []
+            oid_desc = f"oids={len(oids)}"
+        else:
+            oid_desc = "oid=-"
+
+        agent_id = self._task_agent_ids.get(task_id, '-')
+        return f"agent={agent_id} command={task.command} target={target_ip} {oid_desc}"
+
+    def _cleanup_task(self, task_id: str):
+        """Cleanup all task bookkeeping structures."""
+        if task_id in self._task_queues:
+            del self._task_queues[task_id]
+        if task_id in self._async_task_queues:
+            del self._async_task_queues[task_id]
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
+        if task_id in self._task_agent_ids:
+            del self._task_agent_ids[task_id]
     
     async def handle_websocket(self, websocket: WebSocket):
         """Handle WebSocket connection from agent."""
@@ -252,6 +283,7 @@ class AgentManager:
             timeout=timeout
         )
         self.pending_tasks[task_id] = task
+        self._task_agent_ids[task_id] = agent_id
         self._task_queues[task_id] = Queue()
         self._async_task_queues[task_id] = asyncio.Queue(maxsize=1)
         
@@ -269,8 +301,7 @@ class AgentManager:
             self.logger.info(f"Sent task {task_id} ({command}) to agent '{agent_id}'")
         except Exception as e:
             self.logger.error(f"Failed to send task {task_id} to '{agent_id}': {e}")
-            del self.pending_tasks[task_id]
-            del self._task_queues[task_id]
+            self._cleanup_task(task_id)
             raise
         
         return task_id
@@ -284,14 +315,11 @@ class AgentManager:
             result = self._task_queues[task_id].get(timeout=timeout)
             return result
         except Empty:
+            task_desc = self._describe_task(task_id)
+            self.logger.error(f"Timeout ({timeout}s) waiting (sync) for task {task_id} — {task_desc}")
             return None
         finally:
-            if task_id in self._task_queues:
-                del self._task_queues[task_id]
-            if task_id in self._async_task_queues:
-                del self._async_task_queues[task_id]
-            if task_id in self.pending_tasks:
-                del self.pending_tasks[task_id]
+            self._cleanup_task(task_id)
     
     async def wait_for_task_async(self, task_id: str, timeout: float = 30.0) -> Optional[dict]:
         """Wait for task result (async - for async code)."""
@@ -305,15 +333,14 @@ class AgentManager:
             )
             return result
         except asyncio.TimeoutError:
-            self.logger.error(f"Timeout ({timeout}s) waiting for task {task_id} — agent is still running; increase timeout or reduce SNMP repetitions")
+            task_desc = self._describe_task(task_id)
+            self.logger.error(
+                f"Timeout ({timeout}s) waiting for task {task_id} — {task_desc}; "
+                "agent is still running; increase timeout or reduce SNMP repetitions"
+            )
             return {'success': False, 'error': f'Agent task timeout after {timeout}s'}
         finally:
-            if task_id in self._task_queues:
-                del self._task_queues[task_id]
-            if task_id in self._async_task_queues:
-                del self._async_task_queues[task_id]
-            if task_id in self.pending_tasks:
-                del self.pending_tasks[task_id]
+            self._cleanup_task(task_id)
 
 
 # Global instance

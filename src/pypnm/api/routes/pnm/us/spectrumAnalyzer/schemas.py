@@ -121,6 +121,7 @@ class UsAtdmaSpecAnaAnalysisResponse(PnmAnalysisResponse):
 class CmtsUtscRequest(BaseModel):
     cmts_ip: str = Field(description="CMTS IP address")
     community: str = Field(default="private", description="SNMP community string")
+    write_community: str | None = Field(default=None, description="SNMP write community (defaults to community)")
 
 
 class UtscRequest(CmtsUtscRequest):

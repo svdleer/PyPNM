@@ -44,11 +44,12 @@ class CmtsUtscService:
     UTSC_CTRL_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1"
     UTSC_STATUS_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.4.1"
     
-    def __init__(self, cmts_ip: str, rf_port_ifindex: int, community: str = "private") -> None:
+    def __init__(self, cmts_ip: str, rf_port_ifindex: int, community: str = "private", write_community: Optional[str] = None) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cmts_ip = str(cmts_ip)
         self.rf_port_ifindex = rf_port_ifindex
         self.community = community
+        self.write_community = write_community or community
         self.agent_manager = get_agent_manager()
         self.cfg_idx = 1  # Use index .1 which exists on this CMTS
     
@@ -82,7 +83,7 @@ class CmtsUtscService:
                     'oid': oid,
                     'value': value,
                     'type': value_type,
-                    'community': self.community,
+                    'community': self.write_community,
                     'timeout': 10
                 },
                 timeout=30
@@ -976,43 +977,58 @@ class UtscRfPortDiscoveryService:
             )
             return result
 
-        # --- Arris/CommScope I-CCAP descriptor relation (non-fallback) ---
-        # When CoreToRpdMap is absent and UTSC logical rows are not correlated,
-        # derive the RF-port ifIndex by matching the I-CCAP upstream tuple.
-        # Example:
-        #   OFDMA:        cable-us-ofdma 1/0/24.0
-        #   RF interface: cable-upstream 1/0/24
+        # --- Arris/CommScope I-CCAP: map cable-upstream to cable-upstreamRfPort ---
+        # On I-CCAP, UTSC rows are indexed by cable-upstreamRfPort ifindexes,
+        # NOT cable-upstream ifindexes. Multiple channels share one RF port:
+        #   cable-upstream 1/0/24  (modem channel, ifIndex 34214088)
+        #                → cable-upstreamRfPort 1/0  (UTSC RF port, ifIndex 1376387073)
+        # Mapping: cable-upstream X/Y/Z → cable-upstreamRfPort X/Y (drop channel Z).
         if ofdma_ifindex and iccap_upstream_found:
             ofdma_descr = if_descr_map.get(ofdma_ifindex, "")
-            m = re.match(r'cable-us(?:-ofdma)?\s+(\d+)/(\d+)/(\d+)(?:\.\d+)?$', ofdma_descr, re.I)
+            m = re.match(r'cable-us(?:tream|-ofdma)?\s+(\d+)/(\d+)/(\d+)(?:\.\d+)?$', ofdma_descr, re.I)
             if m:
                 lc = int(m.group(1))
-                port = int(m.group(2))
-                chan = int(m.group(3))
-                exact = []
-                subif = []
-                for ifidx, descr in if_descr_map.items():
-                    rm = re.match(r'cable-upstream\s+(\d+)/(\d+)/(\d+)(?:\.(\d+))?$', descr, re.I)
-                    if not rm:
-                        continue
-                    if int(rm.group(1)) == lc and int(rm.group(2)) == port and int(rm.group(3)) == chan:
-                        # Prefer base RF row (no sub-interface), then .0 if needed.
-                        if rm.group(4) is None:
-                            exact.append((ifidx, descr))
-                        elif rm.group(4) == '0':
-                            subif.append((ifidx, descr))
+                connector = int(m.group(2))
 
-                picked = exact[0] if exact else (subif[0] if subif else None)
-                if picked:
-                    ifidx, descr = picked
-                    result["success"] = True
-                    result["rf_port_ifindex"] = ifidx
-                    result["rf_port_description"] = descr
-                    result["logical_channel"] = ofdma_ifindex
-                    self.logger.info(
-                        f"I-CCAP descriptor relation: OFDMA {ofdma_ifindex} ({ofdma_descr}) -> RF {ifidx} ({descr})"
-                    )
-                    return result
+                # Collect UTSC-valid RF port ifindexes for validation
+                utsc_rf_ifindexes = set(r["rf_ifindex"] for r in utsc_rows)
+
+                # Primary: find cable-upstreamRfPort matching linecard/connector
+                for ifidx, descr in if_descr_map.items():
+                    rfp = re.match(r'cable-upstreamRfPort\s+(\d+)/(\d+)', descr, re.I)
+                    if not rfp:
+                        continue
+                    if int(rfp.group(1)) == lc and int(rfp.group(2)) == connector:
+                        if ifidx in utsc_rf_ifindexes:
+                            result["success"] = True
+                            result["rf_port_ifindex"] = ifidx
+                            result["rf_port_description"] = descr
+                            result["logical_channel"] = ofdma_ifindex
+                            self.logger.info(
+                                f"I-CCAP RfPort mapping: {ofdma_descr} (ifIndex {ofdma_ifindex}) "
+                                f"-> {descr} (ifIndex {ifidx})"
+                            )
+                            return result
+                        else:
+                            self.logger.warning(
+                                f"I-CCAP RfPort {descr} (ifIndex {ifidx}) matches linecard/connector "
+                                f"but not in UTSC table — skipping"
+                            )
+
+                # Fallback: match any UTSC row ifDescr with same linecard/connector
+                for ifidx in utsc_rf_ifindexes:
+                    descr = if_descr_map.get(ifidx, "")
+                    um = re.match(r'cable-upstream\w*\s+(\d+)/(\d+)', descr, re.I)
+                    if um and int(um.group(1)) == lc and int(um.group(2)) == connector:
+                        result["success"] = True
+                        result["rf_port_ifindex"] = ifidx
+                        result["rf_port_description"] = descr
+                        result["logical_channel"] = ofdma_ifindex
+                        self.logger.info(
+                            f"I-CCAP UTSC table fallback: {ofdma_descr} (ifIndex {ofdma_ifindex}) "
+                            f"-> {descr} (ifIndex {ifidx})"
+                        )
+                        return result
 
         is_arris_commscope = us_conn_found or arris_rfport_found or iccap_upstream_found
         if is_arris_commscope and ofdma_ifindex:

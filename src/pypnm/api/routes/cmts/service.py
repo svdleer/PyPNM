@@ -173,8 +173,10 @@ class CMTSModemService:
         if enrich and cmts_ip in _enrichment_cache:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
+            cached_count = len(cached.get('modems', []))
+            cache_satisfies_limit = (not limit) or (cached_count >= int(limit))
             
-            if cached.get('enriched') and age < 7200:  # enriched data valid for 2 hours
+            if cached.get('enriched') and age < 7200 and cache_satisfies_limit:  # enriched data valid for 2 hours
                 self.logger.info(f"Returning cached enriched data for {cmts_ip} (age={age:.0f}s)")
                 return {
                     'success': True,
@@ -186,7 +188,7 @@ class CMTSModemService:
                     'cached': True,
                 }
             
-            if cached.get('enriching') and age < 1800:  # enrichment still in progress (30 min max)
+            if cached.get('enriching') and age < 1800 and cache_satisfies_limit:  # enrichment still in progress (30 min max)
                 # Return whatever we have so far (base modems) with enriching=True
                 self.logger.info(f"Enrichment in progress for {cmts_ip} (age={age:.0f}s)")
                 return {
@@ -228,7 +230,9 @@ class CMTSModemService:
             if enrich and modems:
                 # Guard: don't start a second enrichment if one is already running
                 existing = _enrichment_cache.get(cmts_ip, {})
-                if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800:
+                existing_count = len(existing.get('modems', []))
+                existing_satisfies_limit = (not limit) or (existing_count >= int(limit))
+                if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800 and existing_satisfies_limit:
                     self.logger.info(f"Enrichment already in progress for {cmts_ip}, skipping new launch")
                     return {
                         'success': True,
@@ -246,6 +250,7 @@ class CMTSModemService:
                     'enriched': False,
                     'enriching': True,
                     'timestamp': time.time(),
+                    'requested_limit': limit,
                     'enrich_progress': {'completed': 0, 'total': 0},
                 }
                 

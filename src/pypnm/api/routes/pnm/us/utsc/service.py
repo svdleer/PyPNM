@@ -802,7 +802,7 @@ class CmtsUtscService:
             else:
                 # Casa C100G / CommScope EVO vCCAP / Arris E6000:
                 # Probe cfg_index 1-3 for a row matching trigger_mode and write in-place.
-                # If no row found (e.g. after reboot or first run), fall back to destroy+createAndGo.
+                # If no row found (e.g. after reboot or first run), fall back to row creation.
                 # NOTE: on Casa C100G destroying a row removes the DestinationIndex managed
                 # internally — prefer in-place when a row exists.
                 # TODO: verify EVO vCCAP restores DestinationIndex after createAndGo (untested)
@@ -810,6 +810,7 @@ class CmtsUtscService:
                 row_found = False
                 first_existing_idx: Optional[int] = None
                 for probe_idx in range(1, 4):
+                    # Probe TriggerMode first (original approach)
                     r = await self._snmp_get(
                         f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
                     )
@@ -827,6 +828,32 @@ class CmtsUtscService:
                                 break
                         except (ValueError, TypeError):
                             pass
+                    else:
+                        # TriggerMode not readable — check RowStatus as fallback.
+                        # Arris E6000 may have an active row where TriggerMode reads
+                        # 'No Such Instance' after reboot but RowStatus is still active(1).
+                        # WARNING: this RowStatus probe is defense-in-depth added 2026-03-08.
+                        # If the rf_port_ifindex is wrong (e.g. logical channel instead of
+                        # cable-upstreamRfPort), this probe may mask the real issue by
+                        # not finding any rows and falling through to row creation which
+                        # will fail with inconsistentValue. The root cause is usually
+                        # incorrect ifindex from discovery, not missing rows.
+                        rs = await self._snmp_get(
+                            f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{probe_idx}"
+                        )
+                        rs_v = self._parse_get_value(rs)
+                        if rs_v is not None and 'No Such' not in str(rs_v):
+                            try:
+                                rs_int = int(rs_v)
+                                if rs_int in (1, 3):  # active(1) or notReady(3)
+                                    if first_existing_idx is None:
+                                        first_existing_idx = probe_idx
+                                    self.logger.info(
+                                        f"RowStatus probe found row at cfg_index={probe_idx} "
+                                        f"(status={rs_int}) — TriggerMode was unreadable"
+                                    )
+                            except (ValueError, TypeError):
+                                pass
 
                 # Arris/CommScope often has pre-provisioned fixed rows that reject
                 # destroy+createAndGo. If any row exists, reuse it and write columns
@@ -842,16 +869,36 @@ class CmtsUtscService:
 
                 if not row_found:
                     # No pre-provisioned row — create one.
+                    # Arris E6000 rejects createAndGo(4); use createAndWait(5) instead.
+                    # WARNING: defense-in-depth added 2026-03-08. On Arris I-CCAP, rows
+                    # are pre-provisioned by cable-upstreamRfPort ifindex — if we reach
+                    # this branch it likely means rf_port_ifindex is wrong (e.g. a
+                    # cable-upstream logical ifindex instead of cable-upstreamRfPort).
+                    # Both createAndGo and createAndWait will fail with inconsistentValue
+                    # in that case. Fix the discovery (discoverRfPort) first.
+                    create_value = 5 if is_arris else 4
+                    create_label = "createAndWait" if is_arris else "createAndGo"
                     self.logger.warning(
                         f"{vendor}: no row found for TriggerMode={trigger_mode} "
-                        f"— destroy+createAndGo at cfg_index={target_idx}"
+                        f"— destroy+{create_label} at cfg_index={target_idx}"
                     )
                     await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 6, 'i')  # destroy
                     await asyncio.sleep(2)
-                    r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 4, 'i')  # createAndGo
-                    self.logger.info(f"{vendor} createAndGo result: {r}")
+                    r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", create_value, 'i')
+                    self.logger.info(f"{vendor} {create_label} result: {r}")
                     if not r.get('success'):
-                        raise RuntimeError(f"createAndGo failed on {vendor} cfg_index={target_idx}: {r.get('error', r)}")
+                        # Fallback: try the other creation method
+                        alt_value = 4 if is_arris else 5
+                        alt_label = "createAndGo" if is_arris else "createAndWait"
+                        self.logger.warning(
+                            f"{create_label} failed, trying {alt_label} as fallback"
+                        )
+                        r = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", alt_value, 'i')
+                        self.logger.info(f"{vendor} {alt_label} fallback result: {r}")
+                        if not r.get('success'):
+                            raise RuntimeError(
+                                f"Row creation failed on {vendor} cfg_index={target_idx}: {r.get('error', r)}"
+                            )
                     await asyncio.sleep(1)
                 else:
                     self.logger.info(f"Writing columns in-place at cfg_index={target_idx} (no RowStatus touch)...")
@@ -1038,12 +1085,14 @@ class CmtsUtscService:
             )
             self.logger.info(f"TriggerCount={trigger_count}")
             
-            # 12. Set filename (OctetString) — only E6000; notWritable on Casa, not supported on Cisco
-            fn_result = await self._snmp_set(
-                f"{self.OID_UTSC_CFG_FILENAME}{idx}", filename, 's'
-            )
-            if not fn_result.get('success'):
-                self.logger.info(f"Filename SET failed on {vendor} (ignored — Casa/Cisco do not support writable filename): {fn_result.get('error', '')}")
+            # 12. Set filename (OctetString) — E6000 only; notWritable on Casa, not supported on Cisco
+            if is_arris:
+                # CommScope E6000: set to "" so E6000 uses its own default naming.
+                # Per MIB docs: must be "", "/pnm/utsc/filename", or "filename" (no dirs).
+                # E6000 appends timestamp: <filename>_YYYY-MM-DD_HH.MM.SS.mmm
+                await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_FILENAME}{idx}", "", 's'
+                )
             
             # 13. Set destination index if > 0 (Unsigned32)
             if destination_index > 0:
@@ -1161,41 +1210,48 @@ class CmtsUtscService:
                             break
                     except (ValueError, TypeError):
                         pass
-        idx = f".{rf_port_ifindex}.{resolved}"
-        
         self.logger.info(f"Starting UTSC for RF port {rf_port_ifindex}")
-        
-        try:
-            # Casa rows are always createAndWait after configure — must transition
-            # to active(1) before InitiateTest is accepted (otherwise CMTS returns
-            # commitFailed). Set RowStatus=active then verify before proceeding.
-            row_status_result = await self._snmp_get(
-                f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}"
-            )
+
+        async def _try_start_on_idx(target_idx: int) -> dict[str, Any]:
+            idx = f".{rf_port_ifindex}.{target_idx}"
+
+            # Casa rows are often createAndWait after configure; try to move to active first.
+            row_status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
             row_status_val = self._parse_get_value(row_status_result)
             try:
                 row_status_int = int(row_status_val) if row_status_val and 'No Such' not in str(row_status_val) else None
             except (ValueError, TypeError):
                 row_status_int = None
 
-            if row_status_int is not None and row_status_int != 1:  # not already active
-                self.logger.info(f"RowStatus={row_status_int} — setting active(1) before InitiateTest")
+            if row_status_int is not None and row_status_int != 1:
+                self.logger.info(f"cfg_index={target_idx} RowStatus={row_status_int} -> set active(1)")
                 await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
-                # Do NOT sleep or readback — Casa briefly accepts the transition.
-                # Firing InitiateTest immediately while row is in-flight works.
 
-            # Set InitiateTest to true (1)
-            result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
-            
-            if not result.get('success'):
-                return {"success": False, "error": result.get('error', 'Failed to start UTSC')}
-            
-            return {
-                "success": True,
-                "message": "UTSC test started",
-                "rf_port_ifindex": rf_port_ifindex,
-                "cfg_index": resolved
-            }
+            return await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
+
+        try:
+            # Prefer resolved row, then fall back across the standard row set.
+            candidate_indices = [resolved] + [i for i in (1, 2, 3) if i != resolved]
+            last_error = None
+
+            for target_idx in candidate_indices:
+                result = await _try_start_on_idx(target_idx)
+                if result.get('success'):
+                    return {
+                        "success": True,
+                        "message": "UTSC test started",
+                        "rf_port_ifindex": rf_port_ifindex,
+                        "cfg_index": target_idx
+                    }
+
+                last_error = result.get('error', 'Failed to start UTSC')
+                self.logger.warning(f"UTSC start failed on cfg_index={target_idx}: {last_error}")
+
+                # If failure is not row/state related, stop retrying immediately.
+                if 'inconsistentValue' not in str(last_error) and 'commitFailed' not in str(last_error):
+                    break
+
+            return {"success": False, "error": last_error or 'Failed to start UTSC'}
             
         except Exception as e:
             self.logger.error(f"Failed to start UTSC: {e}")

@@ -87,7 +87,10 @@ WINDOW           = 2        # rectangular
 REPEAT_PERIOD    = 100000   # 100 ms (µs)
 FREERUN_DURATION = 120000   # 120 s (ms)
 TRIGGER_COUNT    = 1
-FILENAME         = "utsc_capture"
+# E6000: set to "" so E6000 uses default naming with timestamp appended.
+# Per MIB docs: must be "", "/pnm/utsc/filename", or "filename" (no directories).
+# E6000 appends: <filename>_YYYY-MM-DD_HH.MM.SS.mmm
+FILENAME         = ""
 BDT_ROW          = 1
 
 TFTP_HEX = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))

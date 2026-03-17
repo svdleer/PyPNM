@@ -16,6 +16,7 @@ Performance: ~8-10 seconds via parallel bulk walks (vs ~60+ seconds sequential)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from enum import Enum
@@ -59,8 +60,17 @@ class ChannelStatsRequest(BaseModel):
     community: str = Field(default="public", description="SNMP community string")
     cmts_ip: Optional[str] = Field(default=None, description="CMTS IP address for fiber node lookup")
     cmts_community: Optional[str] = Field(default=None, description="CMTS SNMP community string")
+    cm_index: Optional[int] = Field(default=None, description="Known CM registration index on CMTS (skip MAC walk)")
     skip_connectivity_check: bool = Field(default=False, description="Skip ping/SNMP check")
     cmts_stats: bool = Field(default=False, description="Fetch CMTS-side OFDMA MeanRxMer and IUC profile stats (slower)")
+    experimental_compact_walk: bool = Field(
+        default=False,
+        description="Use compact SNMP roots and rebucket results into table-specific parser format"
+    )
+    cmts_task_timeout_s: float = Field(
+        default=30.0,
+        description="Timeout (seconds) for CMTS-side SNMP walk tasks"
+    )
 
 
 class ChannelStatsResponse(BaseModel):
@@ -154,8 +164,10 @@ class ChannelStatsRouter:
             )
             
             try:
-                # Define table OIDs - agent will walk these in parallel
-                table_oids = [
+                cmts_task_timeout = max(10.0, min(float(request.cmts_task_timeout_s), 90.0))
+
+                # Define canonical table OIDs expected by parser.
+                canonical_table_oids = [
                     '1.3.6.1.2.1.10.127.1.1.1',     # docsIfDownChannelTable
                     '1.3.6.1.2.1.10.127.1.1.4',     # docsIfSigQTable
                     '1.3.6.1.4.1.4491.2.1.20.1.24', # docsIf3SignalQualityExtTable
@@ -170,6 +182,18 @@ class ChannelStatsRouter:
                     '1.3.6.1.4.1.4491.2.1.28.1.14', # docsIf31CmUsOfdmaProfileStatsTable (OFDMA IUC stats)
                     '1.3.6.1.4.1.4491.2.1.27.1.2.5', # docsPnmCmDsOfdmRxMerTable (OFDM DS MER mean)
                 ]
+
+                # Experimental compact mode: fewer roots can be faster on some CMTS,
+                # but still requires parser-compatible rebucketing.
+                if request.experimental_compact_walk:
+                    table_oids = [
+                        '1.3.6.1.2.1.10.127.1.1',      # docsIf root
+                        '1.3.6.1.4.1.4491.2.1.20.1',   # docsIf3 root
+                        '1.3.6.1.4.1.4491.2.1.28.1',   # docsIf31 root
+                        '1.3.6.1.4.1.4491.2.1.27.1.2.5',
+                    ]
+                else:
+                    table_oids = canonical_table_oids
                 
                 # Send parallel walk task to agent
                 import time
@@ -215,7 +239,16 @@ class ChannelStatsRouter:
                 fiber_node_sg_task_id = None
                 cached_cm_index = None
                 if request.cmts_ip and request.mac_address and cmts_agent_id:
-                    cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
+                    if request.cm_index is not None:
+                        try:
+                            cached_cm_index = int(request.cm_index)
+                            _set_cached_cm_index(request.cmts_ip, request.mac_address, cached_cm_index)
+                            self.logger.info(f"Using provided cm_index={cached_cm_index} for {request.mac_address}")
+                        except (ValueError, TypeError):
+                            cached_cm_index = None
+
+                    if cached_cm_index is None:
+                        cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                     if cached_cm_index is not None:
                         # Fast path: direct snmpget for SG ID using known cm_index (runs in parallel with modem walk)
                         try:
@@ -241,7 +274,7 @@ class ChannelStatsRouter:
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=15.0,
+                                timeout=cmts_task_timeout,
                             )
                         if cached_cm_index is not None:
                             # Scoped walks — tiny, fast
@@ -252,7 +285,7 @@ class ChannelStatsRouter:
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cached_cm_index}',
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=15.0,
+                                timeout=cmts_task_timeout,
                             )
                             cmts_profile_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_walk",
@@ -261,7 +294,7 @@ class ChannelStatsRouter:
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.5.1.1.{cached_cm_index}',
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=15.0,
+                                timeout=cmts_task_timeout,
                             )
                         else:
                             # Full walks + MAC walk to resolve cm_index
@@ -272,7 +305,7 @@ class ChannelStatsRouter:
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=15.0,
+                                timeout=cmts_task_timeout,
                             )
                             cmts_cmindex_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_walk",
@@ -281,7 +314,7 @@ class ChannelStatsRouter:
                                     "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=15.0,
+                                timeout=cmts_task_timeout,
                             )
                             cmts_profile_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_walk",
@@ -290,7 +323,7 @@ class ChannelStatsRouter:
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=15.0,
+                                timeout=cmts_task_timeout,
                             )
                     except Exception as e:
                         self.logger.warning(f"Failed to send CMTS OFDMA task: {e}")
@@ -327,14 +360,69 @@ class ChannelStatsRouter:
                     )
 
                 raw_results = agent_result.get("results", {})
+
+                if request.experimental_compact_walk:
+                    # Convert compact-root walk output into parser's canonical
+                    # per-table result map: {table_oid: [entries...]}
+                    normalized = {oid: [] for oid in canonical_table_oids}
+
+                    # Preserve exact-key results when available.
+                    for oid in canonical_table_oids:
+                        if oid in raw_results and isinstance(raw_results.get(oid), list):
+                            normalized[oid].extend(raw_results.get(oid) or [])
+
+                    # Rebucket entries from broader roots by longest matching
+                    # canonical table prefix.
+                    for root_oid, entries in raw_results.items():
+                        if root_oid in canonical_table_oids or not isinstance(entries, list):
+                            continue
+                        for entry in entries:
+                            oid = str(entry.get('oid', ''))
+                            best = None
+                            for t_oid in canonical_table_oids:
+                                if oid.startswith(t_oid + '.') or oid == t_oid:
+                                    if best is None or len(t_oid) > len(best):
+                                        best = t_oid
+                            if best:
+                                normalized[best].append(entry)
+
+                    raw_results = normalized
                 walk_time = time.time() - start_time
+
+                async def _safe_wait_task(task_id: Optional[str], timeout: float):
+                    if not task_id:
+                        return None
+                    try:
+                        return await agent_manager.wait_for_task_async(task_id, timeout=timeout)
+                    except Exception as wait_err:
+                        self.logger.debug(f"Task wait failed for {task_id}: {wait_err}")
+                        return None
+
+                # Await CMTS tasks concurrently so slow paths don't add linearly.
+                (
+                    cmts_ofdma_result,
+                    cmts_cmindex_result,
+                    cmts_rxmer_result,
+                    cmts_profile_result,
+                ) = await asyncio.gather(
+                    _safe_wait_task(cmts_ofdma_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_cmindex_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_rxmer_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_profile_task_id, cmts_task_timeout),
+                )
+
+                cmts_cmindex_timed_out = bool(
+                    cmts_cmindex_task_id
+                    and isinstance(cmts_cmindex_result, dict)
+                    and 'timeout' in str(cmts_cmindex_result.get('error', '')).lower()
+                )
 
                 # Collect CMTS OFDMA result (already running in parallel)
                 ofdma_oid = '1.3.6.1.4.1.4491.2.1.28.1.13'
                 modem_ofdma_empty = not raw_results.get(ofdma_oid)
-                if modem_ofdma_empty and cmts_ofdma_task_id:
+                if modem_ofdma_empty and cmts_ofdma_result:
                     try:
-                        cmts_result = await agent_manager.wait_for_task_async(cmts_ofdma_task_id, timeout=15.0)
+                        cmts_result = cmts_ofdma_result
                         if cmts_result and cmts_result.get("result", {}).get("success"):
                             cmts_ofdma_entries = cmts_result.get("result", {}).get("results", [])
                             if cmts_ofdma_entries:
@@ -354,9 +442,9 @@ class ChannelStatsRouter:
                 # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
                 # First: resolve cm_index (needed for both rxmer and fiber node)
                 cm_index = cached_cm_index
-                if cmts_cmindex_task_id and cm_index is None and request.mac_address:
+                if cmts_cmindex_result and cm_index is None and request.mac_address:
                     try:
-                        cmidx_result = await agent_manager.wait_for_task_async(cmts_cmindex_task_id, timeout=15.0)
+                        cmidx_result = cmts_cmindex_result
                         if cmidx_result and cmidx_result.get('result', {}).get('success'):
                             mac_clean = request.mac_address.replace(':', '').lower()
                             for entry in cmidx_result.get('result', {}).get('results', []):
@@ -390,9 +478,9 @@ class ChannelStatsRouter:
                     except Exception as e:
                         self.logger.debug(f'cm_index resolution failed: {e}')
 
-                if cmts_rxmer_task_id and parsed.get('success'):
+                if cmts_rxmer_result and parsed.get('success'):
                     try:
-                        rxmer_result = await agent_manager.wait_for_task_async(cmts_rxmer_task_id, timeout=15.0)
+                        rxmer_result = cmts_rxmer_result
                         if rxmer_result and rxmer_result.get('result', {}).get('success'):
                             rxmer_entries = rxmer_result.get('result', {}).get('results', [])
                             base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
@@ -425,9 +513,9 @@ class ChannelStatsRouter:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
                 # Collect CMTS OFDMA profile stats (IUC codewords) and inject active_iucs
-                if cmts_profile_task_id and parsed.get('success'):
+                if cmts_profile_result and parsed.get('success'):
                     try:
-                        prof_result = await agent_manager.wait_for_task_async(cmts_profile_task_id, timeout=15.0)
+                        prof_result = cmts_profile_result
                         if prof_result and prof_result.get('result', {}).get('success'):
                             prof_entries = prof_result.get('result', {}).get('results', [])
                             base_oid = '1.3.6.1.4.1.4491.2.1.28.1.5.1.1'
@@ -512,11 +600,20 @@ class ChannelStatsRouter:
                                             if fiber_node:
                                                 break
                         else:
-                            # First call: full sequential lookup (also caches cm_index)
-                            fiber_node = await self._get_fiber_node_from_cmts(
-                                agent_manager, cmts_agent_id, request.cmts_ip,
-                                request.mac_address, request.cmts_community or "public"
-                            )
+                            # If cm-index discovery just timed out, avoid repeating the
+                            # same heavy CM status walk in fallback path.
+                            if cmts_cmindex_timed_out:
+                                self.logger.info(
+                                    "Skipping fiber-node fallback CM status walk because "
+                                    "cm-index task timed out in this request"
+                                )
+                            else:
+                                # First call: full sequential lookup (also caches cm_index)
+                                fiber_node = await self._get_fiber_node_from_cmts(
+                                    agent_manager, cmts_agent_id, request.cmts_ip,
+                                    request.mac_address, request.cmts_community or "public",
+                                    walk_timeout=cmts_task_timeout,
+                                )
                     except Exception as fn_err:
                         self.logger.debug(f'Fiber node lookup failed: {fn_err}')
 
@@ -548,7 +645,7 @@ class ChannelStatsRouter:
     
     async def _get_fiber_node_from_cmts(
         self, agent_manager, agent_id: str, cmts_ip: str, 
-        mac_address: str, community: str
+        mac_address: str, community: str, walk_timeout: float = 30.0
     ) -> str:
         """Lookup fiber node from CMTS using agent SNMP commands."""
         try:
@@ -567,8 +664,8 @@ class ChannelStatsRouter:
             
             # Walk docsIfCmtsCmStatusMacAddress table to find CM index
             oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
-            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=10.0)
-            result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=walk_timeout)
+            result = await agent_manager.wait_for_task_async(task_id, timeout=walk_timeout)
             
             if not result or not result.get("result", {}).get("success"):
                 self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
