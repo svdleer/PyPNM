@@ -642,6 +642,9 @@ class UtscRfPortDiscoveryService:
     CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
     # docsPnmCmtsUtscCfgLogicalChIfIndex (to get RF ports)
     UTSC_CFG_LOGICAL_CH = "1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1.2"
+    # DOCS-RPHY CoreToRpdMap columns (CCAP ifIndex <-> RPD RF port/channel relation)
+    CORE_TO_RPD_RF_CHAN_TYPE = "1.3.6.1.4.1.4491.2.1.30.1.2.6.1.5"
+    CORE_TO_RPD_RF_CHAN_INDEX = "1.3.6.1.4.1.4491.2.1.30.1.2.6.1.6"
     # ifDescr
     OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
     
@@ -728,18 +731,20 @@ class UtscRfPortDiscoveryService:
     async def discover(self, mac_address: str) -> dict:
         """Discover the correct UTSC RF port for a modem.
         
-        Uses ONE parallel SNMP walk (3 OID trees) + ONE get = 2 agent round-trips max.
+        Uses one parallel SNMP walk to collect modem/channel and mapping tables.
         All business logic runs in PyPNM, agent is just an SNMP proxy.
         
         Flow:
-        1. Parallel walk: ifDescr + CM MAC table + OFDMA status (1 agent call)
-        2. Parse results: find CM index, find OFDMA channel, find us-conn ports
-        3. CommScope E6000: map OFDMA slot -> us-conn RF port
-        4. Get RF port description (1 agent call)
+        1. Parallel walk: ifDescr + CM MAC + OFDMA status + UTSC logical rows + RPHY map
+        2. Parse results: find CM index, find OFDMA channel
+        3. Primary mapping: correlate OFDMA ifIndex with UTSC logical rows
+        4. Core-CCAP mapping: DOCS-RPHY CoreToRpdMap (authoritative relation)
+        5. Casa mapping: logical->physical transform when needed
         
         Supports:
-        - CommScope E6000: us-conn RF ports mapped by blade slot from OFDMA channel
-        - Fallback: OFDMA channel ifIndex directly (for other CMTS types)
+        - Arris/CommScope Core-CCAP: CoreToRpdMap relation (no name-based fallback)
+        - Arris/CommScope I-CCAP: logical-row based mapping when available
+        - Casa: logical->physical mapping (16M -> 4M) when needed
         """
         import re
         
@@ -756,11 +761,14 @@ class UtscRfPortDiscoveryService:
         mac_normalized = self.normalize_mac(mac_address)
         self.logger.info(f"Discovering RF port for {mac_normalized} on {self.cmts_ip}")
         
-        # === ONE agent call: parallel walk 3 OID trees ===
+        # One agent call: collect all trees needed for deterministic correlation.
         walk_result = await self._snmp_parallel_walk([
             self.OID_IF_DESCR,       # All interface descriptions (us-conn ports + channel names)
             self.CM_REG_STATUS_MAC,   # All registered CM MACs -> CM index
             self.CM_OFDMA_STATUS,     # All OFDMA channel assignments -> CM -> OFDMA ifIndex
+            self.UTSC_CFG_LOGICAL_CH, # UTSC rows: <rf_ifindex>.<cfg_idx> -> logical channel
+            self.CORE_TO_RPD_RF_CHAN_TYPE,
+            self.CORE_TO_RPD_RF_CHAN_INDEX,
         ])
         
         if not walk_result.get('success') or not walk_result.get('results'):
@@ -771,8 +779,15 @@ class UtscRfPortDiscoveryService:
         if_descr_data = all_data.get(self.OID_IF_DESCR, [])
         cm_mac_data = all_data.get(self.CM_REG_STATUS_MAC, [])
         ofdma_data = all_data.get(self.CM_OFDMA_STATUS, [])
+        utsc_logical_data = all_data.get(self.UTSC_CFG_LOGICAL_CH, [])
+        core_map_type_data = all_data.get(self.CORE_TO_RPD_RF_CHAN_TYPE, [])
+        core_map_index_data = all_data.get(self.CORE_TO_RPD_RF_CHAN_INDEX, [])
         
-        self.logger.info(f"Parallel walk: {len(if_descr_data)} ifDescr, {len(cm_mac_data)} CMs, {len(ofdma_data)} OFDMA entries")
+        self.logger.info(
+            f"Parallel walk: {len(if_descr_data)} ifDescr, {len(cm_mac_data)} CMs, "
+            f"{len(ofdma_data)} OFDMA entries, {len(utsc_logical_data)} UTSC logical rows, "
+            f"{len(core_map_type_data)} CoreToRpdMap type rows"
+        )
         
         # --- Parse CM index from MAC table ---
         cm_index = None
@@ -811,12 +826,11 @@ class UtscRfPortDiscoveryService:
                 if ofdma_ifindex:
                     break
         
-        # --- Build ifDescr lookup and find us-conn / cable-upstreamRfPort ---
+        # --- Build ifDescr lookup and detect vendor families ---
         if_descr_map = {}  # ifindex -> description
-        blade_to_ports = {}  # blade_slot -> [(ifindex, descr)]
         us_conn_found = False
-        arris_rfport_map = {}  # (linecard, connector) -> (ifindex, descr)
         arris_rfport_found = False
+        iccap_upstream_found = False
         
         for entry in if_descr_data:
             ifindex = int(str(entry['oid']).split('.')[-1])
@@ -825,62 +839,190 @@ class UtscRfPortDiscoveryService:
             
             if 'us-conn' in descr.lower():
                 us_conn_found = True
-                blade_match = re.search(r'RPS\d+-(\d+)', descr)
-                if blade_match:
-                    slot = int(blade_match.group(1))
-                    blade_to_ports.setdefault(slot, []).append((ifindex, descr))
             
             # Arris E6000: cable-upstreamRfPort <linecard>/<connector>
             rfport_match = re.match(r'cable-upstreamRfPort\s+(\d+)/(\d+)', descr)
             if rfport_match:
                 arris_rfport_found = True
-                lc = int(rfport_match.group(1))
-                conn = int(rfport_match.group(2))
-                arris_rfport_map[(lc, conn)] = (ifindex, descr)
-        
-        # --- CommScope E6000: map OFDMA slot -> us-conn RF port ---
-        if us_conn_found and ofdma_ifindex:
-            # Get OFDMA channel description from the walk data we already have
-            ofdma_descr = if_descr_map.get(ofdma_ifindex)
-            if not ofdma_descr:
-                # Fallback: single GET for this one ifIndex (2nd agent call)
-                get_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{ofdma_ifindex}")
-                ofdma_descr = self._parse_get_value(get_result) or ""
-            
-            slot_match = re.search(r'cable-us(?:-ofdma)?\s+(\d+)/', ofdma_descr)
-            if slot_match:
-                slot = int(slot_match.group(1))
-                if slot in blade_to_ports and blade_to_ports[slot]:
-                    port_ifindex, port_descr = blade_to_ports[slot][0]
+
+            # Arris/CommScope I-CCAP style upstream descriptors
+            # e.g. "cable-upstream 1/0/24" or "cable-upstream 1/0/24.0"
+            if re.match(r'cable-upstream\s+\d+/\d+/\d+(?:\.\d+)?$', descr, re.I):
+                iccap_upstream_found = True
+
+        # --- Parse UTSC logical rows: <rf_ifindex>.<cfg_idx> -> logical_ifindex ---
+        # OID shape:
+        #   1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1.2.<rf_ifindex>.<cfg_idx>
+        # value:
+        #   logical channel ifIndex (0 allowed on some platforms)
+        utsc_rows = []
+        for entry in utsc_logical_data:
+            oid_str = str(entry.get('oid', ''))
+            instance = oid_str
+            if self.UTSC_CFG_LOGICAL_CH in oid_str:
+                instance = oid_str[len(self.UTSC_CFG_LOGICAL_CH):]
+            parts = instance.strip('.').split('.')
+            if len(parts) < 2:
+                continue
+            try:
+                rf_ifindex = int(parts[0])
+                cfg_idx = int(parts[1])
+                logical_if = int(str(entry.get('value', '0')).strip())
+            except Exception:
+                continue
+            utsc_rows.append({
+                "rf_ifindex": rf_ifindex,
+                "cfg_idx": cfg_idx,
+                "logical_if": logical_if,
+            })
+
+        # Primary fast path for Arris/CommScope style CMTS:
+        # Match modem OFDMA ifIndex to UTSC logical rows and return the RF row index.
+        if ofdma_ifindex and utsc_rows:
+            direct_matches = [
+                r for r in utsc_rows
+                if r["logical_if"] == ofdma_ifindex
+            ]
+            if direct_matches:
+                # Prefer the lowest cfg row if multiple entries share same RF index.
+                direct_matches.sort(key=lambda r: (r["rf_ifindex"], r["cfg_idx"]))
+                picked = direct_matches[0]
+                rf_ifindex = picked["rf_ifindex"]
+                rf_descr = if_descr_map.get(rf_ifindex, f"RF {rf_ifindex}")
+                result["success"] = True
+                result["rf_port_ifindex"] = rf_ifindex
+                result["rf_port_description"] = rf_descr
+                result["logical_channel"] = ofdma_ifindex
+                self.logger.info(
+                    f"UTSC logical-row match: logical {ofdma_ifindex} -> RF {rf_ifindex} "
+                    f"(cfg_index={picked['cfg_idx']})"
+                )
+                return result
+
+        # --- CoreToRpdMap relation for Core-CCAP (Arris/CommScope) ---
+        def _parse_core_to_rpd_index(oid_str: str, base_oid: str):
+            instance = oid_str
+            if base_oid in oid_str:
+                instance = oid_str[len(base_oid):]
+            parts = instance.strip('.').split('.')
+            # Index: coreIfIndex, 6-byte RPD unique-id, direction, rf-port
+            if len(parts) < 9:
+                return None
+            try:
+                core_if = int(parts[0])
+                rpd_uid = '.'.join(parts[1:7])
+                direction = int(parts[7])
+                rf_port = int(parts[8])
+            except Exception:
+                return None
+            return (core_if, rpd_uid, direction, rf_port)
+
+        chan_type_by_key = {}
+        for entry in core_map_type_data:
+            key = _parse_core_to_rpd_index(str(entry.get('oid', '')), self.CORE_TO_RPD_RF_CHAN_TYPE)
+            if key is None:
+                continue
+            try:
+                chan_type_by_key[key] = int(str(entry.get('value', '0')).strip())
+            except Exception:
+                continue
+
+        chan_index_by_key = {}
+        for entry in core_map_index_data:
+            key = _parse_core_to_rpd_index(str(entry.get('oid', '')), self.CORE_TO_RPD_RF_CHAN_INDEX)
+            if key is None:
+                continue
+            try:
+                chan_index_by_key[key] = int(str(entry.get('value', '0')).strip())
+            except Exception:
+                continue
+
+        mapped_rf_ifindex = None
+        mapped_reason = None
+        if ofdma_ifindex and chan_type_by_key:
+            # Preferred: OFDMA channel rows report RfChanType=6.
+            src_rows = [k for k, v in chan_type_by_key.items() if k[0] == ofdma_ifindex and v == 6]
+            if not src_rows:
+                # Some platforms can differ; accept any non-zero channel type as source.
+                src_rows = [k for k, v in chan_type_by_key.items() if k[0] == ofdma_ifindex and v != 0]
+
+            for src in src_rows:
+                _, rpd_uid, direction, rf_port = src
+                target_rows = [
+                    k for k, v in chan_type_by_key.items()
+                    if (
+                        k[1] == rpd_uid
+                        and k[2] == direction
+                        and k[3] == rf_port
+                        and v == 0
+                        and chan_index_by_key.get(k, 0) == 0
+                    )
+                ]
+                if not target_rows:
+                    continue
+                target_rows.sort(key=lambda k: k[0])
+                mapped_rf_ifindex = target_rows[0][0]
+                mapped_reason = f"rpd_uid={rpd_uid},dir={direction},rf_port={rf_port}"
+                break
+
+        if mapped_rf_ifindex is not None:
+            rf_descr = if_descr_map.get(mapped_rf_ifindex, f"RF {mapped_rf_ifindex}")
+            result["success"] = True
+            result["rf_port_ifindex"] = mapped_rf_ifindex
+            result["rf_port_description"] = rf_descr
+            result["logical_channel"] = ofdma_ifindex
+            self.logger.info(
+                f"CoreToRpdMap match: OFDMA {ofdma_ifindex} -> RF {mapped_rf_ifindex} ({mapped_reason})"
+            )
+            return result
+
+        # --- Arris/CommScope I-CCAP descriptor relation (non-fallback) ---
+        # When CoreToRpdMap is absent and UTSC logical rows are not correlated,
+        # derive the RF-port ifIndex by matching the I-CCAP upstream tuple.
+        # Example:
+        #   OFDMA:        cable-us-ofdma 1/0/24.0
+        #   RF interface: cable-upstream 1/0/24
+        if ofdma_ifindex and iccap_upstream_found:
+            ofdma_descr = if_descr_map.get(ofdma_ifindex, "")
+            m = re.match(r'cable-us(?:-ofdma)?\s+(\d+)/(\d+)/(\d+)(?:\.\d+)?$', ofdma_descr, re.I)
+            if m:
+                lc = int(m.group(1))
+                port = int(m.group(2))
+                chan = int(m.group(3))
+                exact = []
+                subif = []
+                for ifidx, descr in if_descr_map.items():
+                    rm = re.match(r'cable-upstream\s+(\d+)/(\d+)/(\d+)(?:\.(\d+))?$', descr, re.I)
+                    if not rm:
+                        continue
+                    if int(rm.group(1)) == lc and int(rm.group(2)) == port and int(rm.group(3)) == chan:
+                        # Prefer base RF row (no sub-interface), then .0 if needed.
+                        if rm.group(4) is None:
+                            exact.append((ifidx, descr))
+                        elif rm.group(4) == '0':
+                            subif.append((ifidx, descr))
+
+                picked = exact[0] if exact else (subif[0] if subif else None)
+                if picked:
+                    ifidx, descr = picked
                     result["success"] = True
-                    result["rf_port_ifindex"] = port_ifindex
-                    result["rf_port_description"] = port_descr
-                    result["logical_channel"] = port_ifindex
-                    self.logger.info(f"CommScope us-conn RF port: {port_descr} ({port_ifindex})")
+                    result["rf_port_ifindex"] = ifidx
+                    result["rf_port_description"] = descr
+                    result["logical_channel"] = ofdma_ifindex
+                    self.logger.info(
+                        f"I-CCAP descriptor relation: OFDMA {ofdma_ifindex} ({ofdma_descr}) -> RF {ifidx} ({descr})"
+                    )
                     return result
-                self.logger.warning(f"No us-conn port for blade slot {slot}")
-        
-        # --- Arris E6000: map OFDMA linecard/connector -> cable-upstreamRfPort ---
-        if arris_rfport_found and ofdma_ifindex:
-            ofdma_descr = if_descr_map.get(ofdma_ifindex)
-            if not ofdma_descr:
-                get_result = await self._snmp_get(f"{self.OID_IF_DESCR}.{ofdma_ifindex}")
-                ofdma_descr = self._parse_get_value(get_result) or ""
-            
-            # cable-us-ofdma <linecard>/<connector>/<channel>.<subif>
-            arris_match = re.match(r'cable-us(?:-ofdma)?\s+(\d+)/(\d+)/', ofdma_descr)
-            if arris_match:
-                lc = int(arris_match.group(1))
-                conn = int(arris_match.group(2))
-                if (lc, conn) in arris_rfport_map:
-                    port_ifindex, port_descr = arris_rfport_map[(lc, conn)]
-                    result["success"] = True
-                    result["rf_port_ifindex"] = port_ifindex
-                    result["rf_port_description"] = port_descr
-                    result["logical_channel"] = port_ifindex
-                    self.logger.info(f"Arris cable-upstreamRfPort: {port_descr} ({port_ifindex})")
-                    return result
-                self.logger.warning(f"No cable-upstreamRfPort for linecard={lc} connector={conn}")
+
+        is_arris_commscope = us_conn_found or arris_rfport_found or iccap_upstream_found
+        if is_arris_commscope and ofdma_ifindex:
+            # Explicitly do not fallback for Arris/CommScope PNM RF port discovery.
+            result["error"] = (
+                f"No CoreToRpdMap relation found for OFDMA ifIndex {ofdma_ifindex}; "
+                "fallback mapping is disabled for PNM"
+            )
+            self.logger.warning(result["error"])
+            return result
         
         # --- Casa 100G: map OFDMA logical (16M range) -> physical RF port (4M range) ---
         # Casa ifDescr: "OFDMA Upstream 0/6.0" (ifIndex 16000048)
@@ -914,16 +1056,13 @@ class UtscRfPortDiscoveryService:
                             result["logical_channel"] = ofdma_ifindex
                             self.logger.info(f"Casa physical RF port (pattern): {descr} ({ifidx})")
                             return result
-        
-        # --- Fallback: use OFDMA channel directly ---
+
         if ofdma_ifindex:
-            ofdma_descr = if_descr_map.get(ofdma_ifindex, f"OFDMA {ofdma_ifindex}")
-            result["success"] = True
-            result["rf_port_ifindex"] = ofdma_ifindex
-            result["rf_port_description"] = ofdma_descr
-            result["logical_channel"] = ofdma_ifindex
-            self.logger.info(f"Fallback OFDMA channel: {ofdma_descr} ({ofdma_ifindex})")
+            result["error"] = (
+                f"Unable to map OFDMA ifIndex {ofdma_ifindex} to a UTSC RF port; "
+                "fallback mapping is disabled for PNM"
+            )
             return result
-        
+
         result["error"] = f"No OFDMA channel found for CM index {cm_index}"
         return result

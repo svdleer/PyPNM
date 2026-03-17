@@ -8,6 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+  PIP_CONFIG_FILE=/etc/pip.conf \
     PIP_ROOT_USER_ACTION=ignore \
     http_proxy=${http_proxy} \
     https_proxy=${https_proxy} \
@@ -35,8 +36,10 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3.12 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Optional pip proxy
-RUN if [ -n "${http_proxy}" ]; then pip config set global.proxy "${http_proxy}"; fi
+# Optional pip proxy (system-wide so it works for root and non-root users)
+RUN if [ -n "${http_proxy}" ]; then \
+      printf "[global]\nproxy = %s\n" "${http_proxy}" > /etc/pip.conf; \
+    fi
 
 # Copy project files
 COPY pyproject.toml README.md LICENSE /app/

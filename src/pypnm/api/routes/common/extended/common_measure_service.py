@@ -959,9 +959,10 @@ class CommonMeasureService(CommonMessagingService):
             self.logger.error(f"{self.log_prefix} - No agent manager available")
             return ServiceStatusCode.LOCAL_FETCH_FAILURE
 
-        # pnm_file_get is only announced by agents whose TFTP root is readable,
-        # ensuring we never accidentally route to ctms-agent which has no PNM files.
+        # pnm_file_get is only announced by agents whose local capture root is
+        # readable, so simple capability routing is sufficient here.
         agent = agent_manager.get_agent_for_capability('pnm_file_get')
+
         if not agent:
             self.logger.warning(
                 f"{self.log_prefix} - No agent with pnm_file_get capability; "

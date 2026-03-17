@@ -209,6 +209,7 @@ class CmSnmpOperation:
         print(f"DEBUG: PYPNM_USE_AGENT_SNMP={agent_enabled}")
         
         if agent_enabled:
+            allow_direct_fallback = os.environ.get('PYPNM_AGENT_ALLOW_DIRECT_FALLBACK', '').lower() == 'true'
             try:
                 from pypnm.snmp.agent_transport import AgentSnmpTransport
                 from pypnm.api.agent.manager import get_agent_manager
@@ -235,10 +236,21 @@ class CmSnmpOperation:
                         )
                     else:
                         print("DEBUG: No agent with snmp_get capability")
+                        if not allow_direct_fallback:
+                            raise RuntimeError(
+                                "PYPNM_USE_AGENT_SNMP=true but no agent with cm_reachable/snmp_get capability is connected"
+                            )
                 else:
                     print("DEBUG: No agent manager available")
+                    if not allow_direct_fallback:
+                        raise RuntimeError(
+                            "PYPNM_USE_AGENT_SNMP=true but AgentManager is unavailable"
+                        )
             except Exception as e:
                 print(f"DEBUG: Agent transport exception: {e}")
+                if not allow_direct_fallback:
+                    self.logger.error(f"Agent transport required but unavailable: {e}")
+                    raise
                 self.logger.warning(f"Agent transport unavailable, falling back to direct SNMP: {e}")
 
         print("DEBUG: Using direct Snmp_v2c transport")

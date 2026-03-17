@@ -808,12 +808,15 @@ class CmtsUtscService:
                 # TODO: verify EVO vCCAP restores DestinationIndex after createAndGo (untested)
                 target_idx = cfg_index
                 row_found = False
+                first_existing_idx: Optional[int] = None
                 for probe_idx in range(1, 4):
                     r = await self._snmp_get(
                         f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
                     )
                     v = self._parse_get_value(r)
                     if v is not None and 'No Such' not in str(v):
+                        if first_existing_idx is None:
+                            first_existing_idx = probe_idx
                         try:
                             if int(v) == trigger_mode:
                                 target_idx = probe_idx
@@ -824,6 +827,16 @@ class CmtsUtscService:
                                 break
                         except (ValueError, TypeError):
                             pass
+
+                # Arris/CommScope often has pre-provisioned fixed rows that reject
+                # destroy+createAndGo. If any row exists, reuse it and write columns
+                # in-place even when TriggerMode differs.
+                if not row_found and first_existing_idx is not None:
+                    target_idx = first_existing_idx
+                    row_found = True
+                    self.logger.info(
+                        f"{vendor}: reusing existing cfg_index={target_idx} (trigger mode will be updated in-place)"
+                    )
 
                 idx = f".{rf_port_ifindex}.{target_idx}"
 

@@ -397,7 +397,7 @@ class CableModemServicePreCheck:
         idx_chan_stack = await self.cm.getDocsIf31CmDsOfdmChannelIdIndexStack()
         if not idx_chan_stack:
             msg = "No OFDM channels found on the cable modem."
-            return ServiceStatusCode.NO_OFDMA_CHANNELS_EXIST, msg
+            return ServiceStatusCode.NO_OFDM_CHANNELS_EXIST, msg
         return ServiceStatusCode.SUCCESS, "OFDM downstream channels detected."
 
     async def validate_ofdma_channel_exist(self) -> tuple[ServiceStatusCode, str]:

@@ -10,7 +10,8 @@ constraint enforcement and trigger flow for each platform.
 CommScope E6000
   - Rows are pre-provisioned per RF port by the CMTS at boot.
   - Probe cfg_index 1-3 for a row matching TriggerMode; write in place.
-  - If no row found: destroy + createAndGo.
+    - If TriggerMode row is missing but any row exists, reuse first existing row.
+    - Only if no row exists at all: destroy + createAndGo.
   - CORE/C-CCAP (ifDescr 'us-conn'): window must be rectangular(2).
   - I-CCAP: window 2-5 supported.
   - Repeat period 50ms-1000ms; freerun 1s-600s; max 250 files per run.
@@ -188,15 +189,32 @@ def detect_vendor() -> tuple[str, str]:
     return "unknown", raw
 
 
-def is_arris_core(rf_port: int) -> bool:
-    """
-    E6000 CORE/C-CCAP carries 'us-conn' in ifDescr and only supports rectangular(2).
-    I-CCAP does not and supports windows 2-5.
-    """
+def get_ifdescr(rf_port: int) -> str:
+    """Read IF-MIB ifDescr for a given ifIndex."""
     raw = snmpget(f"{OID_IF_DESCR}.{rf_port}")
     if " = " in raw:
         raw = raw.split(" = ", 1)[1].strip()
-    return "us-conn" in raw.lower()
+    return raw
+
+
+def detect_e6000_mode(rf_port: int) -> tuple[str, str]:
+    """
+    Detect E6000 mode from ifDescr.
+
+    Returns (mode, ifdescr):
+      - mode='core'  for C-CCAP/CORE style (contains 'us-conn')
+      - mode='iccap' for I-CCAP style (cable-upstream / cable-us-ofdma naming)
+      - mode='unknown' otherwise
+    """
+    descr = get_ifdescr(rf_port)
+    low = descr.lower()
+    if 'us-conn' in low:
+        return 'core', descr
+    if re.search(r'^cable-upstream\s+\d+/\d+/\d+(?:\.\d+)?$', descr, re.I):
+        return 'iccap', descr
+    if re.search(r'^cable-us-ofdma\s+\d+/\d+/\d+(?:\.\d+)?$', descr, re.I):
+        return 'iccap', descr
+    return 'unknown', descr
 
 
 # ============================================================
@@ -218,6 +236,16 @@ def find_row(rf_port: int, trigger_mode: int) -> int | None:
                 return probe
         except Exception:
             pass
+    return None
+
+
+def find_first_existing_row(rf_port: int) -> int | None:
+    """Return first existing cfg_index (1..3) for the RF port, regardless of trigger mode."""
+    for probe in range(1, 4):
+        raw = snmpget(f"{OID_UTSC_TRIG_MODE}.{rf_port}.{probe}")
+        if "No Such" in raw or raw == "":
+            continue
+        return probe
     return None
 
 
@@ -506,13 +534,21 @@ def main():
     window       = WINDOW
     num_bins     = NUM_BINS
     core         = False
+    e6000_mode   = "unknown"
 
     if vendor in ("casa",):
         repeat_us, freerun_ms = apply_casa_constraints(repeat_us, freerun_ms)
         output_fmt = 5   # fftAmplitude — accepted on Casa
     elif vendor == "e6000":
-        core = is_arris_core(RF_PORT)
-        print(f"\n  E6000 subtype: {'CORE/C-CCAP (rectangular window only)' if core else 'I-CCAP (window 2-5)'}")
+        e6000_mode, ifdescr = detect_e6000_mode(RF_PORT)
+        core = (e6000_mode == "core")
+        if e6000_mode == "core":
+            print("\n  E6000 subtype: CORE/C-CCAP (rectangular window only)")
+        elif e6000_mode == "iccap":
+            print("\n  E6000 subtype: I-CCAP (window 2-5)")
+        else:
+            print("\n  E6000 subtype: UNKNOWN (applying safer I-CCAP window policy 2-5)")
+        print(f"  ifDescr          : {ifdescr}")
         repeat_us, freerun_ms, output_fmt, window, num_bins = apply_e6000_constraints(
             repeat_us, freerun_ms, output_fmt, window, core, num_bins
         )
@@ -545,10 +581,17 @@ def main():
             cfg_index = found
             print(f"  writing in place at cfg_index={cfg_index}")
         else:
-            print(f"  no row found — destroy + createAndGo at cfg_index={cfg_index}")
-            destroy_row(RF_PORT, cfg_index)
-            if not create_and_go(RF_PORT, cfg_index):
-                sys.exit(1)
+            # E6000/Casa can have fixed pre-provisioned rows with non-default TriggerMode.
+            # Reuse first existing row before attempting destroy/create.
+            first_existing = find_first_existing_row(RF_PORT)
+            if first_existing is not None:
+                cfg_index = first_existing
+                print(f"  no TriggerMode row; reusing existing cfg_index={cfg_index} (write in place)")
+            else:
+                print(f"  no row exists — destroy + createAndGo at cfg_index={cfg_index}")
+                destroy_row(RF_PORT, cfg_index)
+                if not create_and_go(RF_PORT, cfg_index):
+                    sys.exit(1)
 
     # Configure, trigger, poll
     configure_utsc(RF_PORT, cfg_index, vendor, repeat_us, freerun_ms, output_fmt, window, num_bins)

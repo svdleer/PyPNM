@@ -132,12 +132,26 @@ class ChannelStatsRouter:
             if not agent_manager:
                 raise HTTPException(status_code=503, detail="Agent manager not initialized")
             
-            # Find a CM-reachable agent
-            agent_id = agent_manager.get_agent_id_for_capability('cm_reachable')
-            if not agent_id:
+            # Route modem-side tasks to a CM-reachable agent.
+            cm_agent_id = agent_manager.get_agent_id_for_capability('cm_reachable')
+            if not cm_agent_id:
                 raise HTTPException(status_code=503, detail="No cm_reachable agent available")
+
+            # Route CMTS-side tasks (OFDMA MeanRxMer, fiber-node lookup) to a
+            # CMTS-reachable agent when CMTS context is provided.
+            cmts_agent_id = None
+            if request.cmts_ip:
+                cmts_agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable')
+                if not cmts_agent_id:
+                    self.logger.warning(
+                        f"No cmts_reachable agent available for CMTS {request.cmts_ip}; "
+                        "CMTS-side enrichments will be skipped"
+                    )
             
-            self.logger.info(f"Getting channel stats for {request.modem_ip} via agent {agent_id}")
+            self.logger.info(
+                f"Getting channel stats for {request.modem_ip} via cm_agent={cm_agent_id} "
+                f"cmts_agent={cmts_agent_id or 'none'}"
+            )
             
             try:
                 # Define table OIDs - agent will walk these in parallel
@@ -165,7 +179,7 @@ class ChannelStatsRouter:
                 if not request.skip_connectivity_check:
                     # Quick SNMP check
                     check_task_id = await agent_manager.send_task(
-                        agent_id, "snmp_get",
+                        cm_agent_id, "snmp_get",
                         {"target_ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", "community": request.community},
                         timeout=5.0
                     )
@@ -179,7 +193,7 @@ class ChannelStatsRouter:
                 
                 # Send modem parallel walk task
                 task_id = await agent_manager.send_task(
-                    agent_id,
+                    cm_agent_id,
                     "snmp_parallel_walk",
                     {
                         "ip": request.modem_ip,
@@ -200,13 +214,13 @@ class ChannelStatsRouter:
                 cmts_profile_task_id = None
                 fiber_node_sg_task_id = None
                 cached_cm_index = None
-                if request.cmts_ip and request.mac_address:
+                if request.cmts_ip and request.mac_address and cmts_agent_id:
                     cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                     if cached_cm_index is not None:
                         # Fast path: direct snmpget for SG ID using known cm_index (runs in parallel with modem walk)
                         try:
                             fiber_node_sg_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_get",
+                                cmts_agent_id, "snmp_get",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cached_cm_index}',
@@ -217,11 +231,11 @@ class ChannelStatsRouter:
                         except Exception as e:
                             self.logger.debug(f"Fiber node pre-task failed: {e}")
 
-                if request.cmts_ip and request.cmts_stats:
+                if request.cmts_ip and request.cmts_stats and cmts_agent_id:
                     try:
                         if cached_cm_index is None:
                             cmts_ofdma_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
+                                cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',
@@ -232,7 +246,7 @@ class ChannelStatsRouter:
                         if cached_cm_index is not None:
                             # Scoped walks — tiny, fast
                             cmts_rxmer_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
+                                cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cached_cm_index}',
@@ -241,7 +255,7 @@ class ChannelStatsRouter:
                                 timeout=15.0,
                             )
                             cmts_profile_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
+                                cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.5.1.1.{cached_cm_index}',
@@ -252,7 +266,7 @@ class ChannelStatsRouter:
                         else:
                             # Full walks + MAC walk to resolve cm_index
                             cmts_rxmer_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
+                                cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
@@ -261,7 +275,7 @@ class ChannelStatsRouter:
                                 timeout=15.0,
                             )
                             cmts_cmindex_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
+                                cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
@@ -270,7 +284,7 @@ class ChannelStatsRouter:
                                 timeout=15.0,
                             )
                             cmts_profile_task_id = await agent_manager.send_task(
-                                agent_id, "snmp_walk",
+                                cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',
@@ -363,7 +377,7 @@ class ChannelStatsRouter:
                             # Now that we have cm_index, pre-fetch SG ID for fiber node
                             try:
                                 fiber_node_sg_task_id = await agent_manager.send_task(
-                                    agent_id, "snmp_get",
+                                    cmts_agent_id, "snmp_get",
                                     {
                                         "target_ip": request.cmts_ip,
                                         "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}',
@@ -463,7 +477,7 @@ class ChannelStatsRouter:
 
                 # Resolve fiber node
                 fiber_node = None
-                if request.cmts_ip and request.mac_address:
+                if request.cmts_ip and request.mac_address and cmts_agent_id:
                     try:
                         fn_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                         if fiber_node_sg_task_id and fn_cm_index is not None:
@@ -474,7 +488,7 @@ class ChannelStatsRouter:
                                 cm_sg_id = sg_result.get('result', {}).get('value')
                             if cm_sg_id:
                                 fn_task_id = await agent_manager.send_task(
-                                    agent_id, "snmp_walk",
+                                    cmts_agent_id, "snmp_walk",
                                     {"target_ip": request.cmts_ip, "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3', "community": request.cmts_community or "public"},
                                     timeout=10.0,
                                 )
@@ -500,7 +514,7 @@ class ChannelStatsRouter:
                         else:
                             # First call: full sequential lookup (also caches cm_index)
                             fiber_node = await self._get_fiber_node_from_cmts(
-                                agent_manager, agent_id, request.cmts_ip,
+                                agent_manager, cmts_agent_id, request.cmts_ip,
                                 request.mac_address, request.cmts_community or "public"
                             )
                     except Exception as fn_err:
