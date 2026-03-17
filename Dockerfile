@@ -14,12 +14,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     https_proxy=${https_proxy} \
     no_proxy=${no_proxy} \
     HTTP_PROXY=${http_proxy} \
-    HTTPS_PROXY=${http_proxy} \
+    HTTPS_PROXY=${https_proxy} \
     NO_PROXY=${no_proxy}
 
 WORKDIR /app
 
-# Use HTTPS for Ubuntu repos (archive + security)
+# Install system dependencies
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -31,14 +31,15 @@ RUN apt-get update \
       python3.12-venv \
  && rm -rf /var/lib/apt/lists/*
 
-# Create a venv to avoid PEP 668 / externally-managed-environment
+# Create virtual environment
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3.12 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Optional: pip proxy config (only if you actually pass http_proxy)
+# Optional pip proxy
 RUN if [ -n "${http_proxy}" ]; then pip config set global.proxy "${http_proxy}"; fi
 
+# Copy project files
 COPY pyproject.toml README.md LICENSE /app/
 COPY src/ /app/src/
 COPY demo/ /app/demo/
@@ -47,18 +48,31 @@ COPY tools/ /app/tools/
 COPY mibs/ /app/mibs/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 
-# Install your package into the venv (no --break-system-packages)
+# Install package inside venv
 RUN pip install --upgrade pip \
  && pip install . \
- && pip install pysnmp-mibs \
- && useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
- && chmod +x /app/entrypoint.sh \
- && if [ -f /app/deploy/config/system.json.template ] && [ ! -f /app/deploy/config/system.json ]; then \
-      cp /app/deploy/config/system.json.template /app/deploy/config/system.json; \
+ && pip install pysnmp-mibs
+
+RUN mkdir -p /app/deploy/config \
+ && if [ -f /app/deploy/config/system.json.template ]; then \
+      cp -n /app/deploy/config/system.json.template \
+            /app/deploy/config/system.json; \
     fi \
- && chown -R pypnm:pypnm /home/pypnm
+ && ls -l /app/deploy/config
+
+# Set config path explicitly
+ENV PYPNM_CONFIG=/app/deploy/config/system.json
+
+# Create non-root user
+RUN useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
+ && chown -R pypnm:pypnm /app
+
+USER pypnm
 
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -f http://localhost:8000/docs || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python3.12", "-m", "uvicorn", "pypnm.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -69,4 +69,7 @@ if [ -d "/app/demo" ]; then
   chmod -R u+rwX,go-rwx /app/demo || true
 fi
 
-exec gosu "${APP_USER}" "$@"
+#!/bin/sh
+set -e
+
+exec "$@"

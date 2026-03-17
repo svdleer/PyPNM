@@ -61,8 +61,9 @@ class CMTSModemService:
         agents = agent_manager.get_available_agents()
         if not agents:
             raise Exception("No agents available")
-        
-        agent_id = agents[0]['agent_id']
+
+        # Prefer agent that can reach the CMTS; fall back to first available
+        agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable') or agents[0]['agent_id']
         
         task_id = await agent_manager.send_task(
             agent_id=agent_id,

@@ -121,7 +121,8 @@ class CableModemServicePreCheck:
         mgr = self._get_agent_manager()
         if not mgr:
             return None, None
-        agent = mgr.get_agent_for_capability('snmp_get')
+        # Prefer agent that can reach CMs directly; fall back to any snmp_get agent
+        agent = mgr.get_agent_for_capability('cm_reachable') or mgr.get_agent_for_capability('snmp_get')
         return mgr, agent
 
     # ------------------------------------------------------------------
