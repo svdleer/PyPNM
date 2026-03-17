@@ -49,6 +49,10 @@ from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
     FiberNodeSummary,
     PreEqDataRequest,
     PreEqDataResponse,
+    PlantAssessmentRequest,
+    PlantAssessmentResponse,
+    ModemPlantVerdict,
+    FnPlantStats,
 )
 from pypnm.api.routes.pnm.us.ofdma.rxmer.service import CmtsUsOfdmaRxMerService
 from pypnm.api.routes.common.service.fiber_node_utils import (
@@ -166,7 +170,556 @@ class UsOfdmaRxMerRouter:
                 )
             finally:
                 service.close()
-        
+
+        @self.router.post(
+            "/fiberNode/plant-assessment",
+            summary="Fiber node plant vs in-home assessment (pre-eq + RxMER combined)",
+            response_model=PlantAssessmentResponse,
+        )
+        async def fiber_node_plant_assessment(
+            request: PlantAssessmentRequest,
+        ) -> PlantAssessmentResponse:
+            """
+            Classify each modem on a fiber node as 'plant', 'in-home', 'clean', or 'unknown'
+            by combining three signals:
+
+            1. **Tap shape similarity** — normalized pre-eq magnitude cosine similarity vs FN median.
+               Low similarity (unique tap shape) = in-home indicator.
+
+            2. **Group delay deviation** — |modem gd_pp - FN median gd_pp| > threshold = in-home.
+
+            3. **Shared impaired subcarriers** — subcarriers bad on >plant_share_pct of modems
+               = plant-side ingress or interference.
+
+            Decision table:
+            - Unique tap AND gd outlier                             → in-home (high confidence)
+            - Unique tap OR gd outlier + no shared subcarriers      → in-home (medium confidence)
+            - Shared bad subcarriers >60% + similar tap to FN       → plant
+            - NMTER < 25 dB AND similar tap to FN median            → plant
+            - All metrics nominal                                    → clean
+            """
+            import math as _math
+            import statistics as _stat
+
+            try:
+                mod_preeq = request.modems_preeq
+                sc_stats = request.subcarrier_stats
+                thr = request.mer_bad_threshold_db
+                sim_thr = request.tap_similarity_threshold
+                gd_thr = request.gd_deviation_threshold_us
+                plant_share = request.plant_share_pct
+
+                n_modems = len(mod_preeq)
+                if n_modems == 0:
+                    return PlantAssessmentResponse(success=False, error="No modem pre-eq data provided")
+
+                # ── Build per-modem tap magnitude vectors (use first channel available)
+                # also returns (offsets, dB_rel_to_main, cable_ft, main_tap_loc, sample_period_us)
+                _COAX_VELOCITY_M_S = 0.85 * 299_792_458   # ~2.548e8 m/s (VOP 0.85)
+                _M_TO_FT = 3.28084
+
+                def _tap_profile(channels):
+                    """Return (norm_vec, offsets, dB_rel, cable_ft, main_loc, sp_us) for first usable channel."""
+                    for ch in channels:
+                        taps = ch.taps
+                        if not taps:
+                            continue
+                        mags = [t.magnitude for t in taps]
+                        mx = max(mags) if mags else 0.0
+                        norm_vec = [m / mx if mx > 0 else 0.0 for m in mags]
+
+                        # main tap = argmax (or use header main_tap_location if provided)
+                        main_loc = ch.main_tap_location if ch.main_tap_location is not None else int(mags.index(mx))
+                        main_mag = mags[main_loc] if main_loc < len(mags) else mx
+
+                        offsets = [i - main_loc for i in range(len(mags))]
+
+                        dB_rel: list = []
+                        for m in mags:
+                            if m > 0 and main_mag > 0:
+                                dB_rel.append(round(20 * _math.log10(m / main_mag), 2))
+                            else:
+                                dB_rel.append(None)
+
+                        sp_us: float | None = None
+                        if ch.group_delay and ch.group_delay.sample_period_us:
+                            sp_us = ch.group_delay.sample_period_us
+
+                        cable_ft: list = []
+                        for off in offsets:
+                            if off == 0 or sp_us is None:
+                                cable_ft.append(None)
+                            else:
+                                delay_s = abs(off) * sp_us * 1e-6
+                                dist_m  = delay_s * _COAX_VELOCITY_M_S / 2.0  # one-way (reflection round-trip /2)
+                                cable_ft.append(round(dist_m * _M_TO_FT, 1))
+
+                        return norm_vec, offsets, dB_rel, cable_ft, main_loc, sp_us
+                    return [], [], [], [], None, None
+
+                mac_to_tap_vec:     dict = {}
+                mac_to_tap_profile: dict = {}  # mac -> (offsets, dB_rel, cable_ft, main_loc, sp_us)
+                for mp in mod_preeq:
+                    norm_vec, offsets, dB_rel, cable_ft, main_loc, sp_us = _tap_profile(mp.channels)
+                    if norm_vec:
+                        mac_to_tap_vec[mp.mac] = norm_vec
+                        mac_to_tap_profile[mp.mac] = (offsets, dB_rel, cable_ft, main_loc, sp_us)
+
+                # ── FN-median tap signature (element-wise median, align by length)
+                all_vecs = list(mac_to_tap_vec.values())
+                fn_tap_sig: list[float] = []
+                fn_tap_offsets: list[int] = []
+                fn_tap_dB: list = []
+                fn_tap_cable_ft: list = []
+                fn_main_tap_loc: int | None = None
+                fn_sample_period_us: float | None = None
+                if all_vecs:
+                    min_len = min(len(v) for v in all_vecs)
+                    fn_tap_sig = [
+                        _stat.median(v[i] for v in all_vecs)
+                        for i in range(min_len)
+                    ]
+                    # Modal main tap location and median sample period across modems
+                    all_main_locs = [p[3] for p in mac_to_tap_profile.values() if p[3] is not None]
+                    fn_main_tap_loc = int(_stat.mode(all_main_locs)) if all_main_locs else None
+                    all_sp = [p[4] for p in mac_to_tap_profile.values() if p[4] is not None]
+                    fn_sample_period_us = _stat.median(all_sp) if all_sp else None
+                    if fn_main_tap_loc is not None:
+                        fn_tap_offsets = [i - fn_main_tap_loc for i in range(min_len)]
+                        fn_tap_dB = [
+                            (round(20 * _math.log10(v) if v > 0 else None, 2)
+                             if v > 0 else None)
+                            for v in fn_tap_sig
+                        ]
+                        fn_tap_cable_ft = []
+                        for off in fn_tap_offsets:
+                            if off == 0 or fn_sample_period_us is None:
+                                fn_tap_cable_ft.append(None)
+                            else:
+                                delay_s = abs(off) * fn_sample_period_us * 1e-6
+                                dist_m  = delay_s * _COAX_VELOCITY_M_S / 2.0
+                                fn_tap_cable_ft.append(round(dist_m * _M_TO_FT, 1))
+
+                def _cosine_sim(a: list[float], b: list[float]) -> float:
+                    n = min(len(a), len(b))
+                    if n == 0:
+                        return 0.0
+                    dot = sum(a[i] * b[i] for i in range(n))
+                    na = _math.sqrt(sum(x * x for x in a[:n]))
+                    nb = _math.sqrt(sum(x * x for x in b[:n]))
+                    return dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+                # ── Group delay per modem (use first channel)
+                def _gd_pp(channels) -> float | None:
+                    for ch in channels:
+                        if ch.group_delay and ch.group_delay.delay_pp_us is not None:
+                            return ch.group_delay.delay_pp_us
+                    return None
+
+                def _nmter(channels) -> float | None:
+                    for ch in channels:
+                        if ch.metrics and ch.metrics.nmter_dB is not None:
+                            return ch.metrics.nmter_dB
+                    return None
+
+                mac_to_gd: dict = {}
+                mac_to_nmter: dict = {}
+                for mp in mod_preeq:
+                    gd = _gd_pp(mp.channels)
+                    if gd is not None:
+                        mac_to_gd[mp.mac] = gd
+                    nt = _nmter(mp.channels)
+                    if nt is not None:
+                        mac_to_nmter[mp.mac] = nt
+
+                gd_values = list(mac_to_gd.values())
+                fn_median_gd = _stat.median(gd_values) if gd_values else None
+                nmter_values = list(mac_to_nmter.values())
+                fn_median_nmter = _stat.median(nmter_values) if nmter_values else None
+
+                # ── Per-subcarrier bad-modem count from subcarrier_stats
+                # subcarrier_stats[i].values_db is a list of MER per capture
+                # outlier_macs lists MACs that are 2σ below group mean
+                # Use outlier_macs as proxy for bad-subcarrier membership
+                mac_bad_sc: dict = {}      # mac -> set of sc indices
+                sc_shared_bad: set = set() # sc indices bad on >= plant_share fraction
+                sc_shared_freqs: dict = {} # sc index -> freq_mhz
+
+                if sc_stats:
+                    sc_modem_bad_count: dict[int, int] = {}  # sc_idx -> count of bad modems
+                    sc_bad_macs: dict[int, set] = {}
+                    for sc in sc_stats:
+                        bad_macs = set(sc.outlier_macs)
+                        sc_bad_macs[sc.index] = bad_macs
+                        sc_modem_bad_count[sc.index] = len(bad_macs)
+                        for mac in bad_macs:
+                            mac_bad_sc.setdefault(mac, set()).add(sc.index)
+
+                    for sc_idx, cnt in sc_modem_bad_count.items():
+                        if n_modems > 0 and cnt / n_modems >= plant_share:
+                            sc_shared_bad.add(sc_idx)
+
+                    for sc in sc_stats:
+                        if sc.index in sc_shared_bad:
+                            sc_shared_freqs[sc.index] = sc.frequency_mhz
+
+                # ── Per-modem verdict
+                verdicts: list[ModemPlantVerdict] = []
+                for mp in mod_preeq:
+                    mac = mp.mac
+                    gd_pp = mac_to_gd.get(mac)
+                    nmter = mac_to_nmter.get(mac)
+                    tap_vec    = mac_to_tap_vec.get(mac, [])
+                    tap_prof   = mac_to_tap_profile.get(mac, ([], [], [], None, None))
+                    tap_offsets, tap_dB_rel, tap_cable_ft, tap_main_loc, tap_sp_us = tap_prof
+                    tap_sim = _cosine_sim(tap_vec, fn_tap_sig) if (tap_vec and fn_tap_sig) else None
+                    gd_dev = abs(gd_pp - fn_median_gd) if (gd_pp is not None and fn_median_gd is not None) else None
+
+                    bad_sc = mac_bad_sc.get(mac, set())
+                    unique_bad = len(bad_sc - sc_shared_bad)
+                    shared_bad = len(bad_sc & sc_shared_bad)
+
+                    evidence: list[str] = []
+                    inhome_score = 0.0
+                    plant_score = 0.0
+
+                    if tap_sim is not None:
+                        if tap_sim < sim_thr:
+                            inhome_score += 0.45
+                            evidence.append(f"Unique tap shape (similarity {tap_sim:.2f} < {sim_thr})")
+                        else:
+                            plant_score += 0.2
+                            evidence.append(f"Tap shape matches FN median (similarity {tap_sim:.2f})")
+
+                    if gd_dev is not None:
+                        if gd_dev > gd_thr:
+                            inhome_score += 0.35
+                            evidence.append(f"GD deviation {gd_dev:.3f}µs > {gd_thr}µs threshold")
+                        else:
+                            plant_score += 0.15
+
+                    if unique_bad > 0:
+                        inhome_score += min(0.20, unique_bad / max(len(bad_sc), 1) * 0.20)
+                        evidence.append(f"{unique_bad} unique bad subcarriers (not shared with FN)")
+
+                    if shared_bad > 0:
+                        plant_score += min(0.40, shared_bad / max(len(bad_sc), 1) * 0.40)
+                        evidence.append(f"{shared_bad} shared impaired subcarriers (plant ingress)")
+
+                    if nmter is not None and nmter < 25.0:
+                        plant_score += 0.25
+                        evidence.append(f"Low NMTER {nmter:.1f} dB shared with FN (NMTER < 25 dB)")
+
+                    if inhome_score >= 0.5 and inhome_score > plant_score:
+                        verdict = "in-home"
+                        confidence = round(min(inhome_score, 1.0), 2)
+                    elif plant_score >= 0.35 and plant_score >= inhome_score:
+                        verdict = "plant"
+                        confidence = round(min(plant_score, 1.0), 2)
+                    elif inhome_score < 0.2 and plant_score < 0.2:
+                        verdict = "clean"
+                        confidence = 0.9
+                        evidence.append("All metrics nominal")
+                    else:
+                        verdict = "unknown"
+                        confidence = 0.0
+
+                    verdicts.append(ModemPlantVerdict(
+                        mac=mac,
+                        verdict=verdict,
+                        confidence=confidence,
+                        tap_similarity_to_fn_median=round(tap_sim, 4) if tap_sim is not None else None,
+                        gd_pp_us=gd_pp,
+                        gd_deviation_from_fn_median_us=round(gd_dev, 4) if gd_dev is not None else None,
+                        nmter_dB=nmter,
+                        unique_bad_subcarrier_count=unique_bad,
+                        shared_bad_subcarrier_count=shared_bad,
+                        evidence=evidence,
+                        main_tap_location=tap_main_loc,
+                        tap_offsets=tap_offsets,
+                        tap_dB_relative_to_main=tap_dB_rel,
+                        tap_cable_ft=tap_cable_ft,
+                        sample_period_us=tap_sp_us,
+                    ))
+
+                n_inhome = sum(1 for v in verdicts if v.verdict == "in-home")
+                n_plant = sum(1 for v in verdicts if v.verdict == "plant")
+
+                fn_stats = FnPlantStats(
+                    modem_count=n_modems,
+                    fn_median_gd_pp_us=round(fn_median_gd, 4) if fn_median_gd is not None else None,
+                    fn_median_nmter_dB=round(fn_median_nmter, 2) if fn_median_nmter is not None else None,
+                    fn_tap_signature=[round(v, 4) for v in fn_tap_sig],
+                    fn_tap_offsets=fn_tap_offsets,
+                    fn_tap_dB_relative_to_main=fn_tap_dB,
+                    fn_tap_cable_ft=fn_tap_cable_ft,
+                    fn_main_tap_location=fn_main_tap_loc,
+                    fn_sample_period_us=fn_sample_period_us,
+                    shared_impaired_subcarrier_indices=sorted(sc_shared_bad),
+                    shared_impaired_frequencies_mhz=[
+                        sc_shared_freqs[i] for i in sorted(sc_shared_bad) if i in sc_shared_freqs
+                    ],
+                    plant_issue_detected=len(sc_shared_bad) > 0 or n_plant > 0,
+                    pct_modems_in_home=round(n_inhome / n_modems * 100, 1) if n_modems else 0.0,
+                    pct_modems_plant=round(n_plant / n_modems * 100, 1) if n_modems else 0.0,
+                )
+
+                return PlantAssessmentResponse(
+                    success=True,
+                    fn_stats=fn_stats,
+                    modem_verdicts=verdicts,
+                )
+
+            except Exception as exc:
+                self.logger.exception(f"plant-assessment error: {exc}")
+                return PlantAssessmentResponse(success=False, error=str(exc))
+
+        @self.router.post(
+            "/fiberNode/tap-plot",
+            summary="Pre-equalizer tap distance plot (matplotlib PNG)",
+            response_class=Response,
+        )
+        async def fiber_node_tap_plot(
+            request: PlantAssessmentRequest,
+        ) -> Response:
+            """
+            Render a matplotlib figure showing the pre-equalizer tap magnitude
+            profile (dB relative to main tap) for every modem on the fiber node.
+
+            - X-axis : tap offset from main tap (tap numbers); top twin axis in
+              estimated one-way cable distance (ft) when sample_period_us is available.
+            - Y-axis : magnitude relative to main tap (dB).  Main tap = 0 dB.
+            - One line per modem coloured by plant-assessment verdict:
+                green = clean, yellow = in-home, red = plant, grey = unknown.
+            - Thick dashed black line = FN median profile.
+            - Vertical red line at x=0 marks the main tap.
+            """
+            import io as _io
+            import math as _math
+            import statistics as _stat
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.ticker as mticker
+            import numpy as np
+
+            _COAX_VEL = 0.85 * 299_792_458   # m/s  (VOP 0.85)
+            _M_TO_FT  = 3.28084
+
+            VERDICT_COLOUR = {
+                "clean":   "#2ca02c",  # green
+                "in-home": "#ff7f0e",  # orange
+                "plant":   "#d62728",  # red
+                "unknown": "#9467bd",  # purple
+            }
+
+            try:
+                mod_preeq = request.modems_preeq
+                n_modems  = len(mod_preeq)
+                if n_modems == 0:
+                    return Response(
+                        content=b"",
+                        status_code=400,
+                        media_type="image/png",
+                    )
+
+                # ── helpers (same logic as plant-assessment endpoint)
+                def _tap_profile(channels):
+                    for ch in channels:
+                        taps = ch.taps
+                        if not taps:
+                            continue
+                        mags    = [t.magnitude for t in taps]
+                        mx      = max(mags) if mags else 0.0
+                        norm    = [m / mx if mx > 0 else 0.0 for m in mags]
+                        main_l  = ch.main_tap_location if ch.main_tap_location is not None \
+                                  else int(mags.index(mx))
+                        main_m  = mags[main_l] if main_l < len(mags) else mx
+                        offsets = [i - main_l for i in range(len(mags))]
+                        dB_rel  = [
+                            round(20 * _math.log10(m / main_m), 2)
+                            if (m > 0 and main_m > 0) else None
+                            for m in mags
+                        ]
+                        sp_us   = (ch.group_delay.sample_period_us
+                                   if ch.group_delay and ch.group_delay.sample_period_us
+                                   else None)
+                        return norm, offsets, dB_rel, main_l, sp_us
+                    return [], [], [], None, None
+
+                mac_norm:    dict = {}
+                mac_profile: dict = {}
+                for mp in mod_preeq:
+                    norm, offsets, dB_rel, main_l, sp_us = _tap_profile(mp.channels)
+                    if norm:
+                        mac_norm[mp.mac]    = norm
+                        mac_profile[mp.mac] = (offsets, dB_rel, main_l, sp_us)
+
+                # FN median profile
+                all_vecs   = list(mac_norm.values())
+                fn_dB:      list = []
+                fn_offsets: list = []
+                fn_sp_us:   float | None = None
+                fn_main_l:  int | None   = None
+                if all_vecs:
+                    min_len = min(len(v) for v in all_vecs)
+                    fn_sig  = [_stat.median(v[i] for v in all_vecs) for i in range(min_len)]
+                    all_ml  = [p[2] for p in mac_profile.values() if p[2] is not None]
+                    fn_main_l = int(_stat.mode(all_ml)) if all_ml else None
+                    all_sp  = [p[3] for p in mac_profile.values() if p[3] is not None]
+                    fn_sp_us = _stat.median(all_sp) if all_sp else None
+                    if fn_main_l is not None:
+                        mxv = fn_sig[fn_main_l] if fn_main_l < len(fn_sig) else max(fn_sig, default=1e-9)
+                        fn_offsets = [i - fn_main_l for i in range(min_len)]
+                        fn_dB = [
+                            round(20 * _math.log10(v / mxv), 2)
+                            if (v > 0 and mxv > 0) else None
+                            for v in fn_sig
+                        ]
+
+                # Quick verdict colours (cosine similarity only — no need for full scoring)
+                def _cosine_sim(a, b):
+                    n = min(len(a), len(b))
+                    if n == 0: return 0.0
+                    dot = sum(a[i]*b[i] for i in range(n))
+                    na  = _math.sqrt(sum(x*x for x in a[:n]))
+                    nb  = _math.sqrt(sum(x*x for x in b[:n]))
+                    return dot / (na*nb) if na > 0 and nb > 0 else 0.0
+
+                fn_sig_for_sim = list(mac_norm.values())[0] if mac_norm else []
+                if all_vecs:
+                    min_l = min(len(v) for v in all_vecs)
+                    fn_sig_for_sim = [_stat.median(v[i] for v in all_vecs) for i in range(min_l)]
+
+                mac_verdict: dict = {}
+                sim_thr = request.tap_similarity_threshold
+                gd_thr  = request.gd_deviation_threshold_us
+                all_gd  = []
+                for mp in mod_preeq:
+                    for ch in mp.channels:
+                        if ch.group_delay and ch.group_delay.delay_pp_us is not None:
+                            all_gd.append(ch.group_delay.delay_pp_us)
+                            break
+                fn_gd = _stat.median(all_gd) if all_gd else None
+                mac_gd: dict = {}
+                for mp in mod_preeq:
+                    for ch in mp.channels:
+                        if ch.group_delay and ch.group_delay.delay_pp_us is not None:
+                            mac_gd[mp.mac] = ch.group_delay.delay_pp_us
+                            break
+
+                for mp in mod_preeq:
+                    vec = mac_norm.get(mp.mac, [])
+                    sim = _cosine_sim(vec, fn_sig_for_sim) if (vec and fn_sig_for_sim) else None
+                    gd  = mac_gd.get(mp.mac)
+                    gd_dev = abs(gd - fn_gd) if (gd is not None and fn_gd is not None) else None
+                    if sim is not None and sim < sim_thr:
+                        mac_verdict[mp.mac] = "in-home"
+                    elif gd_dev is not None and gd_dev > gd_thr:
+                        mac_verdict[mp.mac] = "in-home"
+                    else:
+                        mac_verdict[mp.mac] = "clean"   # coarse — plant needs sc_stats
+
+                # ── Figure ────────────────────────────────────────────────────────────
+                fig, ax = plt.subplots(figsize=(13, 5))
+                fig.patch.set_facecolor("#f8f9fa")
+                ax.set_facecolor("#ffffff")
+
+                plotted = []
+                for mp in mod_preeq:
+                    mac  = mp.mac
+                    prof = mac_profile.get(mac)
+                    if not prof:
+                        continue
+                    offsets, dB_rel, _, _ = prof
+                    colour  = VERDICT_COLOUR.get(mac_verdict.get(mac, "unknown"), "#aaaaaa")
+                    ys      = [v if v is not None else float("nan") for v in dB_rel]
+                    label   = f"{mac[-8:]}  ({mac_verdict.get(mac, '?')})"
+                    ax.plot(offsets, ys, color=colour, alpha=0.55, linewidth=1.0, label=label)
+                    plotted.append(mac)
+
+                # FN median overlay
+                if fn_dB and fn_offsets:
+                    fn_ys = [v if v is not None else float("nan") for v in fn_dB]
+                    ax.plot(fn_offsets, fn_ys,
+                            color="black", linewidth=2.2, linestyle="--",
+                            label="FN median", zorder=5)
+
+                # Reference lines
+                ax.axvline(0, color="#cc0000", linewidth=1.5, linestyle="-", zorder=3, alpha=0.7)
+                for ref_dB in (-20, -30, -40):
+                    ax.axhline(ref_dB, color="#aaaaaa", linewidth=0.7, linestyle=":", zorder=1)
+                    ax.text(ax.get_xlim()[0] if ax.get_xlim()[0] != 0 else -1,
+                            ref_dB + 0.5, f"{ref_dB} dB",
+                            fontsize=7, color="#888888", va="bottom")
+
+                ax.set_xlabel("Tap offset from main tap (samples)", fontsize=10)
+                ax.set_ylabel("Magnitude relative to main tap (dB)", fontsize=10)
+                ax.set_title(
+                    f"Pre-Eq Tap Distance Profile — {n_modems} modems"
+                    + (f"  |  sample period {fn_sp_us:.3f} µs" if fn_sp_us else ""),
+                    fontsize=11, fontweight="bold",
+                )
+                ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%+.0f"))
+                ax.grid(True, which="major", linestyle="--", alpha=0.3)
+                ax.set_ylim(bottom=-55, top=3)
+
+                # Twin top x-axis in cable ft (when sample_period_us known)
+                if fn_sp_us and fn_sp_us > 0:
+                    ax2 = ax.twiny()
+                    ax2.set_xlim(ax.get_xlim())
+                    def tap_to_ft(x):
+                        delay_s = abs(x) * fn_sp_us * 1e-6
+                        return delay_s * _COAX_VEL / 2.0 * _M_TO_FT
+                    xlim = ax.get_xlim()
+                    max_off = max(abs(xlim[0]), abs(xlim[1]))
+                    tick_offs = sorted(set(
+                        [o for o in fn_offsets if o != 0] or [int(max_off * 0.5)]
+                    ), key=abs)
+                    # show at most 8 ticks
+                    step = max(1, len(tick_offs) // 8)
+                    shown = [0] + tick_offs[::step]
+                    ax2.set_xticks(shown)
+                    ax2.set_xticklabels(
+                        ["main" if t == 0 else f"{tap_to_ft(t):.0f} ft" for t in shown],
+                        fontsize=8,
+                    )
+                    ax2.set_xlabel("Estimated one-way reflection distance (ft, VOP 0.85)", fontsize=9)
+
+                # Legend — keep manageable
+                handles, labels = ax.get_legend_handles_labels()
+                max_legend = 20
+                if len(handles) > max_legend:
+                    handles = handles[:max_legend]
+                    labels  = labels[:max_legend]
+                    labels[-1] += f" … +{len(plotted) - max_legend + 1} more"
+                ax.legend(handles, labels,
+                          loc="lower right",
+                          fontsize=7,
+                          ncol=max(1, len(handles) // 10),
+                          framealpha=0.7)
+
+                plt.tight_layout()
+                buf = _io.BytesIO()
+                fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+                plt.close(fig)
+                buf.seek(0)
+                return Response(content=buf.getvalue(), media_type="image/png")
+
+            except Exception as exc:
+                self.logger.exception(f"tap-plot error: {exc}")
+                buf = _io.BytesIO()
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(6, 2))
+                ax.text(0.5, 0.5, f"Plot error: {exc}",
+                        ha="center", va="center", transform=ax.transAxes, color="red")
+                fig.savefig(buf, format="png", dpi=72)
+                plt.close(fig)
+                buf.seek(0)
+                return Response(content=buf.getvalue(), media_type="image/png")
+
         @self.router.post(
             "/start",
             summary="Start US OFDMA RxMER measurement",

@@ -114,10 +114,20 @@ class CMTSModemService:
     @staticmethod
     def _parse_mac(raw: str) -> str | None:
         """Normalise a MAC value (hex‑string / 0x‑prefixed / colon‑separated)
-        into ``aa:bb:cc:dd:ee:ff`` format.  Returns *None* on failure."""
-        mac_hex = str(raw)
+        into ``aa:bb:cc:dd:ee:ff`` format.  Returns *None* on failure.
+
+        Handles short octets like ``0:7:11:14:3c:27`` (SNMP strips leading
+        zeros per octet) by zero-padding each octet before joining.
+        """
+        mac_hex = str(raw).strip()
         if mac_hex.startswith('0x'):
             mac_hex = mac_hex[2:]
+        # If colon/hyphen separated, zero-pad each octet then rejoin
+        sep = ':' if ':' in mac_hex else ('-' if '-' in mac_hex else None)
+        if sep:
+            parts = mac_hex.split(sep)
+            if len(parts) == 6:
+                mac_hex = ''.join(p.zfill(2) for p in parts)
         mac_hex = mac_hex.replace(' ', '').replace(':', '').replace('-', '')
         if len(mac_hex) >= 12:
             return ':'.join(mac_hex[i:i + 2] for i in range(0, 12, 2)).lower()

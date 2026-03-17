@@ -217,7 +217,10 @@ class CmSnmpOperation:
                 print(f"DEBUG: Agent manager: {agent_manager}")
                 
                 if agent_manager:
-                    agent = agent_manager.get_agent_for_capability('snmp_get')
+                    # Use cm_reachable capability so cm-agent (not ctms-agent) handles
+                    # modem-side SNMP.  Fall back to snmp_get if no cm_reachable agent.
+                    agent = (agent_manager.get_agent_for_capability('cm_reachable')
+                             or agent_manager.get_agent_for_capability('snmp_get'))
                     print(f"DEBUG: Agent for snmp_get: {agent}")
                     
                     if agent:
@@ -227,7 +230,8 @@ class CmSnmpOperation:
                             community=self._community,
                             port=self._port,
                             timeout=10,
-                            retries=3
+                            retries=3,
+                            agent_id=agent.agent_id,
                         )
                     else:
                         print("DEBUG: No agent with snmp_get capability")

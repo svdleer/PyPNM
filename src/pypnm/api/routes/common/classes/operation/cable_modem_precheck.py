@@ -259,8 +259,8 @@ class CableModemServicePreCheck:
         try:
             mgr, agent = self._get_snmp_agent()
             if not mgr or not agent:
-                self.logger.warning("No agent available for ping – falling back to local")
-                return self._ping_local()
+                self.logger.error("No agent available for ping check — not falling back to local")
+                return ServiceStatusCode.PING_FAILED
 
             task_id = await mgr.send_task(
                 agent.agent_id,
@@ -329,42 +329,18 @@ class CableModemServicePreCheck:
             return ServiceStatusCode.UNREACHABLE_SNMP
 
     async def _snmp_via_agent(self) -> ServiceStatusCode:
-        """SNMP sysDescr check via pyPNMAgent."""
-        try:
-            mgr, agent = self._get_snmp_agent()
-            if not mgr or not agent:
-                self.logger.warning("No agent available for SNMP – falling back to local")
-                return await self._snmp_local()
+        """SNMP sysDescr check via pyPNMAgent.
 
-            community = self._snmp_community or 'public'
-
-            # Use longer timeout to account for agent queue when multiple
-            # parallel requests are in flight (each SNMP operation ~1-3s)
-            timeout = 15.0  # Increased from 5.0 to handle 4+ parallel requests
-
-            task_id = await mgr.send_task(
-                agent.agent_id,
-                'snmp_get',
-                {
-                    'target_ip': self._ip_address,
-                    'oid': '1.3.6.1.2.1.1.1.0',       # sysDescr.0
-                    'community': community,
-                },
-                timeout=timeout,
-            )
-            result = await mgr.wait_for_task_async(task_id, timeout=timeout)
-
-            if result and result.get('type') == 'response':
-                data = result.get('result', {})
-                if data.get('success') and data.get('output'):
-                    self.logger.debug(f"SNMP check passed (agent): {data['output'][:80]}")
-                    return ServiceStatusCode.SUCCESS
-
-            self.logger.debug(f"SNMP check failed (agent): {result}")
-            return ServiceStatusCode.UNREACHABLE_SNMP
-        except Exception as e:
-            self.logger.error(f"SNMP via agent exception: {e}", exc_info=True)
-            return ServiceStatusCode.UNREACHABLE_SNMP
+        When the agent transport is active the agent queue is typically
+        loaded with bulk_get/walk tasks for channel-stats etc.  Sending an
+        extra sysDescr GET just to pre-validate reachability adds latency
+        and frequently times out, returning a false UNREACHABLE_SNMP.
+        Since actual SNMP operations performed later will fail with their
+        own errors if the modem is genuinely unreachable, we skip the
+        redundant check here and return SUCCESS immediately.
+        """
+        self.logger.debug("SNMP precheck skipped (agent transport active — modem reachability checked implicitly)")
+        return ServiceStatusCode.SUCCESS
 
     # ------------------------------------------------------------------
     # MAC address

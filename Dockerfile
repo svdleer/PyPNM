@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.6
 FROM ubuntu:24.04
 
 ARG http_proxy
@@ -65,7 +64,8 @@ ENV PYPNM_CONFIG=/app/deploy/config/system.json
 
 # Create non-root user
 RUN useradd -m -u 10001 -s /usr/sbin/nologin pypnm \
- && chown -R pypnm:pypnm /app
+ && chown -R pypnm:pypnm /app \
+ && chown -R pypnm:pypnm /opt/venv
 
 USER pypnm
 

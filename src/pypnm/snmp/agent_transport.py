@@ -283,12 +283,14 @@ class AgentSnmpTransport:
         port: int = SNMP_PORT,
         timeout: int = 10,
         retries: int = 3,
+        agent_id: str | None = None,
     ) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
         self._host = host.inet if hasattr(host, 'inet') else str(host)
         self._port = port
         self._timeout = timeout
         self._retries = retries
+        self._agent_id = agent_id  # pin to a specific agent when set
 
         if read_community is not None:
             self._read_community = str(read_community)
@@ -309,13 +311,19 @@ class AgentSnmpTransport:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_manager_and_agent(capability: str = 'snmp_get'):
+    def _get_manager_and_agent(capability: str = 'snmp_get', agent_id: str | None = None):
         """Return (agent_manager, agent) or raise RuntimeError."""
         from pypnm.api.agent.manager import get_agent_manager
 
         mgr = get_agent_manager()
         if not mgr:
             raise RuntimeError("Agent manager not initialized")
+        # If a specific agent is pinned, use it directly
+        if agent_id:
+            agent = mgr.get_agent(agent_id)
+            if not agent:
+                raise RuntimeError(f"Pinned agent '{agent_id}' is not connected")
+            return mgr, agent
         agent = mgr.get_agent_for_capability(capability)
         if not agent:
             raise RuntimeError(f"No agent available with '{capability}' capability")
@@ -324,7 +332,7 @@ class AgentSnmpTransport:
     async def _send_and_wait(self, capability: str, command: str,
                              params: dict, timeout: float) -> dict | None:
         """Send a command and async-wait for the response."""
-        mgr, agent = self._get_manager_and_agent(capability)
+        mgr, agent = self._get_manager_and_agent(capability, self._agent_id)
         task_id = await mgr.send_task(
             agent.agent_id, command, params, timeout=timeout,
         )

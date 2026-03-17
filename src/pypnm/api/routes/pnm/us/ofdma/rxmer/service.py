@@ -538,6 +538,10 @@ class CmtsUsOfdmaRxMerService:
                     "num_taps": eq_model.num_taps,
                     "main_tap_location": eq_model.main_tap_location,
                     "taps_per_symbol": eq_model.taps_per_symbol,
+                    "taps": [
+                        {"real": t.real, "imag": t.imag, "magnitude": round(t.magnitude, 4)}
+                        for t in eq_model.taps
+                    ],
                 }
                 
                 # Add metrics if available
@@ -864,7 +868,8 @@ class CmtsUsOfdmaRxMerService:
         tftp_ip: str,
         port: int = 69,
         local_store: bool = False,
-        dest_index: Optional[int] = None
+        dest_index: Optional[int] = None,
+        dest_path: str = "./",
     ) -> dict[str, Any]:
         """
         Create or update a bulk data transfer destination for TFTP uploads.
@@ -894,7 +899,49 @@ class CmtsUsOfdmaRxMerService:
                                 if ip_value:
                                     existing_ip = self._parse_ip_from_octetstring(ip_value)
                                     if existing_ip == tftp_ip:
+                                        # Also check DestBaseUri — it may contain a stale host
+                                        # from a previous misconfiguration (e.g. old alt-TFTP IP).
+                                        # If the URI references a different host, destroy the row
+                                        # and fall through to recreate it cleanly.
+                                        uri_stale = False
+                                        try:
+                                            uri_result = await self._snmp_get(f"{self.OID_BULK_CFG_BASE_URI}.{idx}")
+                                            uri_value = str(self._parse_get_value(uri_result) or '')
+                                            if uri_value and tftp_ip not in uri_value and '://' in uri_value:
+                                                self.logger.warning(
+                                                    f"Bulk dest {idx} IP matches but BaseUri '{uri_value}' "
+                                                    f"references different host — destroying and recreating row"
+                                                )
+                                                uri_stale = True
+                                        except Exception:
+                                            pass
+
+                                        if uri_stale:
+                                            try:
+                                                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 6, 'i')  # destroy
+                                            except Exception:
+                                                pass
+                                            dest_index = idx
+                                            break
+
                                         self.logger.info(f"Found existing TFTP destination at index {idx}")
+                                        # Suspend row to notInService(2) before modifying columns.
+                                        # Many CMTSes (Arris/CommScope) return inconsistentValue
+                                        # if DestBaseUri is SET while the row is active(1).
+                                        _norm_path = dest_path.lstrip('./').lstrip('/')
+                                        _norm_path = (_norm_path + '/') if _norm_path and not _norm_path.endswith('/') else _norm_path
+                                        try:
+                                            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 2, 'i')  # notInService
+                                            await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{idx}", _norm_path, 's')
+                                            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 1, 'i')  # active
+                                            self.logger.info(f"Updated base URI for destination {idx}: '{_norm_path}'")
+                                        except Exception as _e:
+                                            self.logger.warning(f"Could not update base URI on existing dest {idx}: {_e}")
+                                            # Ensure row is left active even if URI update failed
+                                            try:
+                                                await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{idx}", 1, 'i')
+                                            except Exception:
+                                                pass
                                         return {
                                             "success": True,
                                             "destination_index": idx,
@@ -920,9 +967,16 @@ class CmtsUsOfdmaRxMerService:
             # Convert IP to hex bytes for OctetString SET
             ip_parts = tftp_ip.split(".")
             ip_hex = "".join([f"{int(p):02x}" for p in ip_parts])
-            
-            # Cisco cBR-8 flow: createAndGo(4) activates the row immediately
-            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 4, 'i')
+
+            # Normalise dest_path once for use below
+            _path = dest_path.lstrip('./').lstrip('/')
+            _path = (_path + '/') if _path and not _path.endswith('/') else _path
+
+            # Use createAndWait(5) so all columns can be set while the row is
+            # notReady/notInService, then activate with active(1) at the end.
+            # createAndGo(4) activates immediately and some CMTSes (Arris/CommScope)
+            # return inconsistentValue when writing DestBaseUri to an active row.
+            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 5, 'i')  # createAndWait
 
             # IP address type (1=IPv4)
             await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
@@ -933,10 +987,17 @@ class CmtsUsOfdmaRxMerService:
             # LocalStore: false(2) = upload to TFTP only, true(1) = also store on CMTS
             await self._snmp_set(f"{self.OID_BULK_CFG_LOCAL_STORE}.{dest_index}", 2 if not local_store else 1, 'i')
 
-            # Only set BaseUri for Cisco cBR-8, skip for Arris/CommScope
-            if hasattr(self, 'cmts_vendor') and self.cmts_vendor and self.cmts_vendor.lower() == 'cisco':
-                base_uri = f"tftp://{tftp_ip}/"
-                await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", base_uri, 's')
+            # Set DestBaseUri (path only — e.g. "access/pnm/") while row is notInService.
+            # Wrap in try/except so a vendor that doesn't support this OID doesn't abort.
+            if _path:
+                try:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _path, 's')
+                    self.logger.info(f"Set base URI for destination {dest_index}: '{_path}'")
+                except Exception as _uri_err:
+                    self.logger.warning(f"Could not set base URI (vendor may not support it): {_uri_err}")
+
+            # Activate the row
+            await self._snmp_set(f"{self.OID_BULK_CFG_ROW_STATUS}.{dest_index}", 1, 'i')  # active
             
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             

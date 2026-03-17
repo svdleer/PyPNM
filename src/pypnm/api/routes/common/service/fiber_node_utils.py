@@ -129,10 +129,25 @@ def parse_channel_id_list(val) -> frozenset:
     if ',' in s:
         return frozenset(int(x.strip()) for x in s.split(',') if x.strip().isdigit())
     
+    # Colon-separated hex bytes: "01:02:03:04:19:1A"
+    # (returned by agent when 6-byte OctetString contains non-printable bytes)
+    if ':' in s:
+        try:
+            return frozenset(int(b, 16) for b in s.split(':') if b)
+        except ValueError:
+            pass
+    
     # Space-separated hex bytes: "01 02 03 04 19 1a"
     if ' ' in s or s.startswith('0x'):
         try:
             return frozenset(int(b, 16) for b in s.replace('0x', '').split())
+        except ValueError:
+            pass
+    
+    # Flat hex string (no separators): "01020304191a" — agent returns this for >6 byte OctetStrings
+    if len(s) >= 2 and len(s) % 2 == 0 and all(c in '0123456789abcdefABCDEF' for c in s):
+        try:
+            return frozenset(int(s[i:i+2], 16) for i in range(0, len(s), 2))
         except ValueError:
             pass
     

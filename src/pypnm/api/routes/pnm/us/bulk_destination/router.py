@@ -165,7 +165,8 @@ class BulkDestinationRouter:
                     tftp_ip=request.dest_ip,
                     port=69,
                     local_store=False,
-                    dest_index=request.index
+                    dest_index=request.index,
+                    dest_path=request.dest_path,
                 )
                 if not std_result.get('success'):
                     self.logger.warning(f"Standard dest table failed: {std_result.get('error')}")

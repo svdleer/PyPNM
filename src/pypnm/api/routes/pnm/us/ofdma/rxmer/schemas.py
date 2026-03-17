@@ -158,12 +158,20 @@ class PreEqTapDelaySummary(BaseModel):
     post_main_cable_ft: Optional[float] = Field(None, description="Cable length equivalent (feet) for post-main reflection")
 
 
+class TapCoefficient(BaseModel):
+    """Single pre-equalizer tap complex coefficient."""
+    real: int = Field(..., description="Real part of the tap coefficient")
+    imag: int = Field(..., description="Imaginary part of the tap coefficient")
+    magnitude: float = Field(..., description="Magnitude sqrt(real²+imag²)")
+
+
 class PreEqChannelData(BaseModel):
     """Pre-equalization data for one upstream channel."""
     us_ifindex: int = Field(..., description="Upstream channel ifIndex")
     num_taps: int = Field(..., description="Number of equalizer taps")
     main_tap_location: int = Field(..., description="Main tap index")
     taps_per_symbol: int = Field(..., description="Taps per symbol from header")
+    taps: List[TapCoefficient] = Field(default_factory=list, description="Complex tap coefficients (real/imag/magnitude)")
     metrics: Optional[PreEqChannelMetrics] = None
     group_delay: Optional[PreEqGroupDelay] = None
     tap_delay_summary: Optional[PreEqTapDelaySummary] = None
@@ -307,6 +315,69 @@ class FiberNodeCaptureEntry(BaseModel):
     filename: str
     preeq_enabled: bool = Field(default=True)
     ofdma_ifindex: Optional[int] = None   # which upstream channel this capture came from
+
+
+# ============================================================
+# Fiber Node Plant Assessment (pre-eq tap + RxMER combined)
+# ============================================================
+
+class ModemPreeqChannelInput(BaseModel):
+    """Pre-eq channel data as provided by the /preeq endpoint for one modem channel."""
+    us_ifindex: int
+    taps: List[TapCoefficient] = Field(default_factory=list)
+    metrics: Optional[PreEqChannelMetrics] = None
+    group_delay: Optional[PreEqGroupDelay] = None
+
+
+class ModemPreeqInput(BaseModel):
+    """Pre-eq data for one modem (all its upstream channels)."""
+    mac: str = Field(..., description="Cable modem MAC address")
+    channels: List[ModemPreeqChannelInput] = Field(default_factory=list)
+
+
+class ModemPlantVerdict(BaseModel):
+    """Per-modem plant vs in-home assessment result."""
+    mac: str
+    verdict: str = Field(description="'plant' | 'in-home' | 'clean' | 'unknown'")
+    confidence: float = Field(description="0.0–1.0 confidence in the verdict")
+    tap_similarity_to_fn_median: Optional[float] = Field(None, description="Cosine similarity of this modem's tap shape vs FN median (1.0=identical)")
+    gd_pp_us: Optional[float] = Field(None, description="This modem's group delay peak-to-peak (µs)")
+    gd_deviation_from_fn_median_us: Optional[float] = Field(None, description="|modem gd_pp − FN median gd_pp| (µs)")
+    nmter_dB: Optional[float] = Field(None, description="Non Main Tap Energy Ratio (dB)")
+    unique_bad_subcarrier_count: int = Field(0, description="Subcarriers bad on THIS modem but <60% of others")
+    shared_bad_subcarrier_count: int = Field(0, description="Subcarriers bad on >60% of all modems (plant)")
+    evidence: List[str] = Field(default_factory=list, description="Human-readable evidence bullets")
+
+
+class FnPlantStats(BaseModel):
+    """Fiber node level plant assessment statistics."""
+    modem_count: int
+    fn_median_gd_pp_us: Optional[float] = None
+    fn_median_nmter_dB: Optional[float] = None
+    fn_tap_signature: List[float] = Field(default_factory=list, description="FN median normalized tap magnitudes")
+    shared_impaired_subcarrier_indices: List[int] = Field(default_factory=list, description="Subcarrier indices bad on >60% of modems")
+    shared_impaired_frequencies_mhz: List[float] = Field(default_factory=list)
+    plant_issue_detected: bool = False
+    pct_modems_in_home: float = 0.0
+    pct_modems_plant: float = 0.0
+
+
+class PlantAssessmentRequest(BaseModel):
+    """Request for fiber node plant vs in-home assessment."""
+    modems_preeq: List[ModemPreeqInput] = Field(..., description="Pre-eq data per modem")
+    subcarrier_stats: List[SubcarrierGroupStats] = Field(default_factory=list, description="Per-subcarrier group stats from fiberNode/analyze")
+    mer_bad_threshold_db: float = Field(default=28.0, description="MER below this is considered 'bad' (dB)")
+    tap_similarity_threshold: float = Field(default=0.85, description="Cosine similarity below this = unique tap shape = in-home indicator")
+    gd_deviation_threshold_us: float = Field(default=0.3, description="Group delay deviation above this vs FN median = in-home indicator")
+    plant_share_pct: float = Field(default=0.6, description="Fraction of modems that must share bad subcarrier for it to be 'plant'")
+
+
+class PlantAssessmentResponse(BaseModel):
+    """Response from fiber node plant vs in-home assessment."""
+    success: bool
+    fn_stats: Optional[FnPlantStats] = None
+    modem_verdicts: List[ModemPlantVerdict] = Field(default_factory=list)
+    error: Optional[str] = None
 
 
 class FiberNodeAnalysisRequest(BaseModel):
