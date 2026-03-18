@@ -96,6 +96,59 @@ def topology_summary(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/search/suggest")
+def topology_search_suggest(
+    selected_date: str | None = Query(default=None, alias="date"),
+    search_type: str = Query(..., alias="type"),
+    q: str = Query(default=""),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> dict:
+    st = (search_type or "").strip().lower()
+    if st not in {"fibernode", "postal_house", "customer_id"}:
+        raise HTTPException(status_code=400, detail="type must be fibernode, postal_house, or customer_id")
+    try:
+        payload = topology_service.suggest_values(
+            selected_date=selected_date,
+            search_type=st,
+            query=q,
+            limit=limit,
+        )
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/search/modems")
+def topology_search_modems(
+    selected_date: str | None = Query(default=None, alias="date"),
+    search_type: str = Query(..., alias="type"),
+    value: str = Query(default=""),
+    house_number: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=5000),
+) -> dict:
+    st = (search_type or "").strip().lower()
+    vv = (value or "").strip()
+    if st not in {"fibernode", "postal_house", "customer_id"}:
+        raise HTTPException(status_code=400, detail="type must be fibernode, postal_house, or customer_id")
+    if st == "postal_house":
+        if not vv or not (house_number or "").strip():
+            raise HTTPException(status_code=400, detail="postal_house search requires value=<postalcode> and house_number")
+    elif not vv:
+        raise HTTPException(status_code=400, detail="value is required")
+
+    try:
+        payload = topology_service.search_modems(
+            selected_date=selected_date,
+            search_type=st,
+            value=vv,
+            house_number=house_number,
+            limit=limit,
+        )
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/assets/{filename}")
 def topology_asset(filename: str) -> FileResponse:
     try:

@@ -184,6 +184,8 @@ class TopologyStorage:
                     KEY idx_modems_snapshot_mac (snapshot_id, mac),
                     KEY idx_modems_snapshot_fn (snapshot_id, fibernode),
                     KEY idx_modems_snapshot_link (snapshot_id, topology_link_id),
+                    KEY idx_modems_snapshot_customer (snapshot_id, customer_id),
+                    KEY idx_modems_snapshot_postal_house (snapshot_id, postalcode, house_number),
                     KEY idx_modems_snapshot_match (snapshot_id, link_match),
                     CONSTRAINT fk_topology_modems_snapshot FOREIGN KEY (snapshot_id) REFERENCES topology_snapshots(id) ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -218,6 +220,8 @@ class TopologyStorage:
                 ("topology_modems",    "idx_modems_snapshot_mac",      "snapshot_id, mac"),
                 ("topology_modems",    "idx_modems_snapshot_fn",       "snapshot_id, fibernode"),
                 ("topology_modems",    "idx_modems_snapshot_link",     "snapshot_id, topology_link_id"),
+                ("topology_modems",    "idx_modems_snapshot_customer", "snapshot_id, customer_id"),
+                ("topology_modems",    "idx_modems_snapshot_postal_house", "snapshot_id, postalcode, house_number"),
                 ("topology_modems",    "idx_modems_snapshot_match",    "snapshot_id, link_match"),
                 ("topology_hierarchy", "idx_hierarchy_snapshot_node",  "snapshot_id, node_id"),
                 ("topology_hierarchy", "idx_hierarchy_snapshot_cmts",  "snapshot_id, cmts"),
@@ -275,6 +279,141 @@ class TopologyStorage:
             if not row:
                 return None
             return str(row.get("snapshot_date") or "") or None
+
+    def search_modems(
+        self,
+        snapshot_date: str | None,
+        search_type: str,
+        value: str,
+        house_number: str | None = None,
+        limit: int = 200,
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            resolved_date = snapshot_date
+            if not resolved_date:
+                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                latest = cur.fetchone() or {}
+                resolved_date = str(latest.get("snapshot_date") or "") or None
+            if not resolved_date:
+                conn.close()
+                return None, []
+
+            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+            row = cur.fetchone() or {}
+            snapshot_id = int(row.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return resolved_date, []
+
+            base_sql = (
+                "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.address, m.address1, m.address2, m.locality, "
+                "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match, "
+                "h.path AS hierarchy_path "
+                "FROM topology_modems m "
+                "LEFT JOIN topology_hierarchy h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
+                "WHERE m.snapshot_id=%s "
+            )
+
+            st = (search_type or "").strip().lower()
+            vv = (value or "").strip()
+            hn = (house_number or "").strip()
+
+            if st == "fibernode":
+                cur.execute(
+                    base_sql + "AND m.fibernode LIKE %s ORDER BY m.mac ASC LIMIT %s",
+                    (snapshot_id, f"%{vv}%", int(limit)),
+                )
+            elif st == "customer_id":
+                cur.execute(
+                    base_sql + "AND m.customer_id LIKE %s ORDER BY m.mac ASC LIMIT %s",
+                    (snapshot_id, f"%{vv}%", int(limit)),
+                )
+            elif st == "postal_house":
+                if not vv or not hn:
+                    conn.close()
+                    return resolved_date, []
+                cur.execute(
+                    base_sql + "AND m.postalcode=%s AND m.house_number=%s ORDER BY m.mac ASC LIMIT %s",
+                    (snapshot_id, vv, hn, int(limit)),
+                )
+            else:
+                conn.close()
+                return resolved_date, []
+
+            rows = cur.fetchall() or []
+            conn.close()
+            return resolved_date, [dict(r) for r in rows]
+
+    def suggest_values(
+        self,
+        snapshot_date: str | None,
+        search_type: str,
+        query: str,
+        limit: int = 10,
+    ) -> tuple[str | None, list[str]]:
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            resolved_date = snapshot_date
+            if not resolved_date:
+                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                latest = cur.fetchone() or {}
+                resolved_date = str(latest.get("snapshot_date") or "") or None
+            if not resolved_date:
+                conn.close()
+                return None, []
+
+            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+            row = cur.fetchone() or {}
+            snapshot_id = int(row.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return resolved_date, []
+
+            st = (search_type or "").strip().lower()
+            q = (query or "").strip()
+
+            if st == "fibernode":
+                cur.execute(
+                    "SELECT DISTINCT fibernode FROM topology_modems WHERE snapshot_id=%s AND fibernode LIKE %s ORDER BY fibernode ASC LIMIT %s",
+                    (snapshot_id, f"%{q}%", int(limit)),
+                )
+                values = [str(r.get("fibernode") or "") for r in (cur.fetchall() or []) if r.get("fibernode")]
+            elif st == "customer_id":
+                cur.execute(
+                    "SELECT DISTINCT customer_id FROM topology_modems WHERE snapshot_id=%s AND customer_id LIKE %s ORDER BY customer_id ASC LIMIT %s",
+                    (snapshot_id, f"%{q}%", int(limit)),
+                )
+                values = [str(r.get("customer_id") or "") for r in (cur.fetchall() or []) if r.get("customer_id")]
+            elif st == "postal_house":
+                cur.execute(
+                    "SELECT DISTINCT postalcode, house_number FROM topology_modems "
+                    "WHERE snapshot_id=%s AND CONCAT(postalcode, ' ', house_number) LIKE %s "
+                    "ORDER BY postalcode ASC, house_number ASC LIMIT %s",
+                    (snapshot_id, f"%{q}%", int(limit)),
+                )
+                values = [
+                    f"{str(r.get('postalcode') or '').strip()} {str(r.get('house_number') or '').strip()}".strip()
+                    for r in (cur.fetchall() or [])
+                    if r.get("postalcode") and r.get("house_number")
+                ]
+            else:
+                values = []
+
+            conn.close()
+            # Preserve order while dropping empties/duplicates
+            out: list[str] = []
+            seen: set[str] = set()
+            for v in values:
+                if not v or v in seen:
+                    continue
+                seen.add(v)
+                out.append(v)
+            return resolved_date, out
 
     def upsert_snapshot_payload(
         self,
@@ -1246,6 +1385,49 @@ class TopologyService:
     def get_import_job(snapshot_date: str) -> "_ImportJob | None":
         with _import_jobs_lock:
             return _import_jobs.get(snapshot_date)
+
+    def search_modems(
+        self,
+        selected_date: str | None,
+        search_type: str,
+        value: str,
+        house_number: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, rows = self.storage.search_modems(
+            snapshot_date=selected_date,
+            search_type=search_type,
+            value=value,
+            house_number=house_number,
+            limit=limit,
+        )
+        return {
+            "snapshot_date": snapshot_date,
+            "search_type": search_type,
+            "count": len(rows),
+            "modems": rows,
+        }
+
+    def suggest_values(
+        self,
+        selected_date: str | None,
+        search_type: str,
+        query: str,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, suggestions = self.storage.suggest_values(
+            snapshot_date=selected_date,
+            search_type=search_type,
+            query=query,
+            limit=limit,
+        )
+        return {
+            "snapshot_date": snapshot_date,
+            "search_type": search_type,
+            "suggestions": suggestions,
+        }
 
     def get_summary(
         self,
