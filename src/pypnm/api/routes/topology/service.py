@@ -313,7 +313,11 @@ class TopologyStorage:
                 "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match, "
                 "h.path AS hierarchy_path "
                 "FROM topology_modems m "
-                "LEFT JOIN topology_hierarchy h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
+                "LEFT JOIN ("
+                "  SELECT snapshot_id, node_id, MIN(path) AS path "
+                "  FROM topology_hierarchy "
+                "  GROUP BY snapshot_id, node_id"
+                ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
                 "WHERE m.snapshot_id=%s "
             )
 
