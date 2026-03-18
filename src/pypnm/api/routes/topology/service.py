@@ -541,7 +541,8 @@ class TopologyStorage:
                 "SELECT mac, fibernode, topology_link_id, lat, lon, address, address1, address2, locality, postalcode, "
                 "house_number, house_number_extension, customer_id, linked_node_id, linked_node_type, link_match "
                 "FROM topology_modems WHERE snapshot_id=%s "
-                "ORDER BY link_match DESC, mac ASC LIMIT %s",
+                "AND link_match=1 "
+                "ORDER BY RAND() LIMIT %s",
                 (snapshot_id, int(sample_limit)),
             )
             sample_modems = [
