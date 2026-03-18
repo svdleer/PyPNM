@@ -171,6 +171,12 @@ class TopologyStorage:
                     lat DOUBLE NULL,
                     lon DOUBLE NULL,
                     address TEXT NULL,
+                    address1 VARCHAR(255) NULL,
+                    address2 VARCHAR(255) NULL,
+                    locality VARCHAR(255) NULL,
+                    postalcode VARCHAR(32) NULL,
+                    house_number VARCHAR(32) NULL,
+                    house_number_extension VARCHAR(64) NULL,
                     customer_id VARCHAR(128) NULL,
                     linked_node_id VARCHAR(255) NULL,
                     linked_node_type VARCHAR(64) NULL,
@@ -226,6 +232,24 @@ class TopologyStorage:
             for tbl, idx, cols in _ensure_indexes:
                 if (tbl, idx) not in existing_indexes:
                     cur.execute(f"ALTER TABLE `{tbl}` ADD INDEX `{idx}` ({cols})")
+
+            # Idempotently add any missing columns on topology_modems (older installs)
+            cur.execute(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='topology_modems'"
+            )
+            modem_cols = {str(row["COLUMN_NAME"]) for row in (cur.fetchall() or []) if row.get("COLUMN_NAME")}
+            _ensure_modem_cols = {
+                "address1": "VARCHAR(255) NULL",
+                "address2": "VARCHAR(255) NULL",
+                "locality": "VARCHAR(255) NULL",
+                "postalcode": "VARCHAR(32) NULL",
+                "house_number": "VARCHAR(32) NULL",
+                "house_number_extension": "VARCHAR(64) NULL",
+            }
+            for col, ddl in _ensure_modem_cols.items():
+                if col not in modem_cols:
+                    cur.execute(f"ALTER TABLE `topology_modems` ADD COLUMN `{col}` {ddl}")
 
             conn.close()
 
@@ -514,7 +538,8 @@ class TopologyStorage:
                 )
 
             cur.execute(
-                "SELECT mac, fibernode, topology_link_id, lat, lon, address, customer_id, linked_node_id, linked_node_type, link_match "
+                "SELECT mac, fibernode, topology_link_id, lat, lon, address, address1, address2, locality, postalcode, "
+                "house_number, house_number_extension, customer_id, linked_node_id, linked_node_type, link_match "
                 "FROM topology_modems WHERE snapshot_id=%s "
                 "ORDER BY link_match DESC, mac ASC LIMIT %s",
                 (snapshot_id, int(sample_limit)),
@@ -527,6 +552,12 @@ class TopologyStorage:
                     "lat": row.get("lat"),
                     "lon": row.get("lon"),
                     "address": row.get("address") or "",
+                    "address1": row.get("address1") or "",
+                    "address2": row.get("address2") or "",
+                    "locality": row.get("locality") or "",
+                    "postalcode": row.get("postalcode") or "",
+                    "house_number": row.get("house_number") or "",
+                    "house_number_extension": row.get("house_number_extension") or "",
                     "customer_id": row.get("customer_id") or "",
                     "linked_node_id": row.get("linked_node_id"),
                     "linked_node_type": row.get("linked_node_type"),
@@ -630,6 +661,26 @@ class TopologyService:
                 if not row:
                     continue
                 yield {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+
+    def _parse_modem_address(self, address1_raw: str, address2_raw: str) -> tuple[str, str, str]:
+        """Parse modemlocation ADDRESS1 variants into (street, house_number, house_number_extension)."""
+        street = (address1_raw or "").strip()
+        house_number = ""
+        house_ext = ""
+
+        parts = [p.strip() for p in street.strip(" -").split("-") if p.strip()]
+        if len(parts) >= 2:
+            street = parts[0]
+            house_number = parts[1]
+            if len(parts) >= 3:
+                house_ext = parts[2]
+
+        if not house_ext:
+            alt = (address2_raw or "").strip()
+            if alt and len(alt) <= 16 and any(ch.isalnum() for ch in alt):
+                house_ext = alt
+
+        return street, house_number, house_ext
 
     def _stream_import_payload_to_db(
         self,
@@ -755,15 +806,21 @@ class TopologyService:
         # Modems: insert raw first; link matching is done in SQL for memory safety.
         modem_sql = (
             "INSERT INTO topology_modems "
-            "(snapshot_id, mac, fibernode, topology_link_id, lat, lon, address, customer_id, linked_node_id, linked_node_type, link_match) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, 0)"
+            "(snapshot_id, mac, fibernode, topology_link_id, lat, lon, address, address1, address2, locality, postalcode, "
+            "house_number, house_number_extension, customer_id, linked_node_id, linked_node_type, link_match) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, 0)"
         )
         modems_buf: list[tuple[Any, ...]] = []
         modem_rows = 0
         _upd("streaming modem rows", 58)
         for r in self._iter_csv_rows(modemlocation_file):
+            address1_raw = r.get("ADDRESS1", "")
+            address2_raw = r.get("ADDRESS2", "")
+            locality = r.get("LOCALITY", "")
+            postalcode = r.get("POSTALCODE", "")
+            address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw)
             address = " ".join(
-                p for p in [r.get("ADDRESS1", ""), r.get("ADDRESS2", ""), r.get("POSTALCODE", ""), r.get("LOCALITY", "")] if p
+                p for p in [address1_raw, address2_raw, postalcode, locality] if p
             ).strip()
             modems_buf.append(
                 (
@@ -774,6 +831,12 @@ class TopologyService:
                     self._to_float(r.get("LAT")),
                     self._to_float(r.get("LON")),
                     address,
+                    address1,
+                    address2_raw,
+                    locality,
+                    postalcode,
+                    house_number,
+                    house_ext,
                     r.get("CUSTOMERID", ""),
                 )
             )
@@ -920,6 +983,12 @@ class TopologyService:
             elif fibernode and fibernode in fnid_set:
                 potential_fibernode_match += 1
 
+            address1_raw = row.get("ADDRESS1", "")
+            address2_raw = row.get("ADDRESS2", "")
+            locality = row.get("LOCALITY", "")
+            postalcode = row.get("POSTALCODE", "")
+            address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw)
+
             modems.append(
                 {
                     "mac": row.get("MACADDRESS", ""),
@@ -930,13 +999,19 @@ class TopologyService:
                     "address": " ".join(
                         p
                         for p in [
-                            row.get("ADDRESS1", ""),
-                            row.get("ADDRESS2", ""),
-                            row.get("POSTALCODE", ""),
-                            row.get("LOCALITY", ""),
+                            address1_raw,
+                            address2_raw,
+                            postalcode,
+                            locality,
                         ]
                         if p
                     ).strip(),
+                    "address1": address1,
+                    "address2": address2_raw,
+                    "locality": locality,
+                    "postalcode": postalcode,
+                    "house_number": house_number,
+                    "house_number_extension": house_ext,
                     "customer_id": row.get("CUSTOMERID", ""),
                     "linked_node_id": linked_node.get("id") if linked_node else None,
                     "linked_node_type": linked_node.get("node_type") if linked_node else None,
