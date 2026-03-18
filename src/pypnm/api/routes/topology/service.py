@@ -662,7 +662,7 @@ class TopologyService:
                     continue
                 yield {(k or "").strip(): (v or "").strip() for k, v in row.items()}
 
-    def _parse_modem_address(self, address1_raw: str, address2_raw: str) -> tuple[str, str, str]:
+    def _parse_modem_address(self, address1_raw: str, address2_raw: str, locality_raw: str = "") -> tuple[str, str, str]:
         """Parse modemlocation ADDRESS1 variants into (street, house_number, house_number_extension)."""
         street = (address1_raw or "").strip()
         house_number = ""
@@ -677,7 +677,15 @@ class TopologyService:
 
         if not house_ext:
             alt = (address2_raw or "").strip()
-            if alt and len(alt) <= 16 and any(ch.isalnum() for ch in alt):
+            locality = (locality_raw or "").strip().lower()
+            alt_l = alt.lower()
+            compact = "".join(ch for ch in alt if ch.isalnum())
+            looks_like_ext = (
+                # Typical short extension tokens: A, B, bis, 1, 2A, hs
+                (len(compact) <= 4 and any(ch.isdigit() for ch in compact))
+                or (len(compact) <= 3 and compact.isalpha())
+            )
+            if house_number and alt and alt_l != locality and looks_like_ext:
                 house_ext = alt
 
         return street, house_number, house_ext
@@ -818,7 +826,7 @@ class TopologyService:
             address2_raw = r.get("ADDRESS2", "")
             locality = r.get("LOCALITY", "")
             postalcode = r.get("POSTALCODE", "")
-            address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw)
+            address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw, locality)
             address = " ".join(
                 p for p in [address1_raw, address2_raw, postalcode, locality] if p
             ).strip()
@@ -987,7 +995,7 @@ class TopologyService:
             address2_raw = row.get("ADDRESS2", "")
             locality = row.get("LOCALITY", "")
             postalcode = row.get("POSTALCODE", "")
-            address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw)
+            address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw, locality)
 
             modems.append(
                 {
