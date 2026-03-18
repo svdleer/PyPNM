@@ -511,7 +511,8 @@ class TopologyStorage:
 
             cur.execute(
                 "SELECT mac, fibernode, topology_link_id, lat, lon, address, customer_id, linked_node_id, linked_node_type, link_match "
-                "FROM topology_modems WHERE snapshot_id=%s LIMIT %s",
+                "FROM topology_modems WHERE snapshot_id=%s "
+                "ORDER BY link_match DESC, mac ASC LIMIT %s",
                 (snapshot_id, int(sample_limit)),
             )
             sample_modems = [
