@@ -478,6 +478,10 @@ class TopologyStorage:
                 (snapshot_id,),
             )
             node_type_counts = {str(r.get("node_type") or "Unknown"): int(r.get("c") or 0) for r in cur.fetchall() or []}
+            amp_nodes = sum(v for k, v in node_type_counts.items() if str(k).strip().lower() == "amp")
+            tap_nodes = sum(v for k, v in node_type_counts.items() if str(k).strip().lower() == "tap")
+            avg_amp_per_node = (amp_nodes / fiber_nodes_count) if fiber_nodes_count else 0.0
+            avg_tap_per_node = (tap_nodes / fiber_nodes_count) if fiber_nodes_count else 0.0
 
             cur.execute(
                 "SELECT node_id AS id, parent_id, fnid, node_type, link_id, lat, lon, description, metadata_json "
@@ -550,6 +554,10 @@ class TopologyStorage:
                     "topology_edges": edges_count,
                     "modems": modems_count,
                     "fiber_nodes": fiber_nodes_count,
+                    "amp_nodes": amp_nodes,
+                    "tap_nodes": tap_nodes,
+                    "avg_amp_per_node": avg_amp_per_node,
+                    "avg_tap_per_node": avg_tap_per_node,
                     "matched_by_linkid": matched_count,
                     "potential_fibernode_match": 0,
                     "unmatched_modems": unmatched_count,
