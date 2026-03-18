@@ -440,18 +440,38 @@ class TopologyStorage:
                 return None
             snapshot_id = int(snapshot_id_raw)
 
-            cur.execute("SELECT COUNT(*) AS c FROM topology_nodes WHERE snapshot_id=%s", (snapshot_id,))
-            nodes_count = int((cur.fetchone() or {}).get("c", 0))
+            # Single-pass counts for nodes using one query instead of 4 separate ones
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)                                       AS nodes_count,
+                    COUNT(DISTINCT fnid)                          AS fiber_nodes_count
+                FROM topology_nodes WHERE snapshot_id=%s
+                """,
+                (snapshot_id,),
+            )
+            _nd = cur.fetchone() or {}
+            nodes_count = int(_nd.get("nodes_count") or 0)
+            fiber_nodes_count = int(_nd.get("fiber_nodes_count") or 0)
+
+            # Single-pass counts for modems using one query instead of 3 separate ones
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)                                       AS modems_count,
+                    SUM(CASE WHEN link_match=1 THEN 1 ELSE 0 END) AS matched_count,
+                    SUM(CASE WHEN link_match=0 THEN 1 ELSE 0 END) AS unmatched_count
+                FROM topology_modems WHERE snapshot_id=%s
+                """,
+                (snapshot_id,),
+            )
+            _md = cur.fetchone() or {}
+            modems_count   = int(_md.get("modems_count")   or 0)
+            matched_count  = int(_md.get("matched_count")  or 0)
+            unmatched_count= int(_md.get("unmatched_count") or 0)
+
             cur.execute("SELECT COUNT(*) AS c FROM topology_edges WHERE snapshot_id=%s", (snapshot_id,))
             edges_count = int((cur.fetchone() or {}).get("c", 0))
-            cur.execute("SELECT COUNT(*) AS c FROM topology_modems WHERE snapshot_id=%s", (snapshot_id,))
-            modems_count = int((cur.fetchone() or {}).get("c", 0))
-            cur.execute("SELECT COUNT(DISTINCT fnid) AS c FROM topology_nodes WHERE snapshot_id=%s", (snapshot_id,))
-            fiber_nodes_count = int((cur.fetchone() or {}).get("c", 0))
-            cur.execute("SELECT COUNT(*) AS c FROM topology_modems WHERE snapshot_id=%s AND link_match=1", (snapshot_id,))
-            matched_count = int((cur.fetchone() or {}).get("c", 0))
-            cur.execute("SELECT COUNT(*) AS c FROM topology_modems WHERE snapshot_id=%s AND link_match=0", (snapshot_id,))
-            unmatched_count = int((cur.fetchone() or {}).get("c", 0))
 
             cur.execute(
                 "SELECT node_type, COUNT(*) AS c FROM topology_nodes WHERE snapshot_id=%s GROUP BY node_type ORDER BY node_type ASC",
