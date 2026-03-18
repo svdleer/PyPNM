@@ -419,6 +419,35 @@ class TopologyStorage:
                 out.append(v)
             return resolved_date, out
 
+    def get_path_by_node(self, snapshot_date: str | None, node_id: str) -> tuple[str | None, str | None]:
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            resolved_date = snapshot_date
+            if not resolved_date:
+                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                latest = cur.fetchone() or {}
+                resolved_date = str(latest.get("snapshot_date") or "") or None
+            if not resolved_date:
+                conn.close()
+                return None, None
+
+            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+            row = cur.fetchone() or {}
+            snapshot_id = int(row.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return resolved_date, None
+
+            cur.execute(
+                "SELECT MIN(path) AS path FROM topology_hierarchy WHERE snapshot_id=%s AND node_id=%s",
+                (snapshot_id, (node_id or "").strip()),
+            )
+            r = cur.fetchone() or {}
+            conn.close()
+            return resolved_date, (str(r.get("path") or "") or None)
+
     def upsert_snapshot_payload(
         self,
         snapshot_date: str,
@@ -1431,6 +1460,15 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "search_type": search_type,
             "suggestions": suggestions,
+        }
+
+    def get_path_by_node(self, selected_date: str | None, node_id: str) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, path = self.storage.get_path_by_node(snapshot_date=selected_date, node_id=node_id)
+        return {
+            "snapshot_date": snapshot_date,
+            "node_id": node_id,
+            "path": path,
         }
 
     def get_summary(

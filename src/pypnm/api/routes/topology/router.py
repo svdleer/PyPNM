@@ -149,6 +149,21 @@ def topology_search_modems(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/path/by-node")
+def topology_path_by_node(
+    node_id: str = Query(...),
+    selected_date: str | None = Query(default=None, alias="date"),
+) -> dict:
+    nid = (node_id or "").strip()
+    if not nid:
+        raise HTTPException(status_code=400, detail="node_id is required")
+    try:
+        payload = topology_service.get_path_by_node(selected_date=selected_date, node_id=nid)
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/assets/{filename}")
 def topology_asset(filename: str) -> FileResponse:
     try:
