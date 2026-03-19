@@ -1,17 +1,16 @@
-## Agent Review Bundle Summary
+## Review Summary
 - Goal: Update commit message tracking rules and include recent bulk-walk troubleshooting changes.
-- Changes: Clarify commit message tracking/formatting rules; retain bulk-walk handling updates and tests already in scope.
-- Files: AGENTS.md, CODING_AGENTS.md, src/pypnm/docsis/cm_snmp_operation.py, src/pypnm/snmp/snmp_v2c.py, src/pypnm/snmp/snmp_v3.py, tests/test_snmp_v2c_bulk_walk.py, tools/release/release.py
-- Tests: Not run (no new test execution in this step).
-- Notes: Review bundle excludes its own contents.
+- Changes: Clarify commit message tracking and retain bulk-walk handling updates already in scope.
+- Files: src/pypnm/docsis/cm_snmp_operation.py, src/pypnm/snmp/snmp_v2c.py, src/pypnm/snmp/snmp_v3.py, tests/test_snmp_v2c_bulk_walk.py, tools/release/release.py
+- Tests: Not run in this step.
+- Notes: Summary excludes its own contents.
 
-# FILE: AGENTS.md
-# AGENTS.md
+# Workflow Notes
 
-This file provides guidance for coding agents working in this repository.
-Keep it short, accurate, and updated when workflows change.
+This file provides repository workflow guidance.
+Keep it short and current.
 
-## Agent Permissions
+## Permissions
 
 <environment_context>
     <sandbox_mode>danger-full-access</sandbox_mode>
@@ -28,13 +27,13 @@ Keep it short, accurate, and updated when workflows change.
 - Type checking is strict; avoid `Any` and generic container types.
 - Ruff compliance is required (do not auto-format unless explicitly requested).
 
-## Agent Constraints
+## Constraints
 
 - General workflow:
   - Make minimal diffs; avoid formatting churn.
   - Preserve whitespace/alignment in existing files (no auto-reflow).
   - Do not add broad refactors unless explicitly requested.
-  - Provide an end-of-run Agent Review Bundle summary: goal, changes, files, tests, notes.
+    - Provide an end-of-run review summary: goal, changes, files, tests, notes.
 - Typing and API style:
   - Strict typing everywhere; avoid `Dict`/`List`/`Tuple`/`Union` and avoid `Any`.
   - Prefer built-in generics (`dict[str, int]`, `list[str]`) and `A | B` rather than `Union`.

@@ -1684,7 +1684,7 @@ class UsOfdmaRxMerRouter:
                 return {item['oid']: item['value']
                         for item in raw if isinstance(item, dict) and 'oid' in item}
 
-            # ── Step 1: (mdIfIndex, chIfIndex) → chId ──────────────────────
+            # Map (mdIfIndex, chIfIndex) to channel ID.
             w1_raw = await svc._snmp_walk(OID_MD_CH_CFG_CH_ID, timeout=30)
             d1 = _to_dict(w1_raw)
             self.logger.info(f"FN-resolve CHID walk: success={w1_raw.get('success')}, "
@@ -1712,7 +1712,7 @@ class UsOfdmaRxMerRouter:
             if not ifidx_to_md_chid:
                 return {}
 
-            # ── Step 2: FN name from string-indexed OID (shared parse_fn_name_from_oid)
+            # Resolve fiber-node names from string-indexed OIDs.
             w4_raw = await svc._snmp_walk(OID_MD_NODE_STATUS_MD_US_SG_ID, timeout=30)
             d4 = _to_dict(w4_raw)
             self.logger.info(f"FN-resolve FNSG walk: success={w4_raw.get('success')}, "

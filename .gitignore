@@ -56,6 +56,6 @@ site/*
 htmlcov/
 gitleaks-report.json
 
-# Copilot memory artifacts
+# Local memory artifacts
 memories/
 /memories/

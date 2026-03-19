@@ -307,25 +307,14 @@ class CMTSModemService:
                     'modems': [], 'count': 0}
 
     async def _background_enrich(self, cmts_ip: str, modems: list, modem_community: str):
-        """Run enrichment in background and update the cache when done.
-
-        Order:
-          1. _enrich_cmts_interfaces  — fast CMTS-level SNMP walks (~seconds)
-                                        sets ofdma_enabled / cable_mac on all modems
-          2. _enrich_modems_direct    — slow per-modem SNMP for model/firmware
-                                        runs in BATCH_SIZE batches, updates cache after each
-        The cache is updated after step 1 so the GUI shows OFDMA badges within
-        seconds instead of waiting for all per-modem queries to complete.
-        """
+        """Run background enrichment and update the cache in two steps."""
         global _enrichment_cache
         try:
             self.logger.info(f"Background enrichment started for {cmts_ip} ({len(modems)} modems)")
 
-            # ── Step 1: CMTS-level interface enrichment (fast, ~seconds) ──────
-            # Works on the modems list in-place; sets ofdma_enabled, cable_mac etc.
+            # Step 1: fast CMTS-level enrichment.
             await self._enrich_cmts_interfaces(modems)
-            # Push to cache immediately so polls see OFDMA badges right away.
-            # Preserve requested_limit so cache_sufficient stays True on next poll.
+            # Update cache immediately and keep requested_limit intact.
             _existing_req_limit = _enrichment_cache.get(cmts_ip, {}).get('requested_limit')
             _enrichment_cache[cmts_ip] = {
                 'modems': modems,
@@ -337,7 +326,7 @@ class CMTSModemService:
             }
             self.logger.info(f"CMTS interface enrichment done for {cmts_ip} — OFDMA/cable-mac visible")
 
-            # ── Step 2: Per-modem SNMP (slow — model/firmware/docsis) ──────────
+            # Step 2: slower per-modem enrichment.
             await self._enrich_modems_direct(modems, modem_community, cmts_ip=cmts_ip)
 
             _existing_req_limit = _enrichment_cache.get(cmts_ip, {}).get('requested_limit')
@@ -352,12 +341,11 @@ class CMTSModemService:
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
         except Exception as e:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
-            # Mark as enriched=True with whatever partial data we have so that polls
-            # stop retrying and don't trigger an infinite walk→fail→walk cycle.
+            # Stop retry loops and keep partial data.
             if cmts_ip in _enrichment_cache:
                 _enrichment_cache[cmts_ip] = {
                     'modems': _enrichment_cache[cmts_ip].get('modems', modems),
-                    'enriched': True,   # best-effort: stop the retry loop
+                    'enriched': True,
                     'enriching': False,
                     'timestamp': time.time(),
                     'requested_limit': _enrichment_cache.get(cmts_ip, {}).get('requested_limit'),
