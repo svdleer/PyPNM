@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from pypnm.lib.mac_address import MacAddress, MacAddressFormat
+
 
 # ---------------------------------------------------------------------------
 # Background import job state
@@ -916,6 +918,20 @@ class TopologyService:
         except Exception:
             return None
 
+    def _normalize_mac(self, mac: str) -> str:
+        """
+        Normalize MAC address to xx:xx:xx:xx:xx:xx format.
+        
+        Returns empty string if invalid.
+        """
+        if not mac:
+            return ""
+        try:
+            return MacAddress(mac).to_mac_format(MacAddressFormat.COLON)
+        except Exception:
+            # Return original if invalid, don't fail the entire import
+            return mac
+
     def _read_csv(self, path: Path) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
@@ -1124,7 +1140,7 @@ class TopologyService:
             modems_buf.append(
                 (
                     snapshot_id,
-                    r.get("MACADDRESS", ""),
+                    self._normalize_mac(r.get("MACADDRESS", "")),
                     r.get("FIBERNODE", ""),
                     r.get("TOPOLOGYLINKID", ""),
                     self._to_float(r.get("LAT")),
@@ -1290,7 +1306,7 @@ class TopologyService:
 
             modems.append(
                 {
-                    "mac": row.get("MACADDRESS", ""),
+                    "mac": self._normalize_mac(row.get("MACADDRESS", "")),
                     "fibernode": fibernode,
                     "topology_link_id": link_id,
                     "lat": self._to_float(row.get("LAT")),
