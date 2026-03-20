@@ -353,6 +353,56 @@ class TopologyStorage:
             conn.close()
             return resolved_date, [dict(r) for r in rows]
 
+    def get_modem_by_mac(
+        self,
+        snapshot_date: str | None,
+        mac_address: str,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            resolved_date = snapshot_date
+            if not resolved_date:
+                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                latest = cur.fetchone() or {}
+                resolved_date = str(latest.get("snapshot_date") or "") or None
+            if not resolved_date:
+                conn.close()
+                return None, None
+
+            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+            row = cur.fetchone() or {}
+            snapshot_id = int(row.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return resolved_date, None
+
+            mac = (mac_address or "").strip().lower()
+            mac_bare = re.sub(r"[^0-9a-f]", "", mac)
+            if len(mac_bare) != 12:
+                conn.close()
+                return resolved_date, None
+
+            sql = (
+                "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.address, m.address1, m.address2, m.locality, "
+                "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match, "
+                "h.path AS hierarchy_path "
+                "FROM topology_modems m "
+                "LEFT JOIN ("
+                "  SELECT snapshot_id, node_id, MIN(path) AS path "
+                "  FROM topology_hierarchy "
+                "  GROUP BY snapshot_id, node_id"
+                ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
+                "WHERE m.snapshot_id=%s "
+                "AND LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))=%s "
+                "LIMIT 1"
+            )
+            cur.execute(sql, (snapshot_id, mac_bare))
+            modem = cur.fetchone()
+            conn.close()
+            return resolved_date, (dict(modem) if modem else None)
+
     def suggest_values(
         self,
         snapshot_date: str | None,
@@ -1615,6 +1665,20 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "node_id": node_id,
             "path": path,
+        }
+
+    def get_modem_by_mac(self, selected_date: str | None, mac_address: str) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, modem = self.storage.get_modem_by_mac(
+            snapshot_date=selected_date,
+            mac_address=mac_address,
+        )
+        if modem and isinstance(modem, dict) and "mac" in modem:
+            modem["mac"] = self._normalize_mac(modem.get("mac") or "")
+        return {
+            "snapshot_date": snapshot_date,
+            "mac_address": mac_address,
+            "modem": modem,
         }
 
     def get_node_metadata(

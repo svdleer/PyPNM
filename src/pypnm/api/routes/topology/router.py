@@ -149,6 +149,24 @@ def topology_search_modems(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/modem/by-mac")
+def topology_modem_by_mac(
+    mac: str = Query(...),
+    selected_date: str | None = Query(default=None, alias="date"),
+) -> dict:
+    mm = (mac or "").strip()
+    if not mm:
+        raise HTTPException(status_code=400, detail="mac is required")
+    try:
+        payload = topology_service.get_modem_by_mac(
+            selected_date=selected_date,
+            mac_address=mm,
+        )
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/path/by-node")
 def topology_path_by_node(
     node_id: str = Query(...),
