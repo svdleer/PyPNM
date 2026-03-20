@@ -839,7 +839,7 @@ class TopologyStorage:
             )
             sample_modems = [
                 {
-                    "mac": row.get("mac") or "",
+                    "mac": TopologyService._normalize_mac_static(str(row.get("mac") or "")),
                     "fibernode": row.get("fibernode") or "",
                     "topology_link_id": row.get("topology_link_id") or "",
                     "lat": row.get("lat"),
@@ -930,6 +930,15 @@ class TopologyService:
             return MacAddress(mac).to_mac_format(MacAddressFormat.COLON)
         except Exception:
             # Return original if invalid, don't fail the entire import
+            return mac
+
+    @staticmethod
+    def _normalize_mac_static(mac: str) -> str:
+        if not mac:
+            return ""
+        try:
+            return MacAddress(mac).to_mac_format(MacAddressFormat.COLON)
+        except Exception:
             return mac
 
     def _read_csv(self, path: Path) -> list[dict[str, str]]:
@@ -1569,6 +1578,9 @@ class TopologyService:
             house_number=house_number,
             limit=limit,
         )
+        for row in rows:
+            if isinstance(row, dict) and "mac" in row:
+                row["mac"] = self._normalize_mac(row.get("mac") or "")
         return {
             "snapshot_date": snapshot_date,
             "search_type": search_type,
