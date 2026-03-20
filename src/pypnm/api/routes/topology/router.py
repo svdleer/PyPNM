@@ -164,6 +164,26 @@ def topology_path_by_node(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/node-meta")
+def topology_node_meta(
+    node_ids: str = Query(...),
+    direction: str | None = Query(default=None),
+    selected_date: str | None = Query(default=None, alias="date"),
+) -> dict:
+    ids = [part.strip() for part in (node_ids or "").split(",") if part.strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="node_ids is required")
+    try:
+        payload = topology_service.get_node_metadata(
+            selected_date=selected_date,
+            node_ids=ids,
+            direction=direction,
+        )
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/assets/{filename}")
 def topology_asset(filename: str) -> FileResponse:
     try:

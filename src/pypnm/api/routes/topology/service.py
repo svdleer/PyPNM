@@ -448,6 +448,67 @@ class TopologyStorage:
             conn.close()
             return resolved_date, (str(r.get("path") or "") or None)
 
+    def get_node_metadata(
+        self,
+        snapshot_date: str | None,
+        node_ids: list[str],
+        direction: str | None = None,
+    ) -> tuple[str | None, dict[str, dict[str, Any]]]:
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            resolved_date = snapshot_date
+            if not resolved_date:
+                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                latest = cur.fetchone() or {}
+                resolved_date = str(latest.get("snapshot_date") or "") or None
+            if not resolved_date:
+                conn.close()
+                return None, {}
+
+            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+            row = cur.fetchone() or {}
+            snapshot_id = int(row.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return resolved_date, {}
+
+            clean_ids = [str(n or "").strip() for n in node_ids if str(n or "").strip()]
+            if not clean_ids:
+                conn.close()
+                return resolved_date, {}
+
+            placeholders = ",".join(["%s"] * len(clean_ids))
+            params: list[Any] = [snapshot_id, *clean_ids]
+            sql = (
+                "SELECT node_id, MIN(path) AS path, MIN(hub) AS hub, MIN(cmts) AS cmts, "
+                "MIN(serving_group) AS serving_group, MIN(segment) AS segment, MIN(direction) AS direction "
+                "FROM topology_hierarchy WHERE snapshot_id=%s AND node_id IN (" + placeholders + ")"
+            )
+            if direction:
+                sql += " AND direction=%s"
+                params.append(str(direction).strip())
+            sql += " GROUP BY node_id"
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall() or []
+            conn.close()
+
+            out: dict[str, dict[str, Any]] = {}
+            for r in rows:
+                node_id = str(r.get("node_id") or "").strip()
+                if not node_id:
+                    continue
+                out[node_id] = {
+                    "path": str(r.get("path") or "") or None,
+                    "hub": str(r.get("hub") or "") or None,
+                    "cmts": str(r.get("cmts") or "") or None,
+                    "serving_group": str(r.get("serving_group") or "") or None,
+                    "segment": str(r.get("segment") or "") or None,
+                    "direction": str(r.get("direction") or "") or None,
+                }
+            return resolved_date, out
+
     def upsert_snapshot_payload(
         self,
         snapshot_date: str,
@@ -1469,6 +1530,24 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "node_id": node_id,
             "path": path,
+        }
+
+    def get_node_metadata(
+        self,
+        selected_date: str | None,
+        node_ids: list[str],
+        direction: str | None = None,
+    ) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, node_meta = self.storage.get_node_metadata(
+            snapshot_date=selected_date,
+            node_ids=node_ids,
+            direction=direction,
+        )
+        return {
+            "snapshot_date": snapshot_date,
+            "count": len(node_meta),
+            "node_meta": node_meta,
         }
 
     def get_summary(
