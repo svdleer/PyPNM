@@ -509,6 +509,63 @@ class TopologyStorage:
                 }
             return resolved_date, out
 
+    def get_serving_group_metadata(
+        self,
+        snapshot_date: str | None,
+        serving_groups: list[str],
+        direction: str | None = None,
+    ) -> tuple[str | None, dict[str, dict[str, Any]]]:
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            resolved_date = snapshot_date
+            if not resolved_date:
+                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                latest = cur.fetchone() or {}
+                resolved_date = str(latest.get("snapshot_date") or "") or None
+            if not resolved_date:
+                conn.close()
+                return None, {}
+
+            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+            row = cur.fetchone() or {}
+            snapshot_id = int(row.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return resolved_date, {}
+
+            groups = [str(g or "").strip() for g in serving_groups if str(g or "").strip()]
+            if not groups:
+                conn.close()
+                return resolved_date, {}
+
+            placeholders = ",".join(["%s"] * len(groups))
+            params: list[Any] = [snapshot_id, *groups]
+            sql = (
+                "SELECT serving_group, MIN(cmts) AS cmts, MIN(segment) AS segment, MIN(node_id) AS node_id "
+                "FROM topology_hierarchy WHERE snapshot_id=%s AND serving_group IN (" + placeholders + ")"
+            )
+            if direction:
+                sql += " AND direction=%s"
+                params.append(str(direction).strip())
+            sql += " GROUP BY serving_group"
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall() or []
+            conn.close()
+
+            out: dict[str, dict[str, Any]] = {}
+            for r in rows:
+                sg = str(r.get("serving_group") or "").strip()
+                if not sg:
+                    continue
+                out[sg] = {
+                    "cmts": str(r.get("cmts") or "") or None,
+                    "segment": str(r.get("segment") or "") or None,
+                    "node_id": str(r.get("node_id") or "") or None,
+                }
+            return resolved_date, out
+
     def upsert_snapshot_payload(
         self,
         snapshot_date: str,
@@ -1548,6 +1605,24 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "count": len(node_meta),
             "node_meta": node_meta,
+        }
+
+    def get_serving_group_metadata(
+        self,
+        selected_date: str | None,
+        serving_groups: list[str],
+        direction: str | None = None,
+    ) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, sg_meta = self.storage.get_serving_group_metadata(
+            snapshot_date=selected_date,
+            serving_groups=serving_groups,
+            direction=direction,
+        )
+        return {
+            "snapshot_date": snapshot_date,
+            "count": len(sg_meta),
+            "serving_group_meta": sg_meta,
         }
 
     def get_summary(

@@ -184,6 +184,26 @@ def topology_node_meta(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/serving-group-meta")
+def topology_serving_group_meta(
+    groups: str = Query(...),
+    direction: str | None = Query(default=None),
+    selected_date: str | None = Query(default=None, alias="date"),
+) -> dict:
+    items = [part.strip() for part in (groups or "").split(",") if part.strip()]
+    if not items:
+        raise HTTPException(status_code=400, detail="groups is required")
+    try:
+        payload = topology_service.get_serving_group_metadata(
+            selected_date=selected_date,
+            serving_groups=items,
+            direction=direction,
+        )
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/assets/{filename}")
 def topology_asset(filename: str) -> FileResponse:
     try:
