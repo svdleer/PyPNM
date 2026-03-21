@@ -204,10 +204,6 @@ class PollerService:
             )
             # Backward-compatible upgrades for already-existing tables.
             for ddl in [
-                "ALTER TABLE modem_inventory_current ADD COLUMN mac_domain VARCHAR(128) NULL",
-                "ALTER TABLE modem_inventory_current ADD COLUMN upstream_ifindex BIGINT NULL",
-                "ALTER TABLE modem_inventory_current ADD COLUMN ofdma_ifindex BIGINT NULL",
-                "ALTER TABLE modem_inventory_current ADD COLUMN ofdma_rf_port_ifindex BIGINT NULL",
                 "ALTER TABLE scheduler_decision_log ADD COLUMN poller_id BIGINT NULL",
                 "ALTER TABLE scheduler_decision_log ADD COLUMN poller_name VARCHAR(64) NULL",
                 "ALTER TABLE scheduler_decision_log ADD COLUMN reason VARCHAR(64) NULL",
@@ -331,16 +327,6 @@ class PollerService:
         )
         self._execute("CREATE INDEX IF NOT EXISTS idx_scheduler_decision_tick ON scheduler_decision_log(tick_at)")
         self._execute("CREATE INDEX IF NOT EXISTS idx_poller_job_status_created ON poller_job(status, created_at)")
-        for ddl in [
-            "ALTER TABLE modem_inventory_current ADD COLUMN mac_domain TEXT",
-            "ALTER TABLE modem_inventory_current ADD COLUMN upstream_ifindex INTEGER",
-            "ALTER TABLE modem_inventory_current ADD COLUMN ofdma_ifindex INTEGER",
-            "ALTER TABLE modem_inventory_current ADD COLUMN ofdma_rf_port_ifindex INTEGER",
-        ]:
-            try:
-                self._execute(ddl)
-            except Exception:
-                pass
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS modem_rf_snapshot (
