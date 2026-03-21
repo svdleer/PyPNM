@@ -350,14 +350,25 @@ class PollerService:
         self._worker_started = True
 
     def _worker_loop(self) -> None:
+        import logging
+        _log = logging.getLogger(__name__)
         while True:
             try:
                 self._timeout_stale_jobs()
+            except Exception as exc:
+                _log.warning(f"Poller timeout sweep failed: {exc}")
+
+            try:
                 self._process_one_job()
+            except Exception as exc:
+                _log.warning(f"Poller queue worker failed: {exc}")
+
+            try:
                 if self._scheduler.get("enabled") and self._scheduler_due():
                     self.run_scheduler_once()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning(f"Poller scheduler tick failed: {exc}")
+
             time.sleep(2)
 
     def _scheduler_due(self) -> bool:
