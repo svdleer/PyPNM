@@ -844,6 +844,7 @@ class PollerService:
         modems_succeeded = 0
         modems_failed = 0
         error_text = None
+        all_rows = []  # kept for potential future use; upserts are now per-CMTS
         self._update_running_job_progress(
             job_id,
             "Starting poller job: loading settings",
@@ -872,7 +873,6 @@ class PollerService:
                     modems_failed=0,
                 )
                 targets = self._cmts_targets_for_poller(poller)
-                all_rows = []
                 total_targets = len(targets)
                 self._update_running_job_progress(
                     job_id,
@@ -903,28 +903,31 @@ class PollerService:
                     self._update_running_job_progress(
                         job_id,
                         f"CMTS {idx}/{total_targets}: walking {cmts_name}",
-                        rows_collected=len(all_rows),
+                        rows_collected=rows_collected,
                         modems_attempted=modems_attempted,
                         modems_succeeded=modems_succeeded,
                         modems_failed=modems_failed,
                     )
                     modems = self._fetch_cmts_modems(cmts_ip)
                     modems_attempted += len(modems)
-                    modems_succeeded += len(modems)
                     for m in modems:
                         m["cmts"] = cmts_name
                         m["cmts_ip"] = cmts_ip
+                    # Upsert each CMTS batch immediately so partial progress
+                    # is committed to DB even if the job is killed or times out.
+                    written = self._upsert_inventory_rows(modems, source_poller=poller.get("name"))
+                    rows_collected += written
+                    modems_succeeded += len(modems)
                     all_rows.extend(modems)
                     self._update_running_job_progress(
                         job_id,
                         f"CMTS {idx}/{total_targets}: {cmts_name} done ({len(modems)} modems)",
-                        rows_collected=len(all_rows),
+                        rows_collected=rows_collected,
                         modems_attempted=modems_attempted,
                         modems_succeeded=modems_succeeded,
                         modems_failed=modems_failed,
                     )
 
-                rows_collected = self._upsert_inventory_rows(all_rows, source_poller=poller.get("name"))
                 try:
                     self._purge_stale_inventory(int(poller.get("retention_days") or 30))
                 except Exception:
