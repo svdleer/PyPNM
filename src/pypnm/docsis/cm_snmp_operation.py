@@ -2044,6 +2044,24 @@ class CmSnmpOperation:
             if not result or not result.get('success'):
                 failed = (result or {}).get('failed_oid', 'unknown')
                 err    = (result or {}).get('error', 'no response')
+                # Some modem families reject file-specific spectrum control OIDs
+                # (for example notWritable on FileName/FileEnable) while still
+                # accepting the core spectrum trigger parameters.
+                optional_file_oids = {
+                    'docsIf3CmSpectrumAnalysisCtrlCmdFileName.0',
+                    'docsIf3CmSpectrumAnalysisCtrlCmdFileEnable.0',
+                    '1.3.6.1.4.1.4491.2.1.20.1.34.11.0',
+                    '1.3.6.1.4.1.4491.2.1.20.1.34.12.0',
+                }
+                err_l = str(err).lower()
+                if str(failed) in optional_file_oids and ('notwritable' in err_l or 'noaccess' in err_l):
+                    self.logger.warning(
+                        'SPECTRUM SET SEQUENCE partial acceptance: optional file OID %s rejected (%s); proceeding with core settings',
+                        failed,
+                        err,
+                    )
+                    return True
+
                 self.logger.error(f'SPECTRUM SET SEQUENCE FAILED at OID {failed}: {err}')
                 return False
 
