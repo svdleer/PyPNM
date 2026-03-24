@@ -57,16 +57,47 @@ def parse_fn_name_from_oid(oid: str, prefix: str) -> Optional[tuple[str, int, in
         char_parts = parts[2:2 + str_len]
         ascii_values = [int(p) for p in char_parts]
         
-        # Validate printable ASCII range
-        if not all(32 <= v <= 126 for v in ascii_values):
-            return None
+            # Accept printable ASCII (32-126) AND extended Latin-1 (128-255).
+            # Reject NUL (0) and DEL (127) only — operators may use national characters
+            # in fiber node names (e.g. Dutch/EU naming conventions with é, ë, etc.).
+        if any(v == 0 or v == 127 for v in ascii_values):
+                return None
         
         fn_name = ''.join(chr(v) for v in ascii_values)
+            # Accept printable ASCII (32-126) AND extended Latin-1 (128-255).
+            # Reject NUL (0) and DEL (127) only — operators may use national characters
+            # in fiber node names (e.g. Dutch/EU naming conventions with é, ë, etc.).
+        if any(v == 0 or v == 127 for v in ascii_values):
+                return None
         m_cm_sg_id = int(parts[2 + str_len])
         
         return (fn_name, md_if_index, m_cm_sg_id)
     except (ValueError, IndexError):
         return None
+        try:
+            md_if_index = int(parts[0])
+            str_len = int(parts[1])
+
+            # Validate we have enough parts for the name + mCmSgId
+            if len(parts) < 2 + str_len + 1:
+                return None
+
+            # Extract byte values for the FN name
+            char_parts = parts[2:2 + str_len]
+            ascii_values = [int(p) for p in char_parts]
+
+            # Accept printable ASCII (32-126) AND extended Latin-1 (128-255).
+            # Reject NUL (0) and DEL (127) only — operators may use national characters
+            # in fiber node names (e.g. Dutch/EU naming conventions with é, ë, etc.).
+            if any(v == 0 or v == 127 for v in ascii_values):
+                return None
+
+            fn_name = ''.join(chr(v) for v in ascii_values)
+            m_cm_sg_id = int(parts[2 + str_len])
+
+            return (fn_name, md_if_index, m_cm_sg_id)
+        except (ValueError, IndexError):
+            return None
 
 
 def parse_fn_name_from_oid_by_sg_id(oid: str, prefix: str, target_sg_id: int) -> Optional[str]:

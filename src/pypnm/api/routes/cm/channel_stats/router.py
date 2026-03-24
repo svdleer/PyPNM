@@ -655,23 +655,35 @@ class ChannelStatsRouter:
                                 )
                                 fn_result = await agent_manager.wait_for_task_async(fn_task_id, timeout=10.0)
                                 if fn_result and fn_result.get('result', {}).get('success'):
-                                    for entry in fn_result.get('result', {}).get('results', []):
+                                    fn_entries = fn_result.get('result', {}).get('results', [])
+                                    self.logger.info(
+                                        f"FN table walk: {len(fn_entries)} rows for SG ID {cm_sg_id} "
+                                        f"on CMTS {request.cmts_ip}"
+                                    )
+                                    for entry in fn_entries:
                                         if entry.get('oid', '').endswith(f'.{cm_sg_id}'):
                                             parts = entry.get('oid', '').split('.')
                                             for i in range(len(parts) - 1, 1, -1):
                                                 try:
                                                     length = int(parts[i])
                                                     if 1 <= length <= 50:
-                                                        ascii_parts = parts[i+1:i+1+length]
-                                                        if len(ascii_parts) == length:
-                                                            vals = [int(p) for p in ascii_parts]
-                                                            if all(32 <= v <= 126 for v in vals):
+                                                        byte_parts = parts[i+1:i+1+length]
+                                                        if len(byte_parts) == length:
+                                                            vals = [int(p) for p in byte_parts]
+                                                            # Accept printable ASCII + extended Latin-1
+                                                            # (reject NUL/DEL only — allows EU operator names)
+                                                            if not any(v == 0 or v == 127 for v in vals):
                                                                 fiber_node = ''.join(chr(v) for v in vals)
                                                                 break
                                                 except (ValueError, IndexError):
                                                     continue
                                             if fiber_node:
                                                 break
+                                    if not fiber_node:
+                                        self.logger.warning(
+                                            f"FN name not found for SG ID {cm_sg_id} "
+                                            f"on {request.cmts_ip} ({len(fn_entries)} rows walked)"
+                                        )
                         else:
                             # If cm-index discovery just timed out, avoid repeating the
                             # same heavy CM status walk in fallback path.

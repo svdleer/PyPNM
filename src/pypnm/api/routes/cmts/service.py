@@ -626,6 +626,11 @@ class CMTSModemService:
         # Parse docsIf3MdNodeStatusMdDsSgId: mdIfIndex → fiber_node_name
         # OID index format: {mdIfIndex}.{strLen}.{char0}...{charN}.{mCmSgId}
         md_if_to_fn = {}  # mdIfIndex (int) → fiber_node_name (str)
+        _fn_skip_short = 0
+        _fn_skip_len_mismatch = 0
+        _fn_skip_nul = 0
+        _fn_skip_exc = 0
+        _fn_extended_ascii = 0
         for item in fn_node_results:
             oid = item.get('oid', '')
             if not oid.startswith(OID_MD_NODE_DS_SG + '.'):
@@ -633,21 +638,46 @@ class CMTSModemService:
             suffix = oid[len(OID_MD_NODE_DS_SG) + 1:]
             parts = suffix.split('.')
             if len(parts) < 4:
+                _fn_skip_short += 1
                 continue
             try:
                 fn_md_if = int(parts[0])
                 str_len = int(parts[1])
                 if len(parts) < 2 + str_len + 1:
+                    _fn_skip_len_mismatch += 1
                     continue
-                ascii_vals = [int(p) for p in parts[2:2 + str_len]]
-                if all(32 <= v <= 126 for v in ascii_vals):
-                    fn_name = ''.join(chr(v) for v in ascii_vals)
-                    if fn_md_if not in md_if_to_fn:
-                        md_if_to_fn[fn_md_if] = fn_name
+                byte_vals = [int(p) for p in parts[2:2 + str_len]]
+                # Accept printable ASCII (32-126) AND extended Latin-1 (128-255).
+                # Old strict range (32-126) silently rejects fiber node names that
+                # contain extended characters (e.g. Dutch/EU operator naming conventions).
+                # Reject NUL bytes (0) and DEL (127) but allow everything else.
+                if any(v == 0 or v == 127 for v in byte_vals):
+                    _fn_skip_nul += 1
+                    continue
+                fn_name = ''.join(chr(v) for v in byte_vals)
+                if any(v > 126 for v in byte_vals):
+                    _fn_extended_ascii += 1
+                if fn_md_if not in md_if_to_fn:
+                    md_if_to_fn[fn_md_if] = fn_name
             except (ValueError, IndexError):
-                pass
+                _fn_skip_exc += 1
 
-        self.logger.info(f"Resolved {len(md_if_map)} MD-IF-INDEX, {len(if_name_map)} interface names, {len(md_if_to_fn)} fiber nodes")
+        self.logger.info(
+            f"Resolved {len(md_if_map)} MD-IF-INDEX, {len(if_name_map)} interface names, "
+            f"{len(md_if_to_fn)} fiber nodes from {len(fn_node_results)} FN-table rows "
+            f"(skipped: short={_fn_skip_short} len_mismatch={_fn_skip_len_mismatch} "
+            f"nul={_fn_skip_nul} exc={_fn_skip_exc} extended_ascii_names={_fn_extended_ascii})"
+        )
+        if not md_if_to_fn and fn_node_results:
+            self.logger.warning(
+                f"{self.cmts_ip}: docsIf3MdNodeStatusMdDsSgId returned {len(fn_node_results)} rows "
+                f"but ALL were rejected by the name parser — check FN name encoding on this CMTS"
+            )
+        elif not md_if_to_fn:
+            self.logger.warning(
+                f"{self.cmts_ip}: docsIf3MdNodeStatusMdDsSgId returned 0 rows — "
+                f"fiber nodes not configured on this CMTS or OID not supported (Remote PHY?)"
+            )
         
         # Parse OFDMA: modem_index -> ofdma_ifindex
         # Uses vendor-agnostic timing offset check (0 = no OFDMA, >0 = active OFDMA)
