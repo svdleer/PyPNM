@@ -257,6 +257,116 @@ class TopologyStorage:
                 if col not in modem_cols:
                     cur.execute(f"ALTER TABLE `topology_modems` ADD COLUMN `{col}` {ddl}")
 
+            # ── CMTS fiber-node / OFDMA-channel cache ───────────────────
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cmts_fiber_node_cache (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    cmts_ip VARCHAR(64) NOT NULL,
+                    fn_name VARCHAR(128) NOT NULL,
+                    mac_domain VARCHAR(128) NULL,
+                    ifindex BIGINT NOT NULL,
+                    description VARCHAR(512) NULL,
+                    modem_count INT NOT NULL DEFAULT 0,
+                    channel_modem_count INT NOT NULL DEFAULT 0,
+                    updated_at DATETIME NOT NULL,
+                    KEY idx_fn_cache_cmts (cmts_ip),
+                    KEY idx_fn_cache_cmts_fn (cmts_ip, fn_name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+
+            conn.close()
+
+    # ── CMTS fiber-node cache CRUD ──────────────────────────────────
+
+    def get_cached_fiber_nodes(self, cmts_ip: str, max_age_s: int = 259200) -> dict | None:
+        """Return cached channel/list response for a CMTS, or None if stale/missing."""
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT fn_name, mac_domain, ifindex, description, modem_count, "
+                "channel_modem_count, updated_at FROM cmts_fiber_node_cache "
+                "WHERE cmts_ip=%s ORDER BY fn_name, ifindex",
+                (cmts_ip,),
+            )
+            rows = cur.fetchall() or []
+            conn.close()
+
+        if not rows:
+            return None
+
+        updated_at = rows[0].get("updated_at")
+        if updated_at:
+            from datetime import datetime, timezone
+            age = (datetime.now(timezone.utc) - updated_at.replace(tzinfo=timezone.utc)).total_seconds()
+            if age > max_age_s:
+                return None
+
+        # Reconstruct the channel/list response format
+        channels: list[dict] = []
+        fn_map: dict[str, dict] = {}
+        for r in rows:
+            ch = {
+                "ifindex": r["ifindex"],
+                "description": r["description"] or "",
+                "mac_domain": r["fn_name"],
+                "suggested_fn": r["fn_name"],
+                "modem_count": r["channel_modem_count"],
+            }
+            channels.append(ch)
+            if r["fn_name"] not in fn_map:
+                fn_map[r["fn_name"]] = {
+                    "name": r["fn_name"],
+                    "mac_domain": r["mac_domain"] or r["fn_name"],
+                    "channels": [],
+                    "modem_count": r["modem_count"],
+                }
+            fn_map[r["fn_name"]]["channels"].append({
+                "ifindex": r["ifindex"],
+                "description": r["description"] or "",
+                "modem_count": r["channel_modem_count"],
+            })
+
+        return {
+            "success": True,
+            "channels": channels,
+            "fiber_nodes": sorted(fn_map.values(), key=lambda f: f.get("mac_domain", "")),
+            "_cached": True,
+            "_cache_age_s": round(age) if updated_at else 0,
+        }
+
+    def store_fiber_node_cache(self, cmts_ip: str, channels: list[dict], fiber_nodes: list[dict]) -> None:
+        """Store channel/list SNMP walk results in MySQL for fast retrieval."""
+        # Build a lookup: fn_name -> modem_count (unique modems across all channels)
+        fn_modem_count: dict[str, int] = {}
+        for fn in fiber_nodes:
+            fn_modem_count[fn.get("name", "")] = fn.get("modem_count", 0)
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM cmts_fiber_node_cache WHERE cmts_ip=%s", (cmts_ip,))
+            for ch in channels:
+                fn_name = ch.get("mac_domain") or ch.get("suggested_fn") or ""
+                cur.execute(
+                    "INSERT INTO cmts_fiber_node_cache "
+                    "(cmts_ip, fn_name, mac_domain, ifindex, description, "
+                    "modem_count, channel_modem_count, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        cmts_ip,
+                        fn_name,
+                        ch.get("mac_domain", ""),
+                        ch.get("ifindex", 0),
+                        ch.get("description", ""),
+                        fn_modem_count.get(fn_name, 0),
+                        ch.get("modem_count", 0),
+                        now,
+                    ),
+                )
             conn.close()
 
     def get_snapshot_meta(self, snapshot_date: str) -> dict[str, Any] | None:
@@ -552,12 +662,12 @@ class TopologyStorage:
                 if not node_id:
                     continue
                 out[node_id] = {
-                    "path": str(r.get("path") or "") or None,
-                    "hub": str(r.get("hub") or "") or None,
-                    "cmts": str(r.get("cmts") or "") or None,
-                    "serving_group": str(r.get("serving_group") or "") or None,
-                    "segment": str(r.get("segment") or "") or None,
-                    "direction": str(r.get("direction") or "") or None,
+                    "path": str(r.get("path") or "").strip() or None,
+                    "hub": str(r.get("hub") or "").strip() or None,
+                    "cmts": str(r.get("cmts") or "").strip() or None,
+                    "serving_group": str(r.get("serving_group") or "").strip() or None,
+                    "segment": str(r.get("segment") or "").strip() or None,
+                    "direction": str(r.get("direction") or "").strip() or None,
                 }
             return resolved_date, out
 

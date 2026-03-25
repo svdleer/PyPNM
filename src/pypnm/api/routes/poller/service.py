@@ -1215,6 +1215,9 @@ class PollerService:
                     f"(LOWER(COALESCE(vendor,'')) LIKE {marker} OR LOWER(COALESCE(model,'')) LIKE {marker} OR LOWER(COALESCE(fiber_node,'')) LIKE {marker})"
                 )
                 params.extend([sv, sv, sv])
+            elif search_type == "fiber_node":
+                where.append(f"LOWER(COALESCE(fiber_node,'')) LIKE {marker}")
+                params.append(sv)
 
         if interface_filter:
             marker = "%s" if self.backend == "mysql" else "?"

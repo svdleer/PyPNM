@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,6 +77,10 @@ from pypnm.api.routes.common.service.fiber_node_utils import (
 
 class UsOfdmaRxMerRouter:
     """Router for CMTS Upstream OFDMA RxMER operations."""
+
+    # In-memory cache for channel/list results: {cmts_ip: (timestamp, response_dict)}
+    _channel_list_cache: dict[str, tuple[float, dict]] = {}
+    _CHANNEL_LIST_TTL = 259200  # 72 hours — fiber nodes are static
     
     def __init__(self) -> None:
         prefix = "/pnm/us/ofdma/rxmer"
@@ -1816,13 +1821,37 @@ class UsOfdmaRxMerRouter:
         async def get_channel_list(
             cmts_ip: str,
             community: str = "public",
+            refresh: bool = False,
         ):
             """
             Walk ifDescr + DOCS-IF3-MIB fiber node tables to return all OFDMA
             upstream interfaces grouped by real fiber node name.
             Falls back to ifDescr-derived grouping when DOCS-IF3-MIB tables
             are unavailable (non-standard vendors).
+            Results are cached in MySQL (5 min default). Pass refresh=true to force SNMP re-walk.
             """
+            # ── 1. In-memory cache ──────────────────────────────────────
+            mem_cache = UsOfdmaRxMerRouter._channel_list_cache
+            if not refresh and cmts_ip in mem_cache:
+                ts, cached_result = mem_cache[cmts_ip]
+                age = time.time() - ts
+                if age < UsOfdmaRxMerRouter._CHANNEL_LIST_TTL:
+                    self.logger.info(f"channel/list memory-cache hit for {cmts_ip} (age={age:.0f}s)")
+                    return {**cached_result, "_cached": True, "_cache_age_s": round(age)}
+
+            # ── 2. MySQL cache ──────────────────────────────────────────
+            if not refresh:
+                try:
+                    from pypnm.api.routes.topology.service import topology_service
+                    db_result = topology_service.storage.get_cached_fiber_nodes(cmts_ip, max_age_s=UsOfdmaRxMerRouter._CHANNEL_LIST_TTL)
+                    if db_result:
+                        self.logger.info(f"channel/list DB-cache hit for {cmts_ip}")
+                        mem_cache[cmts_ip] = (time.time(), db_result)
+                        return db_result
+                except Exception as _db_err:
+                    self.logger.debug(f"DB cache lookup failed (non-fatal): {_db_err}")
+
+            # ── 3. Live SNMP walk ───────────────────────────────────────
             import re as _re
             service = CmtsUsOfdmaRxMerService(
                 cmts_ip=cmts_ip, community=community, write_community=community
@@ -1964,12 +1993,25 @@ class UsOfdmaRxMerRouter:
                 for md, fn_data in seen.items():
                     fn_data['modem_count'] = len(domain_unique_cms.get(md, set()))
 
-                return {
+                result = {
                     "success":     True,
                     "channels":    channels,
                     "fiber_nodes": sorted([f for f in seen.values() if f['modem_count'] > 0],
                                           key=lambda f: f['mac_domain']),
                 }
+
+                # ── Store in MySQL + memory cache ───────────────────────
+                mem_cache[cmts_ip] = (time.time(), result)
+                try:
+                    from pypnm.api.routes.topology.service import topology_service
+                    topology_service.storage.store_fiber_node_cache(
+                        cmts_ip, result["channels"], result["fiber_nodes"],
+                    )
+                    self.logger.info(f"channel/list stored in DB cache for {cmts_ip}")
+                except Exception as _store_err:
+                    self.logger.debug(f"DB cache store failed (non-fatal): {_store_err}")
+
+                return result
             except Exception as e:
                 self.logger.error(f"channel/list error: {e}")
                 return {"success": False, "error": str(e), "channels": [], "fiber_nodes": []}
