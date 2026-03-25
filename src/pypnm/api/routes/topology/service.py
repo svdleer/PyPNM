@@ -329,10 +329,18 @@ class TopologyStorage:
                 "modem_count": r["channel_modem_count"],
             })
 
+        # Exclude fallback mac-domain entries — only return real FN names
+        _fallback_prefixes = ('cable-mac', 'OFDMA-', 'RPD-', 'FN-cable-mac', 'FN-OFDMA-', 'FN-RPD-', 'Cable')
+        filtered_fns = [
+            f for f in fn_map.values()
+            if not f.get('mac_domain', '').startswith(_fallback_prefixes)
+            and not f.get('name', '').startswith(_fallback_prefixes)
+        ]
+
         return {
             "success": True,
             "channels": channels,
-            "fiber_nodes": sorted(fn_map.values(), key=lambda f: f.get("mac_domain", "")),
+            "fiber_nodes": sorted(filtered_fns, key=lambda f: f.get("mac_domain", "")),
             "_cached": True,
             "_cache_age_s": round(age) if updated_at else 0,
         }

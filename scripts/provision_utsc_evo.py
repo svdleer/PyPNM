@@ -11,20 +11,16 @@ Key differences from E6000:
     - Uses local snmpget/snmpset binaries from PATH
 
 Interface types on EVO:
-  Physical RF port:   ifIndex 40001280+   ifName "RPHY Upstream Physical Interface 1:0/0.0"
+  Physical RF port:   ifIndex 120001280+  ifName "RPHY Upstream RF Port 1:0/0"
                       -> Used as UTSC cfg TABLE INDEX (row key)
+  Physical interface: ifIndex 40001280+   ifName "RPHY Upstream Physical Interface 1:0/0.0"
   Logical OFDMA ch:   ifIndex 160001280+  ifName "RPHY OFDMA Upstream 1:0/0.0/0"
                       -> Used as LogicalChIfIndex (.2) to pin capture to one OFDMA channel
                          Set to 0 to capture any/all channels on the physical port
-  Mapping (physical -> logical OFDMA):
-    40001280 (1:0/0.0)  -> 160001280
-    40001281 (1:0/0.1)  -> 160001282
-    40001296 (1:0/1.0)  -> 160001296
-    40001297 (1:0/1.1)  -> 160001298
 
   ifIndex ranges on EVO:
-    40001280+   RPHY Upstream Physical Interface (SC-QAM + OFDMA physical)
-    120001280+  SC-QAM upstream logical channels
+    40001280+   RPHY Upstream Physical Interface
+    120001280+  RPHY Upstream RF Port (physical RF — used for UTSC)
     160001280+  RPHY OFDMA Upstream logical channels
 
   IMPORTANT: docsPnmCmtsUtscCapabTriggerMode = BITS: 00 00 on ALL ports.
@@ -53,13 +49,15 @@ CMTS_IP    = os.environ.get("CMTS_IP",    "172.16.6.160")
 SNMP_READ  = os.environ.get("SNMP_READ",  "Z1gg0@LL")
 SNMP_WRITE = os.environ.get("SNMP_WRITE", "Z1gg0Sp3c1@l")
 REMOTE_HOST = os.environ.get("REMOTE_HOST", "access-engineering.nl")
+SSH_USER   = os.environ.get("SSH_USER",   "svdleer")
+SSH_PORT   = os.environ.get("SSH_PORT",   "65001")
 
 RF_ARG_GIVEN = len(sys.argv) > 1
-RF_PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 40001280  # physical RF port
-LOGICAL_CH = int(sys.argv[2]) if len(sys.argv) > 2 else 160001280  # logical OFDMA ch
+RF_PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 120001280  # RPHY Upstream RF Port
+LOGICAL_CH = int(sys.argv[2]) if len(sys.argv) > 2 else 0           # 0 = any channel
 
-# Try both common EVO index forms.
-IDX_CANDIDATES = [f".{RF_PORT}", f".{RF_PORT}.1"]
+# EVO compound index: {ifIndex}.{cfgIndex} — cfgIndex=2 for 120001280 RF port
+IDX_CANDIDATES = [f".{RF_PORT}.2"]
 
 
 # TFTP
@@ -78,7 +76,8 @@ STAT_BASE  = "1.3.6.1.4.1.4491.2.1.27.1.3.10.4.1.1"
 
 # RowStatus values
 RS_ACTIVE        = 1
-RS_CREATE_WAIT   = 5   # createAndWait — set mandatory fields before active(1)
+RS_CREATE_GO     = 4   # createAndGo — EVO accepts this for UTSC rows
+RS_CREATE_WAIT   = 5   # createAndWait
 RS_DESTROY       = 6
 
 # Capture parameters — start conservative to find EVO limits
@@ -110,7 +109,7 @@ POLL_TIMEOUT  = 180
 def _run(cmd: str) -> str:
     full = cmd
     if REMOTE_HOST:
-        full = f"ssh -o BatchMode=yes -o ConnectTimeout=10 {REMOTE_HOST} {shlex.quote(cmd)}"
+        full = f"ssh -o BatchMode=yes -o ConnectTimeout=10 -l {SSH_USER} -p {SSH_PORT} {REMOTE_HOST} {shlex.quote(cmd)}"
     r = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=20)
     out = r.stdout.strip()
     if r.returncode != 0:
@@ -148,7 +147,7 @@ SYS_DESCR_OID = "1.3.6.1.2.1.1.1.0"
 
 
 def auto_select_vccap_rf_port():
-    """If user did not pass RF index and device is vCCAP, default to 120001280."""
+    """If user did not pass RF index and device is vCCAP, default to 120001280 (RPHY Upstream RF Port)."""
     global RF_PORT, IDX_CANDIDATES
     if RF_ARG_GIVEN:
         return
@@ -156,7 +155,7 @@ def auto_select_vccap_rf_port():
     sysdescr = raw.lower()
     if "vccap" in sysdescr or "dcts vccap" in sysdescr:
         RF_PORT = 120001280
-        IDX_CANDIDATES = [f".{RF_PORT}", f".{RF_PORT}.1"]
+        IDX_CANDIDATES = [f".{RF_PORT}.2"]
         print(f"  Auto-detected vCCAP from sysDescr; using RF port {RF_PORT}")
 
 
@@ -229,15 +228,15 @@ def configure_utsc_for_idx(idx: str) -> bool:
         else:
             print("  Skipping UTSC RowStatus destroy (SKIP_UTSC_DESTROY=1)")
 
-        # createAndWait — EVO rejects createAndGo(4) with commitFailed
-        print(f"  RowStatus{idx} = createAndWait(5)")
-        r = snmpset(f"{UTSC_BASE}.21{idx}", "i", RS_CREATE_WAIT)
+        # createAndGo — EVO accepts this for UTSC compound-index rows
+        print(f"  RowStatus{idx} = createAndGo(4)")
+        r = snmpset(f"{UTSC_BASE}.21{idx}", "i", RS_CREATE_GO)
         print(f"    {r}")
         time.sleep(0.5)
 
         # Fail fast if EVO rejects row creation for this index.
         rs_after_create = snmpget(f"{UTSC_BASE}.21{idx}")
-        print(f"  RowStatus after createAndWait: {rs_after_create}")
+        print(f"  RowStatus after createAndGo: {rs_after_create}")
         if "No Such" in rs_after_create or rs_after_create.strip() == "":
             print("\n  ERROR: UTSC row was not created for this index.")
             print(f"  Index attempt failed: {idx}")

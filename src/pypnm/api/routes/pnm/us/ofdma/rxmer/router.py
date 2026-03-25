@@ -1993,13 +1993,9 @@ class UsOfdmaRxMerRouter:
                 for md, fn_data in seen.items():
                     fn_data['modem_count'] = len(domain_unique_cms.get(md, set()))
 
-                # Filter out fallback mac-domain entries (cable-mac, OFDMA-, RPD-)
-                # that appear when FN resolution only partially succeeds.
-                _fallback_prefixes = ('cable-mac', 'OFDMA-', 'RPD-', 'FN-cable-mac', 'FN-OFDMA-', 'FN-RPD-')
-                has_real_fn = any(
-                    not f['mac_domain'].startswith(_fallback_prefixes)
-                    for f in seen.values() if f['modem_count'] > 0
-                )
+                # Always exclude fallback mac-domain entries — only show
+                # real FN names from DOCS-IF3-MIB resolution.
+                _fallback_prefixes = ('cable-mac', 'OFDMA-', 'RPD-', 'FN-cable-mac', 'FN-OFDMA-', 'FN-RPD-', 'Cable')
 
                 result = {
                     "success":     True,
@@ -2007,7 +2003,7 @@ class UsOfdmaRxMerRouter:
                     "fiber_nodes": sorted([
                         f for f in seen.values()
                         if f['modem_count'] > 0
-                        and (not has_real_fn or not f['mac_domain'].startswith(_fallback_prefixes))
+                        and not f['mac_domain'].startswith(_fallback_prefixes)
                     ], key=lambda f: f['mac_domain']),
                 }
 
