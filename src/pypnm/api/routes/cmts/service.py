@@ -217,6 +217,7 @@ class CMTSModemService:
                     'cmts_ip': cmts_ip,
                     'enriched': False,
                     'enriching': True,
+                    'cmts_enriched': cached.get('cmts_enriched', False),
                     'cached': True,
                     'enrich_progress': cached.get('enrich_progress', {'completed': 0, 'total': 0}),
                 }
@@ -320,6 +321,7 @@ class CMTSModemService:
                 'modems': modems,
                 'enriched': False,
                 'enriching': True,
+                'cmts_enriched': True,
                 'timestamp': time.time(),
                 'requested_limit': _existing_req_limit,
                 'enrich_progress': {'completed': 0, 'total': len(modems)},
