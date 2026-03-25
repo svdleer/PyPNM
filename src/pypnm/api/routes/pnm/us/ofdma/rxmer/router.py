@@ -1993,11 +1993,22 @@ class UsOfdmaRxMerRouter:
                 for md, fn_data in seen.items():
                     fn_data['modem_count'] = len(domain_unique_cms.get(md, set()))
 
+                # Filter out fallback mac-domain entries (cable-mac, OFDMA-, RPD-)
+                # that appear when FN resolution only partially succeeds.
+                _fallback_prefixes = ('cable-mac', 'OFDMA-', 'RPD-', 'FN-cable-mac', 'FN-OFDMA-', 'FN-RPD-')
+                has_real_fn = any(
+                    not f['mac_domain'].startswith(_fallback_prefixes)
+                    for f in seen.values() if f['modem_count'] > 0
+                )
+
                 result = {
                     "success":     True,
                     "channels":    channels,
-                    "fiber_nodes": sorted([f for f in seen.values() if f['modem_count'] > 0],
-                                          key=lambda f: f['mac_domain']),
+                    "fiber_nodes": sorted([
+                        f for f in seen.values()
+                        if f['modem_count'] > 0
+                        and (not has_real_fn or not f['mac_domain'].startswith(_fallback_prefixes))
+                    ], key=lambda f: f['mac_domain']),
                 }
 
                 # ── Store in MySQL + memory cache ───────────────────────
