@@ -973,17 +973,18 @@ class UsOfdmaRxMerRouter:
             # which Python's Path join treats as absolute, discarding tftp_dir entirely.
             filename = request.filename.lstrip('/')
 
-            # Try API-side FTP prefetch for this capture prefix in both ftp and hybrid modes.
+            # Try API-side FTP prefetch only when file is not already on local
+            # TFTP mount (Commscope files arrive via TFTP, not FTP).
             basename = Path(filename).name
-            try:
-                _fetch_pnm_files(basename, allow_when_local=True)
-            except Exception as e:
-                self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
-
-            # First try exact filename
             filepath = tftp_dir / filename
             if not filepath.exists():
                 filepath = cache_dir / filename
+            if not filepath.exists():
+                try:
+                    _fetch_pnm_files(basename, allow_when_local=True)
+                except Exception as e:
+                    self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
+                filepath = cache_dir / basename
 
             if not filepath.exists():
                 # CMTS may add a path prefix (e.g. /pnm/mer/) and/or a timestamp suffix.
@@ -1120,13 +1121,15 @@ class UsOfdmaRxMerRouter:
             cache_dir = Path(_get_cache_dir())
             filename = request.filename.lstrip('/')
             basename = Path(filename).name
-            try:
-                _fetch_pnm_files(basename, allow_when_local=True)
-            except Exception as e:
-                self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
             filepath = tftp_dir / filename
             if not filepath.exists():
                 filepath = cache_dir / filename
+            if not filepath.exists():
+                try:
+                    _fetch_pnm_files(basename, allow_when_local=True)
+                except Exception as e:
+                    self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
+                filepath = cache_dir / basename
 
             if not filepath.exists():
                 basename = Path(filename).name
