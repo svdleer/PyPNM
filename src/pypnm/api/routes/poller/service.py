@@ -206,6 +206,16 @@ class PollerService:
                 self._execute(ddl)
             except Exception:
                 pass
+        # Indexes for listing/filtering (idempotent CREATE IF NOT EXISTS)
+        for idx_ddl in [
+            "CREATE INDEX idx_inv_cmts ON modem_inventory_current (cmts, mac)",
+            "CREATE INDEX idx_inv_cmts_ip ON modem_inventory_current (cmts_ip)",
+            "CREATE INDEX idx_inv_fiber_node ON modem_inventory_current (fiber_node)",
+        ]:
+            try:
+                self._execute(idx_ddl)
+            except Exception:
+                pass
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS modem_rf_snapshot (
@@ -1163,6 +1173,33 @@ class PollerService:
             (mac_norm,),
         )
         return self._map_inventory_row(rows[0]) if rows else None
+
+    def get_inventory_modems_bulk(self, mac_addresses: list[str]) -> list[Dict[str, Any]]:
+        """Look up multiple modems by MAC address using a single indexed query."""
+        if not mac_addresses:
+            return []
+        # Normalize to colon-separated lowercase (matches PRIMARY KEY format)
+        def _norm(mac: str) -> str:
+            raw = (mac or "").strip().lower().replace("-", "").replace(".", "").replace(":", "")
+            if len(raw) == 12:
+                return ":".join(raw[i:i+2] for i in range(0, 12, 2))
+            return raw
+        normalized = [_norm(m) for m in mac_addresses if m]
+        if not normalized:
+            return []
+        # Batch into chunks of 500 to avoid overly long IN clauses
+        results: list[Dict[str, Any]] = []
+        for i in range(0, len(normalized), 500):
+            batch = normalized[i:i+500]
+            placeholders = ",".join(["%s"] * len(batch))
+            rows = self._query(
+                "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
+                "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, software_version, updated_at "
+                f"FROM modem_inventory_current WHERE mac IN ({placeholders})",
+                tuple(batch),
+            )
+            results.extend(self._map_inventory_row(r) for r in rows)
+        return results
 
     def _map_inventory_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         def _to_bool(value: Any) -> Any:

@@ -87,6 +87,17 @@ def get_inventory_modem(mac_address: str) -> dict:
     return {"status": "success", "modem": modem, "source": "pypnm-inventory"}
 
 
+@router.post("/inventory/modems/bulk")
+def get_inventory_modems_bulk(body: dict) -> dict:
+    mac_addresses = body.get("mac_addresses") or []
+    if not mac_addresses or not isinstance(mac_addresses, list):
+        return {"status": "error", "message": "mac_addresses list required"}
+    if len(mac_addresses) > 5000:
+        return {"status": "error", "message": "max 5000 MACs per request"}
+    modems = poller_service.get_inventory_modems_bulk(mac_addresses)
+    return {"status": "success", "modems": modems, "count": len(modems)}
+
+
 @router.get("/poller-scheduler/status", response_model=PollerSchedulerStatusResponse)
 def poller_scheduler_status() -> PollerSchedulerStatusResponse:
     scheduler = poller_service.get_scheduler_status()
