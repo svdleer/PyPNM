@@ -563,11 +563,11 @@ class ChannelStatsRouter:
                     try:
                         cmidx_result = cmts_cmindex_result
                         if cmidx_result and cmidx_result.get('result', {}).get('success'):
-                            mac_clean = request.mac_address.replace(':', '').lower()
+                            mac_clean = request.mac_address.replace(':', '').replace('-', '').lower()
                             for entry in cmidx_result.get('result', {}).get('results', []):
                                 val = entry.get('value', '')
                                 if isinstance(val, str):
-                                    entry_mac = val.replace(' ', '').replace(':', '').lower()
+                                    entry_mac = val.replace('0x', '').replace(' ', '').replace(':', '').replace('-', '').lower()
                                     if entry_mac == mac_clean:
                                         oid = entry.get('oid', '')
                                         suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
@@ -804,35 +804,32 @@ class ChannelStatsRouter:
             
             # Normalize MAC address to match CMTS format (shortened, colons)
             # CMTS stores MACs like 44:5:3f:d4:19:15 (no leading zeros in bytes)
-            mac_normalized_parts = []
             mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '').lower()
-            for i in range(0, len(mac_clean), 2):
-                byte = mac_clean[i:i+2]
-                # Convert to hex without leading zero: '05' -> '5', '0f' -> 'f'
-                mac_normalized_parts.append(f"{int(byte, 16):x}")
-            mac_normalized = ':'.join(mac_normalized_parts)
-            self.logger.info(f"Normalized MAC: {mac_address} -> {mac_normalized}")
+            self.logger.info(f"Normalized MAC: {mac_address} -> {mac_clean}")
             
-            # Walk docsIfCmtsCmStatusMacAddress table to find CM index
-            oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
+            # Walk docsIf3CmtsCmRegStatusMacAddr to find CM index
+            oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.2'  # docsIf3CmtsCmRegStatusMacAddr
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=walk_timeout)
             result = await agent_manager.wait_for_task_async(task_id, timeout=walk_timeout)
             
             if not result or not result.get("result", {}).get("success"):
-                self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
+                self.logger.warning(f"Failed to walk CM MAC table on CMTS {cmts_ip}")
                 return None
             
-            # Find CM index by matching MAC address
+            # Find CM index by matching MAC address (values may be hex like 0x5cfa25a1ca92)
             cm_index = None
             results = result.get("result", {}).get("results", [])
             for entry in results:
-                cmts_mac = entry.get("value", "")
-                cmts_mac_parts = cmts_mac.split(':')
-                cmts_mac_normalized = ':'.join([f"{int(b, 16):x}" if b else '0' for b in cmts_mac_parts])
-                if cmts_mac_normalized.lower() == mac_normalized.lower():
-                    oid_parts = entry.get("oid", "").split(".")
-                    if oid_parts:
-                        cm_index = oid_parts[-1]
+                val = entry.get("value", "")
+                if isinstance(val, str):
+                    entry_mac = val.replace('0x', '').replace(' ', '').replace(':', '').replace('-', '').lower()
+                    if entry_mac == mac_clean:
+                        oid_str = entry.get("oid", "")
+                        suffix = oid_str.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
+                        try:
+                            cm_index = suffix.strip('.')
+                        except (ValueError, IndexError):
+                            pass
                         break
             
             if not cm_index:
