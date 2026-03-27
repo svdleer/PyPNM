@@ -224,9 +224,9 @@ class ChannelStatsRouter:
                         "ip": request.modem_ip,
                         "oids": table_oids,
                         "community": request.community,
-                        "timeout": 30
+                        "timeout": 10
                     },
-                    timeout=40.0
+                    timeout=90.0
                 )
 
                 # Concurrently send CMTS OFDMA walk + fiber node lookup tasks
