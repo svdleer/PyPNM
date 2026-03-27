@@ -1234,6 +1234,53 @@ class PollerService:
         )
         return True
 
+    def _resolve_modem_ip_from_cmts(self, mac: str, cmts_name: str | None, base: str) -> str | None:
+        """Fallback: if modem not in inventory, do a live CMTS walk to find its IP and upsert."""
+        if not cmts_name:
+            return None
+        # Resolve CMTS IP: look up any row for this CMTS name in inventory
+        rows = self._query(
+            "SELECT cmts_ip FROM modem_inventory_current WHERE LOWER(cmts)=LOWER(%s) AND cmts_ip IS NOT NULL LIMIT 1",
+            (cmts_name,),
+        )
+        cmts_ip = (rows[0] or {}).get("cmts_ip") if rows else None
+        if not cmts_ip:
+            return None
+        community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
+        try:
+            r = requests.get(
+                f"{base}/cmts/modems",
+                params={"cmts_ip": cmts_ip, "community": community, "enrich": "false"},
+                timeout=120,
+                verify=False,
+            )
+            r.raise_for_status()
+            payload = r.json() if r.content else {}
+            modems = payload.get("modems") or []
+            mac_norm = mac.lower().replace(":", "").replace("-", "")
+            for m in modems:
+                m_mac = str(m.get("mac_address") or "").lower().replace(":", "").replace("-", "")
+                if m_mac == mac_norm:
+                    found_ip = m.get("ip_address")
+                    if found_ip:
+                        # Upsert into inventory so the UPDATE later succeeds
+                        self._upsert_inventory_rows([{
+                            "mac_address": mac,
+                            "ip_address": found_ip,
+                            "cmts": cmts_name,
+                            "cmts_ip": cmts_ip,
+                            **{k: m.get(k) for k in (
+                                "fiber_node", "cable_mac", "mac_domain", "status",
+                                "docsis_version", "upstream_interface", "upstream_ifindex",
+                                "ofdma_ifindex", "ofdma_rf_port_ifindex",
+                                "ofdm_enabled", "ofdma_enabled", "partial_service",
+                            )},
+                        }], source_poller="refresh-fallback")
+                    return found_ip
+        except Exception as exc:
+            logger.warning("Live CMTS walk fallback for %s failed: %s", mac, exc)
+        return None
+
     def _process_refresh_queue(self) -> None:
         """Process one queued modem refresh request."""
         rows = self._query(
@@ -1257,11 +1304,13 @@ class PollerService:
         try:
             base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
             community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
-            # Look up modem IP from inventory
+            # Look up modem IP from inventory; if missing, do a live CMTS walk fallback
             modem = self.get_inventory_modem_by_mac(mac)
             modem_ip = (modem or {}).get("ip_address")
             if not modem_ip:
-                raise ValueError(f"Modem {mac} not found in inventory or has no IP")
+                modem_ip = self._resolve_modem_ip_from_cmts(mac, cmts, base)
+                if not modem_ip:
+                    raise ValueError(f"Modem {mac} not in inventory and not found via live CMTS walk")
             # Call sysDescr endpoint
             r = requests.post(
                 f"{base}/system/sysDescr",
