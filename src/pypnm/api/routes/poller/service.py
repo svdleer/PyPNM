@@ -1457,7 +1457,7 @@ class PollerService:
                 )
             self._execute(
                 "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s",
-                ("done", self._now(), req_id),
+                ("completed", self._now(), req_id),
             )
         except Exception as exc:
             self._execute(
