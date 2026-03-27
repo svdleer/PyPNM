@@ -132,3 +132,50 @@ def poller_snapshots_analytics(
 ) -> PollerSnapshotsAnalyticsResponse:
     analytics = poller_service.snapshots_analytics(lookback_days=lookback_days)
     return PollerSnapshotsAnalyticsResponse(status="success", analytics=analytics)
+
+
+# ── Modem refresh (on-demand single-modem enrichment) ──────────
+
+
+@router.post("/modem-refresh")
+def enqueue_modem_refresh(payload: dict) -> dict:
+    mac = payload.get("mac", "")
+    cmts = payload.get("cmts")
+    if not mac:
+        return {"status": "error", "message": "mac is required"}
+    req_id = poller_service.enqueue_modem_refresh(
+        mac=mac, cmts=cmts, requested_by=payload.get("requested_by"),
+    )
+    return {"status": "success", "request_id": req_id}
+
+
+@router.get("/modem-refresh/{mac}/status")
+def get_modem_refresh_status(mac: str) -> dict:
+    result = poller_service.get_refresh_status(mac)
+    if not result:
+        return {"status": "success", "refresh": None}
+    return {"status": "success", "refresh": result}
+
+
+@router.post("/modem-refresh/{req_id}/cancel")
+def cancel_modem_refresh(req_id: int) -> dict:
+    poller_service.cancel_refresh_request(req_id)
+    return {"status": "success", "cancelled": True}
+
+
+# ── Enrichment progress ──────────────────────────────────────
+
+
+@router.get("/inventory/enrichment-progress")
+def get_enrichment_progress(cmts: str | None = None) -> dict:
+    progress = poller_service.get_enrichment_progress(cmts=cmts)
+    return {"status": "success", **progress}
+
+
+# ── Queue heads (admin dashboard) ────────────────────────────
+
+
+@router.get("/queue-head")
+def get_queue_heads() -> dict:
+    heads = poller_service.get_queue_heads()
+    return {"status": "success", **heads}

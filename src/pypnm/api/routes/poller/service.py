@@ -4,20 +4,23 @@ from __future__ import annotations
 
 import os
 import json
-import sqlite3
+import logging
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import pymysql
+import pymysql.cursors
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class PollerService:
     def __init__(self) -> None:
         self._db_lock = threading.Lock()
-        self.backend = self._detect_backend()
-        self.sqlite_path = os.environ.get("DATA_SQLITE_PATH", "/tmp/pypnm_poller.db")
+        self.backend = "mysql"
         scheduler_enabled_default = (os.environ.get("DATA_STORE_SCHEDULER_ENABLED", "true").strip().lower() == "true")
 
         self._scheduler: Dict[str, Any] = {
@@ -32,51 +35,28 @@ class PollerService:
         self._init_db()
         self._start_worker()
 
-    def _detect_backend(self) -> str:
-        explicit = (os.environ.get("DATA_DB_BACKEND") or "").lower()
-        if explicit in {"mysql", "sqlite"}:
-            return explicit
-        if os.environ.get("DATA_DB_HOST") or os.environ.get("AUTH_DB_HOST"):
-            return "mysql"
-        return "sqlite"
-
     def _db_name(self) -> str:
         return os.environ.get("DATA_DB_NAME") or os.environ.get("AUTH_DB_NAME") or "pypnm_auth"
 
     def _connect(self):
-        if self.backend == "mysql":
-            try:
-                import pymysql
-            except Exception as exc:
-                raise RuntimeError("MySQL backend requested but pymysql is unavailable") from exc
-
-            return pymysql.connect(
-                host=os.environ.get("DATA_DB_HOST") or os.environ.get("AUTH_DB_HOST", "127.0.0.1"),
-                port=int(os.environ.get("DATA_DB_PORT") or os.environ.get("AUTH_DB_PORT", "3306")),
-                user=os.environ.get("DATA_DB_USER") or os.environ.get("AUTH_DB_USER", "pypnm"),
-                password=os.environ.get("DATA_DB_PASSWORD") or os.environ.get("AUTH_DB_PASSWORD", "pypnm"),
-                database=self._db_name(),
-                autocommit=True,
-                cursorclass=pymysql.cursors.DictCursor,
-            )
-
-        os.makedirs(os.path.dirname(self.sqlite_path), exist_ok=True)
-        conn = sqlite3.connect(self.sqlite_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return pymysql.connect(
+            host=os.environ.get("DATA_DB_HOST") or os.environ.get("AUTH_DB_HOST", "127.0.0.1"),
+            port=int(os.environ.get("DATA_DB_PORT") or os.environ.get("AUTH_DB_PORT", "3306")),
+            user=os.environ.get("DATA_DB_USER") or os.environ.get("AUTH_DB_USER", "pypnm"),
+            password=os.environ.get("DATA_DB_PASSWORD") or os.environ.get("AUTH_DB_PASSWORD", "pypnm"),
+            database=self._db_name(),
+            autocommit=True,
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=30,
+            read_timeout=30,
+            write_timeout=30,
+        )
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     def _rows(self, cur):
-        rows = cur.fetchall()
-        out = []
-        for r in rows:
-            if isinstance(r, dict):
-                out.append(r)
-            else:
-                out.append(dict(r))
-        return out
+        return cur.fetchall()
 
     def _execute(self, sql: str, params=None):
         params = params or ()
@@ -84,8 +64,6 @@ class PollerService:
             conn = self._connect()
             cur = conn.cursor()
             cur.execute(sql, params)
-            if self.backend == "sqlite":
-                conn.commit()
             try:
                 last_id = cur.lastrowid
             except Exception:
@@ -104,243 +82,148 @@ class PollerService:
             return rows
 
     def _init_db(self) -> None:
-        if self.backend == "mysql":
-            self._execute(
-                """
-                CREATE TABLE IF NOT EXISTS modem_inventory_current (
-                    mac VARCHAR(17) NOT NULL,
-                    ip VARCHAR(45) NULL,
-                    cmts VARCHAR(128) NOT NULL,
-                    cmts_ip VARCHAR(45) NULL,
-                    fiber_node VARCHAR(128) NULL,
-                    cable_mac VARCHAR(128) NULL,
-                    mac_domain VARCHAR(128) NULL,
-                    status VARCHAR(64) NULL,
-                    docsis_version VARCHAR(32) NULL,
-                    vendor VARCHAR(64) NULL,
-                    model VARCHAR(128) NULL,
-                    upstream_interface VARCHAR(128) NULL,
-                    upstream_ifindex BIGINT NULL,
-                    ofdma_ifindex BIGINT NULL,
-                    ofdma_rf_port_ifindex BIGINT NULL,
-                    ofdm_enabled BOOLEAN NULL,
-                    ofdma_enabled BOOLEAN NULL,
-                    partial_service BOOLEAN NULL,
-                    first_seen_at DATETIME NOT NULL,
-                    last_seen_at DATETIME NOT NULL,
-                    updated_at DATETIME NOT NULL,
-                    source_poller VARCHAR(64) NULL,
-                    PRIMARY KEY (mac)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            self._execute(
-                """
-                CREATE TABLE IF NOT EXISTS poller_setting (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    name VARCHAR(64) NOT NULL,
-                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                    scope_type VARCHAR(16) NOT NULL DEFAULT 'all_cmts',
-                    scope_json JSON NULL,
-                    collect_identity BOOLEAN NOT NULL DEFAULT TRUE,
-                    collect_scqam BOOLEAN NOT NULL DEFAULT FALSE,
-                    collect_rxmer BOOLEAN NOT NULL DEFAULT FALSE,
-                    interval_minutes INT NOT NULL DEFAULT 1440,
-                    run_window_start TIME NULL,
-                    run_window_end TIME NULL,
-                    max_concurrency INT NOT NULL DEFAULT 1,
-                    max_agent_queue_depth INT NOT NULL DEFAULT 20,
-                    retention_days INT NOT NULL DEFAULT 30,
-                    heavy_window_start TIME NULL,
-                    heavy_window_end TIME NULL,
-                    heavy_max_modems INT NOT NULL DEFAULT 300,
-                    heavy_delay_ms INT NOT NULL DEFAULT 0,
-                    max_runtime_sec INT NOT NULL DEFAULT 3600,
-                    last_target_offset INT NOT NULL DEFAULT 0,
-                    created_at DATETIME NOT NULL,
-                    updated_at DATETIME NOT NULL,
-                    UNIQUE KEY uk_poller_setting_name (name)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            self._execute(
-                """
-                CREATE TABLE IF NOT EXISTS poller_job (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    poller_id BIGINT NOT NULL,
-                    trigger_type VARCHAR(24) NOT NULL,
-                    status VARCHAR(24) NOT NULL DEFAULT 'queued',
-                    rows_collected INT NOT NULL DEFAULT 0,
-                    modems_attempted INT NOT NULL DEFAULT 0,
-                    modems_succeeded INT NOT NULL DEFAULT 0,
-                    modems_failed INT NOT NULL DEFAULT 0,
-                    requested_by VARCHAR(64) NULL,
-                    request_payload JSON NULL,
-                    started_at DATETIME NULL,
-                    finished_at DATETIME NULL,
-                    error_text TEXT NULL,
-                    cmts_breakdown JSON NULL,
-                    created_at DATETIME NOT NULL,
-                    INDEX idx_job_status_created (status, created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            self._execute(
-                """
-                CREATE TABLE IF NOT EXISTS scheduler_decision_log (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    tick_at DATETIME NOT NULL,
-                    poller_id BIGINT NULL,
-                    poller_name VARCHAR(64) NULL,
-                    decision VARCHAR(16) NOT NULL,
-                    reason VARCHAR(64) NULL,
-                    effective_load INT NULL,
-                    threshold INT NULL,
-                    detail VARCHAR(255) NULL,
-                    created_at DATETIME NOT NULL,
-                    INDEX idx_scheduler_tick (tick_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            # Backward-compatible upgrades for already-existing tables.
-            for ddl in [
-                "ALTER TABLE scheduler_decision_log ADD COLUMN poller_id BIGINT NULL",
-                "ALTER TABLE scheduler_decision_log ADD COLUMN poller_name VARCHAR(64) NULL",
-                "ALTER TABLE scheduler_decision_log ADD COLUMN reason VARCHAR(64) NULL",
-                "ALTER TABLE scheduler_decision_log ADD COLUMN effective_load INT NULL",
-                "ALTER TABLE scheduler_decision_log ADD COLUMN threshold INT NULL",
-                "ALTER TABLE scheduler_decision_log ADD COLUMN detail VARCHAR(255) NULL",
-                "ALTER TABLE scheduler_decision_log ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
-            ]:
-                try:
-                    self._execute(ddl)
-                except Exception:
-                    pass
-            self._execute(
-                """
-                CREATE TABLE IF NOT EXISTS modem_rf_snapshot (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    mac VARCHAR(17) NOT NULL,
-                    cmts VARCHAR(128) NOT NULL,
-                    collected_at DATETIME NOT NULL,
-                    scqam_json JSON NULL,
-                    rxmer_json JSON NULL,
-                    poller_name VARCHAR(64) NOT NULL,
-                    INDEX idx_snapshot_collected (collected_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            return
-
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS modem_inventory_current (
-                mac TEXT PRIMARY KEY,
-                ip TEXT,
-                cmts TEXT NOT NULL,
-                cmts_ip TEXT,
-                fiber_node TEXT,
-                cable_mac TEXT,
-                mac_domain TEXT,
-                status TEXT,
-                docsis_version TEXT,
-                vendor TEXT,
-                model TEXT,
-                upstream_interface TEXT,
-                upstream_ifindex INTEGER,
-                ofdma_ifindex INTEGER,
-                ofdma_rf_port_ifindex INTEGER,
-                ofdm_enabled INTEGER,
-                ofdma_enabled INTEGER,
-                partial_service INTEGER,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                source_poller TEXT
-            )
+                mac VARCHAR(17) NOT NULL,
+                ip VARCHAR(45) NULL,
+                cmts VARCHAR(128) NOT NULL,
+                cmts_ip VARCHAR(45) NULL,
+                fiber_node VARCHAR(128) NULL,
+                cable_mac VARCHAR(128) NULL,
+                mac_domain VARCHAR(128) NULL,
+                status VARCHAR(64) NULL,
+                docsis_version VARCHAR(32) NULL,
+                vendor VARCHAR(64) NULL,
+                model VARCHAR(128) NULL,
+                upstream_interface VARCHAR(128) NULL,
+                upstream_ifindex BIGINT NULL,
+                ofdma_ifindex BIGINT NULL,
+                ofdma_rf_port_ifindex BIGINT NULL,
+                ofdm_enabled BOOLEAN NULL,
+                ofdma_enabled BOOLEAN NULL,
+                partial_service BOOLEAN NULL,
+                first_seen_at DATETIME NOT NULL,
+                last_seen_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                source_poller VARCHAR(64) NULL,
+                PRIMARY KEY (mac)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS poller_setting (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                scope_type TEXT NOT NULL DEFAULT 'all_cmts',
-                scope_json TEXT,
-                collect_identity INTEGER NOT NULL DEFAULT 1,
-                collect_scqam INTEGER NOT NULL DEFAULT 0,
-                collect_rxmer INTEGER NOT NULL DEFAULT 0,
-                interval_minutes INTEGER NOT NULL DEFAULT 1440,
-                run_window_start TEXT,
-                run_window_end TEXT,
-                max_concurrency INTEGER NOT NULL DEFAULT 1,
-                max_agent_queue_depth INTEGER NOT NULL DEFAULT 20,
-                retention_days INTEGER NOT NULL DEFAULT 30,
-                heavy_window_start TEXT,
-                heavy_window_end TEXT,
-                heavy_max_modems INTEGER NOT NULL DEFAULT 300,
-                heavy_delay_ms INTEGER NOT NULL DEFAULT 0,
-                max_runtime_sec INTEGER NOT NULL DEFAULT 3600,
-                last_target_offset INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                name VARCHAR(64) NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                scope_type VARCHAR(16) NOT NULL DEFAULT 'all_cmts',
+                scope_json JSON NULL,
+                collect_identity BOOLEAN NOT NULL DEFAULT TRUE,
+                collect_scqam BOOLEAN NOT NULL DEFAULT FALSE,
+                collect_rxmer BOOLEAN NOT NULL DEFAULT FALSE,
+                interval_minutes INT NOT NULL DEFAULT 1440,
+                run_window_start TIME NULL,
+                run_window_end TIME NULL,
+                max_concurrency INT NOT NULL DEFAULT 1,
+                max_agent_queue_depth INT NOT NULL DEFAULT 20,
+                retention_days INT NOT NULL DEFAULT 30,
+                heavy_window_start TIME NULL,
+                heavy_window_end TIME NULL,
+                heavy_max_modems INT NOT NULL DEFAULT 300,
+                heavy_delay_ms INT NOT NULL DEFAULT 0,
+                max_runtime_sec INT NOT NULL DEFAULT 3600,
+                last_target_offset INT NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                UNIQUE KEY uk_poller_setting_name (name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS poller_job (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                poller_id INTEGER NOT NULL,
-                trigger_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                rows_collected INTEGER NOT NULL DEFAULT 0,
-                modems_attempted INTEGER NOT NULL DEFAULT 0,
-                modems_succeeded INTEGER NOT NULL DEFAULT 0,
-                modems_failed INTEGER NOT NULL DEFAULT 0,
-                requested_by TEXT,
-                request_payload TEXT,
-                started_at TEXT,
-                finished_at TEXT,
-                error_text TEXT,
-                cmts_breakdown TEXT,
-                created_at TEXT NOT NULL
-            )
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                poller_id BIGINT NOT NULL,
+                trigger_type VARCHAR(24) NOT NULL,
+                status VARCHAR(24) NOT NULL DEFAULT 'queued',
+                rows_collected INT NOT NULL DEFAULT 0,
+                modems_attempted INT NOT NULL DEFAULT 0,
+                modems_succeeded INT NOT NULL DEFAULT 0,
+                modems_failed INT NOT NULL DEFAULT 0,
+                requested_by VARCHAR(64) NULL,
+                request_payload JSON NULL,
+                started_at DATETIME NULL,
+                finished_at DATETIME NULL,
+                error_text TEXT NULL,
+                cmts_breakdown JSON NULL,
+                created_at DATETIME NOT NULL,
+                INDEX idx_job_status_created (status, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS scheduler_decision_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tick_at TEXT NOT NULL,
-                poller_id INTEGER,
-                poller_name TEXT,
-                decision TEXT NOT NULL,
-                reason TEXT,
-                effective_load INTEGER,
-                threshold INTEGER,
-                detail TEXT,
-                created_at TEXT NOT NULL
-            )
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                tick_at DATETIME NOT NULL,
+                poller_id BIGINT NULL,
+                poller_name VARCHAR(64) NULL,
+                decision VARCHAR(16) NOT NULL,
+                reason VARCHAR(64) NULL,
+                effective_load INT NULL,
+                threshold INT NULL,
+                detail VARCHAR(255) NULL,
+                created_at DATETIME NOT NULL,
+                INDEX idx_scheduler_tick (tick_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
-        self._execute("CREATE INDEX IF NOT EXISTS idx_scheduler_decision_tick ON scheduler_decision_log(tick_at)")
-        self._execute("CREATE INDEX IF NOT EXISTS idx_poller_job_status_created ON poller_job(status, created_at)")
+        # Backward-compatible upgrades for already-existing tables.
+        for ddl in [
+            "ALTER TABLE scheduler_decision_log ADD COLUMN poller_id BIGINT NULL",
+            "ALTER TABLE scheduler_decision_log ADD COLUMN poller_name VARCHAR(64) NULL",
+            "ALTER TABLE scheduler_decision_log ADD COLUMN reason VARCHAR(64) NULL",
+            "ALTER TABLE scheduler_decision_log ADD COLUMN effective_load INT NULL",
+            "ALTER TABLE scheduler_decision_log ADD COLUMN threshold INT NULL",
+            "ALTER TABLE scheduler_decision_log ADD COLUMN detail VARCHAR(255) NULL",
+            "ALTER TABLE scheduler_decision_log ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            try:
+                self._execute(ddl)
+            except Exception:
+                pass
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS modem_rf_snapshot (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mac TEXT NOT NULL,
-                cmts TEXT NOT NULL,
-                collected_at TEXT NOT NULL,
-                scqam_json TEXT,
-                rxmer_json TEXT,
-                poller_name TEXT NOT NULL
-            )
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                mac VARCHAR(17) NOT NULL,
+                cmts VARCHAR(128) NOT NULL,
+                collected_at DATETIME NOT NULL,
+                scqam_json JSON NULL,
+                rxmer_json JSON NULL,
+                poller_name VARCHAR(64) NOT NULL,
+                INDEX idx_snapshot_collected (collected_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
-        self._execute("CREATE INDEX IF NOT EXISTS idx_modem_rf_snapshot_collected ON modem_rf_snapshot(collected_at)")
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS modem_refresh_request (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                mac VARCHAR(17) NOT NULL,
+                cmts VARCHAR(128) NULL,
+                status VARCHAR(24) NOT NULL DEFAULT 'queued',
+                requested_by VARCHAR(64) NULL,
+                created_at DATETIME NOT NULL,
+                started_at DATETIME NULL,
+                finished_at DATETIME NULL,
+                error_text TEXT NULL,
+                INDEX idx_refresh_status (status, created_at),
+                INDEX idx_refresh_mac (mac, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
 
     def _start_worker(self) -> None:
         if self._worker_started:
@@ -350,24 +233,27 @@ class PollerService:
         self._worker_started = True
 
     def _worker_loop(self) -> None:
-        import logging
-        _log = logging.getLogger(__name__)
         while True:
             try:
                 self._timeout_stale_jobs()
             except Exception as exc:
-                _log.warning(f"Poller timeout sweep failed: {exc}")
+                logger.warning("Poller timeout sweep failed: %s", exc)
 
             try:
                 self._process_one_job()
             except Exception as exc:
-                _log.warning(f"Poller queue worker failed: {exc}")
+                logger.warning("Poller queue worker failed: %s", exc)
+
+            try:
+                self._process_refresh_queue()
+            except Exception as exc:
+                logger.warning("Refresh queue worker failed: %s", exc)
 
             try:
                 if self._scheduler.get("enabled") and self._scheduler_due():
                     self.run_scheduler_once()
             except Exception as exc:
-                _log.warning(f"Poller scheduler tick failed: {exc}")
+                logger.warning("Poller scheduler tick failed: %s", exc)
 
             time.sleep(2)
 
@@ -387,31 +273,18 @@ class PollerService:
 
     def _timeout_stale_jobs(self) -> None:
         max_runtime = max(60, int(os.environ.get("DATA_STORE_JOB_MAX_RUNTIME_SEC", "14400")))
-        if self.backend == "mysql":
-            self._execute(
-                """
-                UPDATE poller_job j
-                LEFT JOIN poller_setting p ON p.id = j.poller_id
-                SET j.status=%s,
-                    j.finished_at=%s,
-                    j.error_text=CONCAT('Timed out after ', COALESCE(NULLIF(p.max_runtime_sec, 0), %s), 's')
-                WHERE j.status='running' AND j.started_at IS NOT NULL
-                  AND TIMESTAMPDIFF(SECOND, j.started_at, UTC_TIMESTAMP()) > COALESCE(NULLIF(p.max_runtime_sec, 0), %s)
-                """,
-                ("timed_out", self._now(), max_runtime, max_runtime),
-            )
-        else:
-            self._execute(
-                """
-                UPDATE poller_job
-                SET status=?, finished_at=?, error_text=?
-                WHERE status='running' AND started_at IS NOT NULL
-                  AND ((julianday('now') - julianday(started_at)) * 86400.0) >
-                      COALESCE(NULLIF((SELECT max_runtime_sec FROM poller_setting p WHERE p.id = poller_job.poller_id), 0), ?)
-                """,
-                ("timed_out", self._now(), f"Timed out after {max_runtime}s", max_runtime),
-            )
-
+        self._execute(
+            """
+            UPDATE poller_job j
+            LEFT JOIN poller_setting p ON p.id = j.poller_id
+            SET j.status=%s,
+                j.finished_at=%s,
+                j.error_text=CONCAT('Timed out after ', COALESCE(NULLIF(p.max_runtime_sec, 0), %s), 's')
+            WHERE j.status='running' AND j.started_at IS NOT NULL
+              AND TIMESTAMPDIFF(SECOND, j.started_at, UTC_TIMESTAMP()) > COALESCE(NULLIF(p.max_runtime_sec, 0), %s)
+            """,
+            ("timed_out", self._now(), max_runtime, max_runtime),
+        )
     def _log_scheduler_decisions(self, tick_at: str, decisions: List[Dict[str, Any]]) -> None:
         if not decisions:
             return
@@ -432,26 +305,14 @@ class PollerService:
                         d.get("detail"),
                         self._now(),
                     )
-                    if self.backend == "mysql":
-                        cur.execute(
-                            """
-                            INSERT INTO scheduler_decision_log
-                            (tick_at, poller_id, poller_name, decision, reason, effective_load, threshold, detail, created_at)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            """,
-                            vals,
-                        )
-                    else:
-                        cur.execute(
-                            """
-                            INSERT INTO scheduler_decision_log
-                            (tick_at, poller_id, poller_name, decision, reason, effective_load, threshold, detail, created_at)
-                            VALUES (?,?,?,?,?,?,?,?,?)
-                            """,
-                            vals,
-                        )
-                if self.backend == "sqlite":
-                    conn.commit()
+                    cur.execute(
+                        """
+                        INSERT INTO scheduler_decision_log
+                        (tick_at, poller_id, poller_name, decision, reason, effective_load, threshold, detail, created_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        vals,
+                    )
                 conn.close()
         except Exception:
             # Keep scheduler operational even if decision logging has schema drift.
@@ -459,7 +320,7 @@ class PollerService:
 
     def _get_scheduler_decisions(self, limit: int = 100) -> List[Dict[str, Any]]:
         lim = max(1, int(limit))
-        ph = "%s" if self.backend == "mysql" else "?"
+        ph = "%s"
         try:
             return self._query(
                 f"SELECT tick_at, poller_id, poller_name, decision, reason, effective_load, threshold, detail FROM scheduler_decision_log ORDER BY id DESC LIMIT {ph}",
@@ -756,50 +617,26 @@ class PollerService:
                     source_poller,
                 )
 
-                if self.backend == "mysql":
-                    cur.execute(
-                        """
-                        INSERT INTO modem_inventory_current
-                                                (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
-                                                 upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
-                         first_seen_at, last_seen_at, updated_at, source_poller)
-                                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON DUPLICATE KEY UPDATE
-                          ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
-                                                    cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
-                          vendor=VALUES(vendor), model=VALUES(model), upstream_interface=VALUES(upstream_interface),
-                                                    upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
-                                                    ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
-                          ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
-                          partial_service=VALUES(partial_service), last_seen_at=VALUES(last_seen_at),
-                          updated_at=VALUES(updated_at), source_poller=VALUES(source_poller)
-                        """,
-                        values,
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO modem_inventory_current
-                                                (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
-                                                 upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
-                         first_seen_at, last_seen_at, updated_at, source_poller)
-                                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(mac) DO UPDATE SET
-                          ip=excluded.ip, cmts=excluded.cmts, cmts_ip=excluded.cmts_ip, fiber_node=excluded.fiber_node,
-                                                    cable_mac=excluded.cable_mac, mac_domain=excluded.mac_domain, status=excluded.status, docsis_version=excluded.docsis_version,
-                          vendor=excluded.vendor, model=excluded.model, upstream_interface=excluded.upstream_interface,
-                                                    upstream_ifindex=excluded.upstream_ifindex, ofdma_ifindex=excluded.ofdma_ifindex,
-                                                    ofdma_rf_port_ifindex=excluded.ofdma_rf_port_ifindex,
-                          ofdm_enabled=excluded.ofdm_enabled, ofdma_enabled=excluded.ofdma_enabled,
-                          partial_service=excluded.partial_service, last_seen_at=excluded.last_seen_at,
-                          updated_at=excluded.updated_at, source_poller=excluded.source_poller
-                        """,
-                        values,
-                    )
+                cur.execute(
+                    """
+                    INSERT INTO modem_inventory_current
+                                            (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
+                                             upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
+                     first_seen_at, last_seen_at, updated_at, source_poller)
+                                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
+                                                cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
+                      vendor=VALUES(vendor), model=VALUES(model), upstream_interface=VALUES(upstream_interface),
+                                                upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
+                                                ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
+                      ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
+                      partial_service=VALUES(partial_service), last_seen_at=VALUES(last_seen_at),
+                      updated_at=VALUES(updated_at), source_poller=VALUES(source_poller)
+                    """,
+                    values,
+                )
                 inserted += 1
-
-            if self.backend == "sqlite":
-                conn.commit()
             conn.close()
         return inserted
 
@@ -808,17 +645,10 @@ class PollerService:
         before = self._query("SELECT COUNT(*) AS c FROM modem_inventory_current")
         count_before = int((before[0] or {}).get("c") or 0) if before else 0
 
-        if self.backend == "mysql":
-            self._execute(
-                "DELETE FROM modem_inventory_current WHERE last_seen_at < (UTC_TIMESTAMP() - INTERVAL %s DAY)",
-                (days,),
-            )
-        else:
-            self._execute(
-                "DELETE FROM modem_inventory_current WHERE last_seen_at < datetime('now', ?)",
-                (f"-{days} day",),
-            )
-
+        self._execute(
+            "DELETE FROM modem_inventory_current WHERE last_seen_at < (UTC_TIMESTAMP() - INTERVAL %s DAY)",
+            (days,),
+        )
         after = self._query("SELECT COUNT(*) AS c FROM modem_inventory_current")
         count_after = int((after[0] or {}).get("c") or 0) if after else 0
         return max(0, count_before - count_after)
@@ -833,9 +663,7 @@ class PollerService:
         poller_id = int(job.get("poller_id") or 0)
 
         self._execute(
-            "UPDATE poller_job SET status=%s, started_at=%s WHERE id=%s"
-            if self.backend == "mysql"
-            else "UPDATE poller_job SET status=?, started_at=? WHERE id=?",
+            "UPDATE poller_job SET status=%s, started_at=%s WHERE id=%s",
             ("running", self._now(), job_id),
         )
 
@@ -855,7 +683,7 @@ class PollerService:
         )
         try:
             pr = self._query(
-                "SELECT * FROM poller_setting WHERE id=%s" if self.backend == "mysql" else "SELECT * FROM poller_setting WHERE id=?",
+                "SELECT * FROM poller_setting WHERE id=%s",
                 (poller_id,),
             )
             poller = pr[0] if pr else None
@@ -886,7 +714,7 @@ class PollerService:
                     error_text = "No CMTS targets resolved (check scope/appdb config)"
                 for idx, t in enumerate(targets, start=1):
                     status_rows = self._query(
-                        "SELECT status FROM poller_job WHERE id=%s" if self.backend == "mysql" else "SELECT status FROM poller_job WHERE id=?",
+                        "SELECT status FROM poller_job WHERE id=%s",
                         (job_id,),
                     )
                     current_status = str((status_rows[0] or {}).get("status") or "").lower() if status_rows else ""
@@ -938,9 +766,7 @@ class PollerService:
             modems_failed = max(modems_failed, 1)
 
         self._execute(
-            "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'"
-            if self.backend == "mysql"
-            else "UPDATE poller_job SET status=?, finished_at=?, rows_collected=?, modems_attempted=?, modems_succeeded=?, modems_failed=?, error_text=? WHERE id=? AND status='running'",
+            "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
             ("done" if not error_text else "failed", self._now(), int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), error_text, job_id),
         )
 
@@ -955,9 +781,7 @@ class PollerService:
         modems_failed: int,
     ) -> None:
         self._execute(
-            "UPDATE poller_job SET rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'"
-            if self.backend == "mysql"
-            else "UPDATE poller_job SET rows_collected=?, modems_attempted=?, modems_succeeded=?, modems_failed=?, error_text=? WHERE id=? AND status='running'",
+            "UPDATE poller_job SET rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
             (int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), str(message), int(job_id)),
         )
 
@@ -974,16 +798,16 @@ class PollerService:
             cols += ["created_at", "updated_at"]
             vals += [now, now]
 
-            ph = ", ".join(["%s" if self.backend == "mysql" else "?"] * len(cols))
+            ph = ", ".join(["%s"] * len(cols))
             sql = f"INSERT INTO poller_setting ({', '.join(cols)}) VALUES ({ph})"
             return int(self._execute(sql, tuple(vals)) or 0)
 
         poller_id = int(poller_id)
         set_cols = [k for k in payload.keys() if k != "id"]
-        assignments = ", ".join([f"{k}={'%s' if self.backend == 'mysql' else '?'}" for k in set_cols] + ["updated_at=%s" if self.backend == "mysql" else "updated_at=?"])
+        assignments = ", ".join([f"{k}=%s" for k in set_cols] + ["updated_at=%s"])
         params = [payload[k] for k in set_cols] + [now, poller_id]
         sql = (
-            f"UPDATE poller_setting SET {assignments} WHERE id={'%s' if self.backend == 'mysql' else '?'}"
+            f"UPDATE poller_setting SET {assignments} WHERE id={'%s'}"
         )
         self._execute(sql, tuple(params))
         return poller_id
@@ -992,15 +816,13 @@ class PollerService:
         now = self._now()
         sql = (
             "INSERT INTO poller_job (poller_id, trigger_type, status, requested_by, request_payload, created_at) VALUES (%s,%s,%s,%s,%s,%s)"
-            if self.backend == "mysql"
-            else "INSERT INTO poller_job (poller_id, trigger_type, status, requested_by, request_payload, created_at) VALUES (?,?,?,?,?,?)"
         )
         payload = '{"source":"' + (source or "api") + '"}'
         return int(self._execute(sql, (int(poller_id), "manual", "queued", source or "api", payload, now)) or 0)
 
     def list_jobs(self, limit: int = 30) -> List[Dict[str, Any]]:
         lim = max(1, int(limit))
-        ph = "%s" if self.backend == "mysql" else "?"
+        ph = "%s"
         rows = self._query(
             f"SELECT id, poller_id, status, rows_collected, modems_attempted, modems_succeeded, modems_failed, error_text, started_at, finished_at, created_at FROM poller_job ORDER BY id DESC LIMIT {ph}",
             (lim,),
@@ -1021,7 +843,7 @@ class PollerService:
 
     def kill_job(self, job_id: int) -> Dict[str, Any]:
         rows = self._query(
-            "SELECT id, status FROM poller_job WHERE id=%s" if self.backend == "mysql" else "SELECT id, status FROM poller_job WHERE id=?",
+            "SELECT id, status FROM poller_job WHERE id=%s",
             (int(job_id),),
         )
         if not rows:
@@ -1032,9 +854,7 @@ class PollerService:
             return {"killed": 0, "state": state}
 
         self._execute(
-            "UPDATE poller_job SET status=%s, finished_at=%s, error_text=%s WHERE id=%s AND status IN ('queued','running')"
-            if self.backend == "mysql"
-            else "UPDATE poller_job SET status=?, finished_at=?, error_text=? WHERE id=? AND status IN ('queued','running')",
+            "UPDATE poller_job SET status=%s, finished_at=%s, error_text=%s WHERE id=%s AND status IN ('queued','running')",
             ("cancelled", self._now(), "Killed by admin", int(job_id)),
         )
         return {"killed": 1, "state": "cancelled"}
@@ -1073,9 +893,7 @@ class PollerService:
                 continue
 
             active = self._query(
-                "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') LIMIT 1"
-                if self.backend == "mysql"
-                else "SELECT id FROM poller_job WHERE poller_id=? AND status IN ('queued','running') LIMIT 1",
+                "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') LIMIT 1",
                 (pid,),
             )
             if active:
@@ -1083,26 +901,15 @@ class PollerService:
                 continue
 
             minutes = max(1, int(p.get("interval_minutes") or 1440))
-            if self.backend == "mysql":
-                due = self._query(
-                    """
-                    SELECT id FROM poller_job
-                    WHERE poller_id=%s
-                      AND created_at >= (UTC_TIMESTAMP() - INTERVAL %s MINUTE)
-                    LIMIT 1
-                    """,
-                    (pid, minutes),
-                )
-            else:
-                due = self._query(
-                    """
-                    SELECT id FROM poller_job
-                    WHERE poller_id=?
-                      AND created_at >= datetime('now', ?)
-                    LIMIT 1
-                    """,
-                    (pid, f"-{minutes} minute"),
-                )
+            due = self._query(
+                """
+                SELECT id FROM poller_job
+                WHERE poller_id=%s
+                  AND created_at >= (UTC_TIMESTAMP() - INTERVAL %s MINUTE)
+                LIMIT 1
+                """,
+                (pid, minutes),
+            )
             if due:
                 decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "interval_not_due"})
                 continue
@@ -1122,21 +929,20 @@ class PollerService:
         max_rows = min(capped_days, capped_limit)
         rows = []
 
-        if self.backend == "mysql":
-            raw = self._query(
-                """
-                SELECT DATE(collected_at) AS d, COUNT(*) AS snapshot_count
-                FROM modem_rf_snapshot
-                WHERE collected_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)
-                GROUP BY DATE(collected_at)
-                ORDER BY d DESC
-                LIMIT %s
-                """,
-                (capped_days, max_rows),
-            )
-            for idx, r in enumerate(raw):
-                rows.append({"day_offset": idx, "snapshot_count": int(r.get("snapshot_count") or 0)})
-            return rows
+        raw = self._query(
+            """
+            SELECT DATE(collected_at) AS d, COUNT(*) AS snapshot_count
+            FROM modem_rf_snapshot
+            WHERE collected_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)
+            GROUP BY DATE(collected_at)
+            ORDER BY d DESC
+            LIMIT %s
+            """,
+            (capped_days, max_rows),
+        )
+        for idx, r in enumerate(raw):
+            rows.append({"day_offset": idx, "snapshot_count": int(r.get("snapshot_count") or 0)})
+        return rows
 
         raw = self._query(
             """
@@ -1155,17 +961,10 @@ class PollerService:
 
     def snapshots_analytics(self, lookback_days: int = 14) -> Dict[str, Any]:
         days = max(1, int(lookback_days))
-        if self.backend == "mysql":
-            raw = self._query(
-                "SELECT COUNT(*) AS c FROM modem_rf_snapshot WHERE collected_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)",
-                (days,),
-            )
-        else:
-            raw = self._query(
-                "SELECT COUNT(*) AS c FROM modem_rf_snapshot WHERE collected_at >= datetime('now', ?)",
-                (f"-{days} day",),
-            )
-
+        raw = self._query(
+            "SELECT COUNT(*) AS c FROM modem_rf_snapshot WHERE collected_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)",
+            (days,),
+        )
         total = int((raw[0] or {}).get("c") or 0) if raw else 0
         return {
             "lookback_days": days,
@@ -1186,7 +985,7 @@ class PollerService:
         params: List[Any] = []
 
         if cmts:
-            marker = "%s" if self.backend == "mysql" else "?"
+            marker = "%s"
             where.append(
                 f"(LOWER(COALESCE(cmts,'')) = LOWER({marker}) OR LOWER(COALESCE(cmts_ip,'')) = LOWER({marker}))"
             )
@@ -1194,7 +993,7 @@ class PollerService:
 
         if search_value:
             sv = f"%{str(search_value).lower()}%"
-            marker = "%s" if self.backend == "mysql" else "?"
+            marker = "%s"
             if search_type == "ip":
                 where.append(f"LOWER(COALESCE(ip,'')) LIKE {marker}")
                 params.append(sv)
@@ -1220,12 +1019,12 @@ class PollerService:
                 params.append(sv)
 
         if interface_filter:
-            marker = "%s" if self.backend == "mysql" else "?"
+            marker = "%s"
             where.append(f"(LOWER(COALESCE(upstream_interface,'')) LIKE {marker} OR LOWER(COALESCE(cable_mac,'')) LIKE {marker})")
             params.append(f"%{str(interface_filter).lower()}%")
 
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
-        marker = "%s" if self.backend == "mysql" else "?"
+        marker = "%s"
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
             "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, updated_at "
@@ -1235,7 +1034,7 @@ class PollerService:
         return [self._map_inventory_row(row) for row in rows]
 
     def get_inventory_modem_by_mac(self, mac_address: str) -> Optional[Dict[str, Any]]:
-        marker = "%s" if self.backend == "mysql" else "?"
+        marker = "%s"
         mac_norm = (mac_address or "").lower().replace(":", "").replace("-", "")
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
@@ -1281,6 +1080,126 @@ class PollerService:
             "partial_service": _to_bool(row.get("partial_service")),
             "updated_at": row.get("updated_at"),
         }
+
+    # ── Modem refresh (on-demand single-modem enrichment) ──────────
+
+    def enqueue_modem_refresh(self, mac: str, cmts: str | None = None, requested_by: str | None = None) -> int:
+        now = self._now()
+        return int(
+            self._execute(
+                "INSERT INTO modem_refresh_request (mac, cmts, status, requested_by, created_at) VALUES (%s,%s,%s,%s,%s)",
+                (mac.lower().replace("-", ":"), cmts, "queued", requested_by or "api", now),
+            ) or 0
+        )
+
+    def get_refresh_status(self, mac: str) -> dict | None:
+        rows = self._query(
+            "SELECT id, mac, cmts, status, error_text, created_at, started_at, finished_at "
+            "FROM modem_refresh_request WHERE LOWER(mac) = %s ORDER BY id DESC LIMIT 1",
+            (mac.lower().replace("-", ":"),),
+        )
+        return rows[0] if rows else None
+
+    def cancel_refresh_request(self, req_id: int) -> bool:
+        self._execute(
+            "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s AND status IN ('queued','running')",
+            ("cancelled", self._now(), int(req_id)),
+        )
+        return True
+
+    def _process_refresh_queue(self) -> None:
+        """Process one queued modem refresh request."""
+        rows = self._query(
+            "SELECT id, mac, cmts FROM modem_refresh_request WHERE status='queued' ORDER BY id ASC LIMIT 1"
+        )
+        if not rows:
+            return
+        req = rows[0]
+        req_id = int(req["id"])
+        mac = req["mac"]
+        cmts = req.get("cmts")
+
+        self._execute(
+            "UPDATE modem_refresh_request SET status=%s, started_at=%s WHERE id=%s",
+            ("running", self._now(), req_id),
+        )
+        try:
+            base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
+            community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
+            # Look up modem IP from inventory
+            modem = self.get_inventory_modem_by_mac(mac)
+            modem_ip = (modem or {}).get("ip_address")
+            if not modem_ip:
+                raise ValueError(f"Modem {mac} not found in inventory or has no IP")
+            # Call sysDescr endpoint
+            r = requests.post(
+                f"{base}/system/sysDescr",
+                json={"ip_address": modem_ip, "community": community},
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json() if r.content else {}
+            vendor = data.get("vendor") or data.get("VENDOR")
+            model = data.get("model") or data.get("MODEL") or data.get("hw_rev") or data.get("HW_REV")
+            if vendor or model:
+                self._execute(
+                    "UPDATE modem_inventory_current SET vendor=%s, model=%s, updated_at=%s WHERE mac=%s",
+                    (vendor, model, self._now(), mac),
+                )
+            self._execute(
+                "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s",
+                ("done", self._now(), req_id),
+            )
+        except Exception as exc:
+            self._execute(
+                "UPDATE modem_refresh_request SET status=%s, finished_at=%s, error_text=%s WHERE id=%s",
+                ("failed", self._now(), str(exc)[:500], req_id),
+            )
+
+    # ── Enrichment progress ──────────────────────────────────────
+
+    def get_enrichment_progress(self, cmts: str | None = None) -> dict:
+        where = ""
+        params: list = []
+        if cmts:
+            where = " WHERE (LOWER(COALESCE(cmts,'')) = LOWER(%s) OR LOWER(COALESCE(cmts_ip,'')) = LOWER(%s))"
+            params = [cmts, cmts]
+
+        total_rows = self._query(f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}", tuple(params))
+        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+
+        enriched_rows = self._query(
+            f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}"
+            + (" AND" if where else " WHERE")
+            + " COALESCE(vendor,'') <> '' AND COALESCE(model,'') <> ''",
+            tuple(params),
+        )
+        enriched = int((enriched_rows[0] or {}).get("c") or 0) if enriched_rows else 0
+
+        # Check if any refresh requests are in progress
+        pending_rows = self._query(
+            "SELECT COUNT(*) AS c FROM modem_refresh_request WHERE status IN ('queued','running')"
+        )
+        pending = int((pending_rows[0] or {}).get("c") or 0) if pending_rows else 0
+
+        return {
+            "total": total,
+            "enriched": enriched,
+            "pending_refresh": pending,
+            "enriching": pending > 0,
+            "percentage": round(enriched / total * 100, 1) if total > 0 else 0.0,
+        }
+
+    # ── Queue head (admin dashboard) ─────────────────────────────
+
+    def get_queue_heads(self) -> dict:
+        poller_head = self._query(
+            "SELECT id, poller_id, status, created_at FROM poller_job WHERE status IN ('queued','running') ORDER BY id ASC LIMIT 5"
+        )
+        refresh_head = self._query(
+            "SELECT id, mac, status, created_at FROM modem_refresh_request WHERE status IN ('queued','running') ORDER BY id ASC LIMIT 5"
+        )
+        return {"poller_jobs": poller_head, "refresh_requests": refresh_head}
 
 
 poller_service = PollerService()
