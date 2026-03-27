@@ -55,6 +55,17 @@ class PollerService:
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+    @staticmethod
+    def _normalize_mac(mac: str) -> str:
+        raw = (mac or "").strip().lower().replace("-", ":").replace(".", "")
+        # If MAC has no separators and is 12 hex chars, format as aa:bb:cc:dd:ee:ff
+        if ":" not in raw:
+            compact = "".join(ch for ch in raw if ch in "0123456789abcdef")
+            if len(compact) == 12:
+                return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
+            return compact
+        return raw
+
     def _rows(self, cur):
         return cur.fetchall()
 
@@ -103,6 +114,7 @@ class PollerService:
                 ofdm_enabled BOOLEAN NULL,
                 ofdma_enabled BOOLEAN NULL,
                 partial_service BOOLEAN NULL,
+                software_version VARCHAR(128) NULL,
                 first_seen_at DATETIME NOT NULL,
                 last_seen_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
@@ -181,6 +193,7 @@ class PollerService:
         )
         # Backward-compatible upgrades for already-existing tables.
         for ddl in [
+            "ALTER TABLE modem_inventory_current ADD COLUMN software_version VARCHAR(128) NULL",
             "ALTER TABLE scheduler_decision_log ADD COLUMN poller_id BIGINT NULL",
             "ALTER TABLE scheduler_decision_log ADD COLUMN poller_name VARCHAR(64) NULL",
             "ALTER TABLE scheduler_decision_log ADD COLUMN reason VARCHAR(64) NULL",
@@ -611,6 +624,7 @@ class PollerService:
                     1 if r.get("ofdm_enabled") else 0,
                     1 if r.get("ofdma_enabled") else 0,
                     1 if r.get("partial_service") else 0,
+                    r.get("software_version") or r.get("firmware") or None,
                     now,
                     now,
                     now,
@@ -622,8 +636,8 @@ class PollerService:
                     INSERT INTO modem_inventory_current
                                             (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
                                              upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
-                     first_seen_at, last_seen_at, updated_at, source_poller)
-                                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     software_version, first_seen_at, last_seen_at, updated_at, source_poller)
+                                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
                       ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
                                                 cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
@@ -631,7 +645,8 @@ class PollerService:
                                                 upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
                                                 ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
                       ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
-                      partial_service=VALUES(partial_service), last_seen_at=VALUES(last_seen_at),
+                      partial_service=VALUES(partial_service), software_version=VALUES(software_version),
+                      last_seen_at=VALUES(last_seen_at),
                       updated_at=VALUES(updated_at), source_poller=VALUES(source_poller)
                     """,
                     values,
@@ -666,6 +681,9 @@ class PollerService:
             "UPDATE poller_job SET status=%s, started_at=%s WHERE id=%s",
             ("running", self._now(), job_id),
         )
+        claimed = self._query("SELECT status FROM poller_job WHERE id=%s", (job_id,))
+        if not claimed or str((claimed[0] or {}).get("status") or "") != "running":
+            return
 
         rows_collected = 0
         modems_attempted = 0
@@ -813,12 +831,20 @@ class PollerService:
         return poller_id
 
     def enqueue_run(self, poller_id: int, source: Optional[str] = None) -> int:
+        active = self._query(
+            "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
+            (int(poller_id),),
+        )
+        if active:
+            return int((active[0] or {}).get("id") or 0)
+
         now = self._now()
         sql = (
             "INSERT INTO poller_job (poller_id, trigger_type, status, requested_by, request_payload, created_at) VALUES (%s,%s,%s,%s,%s,%s)"
         )
+        trigger = "scheduler" if (source or "api") == "scheduler" else "manual"
         payload = '{"source":"' + (source or "api") + '"}'
-        return int(self._execute(sql, (int(poller_id), "manual", "queued", source or "api", payload, now)) or 0)
+        return int(self._execute(sql, (int(poller_id), trigger, "queued", source or "api", payload, now)) or 0)
 
     def list_jobs(self, limit: int = 30) -> List[Dict[str, Any]]:
         lim = max(1, int(limit))
@@ -875,52 +901,70 @@ class PollerService:
         return dict(self._scheduler)
 
     def run_scheduler_once(self) -> int:
+        if self._scheduler.get("running"):
+            return 0
+
         self._scheduler["running"] = True
         tick_iso = datetime.now(timezone.utc).isoformat()
         tick_sql = self._now()
         self._scheduler["last_tick"] = tick_iso
         queued = 0
         decisions = []
-        pollers = self._query("SELECT id, name, enabled, interval_minutes FROM poller_setting ORDER BY id ASC")
-        for p in pollers:
-            pid = int(p.get("id") or 0)
-            if pid <= 0:
-                continue
-            pname = p.get("name") or f"poller-{pid}"
-
-            if int(p.get("enabled") or 0) != 1:
-                decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "disabled"})
-                continue
-
-            active = self._query(
-                "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') LIMIT 1",
-                (pid,),
+        try:
+            max_global_active = max(1, int(os.environ.get("DATA_STORE_MAX_ACTIVE_JOBS", "10")))
+            global_active_rows = self._query(
+                "SELECT COUNT(*) AS c FROM poller_job WHERE status IN ('queued','running')"
             )
-            if active:
-                decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "active_job_exists"})
-                continue
+            global_active = int((global_active_rows[0] or {}).get("c") or 0) if global_active_rows else 0
 
-            minutes = max(1, int(p.get("interval_minutes") or 1440))
-            due = self._query(
-                """
-                SELECT id FROM poller_job
-                WHERE poller_id=%s
-                  AND created_at >= (UTC_TIMESTAMP() - INTERVAL %s MINUTE)
-                LIMIT 1
-                """,
-                (pid, minutes),
-            )
-            if due:
-                decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "interval_not_due"})
-                continue
+            pollers = self._query("SELECT id, name, enabled, interval_minutes FROM poller_setting ORDER BY id ASC")
+            for p in pollers:
+                pid = int(p.get("id") or 0)
+                if pid <= 0:
+                    continue
+                pname = p.get("name") or f"poller-{pid}"
 
-            self.enqueue_run(pid, source="scheduler")
-            queued += 1
-            decisions.append({"poller_id": pid, "poller_name": pname, "decision": "queued", "reason": "ok"})
+                if int(p.get("enabled") or 0) != 1:
+                    decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "disabled"})
+                    continue
 
-        self._scheduler["decisions"] = decisions[:100]
-        self._log_scheduler_decisions(tick_sql, decisions)
-        self._scheduler["running"] = False
+                if global_active >= max_global_active:
+                    decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "global_active_limit"})
+                    continue
+
+                active = self._query(
+                    "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') LIMIT 1",
+                    (pid,),
+                )
+                if active:
+                    decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "active_job_exists"})
+                    continue
+
+                minutes = max(1, int(p.get("interval_minutes") or 1440))
+                due = self._query(
+                    """
+                    SELECT id FROM poller_job
+                    WHERE poller_id=%s
+                      AND created_at >= (UTC_TIMESTAMP() - INTERVAL %s MINUTE)
+                    LIMIT 1
+                    """,
+                    (pid, minutes),
+                )
+                if due:
+                    decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "interval_not_due"})
+                    continue
+
+                new_id = self.enqueue_run(pid, source="scheduler")
+                if new_id:
+                    queued += 1
+                    global_active += 1
+                    decisions.append({"poller_id": pid, "poller_name": pname, "decision": "queued", "reason": "ok"})
+                else:
+                    decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "enqueue_rejected"})
+        finally:
+            self._scheduler["decisions"] = decisions[:100]
+            self._log_scheduler_decisions(tick_sql, decisions)
+            self._scheduler["running"] = False
         return queued
 
     def snapshots_by_day(self, lookback_days: int = 14, limit: int = 300) -> List[Dict[str, Any]]:
@@ -1027,7 +1071,7 @@ class PollerService:
         marker = "%s"
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, updated_at "
+            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, software_version, updated_at "
             f"FROM modem_inventory_current{where_sql} ORDER BY cmts ASC, mac ASC LIMIT {marker}",
             tuple(params + [limit]),
         )
@@ -1038,7 +1082,7 @@ class PollerService:
         mac_norm = (mac_address or "").lower().replace(":", "").replace("-", "")
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, updated_at "
+            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, software_version, updated_at "
             f"FROM modem_inventory_current WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = {marker} LIMIT 1",
             (mac_norm,),
         )
@@ -1078,29 +1122,53 @@ class PollerService:
             "ofdm_enabled": _to_bool(row.get("ofdm_enabled")),
             "ofdma_enabled": _to_bool(row.get("ofdma_enabled")),
             "partial_service": _to_bool(row.get("partial_service")),
+            "software_version": row.get("software_version"),
             "updated_at": row.get("updated_at"),
         }
 
     # ── Modem refresh (on-demand single-modem enrichment) ──────────
 
     def enqueue_modem_refresh(self, mac: str, cmts: str | None = None, requested_by: str | None = None) -> int:
+        normalized_mac = self._normalize_mac(mac)
+        # Dedupe: if there's already a queued/running refresh for this modem, reuse it.
+        existing = self._query(
+            "SELECT id FROM modem_refresh_request "
+            "WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = LOWER(%s) "
+            "AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
+            (normalized_mac.replace(":", "").replace("-", ""),),
+        )
+        if existing:
+            return int((existing[0] or {}).get("id") or 0)
+
         now = self._now()
         return int(
             self._execute(
                 "INSERT INTO modem_refresh_request (mac, cmts, status, requested_by, created_at) VALUES (%s,%s,%s,%s,%s)",
-                (mac.lower().replace("-", ":"), cmts, "queued", requested_by or "api", now),
+                (normalized_mac, cmts, "queued", requested_by or "api", now),
             ) or 0
         )
 
     def get_refresh_status(self, mac: str) -> dict | None:
+        mac_norm = self._normalize_mac(mac).replace(":", "").replace("-", "")
         rows = self._query(
             "SELECT id, mac, cmts, status, error_text, created_at, started_at, finished_at "
-            "FROM modem_refresh_request WHERE LOWER(mac) = %s ORDER BY id DESC LIMIT 1",
-            (mac.lower().replace("-", ":"),),
+            "FROM modem_refresh_request "
+            "WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = LOWER(%s) "
+            "ORDER BY id DESC LIMIT 1",
+            (mac_norm,),
         )
         return rows[0] if rows else None
 
     def cancel_refresh_request(self, req_id: int) -> bool:
+        before = self._query(
+            "SELECT status FROM modem_refresh_request WHERE id=%s LIMIT 1",
+            (int(req_id),),
+        )
+        if not before:
+            return False
+        current_status = str((before[0] or {}).get("status") or "").lower()
+        if current_status not in {"queued", "running"}:
+            return False
         self._execute(
             "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s AND status IN ('queued','running')",
             ("cancelled", self._now(), int(req_id)),
@@ -1119,10 +1187,14 @@ class PollerService:
         mac = req["mac"]
         cmts = req.get("cmts")
 
+        # Claim only if still queued; if not, another worker/admin changed state.
         self._execute(
             "UPDATE modem_refresh_request SET status=%s, started_at=%s WHERE id=%s",
             ("running", self._now(), req_id),
         )
+        claimed = self._query("SELECT status FROM modem_refresh_request WHERE id=%s", (req_id,))
+        if not claimed or str((claimed[0] or {}).get("status") or "") != "running":
+            return
         try:
             base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
             community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
@@ -1139,12 +1211,39 @@ class PollerService:
             )
             r.raise_for_status()
             data = r.json() if r.content else {}
-            vendor = data.get("vendor") or data.get("VENDOR")
-            model = data.get("model") or data.get("MODEL") or data.get("hw_rev") or data.get("HW_REV")
-            if vendor or model:
+
+            # Extract sysDescr string and parse vendor/model/software
+            raw_descr = ""
+            results = data.get("results") or {}
+            sys_descr_obj = results.get("sysDescr")
+            if isinstance(sys_descr_obj, dict):
+                raw_descr = sys_descr_obj.get("raw") or sys_descr_obj.get("description") or str(sys_descr_obj)
+            elif isinstance(sys_descr_obj, str):
+                raw_descr = sys_descr_obj
+
+            vendor = None
+            model_name = None
+            software_ver = None
+
+            if raw_descr:
+                from pypnm.api.routes.cmts.service import CMTSModemService
+                parsed = CMTSModemService._parse_sys_descr(None, raw_descr)
+                vendor = parsed.get("vendor")
+                model_name = parsed.get("model")
+                software_ver = parsed.get("software")
+
+            # Fallback: try flat fields from response
+            if not vendor:
+                vendor = data.get("vendor") or data.get("VENDOR")
+            if not model_name:
+                model_name = data.get("model") or data.get("MODEL") or data.get("hw_rev") or data.get("HW_REV")
+            if not software_ver:
+                software_ver = data.get("software_version") or data.get("SW_REV")
+
+            if vendor or model_name or software_ver:
                 self._execute(
-                    "UPDATE modem_inventory_current SET vendor=%s, model=%s, updated_at=%s WHERE mac=%s",
-                    (vendor, model, self._now(), mac),
+                    "UPDATE modem_inventory_current SET vendor=%s, model=%s, software_version=%s, updated_at=%s WHERE mac=%s",
+                    (vendor, model_name, software_ver, self._now(), mac),
                 )
             self._execute(
                 "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s",
@@ -1171,15 +1270,26 @@ class PollerService:
         enriched_rows = self._query(
             f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}"
             + (" AND" if where else " WHERE")
-            + " COALESCE(vendor,'') <> '' AND COALESCE(model,'') <> ''",
+            + " LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('', 'unknown', 'n/a')"
+            + " AND ("
+            + " TRIM(COALESCE(software_version,'')) <> ''"
+            + " OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('', 'unknown', 'n/a')"
+            + " )",
             tuple(params),
         )
         enriched = int((enriched_rows[0] or {}).get("c") or 0) if enriched_rows else 0
 
-        # Check if any refresh requests are in progress
-        pending_rows = self._query(
-            "SELECT COUNT(*) AS c FROM modem_refresh_request WHERE status IN ('queued','running')"
-        )
+        # Check if any refresh requests are in progress (scoped to CMTS when provided)
+        if cmts:
+            pending_rows = self._query(
+                "SELECT COUNT(*) AS c FROM modem_refresh_request "
+                "WHERE status IN ('queued','running') AND LOWER(COALESCE(cmts,'')) = LOWER(%s)",
+                (cmts,),
+            )
+        else:
+            pending_rows = self._query(
+                "SELECT COUNT(*) AS c FROM modem_refresh_request WHERE status IN ('queued','running')"
+            )
         pending = int((pending_rows[0] or {}).get("c") or 0) if pending_rows else 0
 
         return {

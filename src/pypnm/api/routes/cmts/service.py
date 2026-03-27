@@ -180,22 +180,19 @@ class CMTSModemService:
             return {'success': False, 'error': 'No agents available',
                     'modems': [], 'count': 0}
 
-        # ── Check cache first ────────────────────────────────────────
+        # ── Tier 1: In-memory cache (Redis-like speed) ─────────────────
         if enrich and cmts_ip in _enrichment_cache:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
             cached_count = len(cached.get('modems', []))
             cached_req_limit = cached.get('requested_limit') or 0
-            # Cache satisfies the request if we have enough modems, OR if the
-            # walk was done with at least the same limit (meaning the CMTS
-            # simply doesn't have that many modems — all of them are cached).
             cache_sufficient = (
                 not limit
                 or cached_count >= int(limit)
                 or (cached_req_limit and cached_req_limit >= int(limit))
             )
-            
-            if cached.get('enriched') and age < 7200 and cache_sufficient:  # enriched data valid for 2 hours
+
+            if cached.get('enriched') and age < 7200 and cache_sufficient:
                 self.logger.info(f"Returning cached enriched data for {cmts_ip} (age={age:.0f}s)")
                 return {
                     'success': True,
@@ -206,9 +203,8 @@ class CMTSModemService:
                     'enriching': False,
                     'cached': True,
                 }
-            
-            if cached.get('enriching') and age < 1800 and cache_sufficient:  # enrichment still in progress (30 min max)
-                # Return whatever we have so far (base modems) with enriching=True
+
+            if cached.get('enriching') and age < 1800 and cache_sufficient:
                 self.logger.info(f"Enrichment in progress for {cmts_ip} (age={age:.0f}s)")
                 return {
                     'success': True,
@@ -221,7 +217,96 @@ class CMTSModemService:
                     'cached': True,
                     'enrich_progress': cached.get('enrich_progress', {'completed': 0, 'total': 0}),
                 }
-        
+
+        # ── Tier 2: MySQL inventory (survives restarts) ──────────────
+        try:
+            from pypnm.api.routes.poller.service import poller_service
+            inv_modems = poller_service.list_inventory_modems(
+                cmts=cmts_ip, limit=limit,
+            )
+            if inv_modems:
+                # Check freshness: oldest updated_at within 2 hours
+                from datetime import datetime, timezone as tz
+                timestamps = []
+                for m in inv_modems:
+                    ts = m.get('updated_at') or m.get('last_seen_at')
+                    if ts:
+                        try:
+                            if isinstance(ts, str):
+                                dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+                            else:
+                                dt = ts
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=tz.utc)
+                            timestamps.append(dt)
+                        except Exception:
+                            pass
+                if timestamps:
+                    oldest = min(timestamps)
+                    age_s = (datetime.now(tz.utc) - oldest).total_seconds()
+                else:
+                    age_s = float('inf')
+
+                is_fresh = age_s < 7200
+                sample = inv_modems[:200]
+                enriched_count = sum(
+                    1 for m in sample
+                    if (m.get('vendor') or '').strip().lower() not in ('', 'unknown')
+                    and (m.get('software_version') or m.get('model') or '').strip()
+                )
+                is_enriched = (enriched_count / max(len(sample), 1)) >= 0.40
+
+                # Non-enrich requests can use any fresh inventory snapshot.
+                if is_fresh and not enrich:
+                    self.logger.info(
+                        f"Returning {len(inv_modems)} modems for {cmts_ip} "
+                        f"from MySQL inventory (age={age_s:.0f}s, non-enrich request)"
+                    )
+                    return {
+                        'success': True,
+                        'modems': inv_modems,
+                        'count': len(inv_modems),
+                        'cmts_ip': cmts_ip,
+                        'enriched': False,
+                        'enriching': False,
+                        'cached': True,
+                        'source': 'mysql-inventory',
+                    }
+
+                # Enrich requests require quality threshold from inventory.
+                if is_fresh and enrich and is_enriched:
+                    self.logger.info(
+                        f"Returning {len(inv_modems)} modems for {cmts_ip} "
+                        f"from MySQL inventory (age={age_s:.0f}s, enriched)"
+                    )
+                    # Warm the in-memory cache so next hit is Tier 1
+                    _enrichment_cache[cmts_ip] = {
+                        'modems': inv_modems,
+                        'enriched': True,
+                        'enriching': False,
+                        'timestamp': time.time(),
+                        'requested_limit': limit,
+                    }
+                    return {
+                        'success': True,
+                        'modems': inv_modems,
+                        'count': len(inv_modems),
+                        'cmts_ip': cmts_ip,
+                        'enriched': True,
+                        'enriching': False,
+                        'cached': True,
+                        'source': 'mysql-inventory',
+                    }
+
+                if is_fresh and enrich and not is_enriched:
+                    self.logger.info(
+                        f"MySQL inventory for {cmts_ip} is fresh but not enriched "
+                        f"({enriched_count}/{len(sample)}) — falling through to SNMP"
+                    )
+        except Exception as exc:
+            self.logger.warning(f"MySQL inventory lookup skipped for {cmts_ip}: {exc}")
+
+        # ── Tier 3: Live SNMP walk (slow, last resort) ───────────────
         try:
             # ── Step 1: Parallel SNMP walks via agent ────────────────────
             walk_oids = [
@@ -341,6 +426,14 @@ class CMTSModemService:
             }
             enriched_count = sum(1 for m in modems if m.get('model'))
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
+
+            # Persist to MySQL so Tier 2 survives container restarts
+            try:
+                from pypnm.api.routes.poller.service import poller_service
+                written = poller_service._upsert_inventory_rows(modems, source_poller='live-enrich')
+                self.logger.info(f"Wrote {written} enriched modems to MySQL inventory for {cmts_ip}")
+            except Exception as db_exc:
+                self.logger.warning(f"MySQL inventory write-back failed for {cmts_ip}: {db_exc}")
         except Exception as e:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
             # Stop retry loops and keep partial data.
