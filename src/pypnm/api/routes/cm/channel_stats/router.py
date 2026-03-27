@@ -274,6 +274,21 @@ class ChannelStatsRouter:
                             )
                         except Exception as e:
                             self.logger.debug(f"Fiber node pre-task failed: {e}")
+                    else:
+                        # No cached cm_index — send MAC table walk to resolve it
+                        # in parallel with modem walks (avoids 30s fallback later)
+                        try:
+                            cmts_cmindex_task_id = await agent_manager.send_task(
+                                cmts_agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=cmts_task_timeout,
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"cm_index pre-task failed: {e}")
 
                 if request.cmts_ip and request.cmts_stats and cmts_agent_id:
                     try:
@@ -318,15 +333,8 @@ class ChannelStatsRouter:
                                 },
                                 timeout=cmts_task_timeout,
                             )
-                            cmts_cmindex_task_id = await agent_manager.send_task(
-                                cmts_agent_id, "snmp_walk",
-                                {
-                                    "target_ip": request.cmts_ip,
-                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
-                                    "community": request.cmts_community or "public",
-                                },
-                                timeout=cmts_task_timeout,
-                            )
+                            # cmts_cmindex_task_id already dispatched in the
+                            # outer block above; reuse it, don't send again.
                             cmts_profile_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_walk",
                                 {
