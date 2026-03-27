@@ -1246,7 +1246,17 @@ class PollerService:
             # Call sysDescr endpoint
             r = requests.post(
                 f"{base}/system/sysDescr",
-                json={"ip_address": modem_ip, "community": community},
+                json={
+                    "cable_modem": {
+                        "mac_address": mac,
+                        "ip_address": modem_ip,
+                        "snmp": {
+                            "snmp_v2c": {
+                                "community": community,
+                            }
+                        },
+                    }
+                },
                 timeout=30,
             )
             r.raise_for_status()
