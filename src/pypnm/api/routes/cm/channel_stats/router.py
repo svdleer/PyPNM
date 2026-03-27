@@ -216,7 +216,11 @@ class ChannelStatsRouter:
                             error="SNMP not responding on modem"
                         )
                 
-                # Send modem parallel walk task
+                # Send modem parallel walk task.
+                # Cable modems have few rows per table (<50), so use small
+                # max_repetitions (25 vs agent default 500) and short PDU
+                # timeout (3s) to avoid bloated GetBulk requests that stall
+                # the modem's SNMP agent.
                 task_id = await agent_manager.send_task(
                     cm_agent_id,
                     "snmp_parallel_walk",
@@ -224,7 +228,8 @@ class ChannelStatsRouter:
                         "ip": request.modem_ip,
                         "oids": table_oids,
                         "community": request.community,
-                        "timeout": 10
+                        "timeout": 3,
+                        "max_repetitions": 25,
                     },
                     timeout=90.0
                 )
@@ -391,8 +396,9 @@ class ChannelStatsRouter:
                     except Exception as e:
                         self.logger.warning(f"Failed to send CMTS OFDMA task: {e}")
 
-                # Wait for modem walk result
-                result = await agent_manager.wait_for_task_async(task_id, timeout=40.0)
+                # Wait for modem walk result (13 OIDs walked sequentially;
+                # typical: 2-4s each = 30-50s total)
+                result = await agent_manager.wait_for_task_async(task_id, timeout=90.0)
 
                 if not result:
                     return ChannelStatsResponse(
