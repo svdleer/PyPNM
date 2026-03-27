@@ -253,6 +253,11 @@ class PollerService:
                 logger.warning("Poller timeout sweep failed: %s", exc)
 
             try:
+                self._timeout_stale_refresh_requests()
+            except Exception as exc:
+                logger.warning("Refresh timeout sweep failed: %s", exc)
+
+            try:
                 self._process_one_job()
             except Exception as exc:
                 logger.warning("Poller queue worker failed: %s", exc)
@@ -295,6 +300,20 @@ class PollerService:
                 j.error_text=CONCAT('Timed out after ', COALESCE(NULLIF(p.max_runtime_sec, 0), %s), 's')
             WHERE j.status='running' AND j.started_at IS NOT NULL
               AND TIMESTAMPDIFF(SECOND, j.started_at, UTC_TIMESTAMP()) > COALESCE(NULLIF(p.max_runtime_sec, 0), %s)
+            """,
+            ("timed_out", self._now(), max_runtime, max_runtime),
+        )
+
+    def _timeout_stale_refresh_requests(self) -> None:
+        max_runtime = max(30, int(os.environ.get("DATA_STORE_REFRESH_MAX_RUNTIME_SEC", "300")))
+        self._execute(
+            """
+            UPDATE modem_refresh_request
+            SET status=%s,
+                finished_at=%s,
+                error_text=CONCAT('Timed out after ', %s, 's')
+            WHERE status='running' AND started_at IS NOT NULL
+              AND TIMESTAMPDIFF(SECOND, started_at, UTC_TIMESTAMP()) > %s
             """,
             ("timed_out", self._now(), max_runtime, max_runtime),
         )
