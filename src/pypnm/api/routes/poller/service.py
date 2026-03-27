@@ -1251,8 +1251,8 @@ class PollerService:
         )
         return True
 
-    def _resolve_modem_ip_from_cmts(self, mac: str, cmts_name: str | None, base: str) -> str | None:
-        """Fallback: if modem not in inventory, do a live CMTS walk to find its IP and upsert."""
+    def _resolve_modem_from_cmts(self, mac: str, cmts_name: str | None, base: str) -> Dict[str, Any] | None:
+        """Fallback: do a live CMTS walk to find modem row and upsert inventory."""
         if not cmts_name:
             return None
         # Resolve CMTS IP: look up any row for this CMTS name in inventory
@@ -1263,11 +1263,18 @@ class PollerService:
         cmts_ip = (rows[0] or {}).get("cmts_ip") if rows else None
         if not cmts_ip:
             return None
-        community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
+        cmts_community = os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public"
+        modem_community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
         try:
             r = requests.get(
                 f"{base}/cmts/modems",
-                params={"cmts_ip": cmts_ip, "community": community, "enrich": "false"},
+                params={
+                    "cmts_ip": cmts_ip,
+                    "community": cmts_community,
+                    "modem_community": modem_community,
+                    "enrich": "false",
+                    "limit": 10000,
+                },
                 timeout=120,
                 verify=False,
             )
@@ -1291,12 +1298,20 @@ class PollerService:
                                 "docsis_version", "upstream_interface", "upstream_ifindex",
                                 "ofdma_ifindex", "ofdma_rf_port_ifindex",
                                 "ofdm_enabled", "ofdma_enabled", "partial_service",
+                                "firmware", "software_version", "vendor", "model",
                             )},
                         }], source_poller="refresh-fallback")
-                    return found_ip
+                    out = dict(m)
+                    out["cmts_ip"] = cmts_ip
+                    out["cmts"] = cmts_name
+                    return out
         except Exception as exc:
             logger.warning("Live CMTS walk fallback for %s failed: %s", mac, exc)
         return None
+
+    def _resolve_modem_ip_from_cmts(self, mac: str, cmts_name: str | None, base: str) -> str | None:
+        modem = self._resolve_modem_from_cmts(mac, cmts_name, base)
+        return (modem or {}).get("ip_address")
 
     def _process_refresh_queue(self) -> None:
         """Process one queued modem refresh request."""
@@ -1323,9 +1338,11 @@ class PollerService:
             community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
             # Look up modem IP from inventory; if missing, do a live CMTS walk fallback
             modem = self.get_inventory_modem_by_mac(mac)
+            cmts_fallback_modem = None
             modem_ip = (modem or {}).get("ip_address")
             if not modem_ip:
-                modem_ip = self._resolve_modem_ip_from_cmts(mac, cmts, base)
+                cmts_fallback_modem = self._resolve_modem_from_cmts(mac, cmts, base)
+                modem_ip = (cmts_fallback_modem or {}).get("ip_address")
                 if not modem_ip:
                     raise ValueError(f"Modem {mac} not in inventory and not found via live CMTS walk")
             # Call sysDescr endpoint
@@ -1374,6 +1391,27 @@ class PollerService:
                 model_name = data.get("model") or data.get("MODEL") or data.get("hw_rev") or data.get("HW_REV")
             if not software_ver:
                 software_ver = data.get("software_version") or data.get("SW_REV")
+
+            # Fallback: nested sysDescr object fields from System API
+            if isinstance(sys_descr_obj, dict):
+                if not vendor:
+                    vendor = sys_descr_obj.get("vendor") or sys_descr_obj.get("VENDOR")
+                if not model_name:
+                    model_name = sys_descr_obj.get("model") or sys_descr_obj.get("MODEL") or sys_descr_obj.get("hw_rev")
+                if not software_ver:
+                    software_ver = sys_descr_obj.get("sw_rev") or sys_descr_obj.get("SW_REV") or sys_descr_obj.get("software")
+
+            # Final fallback: values from CMTS walk row (often includes firmware)
+            if (not vendor or not model_name or not software_ver) and cmts:
+                if not cmts_fallback_modem:
+                    cmts_fallback_modem = self._resolve_modem_from_cmts(mac, cmts, base)
+                if isinstance(cmts_fallback_modem, dict):
+                    if not vendor:
+                        vendor = cmts_fallback_modem.get("vendor")
+                    if not model_name:
+                        model_name = cmts_fallback_modem.get("model")
+                    if not software_ver:
+                        software_ver = cmts_fallback_modem.get("software_version") or cmts_fallback_modem.get("firmware")
 
             if vendor or model_name or software_ver:
                 self._execute(
