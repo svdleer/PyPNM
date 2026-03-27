@@ -424,6 +424,36 @@ class ChannelStatsRouter:
 
                 raw_results = agent_result.get("results", {})
 
+                # Log per-OID walk durations returned by the agent (if available)
+                walk_durations = agent_result.get("walk_durations", {})
+                if walk_durations:
+                    # Build human-readable OID name mapping
+                    oid_names = {v: k for k, v in {
+                        'DownCh': '1.3.6.1.2.1.10.127.1.1.1',
+                        'SigQ': '1.3.6.1.2.1.10.127.1.1.4',
+                        'RxMER': '1.3.6.1.4.1.4491.2.1.20.1.24',
+                        'DsOFDM': '1.3.6.1.4.1.4491.2.1.28.1.9',
+                        'DsOFDMPow': '1.3.6.1.4.1.4491.2.1.28.1.11',
+                        'RxChStat': '1.3.6.1.4.1.4491.2.1.28.1.2',
+                        'DsOFDMProf': '1.3.6.1.4.1.4491.2.1.28.1.10',
+                        'UpCh': '1.3.6.1.2.1.10.127.1.1.2',
+                        'UsStatus': '1.3.6.1.4.1.4491.2.1.20.1.2',
+                        'UsOFDMA': '1.3.6.1.4.1.4491.2.1.28.1.13',
+                        'UsOFDMAStat': '1.3.6.1.4.1.4491.2.1.28.1.12',
+                        'UsOFDMAProf': '1.3.6.1.4.1.4491.2.1.28.1.14',
+                        'PnmRxMer': '1.3.6.1.4.1.4491.2.1.27.1.2.5',
+                    }.items()}
+                    dur_parts = sorted(walk_durations.items(), key=lambda x: -x[1])
+                    dur_str = ' | '.join(
+                        f"{oid_names.get(oid, oid.split('.')[-1])}={dur}s({len(raw_results.get(oid, []))})"
+                        for oid, dur in dur_parts
+                    )
+                    total_walk = sum(walk_durations.values())
+                    self.logger.info(
+                        f"Per-OID walk durations for {request.modem_ip}: "
+                        f"total={total_walk:.1f}s | {dur_str}"
+                    )
+
                 if request.experimental_compact_walk:
                     # Convert compact-root walk output into parser's canonical
                     # per-table result map: {table_oid: [entries...]}
@@ -721,6 +751,9 @@ class ChannelStatsRouter:
                     )
 
                 if parsed.get("success"):
+                    timing = parsed.get("timing", {})
+                    if walk_durations:
+                        timing["walk_durations"] = walk_durations
                     return ChannelStatsResponse(
                         success=True,
                         status=0,
@@ -728,7 +761,7 @@ class ChannelStatsRouter:
                         modem_ip=parsed.get("modem_ip"),
                         fiber_node=fiber_node,
                         timestamp=parsed.get("timestamp"),
-                        timing=parsed.get("timing"),
+                        timing=timing,
                         downstream=parsed.get("downstream"),
                         upstream=parsed.get("upstream"),
                         ofdm_stats=ofdm_stats,
