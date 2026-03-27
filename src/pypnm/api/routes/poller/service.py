@@ -564,7 +564,7 @@ class PollerService:
         # Final fallback: use all appdb targets if scope parse failed/empty.
         return all_from_appdb
 
-    def _fetch_cmts_modems(self, cmts_ip: str) -> List[Dict[str, Any]]:
+    def _fetch_cmts_modems(self, cmts_ip: str, timeout_sec: int = 300) -> List[Dict[str, Any]]:
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
         params = {
             "cmts_ip": cmts_ip,
@@ -573,16 +573,14 @@ class PollerService:
             "enrich": "true",
             "modem_community": os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private",
         }
-        try:
-            r = requests.get(f"{base}/cmts/modems", params=params, timeout=120, verify=False)
-            r.raise_for_status()
-            payload = r.json() if r.content else {}
-            if isinstance(payload, dict) and payload.get("success"):
-                modems = payload.get("modems") or []
-                return modems if isinstance(modems, list) else []
-            return []
-        except Exception:
-            return []
+        request_timeout = max(30, int(timeout_sec or 300))
+        r = requests.get(f"{base}/cmts/modems", params=params, timeout=request_timeout, verify=False)
+        r.raise_for_status()
+        payload = r.json() if r.content else {}
+        if isinstance(payload, dict) and payload.get("success"):
+            modems = payload.get("modems") or []
+            return modems if isinstance(modems, list) else []
+        raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {payload}")
 
     def _upsert_inventory_rows(self, rows: List[Dict[str, Any]], source_poller: Optional[str]) -> int:
         if not rows:
@@ -720,9 +718,12 @@ class PollerService:
                 )
                 targets = self._cmts_targets_for_poller(poller)
                 total_targets = len(targets)
+                start_offset = max(0, int(poller.get("last_target_offset") or 0))
+                subtask_timeout_sec = max(30, int(os.environ.get("DATA_STORE_SUBTASK_TIMEOUT_SEC", "300")))
+                subtask_retries = max(0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1")))
                 self._update_running_job_progress(
                     job_id,
-                    f"Resolved {total_targets} CMTS target(s)",
+                    f"Resolved {total_targets} CMTS target(s) (resume offset={start_offset})",
                     rows_collected=0,
                     modems_attempted=0,
                     modems_succeeded=0,
@@ -731,6 +732,9 @@ class PollerService:
                 if total_targets == 0:
                     error_text = "No CMTS targets resolved (check scope/appdb config)"
                 for idx, t in enumerate(targets, start=1):
+                    if idx <= start_offset:
+                        continue
+
                     status_rows = self._query(
                         "SELECT status FROM poller_job WHERE id=%s",
                         (job_id,),
@@ -754,7 +758,31 @@ class PollerService:
                         modems_succeeded=modems_succeeded,
                         modems_failed=modems_failed,
                     )
-                    modems = self._fetch_cmts_modems(cmts_ip)
+                    modems = None
+                    last_target_error = None
+                    for attempt in range(subtask_retries + 1):
+                        try:
+                            modems = self._fetch_cmts_modems(cmts_ip, timeout_sec=subtask_timeout_sec)
+                            break
+                        except Exception as exc:
+                            last_target_error = exc
+                            self._update_running_job_progress(
+                                job_id,
+                                f"CMTS {idx}/{total_targets}: {cmts_name} attempt {attempt + 1}/{subtask_retries + 1} failed ({exc})",
+                                rows_collected=rows_collected,
+                                modems_attempted=modems_attempted,
+                                modems_succeeded=modems_succeeded,
+                                modems_failed=modems_failed,
+                            )
+                    if modems is None:
+                        self._execute(
+                            "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
+                            (idx - 1, self._now(), poller_id),
+                        )
+                        error_text = f"Subtask timeout/failure at CMTS {idx}/{total_targets} ({cmts_name}): {last_target_error}"
+                        modems_failed = max(modems_failed, 1)
+                        break
+
                     modems_attempted += len(modems)
                     for m in modems:
                         m["cmts"] = cmts_name
@@ -765,9 +793,13 @@ class PollerService:
                     rows_collected += written
                     modems_succeeded += len(modems)
                     all_rows.extend(modems)
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
+                        (idx, self._now(), poller_id),
+                    )
                     self._update_running_job_progress(
                         job_id,
-                        f"CMTS {idx}/{total_targets}: {cmts_name} done ({len(modems)} modems)",
+                        f"CMTS {idx}/{total_targets}: {cmts_name} done ({len(modems)} modems) [checkpoint={idx}]",
                         rows_collected=rows_collected,
                         modems_attempted=modems_attempted,
                         modems_succeeded=modems_succeeded,
@@ -779,6 +811,12 @@ class PollerService:
                 except Exception:
                     pass
 
+                if not error_text:
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
+                        (0, self._now(), poller_id),
+                    )
+
         except Exception as exc:
             error_text = str(exc)
             modems_failed = max(modems_failed, 1)
@@ -787,6 +825,8 @@ class PollerService:
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
             ("done" if not error_text else "failed", self._now(), int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), error_text, job_id),
         )
+        if error_text and 'Subtask timeout/failure' in str(error_text):
+            self.enqueue_run(poller_id, source="resume")
 
     def _update_running_job_progress(
         self,
