@@ -567,7 +567,8 @@ class ChannelStatsRouter:
                         self.logger.info(
                             f'cm_index resolution: success={cmidx_success}, '
                             f'entries={len(cmidx_entries)}, '
-                            f'result_keys={list(cmidx_result.keys()) if isinstance(cmidx_result, dict) else "not-dict"}'
+                            f'result_keys={list(cmidx_result.keys()) if isinstance(cmidx_result, dict) else "not-dict"}, '
+                            f'error={cmidx_result.get("result", {}).get("error", "none") if isinstance(cmidx_result, dict) else "N/A"}'
                         )
                         if cmidx_success:
                             mac_clean = request.mac_address.replace(':', '').replace('-', '').lower()
