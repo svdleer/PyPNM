@@ -562,20 +562,38 @@ class ChannelStatsRouter:
                 if cmts_cmindex_result and cm_index is None and request.mac_address:
                     try:
                         cmidx_result = cmts_cmindex_result
-                        if cmidx_result and cmidx_result.get('result', {}).get('success'):
-                            mac_clean = request.mac_address.replace(':', '').lower()
-                            for entry in cmidx_result.get('result', {}).get('results', []):
+                        cmidx_success = cmidx_result.get('result', {}).get('success')
+                        cmidx_entries = cmidx_result.get('result', {}).get('results', [])
+                        self.logger.info(
+                            f'cm_index resolution: success={cmidx_success}, '
+                            f'entries={len(cmidx_entries)}, '
+                            f'result_keys={list(cmidx_result.keys()) if isinstance(cmidx_result, dict) else "not-dict"}'
+                        )
+                        if cmidx_success:
+                            mac_clean = request.mac_address.replace(':', '').replace('-', '').lower()
+                            # Also try with 0x prefix stripped
+                            found = False
+                            for entry in cmidx_entries:
                                 val = entry.get('value', '')
                                 if isinstance(val, str):
-                                    entry_mac = val.replace(' ', '').replace(':', '').lower()
+                                    # Strip 0x prefix, spaces, colons, dashes
+                                    entry_mac = val.replace('0x', '').replace(' ', '').replace(':', '').replace('-', '').lower()
                                     if entry_mac == mac_clean:
                                         oid = entry.get('oid', '')
                                         suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
                                         try:
                                             cm_index = int(suffix.strip('.'))
+                                            found = True
                                         except ValueError:
                                             pass
                                         break
+                            if not found and cmidx_entries:
+                                # Log first few entry formats to debug MAC matching
+                                samples = [e.get('value', '')[:30] for e in cmidx_entries[:3]]
+                                self.logger.warning(
+                                    f'cm_index MAC not found. Looking for {mac_clean}, '
+                                    f'sample values: {samples}'
+                                )
                         if cm_index is not None:
                             self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
                             _set_cached_cm_index(request.cmts_ip, request.mac_address, cm_index)
