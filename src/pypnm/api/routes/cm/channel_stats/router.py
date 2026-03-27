@@ -275,19 +275,17 @@ class ChannelStatsRouter:
                         except Exception as e:
                             self.logger.debug(f"Fiber node pre-task failed: {e}")
                     else:
-                        # No cached cm_index — send IPv4 table walk to resolve it
-                        # in parallel with modem walks (avoids 30s fallback later).
-                        # Use docsIf3CmtsCmRegStatusIPv4Addr (.1.5) — the MAC column
-                        # (.1.2) times out on some CMTS, but .1.5 reliably responds.
+                        # No cached cm_index — send MAC table walk to resolve it
+                        # in parallel with modem walks (avoids 30s fallback later)
                         try:
                             cmts_cmindex_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_walk",
                                 {
                                     "target_ip": request.cmts_ip,
-                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.5',  # docsIf3CmtsCmRegStatusIPv4Addr
+                                    "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
                                     "community": request.cmts_community or "public",
                                 },
-                                timeout=60.0,  # Large table (9000+ modems), needs >30s
+                                timeout=cmts_task_timeout,
                             )
                         except Exception as e:
                             self.logger.debug(f"cm_index pre-task failed: {e}")
@@ -561,37 +559,23 @@ class ChannelStatsRouter:
                 # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
                 # First: resolve cm_index (needed for both rxmer and fiber node)
                 cm_index = cached_cm_index
-                if cmts_cmindex_result and cm_index is None and request.modem_ip:
+                if cmts_cmindex_result and cm_index is None and request.mac_address:
                     try:
                         cmidx_result = cmts_cmindex_result
-                        cmidx_success = cmidx_result.get('result', {}).get('success')
-                        cmidx_entries = cmidx_result.get('result', {}).get('results', [])
-                        self.logger.info(
-                            f'cm_index resolution: success={cmidx_success}, '
-                            f'entries={len(cmidx_entries)}, '
-                            f'error={cmidx_result.get("result", {}).get("error", "none") if isinstance(cmidx_result, dict) else "N/A"}'
-                        )
-                        if cmidx_success:
-                            # Match by IPv4 address (walked docsIf3CmtsCmRegStatusIPv4Addr .1.5)
-                            modem_ip = request.modem_ip.strip()
-                            found = False
-                            for entry in cmidx_entries:
-                                val = str(entry.get('value', '')).strip()
-                                if val == modem_ip:
-                                    oid = entry.get('oid', '')
-                                    suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.5.')[-1]
-                                    try:
-                                        cm_index = int(suffix.strip('.'))
-                                        found = True
-                                    except ValueError:
-                                        pass
-                                    break
-                            if not found and cmidx_entries:
-                                samples = [e.get('value', '')[:30] for e in cmidx_entries[:3]]
-                                self.logger.warning(
-                                    f'cm_index IP not found. Looking for {modem_ip}, '
-                                    f'sample values: {samples}'
-                                )
+                        if cmidx_result and cmidx_result.get('result', {}).get('success'):
+                            mac_clean = request.mac_address.replace(':', '').lower()
+                            for entry in cmidx_result.get('result', {}).get('results', []):
+                                val = entry.get('value', '')
+                                if isinstance(val, str):
+                                    entry_mac = val.replace(' ', '').replace(':', '').lower()
+                                    if entry_mac == mac_clean:
+                                        oid = entry.get('oid', '')
+                                        suffix = oid.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.2.')[-1]
+                                        try:
+                                            cm_index = int(suffix.strip('.'))
+                                        except ValueError:
+                                            pass
+                                        break
                         if cm_index is not None:
                             self.logger.info(f'Resolved cm_index={cm_index} for MAC {request.mac_address}')
                             _set_cached_cm_index(request.cmts_ip, request.mac_address, cm_index)
@@ -758,7 +742,6 @@ class ChannelStatsRouter:
                                     agent_manager, cmts_agent_id, request.cmts_ip,
                                     request.mac_address, request.cmts_community or "public",
                                     walk_timeout=cmts_task_timeout,
-                                    modem_ip=request.modem_ip,
                                 )
                     except Exception as fn_err:
                         self.logger.debug(f'Fiber node lookup failed: {fn_err}')
@@ -813,37 +796,44 @@ class ChannelStatsRouter:
     
     async def _get_fiber_node_from_cmts(
         self, agent_manager, agent_id: str, cmts_ip: str, 
-        mac_address: str, community: str, walk_timeout: float = 30.0,
-        modem_ip: str | None = None,
+        mac_address: str, community: str, walk_timeout: float = 30.0
     ) -> str:
         """Lookup fiber node from CMTS using agent SNMP commands."""
         try:
             self.logger.info(f"Looking up fiber node for {mac_address} on CMTS {cmts_ip}")
             
-            # Walk docsIf3CmtsCmRegStatusIPv4Addr to find cm_index by IP.
-            # The MAC column (.1.2) times out on some CMTS; .1.5 (IPv4) is reliable.
-            oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.5'  # docsIf3CmtsCmRegStatusIPv4Addr
+            # Normalize MAC address to match CMTS format (shortened, colons)
+            # CMTS stores MACs like 44:5:3f:d4:19:15 (no leading zeros in bytes)
+            mac_normalized_parts = []
+            mac_clean = mac_address.replace(':', '').replace('-', '').replace('.', '').lower()
+            for i in range(0, len(mac_clean), 2):
+                byte = mac_clean[i:i+2]
+                # Convert to hex without leading zero: '05' -> '5', '0f' -> 'f'
+                mac_normalized_parts.append(f"{int(byte, 16):x}")
+            mac_normalized = ':'.join(mac_normalized_parts)
+            self.logger.info(f"Normalized MAC: {mac_address} -> {mac_normalized}")
+            
+            # Walk docsIfCmtsCmStatusMacAddress table to find CM index
+            oid = '1.3.6.1.2.1.10.127.1.3.3.1.2'  # docsIfCmtsCmStatusMacAddress
             task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=walk_timeout)
             result = await agent_manager.wait_for_task_async(task_id, timeout=walk_timeout)
             
             if not result or not result.get("result", {}).get("success"):
-                self.logger.warning(f"Failed to walk CM IPv4 table on CMTS {cmts_ip}")
+                self.logger.warning(f"Failed to walk CM status table on CMTS {cmts_ip}")
                 return None
             
-            # Find CM index by matching IP address
+            # Find CM index by matching MAC address
             cm_index = None
             results = result.get("result", {}).get("results", [])
-            target_ip = (modem_ip or "").strip()
             for entry in results:
-                val = str(entry.get("value", "")).strip()
-                if val == target_ip:
-                    oid_str = entry.get("oid", "")
-                    suffix = oid_str.split('1.3.6.1.4.1.4491.2.1.20.1.3.1.5.')[-1]
-                    try:
-                        cm_index = suffix.strip('.')
-                    except (ValueError, IndexError):
-                        pass
-                    break
+                cmts_mac = entry.get("value", "")
+                cmts_mac_parts = cmts_mac.split(':')
+                cmts_mac_normalized = ':'.join([f"{int(b, 16):x}" if b else '0' for b in cmts_mac_parts])
+                if cmts_mac_normalized.lower() == mac_normalized.lower():
+                    oid_parts = entry.get("oid", "").split(".")
+                    if oid_parts:
+                        cm_index = oid_parts[-1]
+                        break
             
             if not cm_index:
                 self.logger.warning(f"MAC {mac_address} not found in CMTS table")
