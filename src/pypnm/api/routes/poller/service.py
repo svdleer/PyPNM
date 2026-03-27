@@ -1029,50 +1029,55 @@ class PollerService:
     def snapshots_by_day(self, lookback_days: int = 14, limit: int = 300) -> List[Dict[str, Any]]:
         capped_days = max(1, int(lookback_days))
         capped_limit = max(1, int(limit))
-        max_rows = min(capped_days, capped_limit)
-        rows = []
-
         raw = self._query(
             """
-            SELECT DATE(collected_at) AS d, COUNT(*) AS snapshot_count
-            FROM modem_rf_snapshot
-            WHERE collected_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)
-            GROUP BY DATE(collected_at)
-            ORDER BY d DESC
+            SELECT
+                DATE(COALESCE(j.finished_at, j.started_at, j.created_at)) AS day,
+                COALESCE(NULLIF(p.name, ''), CONCAT('poller-', j.poller_id)) AS poller_name,
+                SUM(GREATEST(COALESCE(j.rows_collected, 0), 0)) AS snapshots
+            FROM poller_job j
+            LEFT JOIN poller_setting p ON p.id = j.poller_id
+            WHERE COALESCE(j.finished_at, j.started_at, j.created_at) >= (UTC_TIMESTAMP() - INTERVAL %s DAY)
+              AND j.status IN ('running', 'done', 'failed', 'timed_out', 'cancelled', 'completed')
+            GROUP BY DATE(COALESCE(j.finished_at, j.started_at, j.created_at)), COALESCE(NULLIF(p.name, ''), CONCAT('poller-', j.poller_id))
+            ORDER BY day DESC, snapshots DESC
             LIMIT %s
             """,
-            (capped_days, max_rows),
+            (capped_days, capped_limit),
         )
-        for idx, r in enumerate(raw):
-            rows.append({"day_offset": idx, "snapshot_count": int(r.get("snapshot_count") or 0)})
-        return rows
-
-        raw = self._query(
-            """
-            SELECT DATE(collected_at) AS d, COUNT(*) AS snapshot_count
-            FROM modem_rf_snapshot
-            WHERE collected_at >= datetime('now', ?)
-            GROUP BY DATE(collected_at)
-            ORDER BY d DESC
-            LIMIT ?
-            """,
-            (f"-{capped_days} day", max_rows),
-        )
-        for idx, r in enumerate(raw):
-            rows.append({"day_offset": idx, "snapshot_count": int(r.get("snapshot_count") or 0)})
+        rows: List[Dict[str, Any]] = []
+        for r in raw:
+            rows.append(
+                {
+                    "day": str(r.get("day") or ""),
+                    "poller_name": str(r.get("poller_name") or "unknown"),
+                    "snapshots": int(r.get("snapshots") or 0),
+                }
+            )
         return rows
 
     def snapshots_analytics(self, lookback_days: int = 14) -> Dict[str, Any]:
         days = max(1, int(lookback_days))
-        raw = self._query(
-            "SELECT COUNT(*) AS c FROM modem_rf_snapshot WHERE collected_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)",
-            (days,),
-        )
-        total = int((raw[0] or {}).get("c") or 0) if raw else 0
+        rows = self.snapshots_by_day(lookback_days=days, limit=5000)
+        per_day: Dict[str, int] = {}
+        for r in rows:
+            day = str(r.get("day") or "")
+            per_day[day] = per_day.get(day, 0) + int(r.get("snapshots") or 0)
+
+        daily_series = [{"day": d, "total": t} for d, t in sorted(per_day.items(), reverse=True)]
+        total = sum(int(x.get("total") or 0) for x in daily_series)
+        half = max(1, len(daily_series) // 2)
+        recent_sum = sum(int(x.get("total") or 0) for x in daily_series[:half])
+        older_sum = sum(int(x.get("total") or 0) for x in daily_series[half:])
+        growth_pct = 0.0 if older_sum <= 0 else round(((recent_sum - older_sum) / older_sum) * 100.0, 1)
         return {
             "lookback_days": days,
             "total_snapshots": total,
+            "total_snapshots_window": total,
             "avg_per_day": round(total / days, 2),
+            "growth_pct": growth_pct,
+            "deleted_last_24h": 0,
+            "daily_series": daily_series,
         }
 
     def list_inventory_modems(
