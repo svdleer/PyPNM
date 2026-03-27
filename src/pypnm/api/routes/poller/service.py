@@ -306,6 +306,7 @@ class PollerService:
 
     def _timeout_stale_refresh_requests(self) -> None:
         max_runtime = max(30, int(os.environ.get("DATA_STORE_REFRESH_MAX_RUNTIME_SEC", "300")))
+        max_queue_age = max(30, int(os.environ.get("DATA_STORE_REFRESH_MAX_QUEUE_AGE_SEC", str(max_runtime))))
         self._execute(
             """
             UPDATE modem_refresh_request
@@ -316,6 +317,17 @@ class PollerService:
               AND TIMESTAMPDIFF(SECOND, started_at, UTC_TIMESTAMP()) > %s
             """,
             ("timed_out", self._now(), max_runtime, max_runtime),
+        )
+        self._execute(
+            """
+            UPDATE modem_refresh_request
+            SET status=%s,
+                finished_at=%s,
+                error_text=CONCAT('Expired in queue after ', %s, 's')
+            WHERE status='queued' AND created_at IS NOT NULL
+              AND TIMESTAMPDIFF(SECOND, created_at, UTC_TIMESTAMP()) > %s
+            """,
+            ("timed_out", self._now(), max_queue_age, max_queue_age),
         )
     def _log_scheduler_decisions(self, tick_at: str, decisions: List[Dict[str, Any]]) -> None:
         if not decisions:
