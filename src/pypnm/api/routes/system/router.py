@@ -63,9 +63,14 @@ class SystemRouter:
             self.logger.info(f"Retrieving sysDescr for MAC: {mac}, IP: {ip}")
 
             try:
-                status, msg = await CableModemServicePreCheck(mac_address=mac,
-                                                              ip_address=ip,
-                                                              snmp_config=request.cable_modem.snmp).run_precheck()
+                # sysDescr retrieval should not depend on docsPnmCmCtlStatus readiness checks.
+                # Those checks can timeout under agent queue load and mask a valid sysDescr query.
+                status, msg = await CableModemServicePreCheck(
+                    mac_address=mac,
+                    ip_address=ip,
+                    snmp_config=request.cable_modem.snmp,
+                    validate_pnm_ready_status=False,
+                ).run_precheck()
                 if status != ServiceStatusCode.SUCCESS:
                     self.logger.error(msg)
                     return SnmpResponse(mac_address=mac, status=status, message=msg)

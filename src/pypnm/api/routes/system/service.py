@@ -40,11 +40,19 @@ class SystemSnmpService:
         """
         try:
             logger.info(f"Fetching sysDescr for {request.cable_modem.mac_address}@{request.cable_modem.ip_address}")
+            snmp_cfg = request.cable_modem.snmp
+            community = (
+                snmp_cfg.snmp_v2c.community
+                if snmp_cfg and snmp_cfg.snmp_v2c and snmp_cfg.snmp_v2c.community
+                else None
+            )
             cm = CableModem(
                 mac_address=MacAddress(request.cable_modem.mac_address),
-                inet=Inet(request.cable_modem.ip_address)
+                inet=Inet(request.cable_modem.ip_address),
+                **({"write_community": community} if community else {}),
             )
-            system_description: SystemDescriptor = await cm.getSysDescr()
+            # Agent-backed SNMP can exceed 10s under load; use a higher timeout for sysDescr.
+            system_description: SystemDescriptor = await cm.getSysDescr(timeout=25, retries=2)
 
             return SysDescrResponse(
                 mac_address=request.cable_modem.mac_address,
@@ -76,9 +84,16 @@ class SystemSnmpService:
         """
         try:
             logger.info(f"Fetching sysUpTime for {request.cable_modem.mac_address}@{request.cable_modem.ip_address}")
+            snmp_cfg = request.cable_modem.snmp
+            community = (
+                snmp_cfg.snmp_v2c.community
+                if snmp_cfg and snmp_cfg.snmp_v2c and snmp_cfg.snmp_v2c.community
+                else None
+            )
             cm = CableModem(
                 mac_address=MacAddress(request.cable_modem.mac_address),
-                inet=Inet(request.cable_modem.ip_address)
+                inet=Inet(request.cable_modem.ip_address),
+                **({"write_community": community} if community else {}),
             )
 
             raw_uptime: str = await cm.getSysUpTime()
