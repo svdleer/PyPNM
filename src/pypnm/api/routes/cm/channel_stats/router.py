@@ -518,7 +518,7 @@ class ChannelStatsRouter:
                     cmts_ifname_result,
                 ) = await asyncio.gather(
                     _safe_wait_task(cmts_ofdma_task_id, cmts_task_timeout),
-                    _safe_wait_task(cmts_cmindex_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_cmindex_task_id, max(cmts_task_timeout, 45.0)),  # MAC table is large (~9k entries, ~33s)
                     _safe_wait_task(cmts_rxmer_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_profile_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_partial_reason_task_id, cmts_task_timeout),
