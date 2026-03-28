@@ -1193,6 +1193,138 @@ class UsOfdmaRxMerRouter:
                 self.logger.error(f"Error parsing US RxMER file for getData: {e}")
                 return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
 
+        @self.router.post(
+            "/getCaptureAndData",
+            summary="Get US OFDMA RxMER capture as PNG + JSON in one call",
+            response_model=UsOfdmaRxMerCaptureResponse,
+        )
+        async def get_capture_and_data(
+            request: UsOfdmaRxMerCaptureRequest,
+        ) -> UsOfdmaRxMerCaptureResponse:
+            """
+            Single-call endpoint that fetches the file once and returns both
+            a base64-encoded PNG plot and the parsed JSON data.
+            Eliminates the double FTP fetch of calling getCapture + getData.
+            """
+            import base64
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import glob
+
+            from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
+
+            # ── file resolution (same logic as getCapture) ──
+            tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
+            cache_dir = Path(_get_cache_dir())
+            filename = request.filename.lstrip('/')
+            basename = Path(filename).name
+            filepath = tftp_dir / filename
+            if not filepath.exists():
+                filepath = cache_dir / filename
+            if not filepath.exists():
+                try:
+                    _fetch_pnm_files(basename, allow_when_local=True)
+                except Exception as e:
+                    self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
+                filepath = cache_dir / basename
+
+            if not filepath.exists():
+                basename = Path(filename).name
+                for pattern in [
+                    str(tftp_dir / f"{filename}_*"),
+                    str(tftp_dir / "**" / basename),
+                    str(tftp_dir / "**" / f"{basename}_*"),
+                    str(cache_dir / f"{filename}_*"),
+                    str(cache_dir / "**" / basename),
+                    str(cache_dir / "**" / f"{basename}_*"),
+                ]:
+                    matching_files = sorted(glob.glob(pattern, recursive=True), reverse=True)
+                    if matching_files:
+                        filepath = Path(matching_files[0])
+                        self.logger.info(f"Found file via pattern: {filepath}")
+                        break
+                else:
+                    return UsOfdmaRxMerCaptureResponse(
+                        success=False, error=f"File not found: {Path(filename).name}"
+                    )
+
+            self.logger.info(f"Loading US RxMER file (combined): {filepath}")
+
+            try:
+                data = filepath.read_bytes()
+                if _is_ftp_mode():
+                    _delete_pnm_files(basename)
+                parser = CmtsUsOfdmaRxMer(data)
+                model = parser.to_model()
+
+                values = model.values
+                valid_values = [v for v in values if v < 63.5]
+                spacing_khz = model.subcarrier_spacing / 1000
+                zero_freq_mhz = model.subcarrier_zero_frequency / 1e6
+                first_idx = model.first_active_subcarrier_index
+                freqs_mhz = [
+                    round(zero_freq_mhz + (first_idx + i) * spacing_khz / 1000, 4)
+                    for i in range(len(values))
+                ]
+
+                # ── generate PNG plot ──
+                fig, ax = plt.subplots(figsize=(14, 6))
+                line_color = '#36A2EB'
+                ax.plot(freqs_mhz, values, color=line_color, linewidth=1.5, label='RxMER')
+                ax.fill_between(freqs_mhz, values, alpha=0.2, color=line_color)
+                ax.axhline(y=35, color='#4CAF50', linestyle='--', alpha=0.7, linewidth=1, label='Good (≥35 dB)')
+                ax.axhline(y=30, color='#FF9800', linestyle='--', alpha=0.7, linewidth=1, label='Marginal (≥30 dB)')
+                preeq_label = "Pre-EQ: ON" if model.preeq_enabled else "Pre-EQ: OFF"
+                ax.set_xlabel('Frequency (MHz)', fontsize=12)
+                ax.set_ylabel('RxMER (dB)', fontsize=12)
+                ax.set_title(
+                    f'Upstream OFDMA RxMER - CM: {model.cm_mac_address}\n'
+                    f'CCAP: {model.ccap_id} | {preeq_label} | '
+                    f'Avg: {model.signal_statistics.mean:.1f} dB | '
+                    f'Min: {min(valid_values):.1f} dB | '
+                    f'Max: {max(valid_values):.1f} dB | '
+                    f'Subcarriers: {model.num_active_subcarriers}',
+                    fontsize=11,
+                )
+                y_min, y_max = min(valid_values), max(valid_values)
+                y_padding = max(2.0, (y_max - y_min) * 0.1)
+                ax.set_ylim(max(0, y_min - y_padding), y_max + y_padding)
+                ax.set_xlim(min(freqs_mhz) - 0.2, max(freqs_mhz) + 0.2)
+                ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+                ax.legend(loc='lower right', fontsize=9)
+                plt.tight_layout()
+
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                buf.seek(0)
+                image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                stats = model.signal_statistics
+                return UsOfdmaRxMerCaptureResponse(
+                    success=True,
+                    cm_mac_address=model.cm_mac_address,
+                    filename=str(filepath.name),
+                    ccap_id=model.ccap_id,
+                    num_active_subcarriers=model.num_active_subcarriers,
+                    first_active_subcarrier_index=model.first_active_subcarrier_index,
+                    subcarrier_zero_frequency_hz=model.subcarrier_zero_frequency,
+                    subcarrier_spacing_hz=model.subcarrier_spacing,
+                    num_averages=getattr(model, 'num_averages', None),
+                    preeq_enabled=model.preeq_enabled,
+                    rxmer_min_db=round(min(valid_values), 2) if valid_values else None,
+                    rxmer_avg_db=round(stats.mean, 2),
+                    rxmer_max_db=round(max(valid_values), 2) if valid_values else None,
+                    rxmer_std_db=round(stats.std, 2) if hasattr(stats, 'std') else None,
+                    values=[round(v, 2) for v in values],
+                    frequencies_mhz=freqs_mhz,
+                    image_base64=image_b64,
+                )
+            except Exception as e:
+                self.logger.error(f"Error in getCaptureAndData: {e}")
+                return UsOfdmaRxMerCaptureResponse(success=False, error=str(e))
+
         # ------------------------------------------------------------------
         # Shared analysis engine (used by all comparison + fiber node routes)
         # ------------------------------------------------------------------

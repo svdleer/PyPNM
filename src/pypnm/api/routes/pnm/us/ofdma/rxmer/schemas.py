@@ -433,4 +433,5 @@ class UsOfdmaRxMerCaptureResponse(BaseModel):
     rxmer_std_db: Optional[float] = None
     values: Optional[list[float]] = None
     frequencies_mhz: Optional[list[float]] = None
+    image_base64: Optional[str] = Field(None, description="Base64-encoded PNG plot (only from /getCaptureAndData)")
     error: Optional[str] = None
