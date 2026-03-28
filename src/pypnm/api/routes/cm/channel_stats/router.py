@@ -568,7 +568,13 @@ class ChannelStatsRouter:
                 if cmts_cmindex_result and cm_index is None and request.mac_address:
                     try:
                         cmidx_result = cmts_cmindex_result
-                        if cmidx_result and cmidx_result.get('result', {}).get('success'):
+                        inner = cmidx_result.get('result', {})
+                        self.logger.info(
+                            f"cm_index inner result: success={inner.get('success')}, "
+                            f"error={inner.get('error', 'none')!r}, "
+                            f"entries={len(inner.get('results', []))}"
+                        )
+                        if inner.get('success'):
                             entries = cmidx_result.get('result', {}).get('results', [])
                             mac_clean = request.mac_address.replace(':', '').replace('-', '').lower()
                             self.logger.info(
