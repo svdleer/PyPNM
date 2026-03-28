@@ -563,8 +563,14 @@ class ChannelStatsRouter:
                     try:
                         cmidx_result = cmts_cmindex_result
                         if cmidx_result and cmidx_result.get('result', {}).get('success'):
+                            entries = cmidx_result.get('result', {}).get('results', [])
                             mac_clean = request.mac_address.replace(':', '').replace('-', '').lower()
-                            for entry in cmidx_result.get('result', {}).get('results', []):
+                            self.logger.info(
+                                f"cm_index resolution: {len(entries)} entries, "
+                                f"looking for mac={mac_clean}, "
+                                f"sample={entries[0] if entries else 'empty'}"
+                            )
+                            for entry in entries:
                                 val = entry.get('value', '')
                                 if isinstance(val, str):
                                     entry_mac = val.replace('0x', '').replace(' ', '').replace(':', '').replace('-', '').lower()
