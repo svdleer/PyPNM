@@ -931,7 +931,9 @@ class CMTSModemService:
                     params={
                         'target_ip': ip,
                         'oids': ALL_OIDS,
-                        'community': modem_community,
+                        # Do NOT pass community — let the CM agent use its own
+                        # configured cm_community (the API-side modem_community
+                        # is the BFF/CMTS community, not the modem community).
                         'timeout': 3,   # fail-fast: offline modems clear in 3s, no retries
                         'retries': 0,   # enrichment — don't retry; skip and move on
                         'max_concurrent': 3,

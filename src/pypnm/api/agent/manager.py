@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import uuid
+from collections import deque
 from queue import Queue, Empty
 from typing import Optional
 from fastapi import WebSocket
@@ -40,6 +41,9 @@ class AgentManager:
             'file_get', 'pnm_file_get', 'snmp_set_sequence',
         })
         self.LONG_TASK_TIMEOUT: float = 90.0   # default timeout for long commands
+        # Per-agent log ring buffers — populated by agents streaming type=log messages
+        self.AGENT_LOG_BUFFER_SIZE: int = 1000
+        self._agent_logs: dict[str, deque[dict]] = {}
 
     def _describe_task(self, task_id: str) -> str:
         """Build a concise task description for timeout/error diagnostics."""
@@ -172,6 +176,10 @@ class AgentManager:
                 self._handle_error(data)
                 return None
             
+            elif msg_type == 'log':
+                self._handle_log(data)
+                return None
+            
             else:
                 self.logger.warning(f"Unknown message type: {msg_type}")
                 return None
@@ -262,6 +270,44 @@ class AgentManager:
             
             if request_id in self._task_queues:
                 self._task_queues[request_id].put(data)
+
+    def _handle_log(self, data: dict) -> None:
+        """Store a streamed log entry from an agent in its ring buffer."""
+        agent_id = data.get("agent_id", "unknown")
+        entry = data.get("entry", {})
+        if not entry:
+            return
+        buf = self._agent_logs.get(agent_id)
+        if buf is None:
+            buf = deque(maxlen=self.AGENT_LOG_BUFFER_SIZE)
+            self._agent_logs[agent_id] = buf
+        buf.append(entry)
+
+    def get_agent_logs(
+        self,
+        agent_id: str | None = None,
+        level: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Return recent log entries, optionally filtered by agent and level."""
+        level_upper = level.upper() if level else None
+        level_order = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+        min_level = level_order.get(level_upper, 0) if level_upper else 0
+
+        entries: list[dict] = []
+        sources = (
+            [(agent_id, self._agent_logs.get(agent_id, deque()))]
+            if agent_id
+            else list(self._agent_logs.items())
+        )
+        for aid, buf in sources:
+            for e in buf:
+                elevel = level_order.get((e.get("level") or "").upper(), 0)
+                if elevel >= min_level:
+                    entries.append({**e, "agent_id": aid})
+
+        entries.sort(key=lambda x: x.get("ts", 0))
+        return entries[-limit:]
     
     def remove_agent(self, websocket: WebSocket):
         """Remove agent by WebSocket connection."""

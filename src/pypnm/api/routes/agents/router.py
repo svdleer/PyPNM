@@ -1,7 +1,7 @@
 # PyPNM Agent API Routes
 # SPDX-License-Identifier: Apache-2.0
 
-from fastapi import APIRouter, WebSocket, HTTPException, Depends
+from fastapi import APIRouter, WebSocket, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 from typing import Optional
 import logging
@@ -58,6 +58,20 @@ async def list_agents():
         "count": len(agents),
         "status": "success"
     }
+
+
+@router.get("/logs")
+async def get_agent_logs(
+    agent_id: str | None = Query(default=None, description="Filter by agent ID"),
+    level: str | None = Query(default=None, description="Minimum log level (DEBUG/INFO/WARNING/ERROR)"),
+    limit: int = Query(default=200, ge=1, le=5000, description="Max entries to return"),
+):
+    """Return recent log entries streamed from connected agents."""
+    agent_manager = get_agent_manager()
+    if not agent_manager:
+        raise HTTPException(status_code=503, detail="Agent manager not initialized")
+    entries = agent_manager.get_agent_logs(agent_id=agent_id, level=level, limit=limit)
+    return {"status": "success", "logs": entries, "count": len(entries)}
 
 
 @router.get("/{agent_id}")
