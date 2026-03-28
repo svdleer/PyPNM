@@ -1018,8 +1018,7 @@ class UsOfdmaRxMerRouter:
                 # Read and parse file
                 data = filepath.read_bytes()
                 # Housekeeping: file in memory — delete from FTP + local cache
-                if _is_ftp_mode():
-                    _delete_pnm_files(basename)
+                _delete_pnm_files(basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
                 
@@ -1154,8 +1153,7 @@ class UsOfdmaRxMerRouter:
             try:
                 data = filepath.read_bytes()
                 # Housekeeping: file in memory — delete from FTP + local cache
-                if _is_ftp_mode():
-                    _delete_pnm_files(basename)
+                _delete_pnm_files(basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
 
@@ -1253,8 +1251,7 @@ class UsOfdmaRxMerRouter:
 
             try:
                 data = filepath.read_bytes()
-                if _is_ftp_mode():
-                    _delete_pnm_files(basename)
+                _delete_pnm_files(basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
 

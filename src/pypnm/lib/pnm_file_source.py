@@ -136,6 +136,9 @@ def delete_pnm_files(filename_prefix: str, *, ftp_cfg: dict | None = None) -> in
     """
     Delete files matching *filename_prefix* from FTP server and local cache.
     Returns number of deleted files.
+
+    Cleans FTP when ``is_ftp_mode()`` **or** when ``FTP_SERVER_IP`` is set
+    (hybrid mode: PNM_FILE_SOURCE=local but files fetched via FTP on demand).
     """
     if ftp_cfg is None:
         ftp_cfg = get_ftp_config()
@@ -143,7 +146,8 @@ def delete_pnm_files(filename_prefix: str, *, ftp_cfg: dict | None = None) -> in
     prefix = Path(filename_prefix).name
     deleted = 0
 
-    if is_ftp_mode():
+    ftp_host = ftp_cfg.get('host', '') or ''
+    if is_ftp_mode() or ftp_host not in ('', '127.0.0.1'):
         try:
             ftp = ftplib.FTP()
             ftp.connect(ftp_cfg['host'], ftp_cfg['port'], timeout=15)
