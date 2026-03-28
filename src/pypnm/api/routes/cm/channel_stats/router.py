@@ -559,6 +559,12 @@ class ChannelStatsRouter:
                 # Collect CMTS OFDMA MeanRxMer and inject into parsed channels
                 # First: resolve cm_index (needed for both rxmer and fiber node)
                 cm_index = cached_cm_index
+                self.logger.info(
+                    f"cm_index pre-check: cached={cached_cm_index}, "
+                    f"cmidx_result_type={type(cmts_cmindex_result).__name__}, "
+                    f"cmidx_result_keys={list(cmts_cmindex_result.keys()) if isinstance(cmts_cmindex_result, dict) else 'N/A'}, "
+                    f"mac={request.mac_address}"
+                )
                 if cmts_cmindex_result and cm_index is None and request.mac_address:
                     try:
                         cmidx_result = cmts_cmindex_result
