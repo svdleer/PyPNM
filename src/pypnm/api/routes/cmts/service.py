@@ -909,6 +909,37 @@ class CMTSModemService:
         if not online_modems:
             return modems
 
+        # ── Pre-filter: ICMP ping sweep to skip unreachable modems ───
+        # Eliminates ~50% of 3s SNMP timeouts, cutting enrichment time in half.
+        all_ips = [m.get('ip_address') for m in online_modems]
+        try:
+            sweep_result = await self._send_cm_agent_command(
+                command='ping_sweep',
+                params={
+                    'targets': all_ips,
+                    'count': 1,
+                    'timeout': 1,
+                    'concurrent_tasks': 200,
+                },
+                timeout=60,
+            )
+            if sweep_result and sweep_result.get('success'):
+                reachable_set = set(sweep_result.get('reachable', []))
+                before = len(online_modems)
+                online_modems = [m for m in online_modems if m.get('ip_address') in reachable_set]
+                skipped = before - len(online_modems)
+                self.logger.info(
+                    f"Ping sweep: {len(reachable_set)}/{before} reachable, "
+                    f"skipping {skipped} unreachable modems"
+                )
+            else:
+                self.logger.warning(
+                    f"Ping sweep failed ({sweep_result.get('error') if sweep_result else 'no result'}), "
+                    "proceeding with all modems"
+                )
+        except Exception as e:
+            self.logger.warning(f"Ping sweep unavailable ({e}), proceeding with all modems")
+
         # Initialise progress in cache so polling clients can track it
         if cmts_ip and cmts_ip in _enrichment_cache:
             _enrichment_cache[cmts_ip]['enrich_progress'] = {'completed': 0, 'total': len(online_modems)}
