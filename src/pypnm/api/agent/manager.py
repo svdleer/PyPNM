@@ -180,6 +180,10 @@ class AgentManager:
                 self._handle_log(data)
                 return None
             
+            elif msg_type == 'log_batch':
+                self._handle_log_batch(data)
+                return None
+            
             else:
                 self.logger.warning(f"Unknown message type: {msg_type}")
                 return None
@@ -282,6 +286,20 @@ class AgentManager:
             buf = deque(maxlen=self.AGENT_LOG_BUFFER_SIZE)
             self._agent_logs[agent_id] = buf
         buf.append(entry)
+
+    def _handle_log_batch(self, data: dict) -> None:
+        """Store a batch of log entries from an agent."""
+        agent_id = data.get("agent_id", "unknown")
+        entries = data.get("entries", [])
+        if not entries:
+            return
+        buf = self._agent_logs.get(agent_id)
+        if buf is None:
+            buf = deque(maxlen=self.AGENT_LOG_BUFFER_SIZE)
+            self._agent_logs[agent_id] = buf
+        for entry in entries:
+            if isinstance(entry, dict):
+                buf.append(entry)
 
     def get_agent_logs(
         self,
