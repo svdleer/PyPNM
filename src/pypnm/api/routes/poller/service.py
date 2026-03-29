@@ -637,61 +637,68 @@ class PollerService:
             except Exception:
                 return None
 
-        with self._db_lock:
-            conn = self._connect()
-            cur = conn.cursor()
-            for r in rows:
-                mac = (r.get("mac_address") or r.get("mac") or "").lower().replace("-", ":")
-                if not mac:
-                    continue
-                values = (
-                    mac,
-                    r.get("ip_address") or r.get("ip"),
-                    r.get("cmts") or "unknown",
-                    r.get("cmts_ip"),
-                    r.get("fiber_node"),
-                    r.get("cable_mac"),
-                    r.get("mac_domain"),
-                    r.get("status"),
-                    r.get("docsis_version"),
-                    r.get("vendor"),
-                    r.get("model"),
-                    r.get("upstream_interface"),
-                    _to_int(r.get("upstream_ifindex") or r.get("md_if_index")),
-                    _to_int(r.get("ofdma_ifindex")),
-                    _to_int(r.get("ofdma_rf_port_ifindex") or r.get("rf_port_ifindex")),
-                    1 if r.get("ofdm_enabled") else 0,
-                    1 if r.get("ofdma_enabled") else 0,
-                    1 if r.get("partial_service") else 0,
-                    r.get("software_version") or r.get("firmware") or None,
-                    now,
-                    now,
-                    now,
-                    source_poller,
-                )
+        # Build all value tuples first (no lock needed)
+        all_values = []
+        for r in rows:
+            mac = (r.get("mac_address") or r.get("mac") or "").lower().replace("-", ":")
+            if not mac:
+                continue
+            all_values.append((
+                mac,
+                r.get("ip_address") or r.get("ip"),
+                r.get("cmts") or "unknown",
+                r.get("cmts_ip"),
+                r.get("fiber_node"),
+                r.get("cable_mac"),
+                r.get("mac_domain"),
+                r.get("status"),
+                r.get("docsis_version"),
+                r.get("vendor"),
+                r.get("model"),
+                r.get("upstream_interface"),
+                _to_int(r.get("upstream_ifindex") or r.get("md_if_index")),
+                _to_int(r.get("ofdma_ifindex")),
+                _to_int(r.get("ofdma_rf_port_ifindex") or r.get("rf_port_ifindex")),
+                1 if r.get("ofdm_enabled") else 0,
+                1 if r.get("ofdma_enabled") else 0,
+                1 if r.get("partial_service") else 0,
+                r.get("software_version") or r.get("firmware") or None,
+                now,
+                now,
+                now,
+                source_poller,
+            ))
 
-                cur.execute(
-                    """
-                    INSERT INTO modem_inventory_current
-                                            (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
-                                             upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
-                     software_version, first_seen_at, last_seen_at, updated_at, source_poller)
-                                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                      ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
-                                                cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
-                      vendor=VALUES(vendor), model=VALUES(model), upstream_interface=VALUES(upstream_interface),
-                                                upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
-                                                ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
-                      ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
-                      partial_service=VALUES(partial_service), software_version=VALUES(software_version),
-                      last_seen_at=VALUES(last_seen_at),
-                      updated_at=VALUES(updated_at), source_poller=VALUES(source_poller)
-                    """,
-                    values,
-                )
-                inserted += 1
-            conn.close()
+        sql = """
+            INSERT INTO modem_inventory_current
+                (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
+                 upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
+                 software_version, first_seen_at, last_seen_at, updated_at, source_poller)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+              ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
+              cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
+              vendor=VALUES(vendor), model=VALUES(model), upstream_interface=VALUES(upstream_interface),
+              upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
+              ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
+              ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
+              partial_service=VALUES(partial_service), software_version=VALUES(software_version),
+              last_seen_at=VALUES(last_seen_at),
+              updated_at=VALUES(updated_at), source_poller=VALUES(source_poller)
+        """
+
+        # Process in batches of 500, releasing the lock between batches
+        # so reads are not starved for tens of seconds.
+        BATCH = 500
+        for i in range(0, len(all_values), BATCH):
+            batch = all_values[i:i + BATCH]
+            with self._db_lock:
+                conn = self._connect()
+                cur = conn.cursor()
+                cur.executemany(sql, batch)
+                conn.close()
+            inserted += len(batch)
+
         return inserted
 
     def _purge_stale_inventory(self, retention_days: int) -> int:
