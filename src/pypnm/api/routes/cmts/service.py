@@ -904,6 +904,7 @@ class CMTSModemService:
 
         MAX_CONCURRENT = 20  # 2 cm-agents × 10 bulk threads each, round-robin balanced
         FLUSH_EVERY = 40      # flush enriched data to cache every N completions
+        MAX_ENRICHMENT_SECS = 600  # hard cap: 10 min — finish with partial results
 
         self.logger.info(f"Direct enrichment: {len(online_modems)} modems (max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, community={modem_community})")
         if not online_modems:
@@ -1043,7 +1044,18 @@ class CMTSModemService:
             async with sem:
                 await _enrich_one(modem)
 
-        await asyncio.gather(*[_enrich_one_sem(m) for m in online_modems])
+        # Hard time cap: cancel remaining tasks after MAX_ENRICHMENT_SECS
+        # so huge CMTSes (10k+ modems) don't block the enrichment pipeline.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[_enrich_one_sem(m) for m in online_modems]),
+                timeout=MAX_ENRICHMENT_SECS,
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"Direct enrichment hit {MAX_ENRICHMENT_SECS}s time cap: "
+                f"{enriched_count}/{len(online_modems)} enriched so far, finishing with partial results"
+            )
 
         # Final timestamp flush
         if cmts_ip and cmts_ip in _enrichment_cache:
