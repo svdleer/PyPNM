@@ -427,6 +427,13 @@ class CMTSModemService:
             enriched_count = sum(1 for m in modems if m.get('model'))
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
 
+            # Stamp cmts_ip on every modem so MySQL inventory stores the
+            # real CMTS IP (not 'unknown').  The BFF adds cmts_hostname
+            # separately, but the API-side must provide cmts_ip at minimum.
+            for m in modems:
+                if not m.get('cmts_ip'):
+                    m['cmts_ip'] = cmts_ip
+
             # Persist to MySQL so Tier 2 survives container restarts
             try:
                 from pypnm.api.routes.poller.service import poller_service
