@@ -88,7 +88,7 @@ class CMTSModemService:
             return result
         return {'success': False, 'error': 'No result from agent'}
 
-    async def _send_cm_agent_command(self, command: str, params: dict, timeout: float = 30) -> dict:
+    async def _send_cm_agent_command(self, command: str, params: dict, timeout: float = 30, priority: str = 'bulk') -> dict:
         """Send command to CM-reachable agent (for direct modem SNMP)."""
         agent_manager = get_agent_manager()
         if not agent_manager:
@@ -103,7 +103,7 @@ class CMTSModemService:
             command=command,
             params=params,
             timeout=timeout,
-            priority='bulk',   # enrichment — goes to the 5-worker bulk pool
+            priority=priority,
         )
 
         result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
@@ -902,7 +902,7 @@ class CMTSModemService:
                          and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses]
 
-        MAX_CONCURRENT = 20  # 2 agents × 10 bulk threads each; fill both agents fully
+        MAX_CONCURRENT = 20  # 2 cm-agents × 10 bulk threads each, round-robin balanced
         FLUSH_EVERY = 40      # flush enriched data to cache every N completions
 
         self.logger.info(f"Direct enrichment: {len(online_modems)} modems (max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, community={modem_community})")
