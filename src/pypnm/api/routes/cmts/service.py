@@ -902,8 +902,8 @@ class CMTSModemService:
                          and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses]
 
-        MAX_CONCURRENT = 10  # 2 agents × 10 bulk threads; = 5 in-flight per agent, no queuing
-        FLUSH_EVERY = 20      # flush enriched data to cache every N completions
+        MAX_CONCURRENT = 20  # 2 agents × 10 bulk threads each; fill both agents fully
+        FLUSH_EVERY = 40      # flush enriched data to cache every N completions
 
         self.logger.info(f"Direct enrichment: {len(online_modems)} modems (max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, community={modem_community})")
         if not online_modems:
@@ -965,7 +965,7 @@ class CMTSModemService:
                         # Do NOT pass community — let the CM agent use its own
                         # configured cm_community (the API-side modem_community
                         # is the BFF/CMTS community, not the modem community).
-                        'timeout': 3,   # fail-fast: offline modems clear in 3s, no retries
+                        'timeout': 2,   # ping sweep pre-filtered; 2s enough for reachable modems
                         'retries': 0,   # enrichment — don't retry; skip and move on
                         'max_concurrent': 3,
                     },
