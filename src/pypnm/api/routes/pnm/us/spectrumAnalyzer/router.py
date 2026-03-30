@@ -43,11 +43,14 @@ _USE_FTP = os.environ.get('PNM_FILE_SOURCE', 'local').lower() in ('ftp', 'agent'
 
 
 def _get_utsc_base() -> str:
-    """Return the directory to read UTSC files from (local mount or FTP cache)."""
-    if _USE_FTP:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        return _CACHE_DIR
-    return TFTP_BASE
+    """Return the primary directory to read UTSC files from.
+
+    Agent-fetched files land in _CACHE_DIR.  Local TFTP mount is TFTP_BASE.
+    Returns _CACHE_DIR (always exists) so agent-fetched files are found.
+    The streaming loop also searches TFTP_BASE for locally-mounted files.
+    """
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    return _CACHE_DIR
 
 
 def _ftp_fetch_utsc_files() -> list[str]:
@@ -84,6 +87,86 @@ def _ftp_fetch_utsc_files() -> list[str]:
         ftp.quit()
     except Exception as e:
         logger.debug(f"FTP fetch error: {e}")
+    return fetched
+
+
+async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
+    """Fetch new UTSC files via file-agent WebSocket (bypasses FTP overhead).
+
+    Two-step approach:
+    1. ``file_list`` — ask the agent for all filenames matching UTSC prefixes
+       (fast: no file content transferred)
+    2. ``file_get`` — fetch only the files not yet processed (returns base64)
+
+    Falls back to FTP when no file-agent is available.
+    """
+    import base64
+    from pypnm.api.agent.manager import get_agent_manager
+
+    agent_manager = get_agent_manager()
+    if not agent_manager:
+        return _ftp_fetch_utsc_files()
+
+    candidate_ids = agent_manager.get_all_agent_ids_for_capability('file_list')
+    if not candidate_ids:
+        return _ftp_fetch_utsc_files()
+
+    agent_id = candidate_ids[0]
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+
+    # Step 1: list matching files on the agent's TFTP root
+    try:
+        task_id = await agent_manager.send_task(
+            agent_id=agent_id,
+            command='file_list',
+            params={'prefixes': ['utsc_', 'PNMCcapUsSpecAn_']},
+            timeout=10,
+        )
+        result = await agent_manager.wait_for_task_async(task_id, timeout=10)
+        result_inner = (result or {}).get('result') or result or {}
+        if not result_inner.get('success'):
+            return _ftp_fetch_utsc_files()
+    except Exception as e:
+        logger.debug(f"Agent file_list failed: {e}")
+        return _ftp_fetch_utsc_files()
+
+    remote_files = result_inner.get('files', [])
+    # Filter to only files we haven't processed yet
+    processed_basenames = {os.path.basename(p) for p in processed_files}
+    new_files = [f for f in remote_files
+                 if f not in processed_basenames
+                 and not os.path.exists(os.path.join(_CACHE_DIR, f))]
+
+    if not new_files:
+        return []
+
+    # Step 2: fetch each new file via file_get
+    fetched: list[str] = []
+    for filename in new_files:
+        try:
+            task_id = await agent_manager.send_task(
+                agent_id=agent_id,
+                command='file_get',
+                params={'filename': filename, 'glob': False},
+                timeout=15,
+                priority='bulk',
+            )
+            result = await agent_manager.wait_for_task_async(task_id, timeout=15)
+            result_inner = (result or {}).get('result') or result or {}
+            if not result_inner.get('success'):
+                continue
+
+            content = base64.b64decode(result_inner['content_base64'])
+            local_path = os.path.join(_CACHE_DIR, filename)
+            with open(local_path, 'wb') as fh:
+                fh.write(content)
+            fetched.append(local_path)
+            logger.debug(f"Agent fetched UTSC file: {filename} ({len(content)} bytes)")
+        except Exception as e:
+            logger.debug(f"Agent file_get failed for {filename}: {e}")
+
+    if fetched:
+        logger.info(f"Agent fetched {len(fetched)} new UTSC file(s)")
     return fetched
 
 
@@ -459,9 +542,8 @@ async def _stream_spectrum_data(
                 break
             
             try:
-                # Fetch files from FTP if needed, then find local copies
-                if _USE_FTP:
-                    _ftp_fetch_utsc_files()
+                # Fetch files via agent (WebSocket) or FTP fallback, then find local copies
+                await _agent_fetch_utsc_files(processed_files)
                 utsc_base = _get_utsc_base()
                 files = sorted(
                     glob.glob(f"{utsc_base}/utsc_*") + glob.glob(f"{utsc_base}/PNMCcapUsSpecAn_*"),
