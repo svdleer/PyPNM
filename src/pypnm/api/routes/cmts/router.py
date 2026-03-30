@@ -28,6 +28,7 @@ async def get_cmts_modems(
     limit: int = 10000,
     enrich: bool = False,
     modem_community: str = "private",
+    cmts_hostname: str = "",
 ) -> CMTSModemResponse:
     """
     **CMTS Modem Discovery**
@@ -71,7 +72,8 @@ async def get_cmts_modems(
             community=community,
             limit=limit,
             enrich=enrich,
-            modem_community=modem_community
+            modem_community=modem_community,
+            cmts_hostname=cmts_hostname or "",
         )
         
         if not result.get('success'):

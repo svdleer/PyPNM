@@ -153,7 +153,8 @@ class CMTSModemService:
         community: str = "public", 
         limit: int = 10000,
         enrich: bool = False,
-        modem_community: str = "private"
+        modem_community: str = "private",
+        cmts_hostname: str = "",
     ) -> Dict[str, Any]:
         """Discover cable modems from a CMTS.
 
@@ -365,7 +366,7 @@ class CMTSModemService:
                 
                 # Fire-and-forget background enrichment
                 asyncio.create_task(
-                    self._background_enrich(cmts_ip, modems, modem_community)
+                    self._background_enrich(cmts_ip, modems, modem_community, cmts_hostname=cmts_hostname)
                 )
                 
                 self.logger.info(f"Returning {len(modems)} modems immediately, enrichment started in background")
@@ -392,7 +393,7 @@ class CMTSModemService:
             return {'success': False, 'error': str(e),
                     'modems': [], 'count': 0}
 
-    async def _background_enrich(self, cmts_ip: str, modems: list, modem_community: str):
+    async def _background_enrich(self, cmts_ip: str, modems: list, modem_community: str, cmts_hostname: str = ""):
         """Run background enrichment and update the cache in two steps."""
         global _enrichment_cache
         try:
@@ -427,12 +428,12 @@ class CMTSModemService:
             enriched_count = sum(1 for m in modems if m.get('model'))
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
 
-            # Stamp cmts/cmts_ip on every modem so MySQL inventory stores the
-            # real CMTS IP (not 'unknown').  The BFF resolves the hostname
-            # separately, but the API-side must provide cmts + cmts_ip.
+            # Stamp cmts/cmts_ip on every modem for MySQL inventory.
+            # cmts_hostname comes from the BFF (ISW API); fall back to IP.
+            cmts_label = cmts_hostname or cmts_ip
             for m in modems:
                 if not m.get('cmts') or m['cmts'] == 'unknown':
-                    m['cmts'] = cmts_ip
+                    m['cmts'] = cmts_label
                 if not m.get('cmts_ip'):
                     m['cmts_ip'] = cmts_ip
 
