@@ -427,10 +427,12 @@ class CMTSModemService:
             enriched_count = sum(1 for m in modems if m.get('model'))
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
 
-            # Stamp cmts_ip on every modem so MySQL inventory stores the
-            # real CMTS IP (not 'unknown').  The BFF adds cmts_hostname
-            # separately, but the API-side must provide cmts_ip at minimum.
+            # Stamp cmts/cmts_ip on every modem so MySQL inventory stores the
+            # real CMTS IP (not 'unknown').  The BFF resolves the hostname
+            # separately, but the API-side must provide cmts + cmts_ip.
             for m in modems:
+                if not m.get('cmts') or m['cmts'] == 'unknown':
+                    m['cmts'] = cmts_ip
                 if not m.get('cmts_ip'):
                     m['cmts_ip'] = cmts_ip
 
