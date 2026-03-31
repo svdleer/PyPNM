@@ -617,7 +617,7 @@ class CMTSModemService:
                 modem['upstream_ifindex'] = us_ifindex
                 modem['upstream_interface'] = if_name_map.get(us_ifindex, f'US-CH {us_ifindex}')
             else:
-                modem['upstream_interface'] = 'SC-QAM'
+                modem['upstream_interface'] = None
 
             if index in us_ch_map:
                 modem['upstream_channel_id'] = us_ch_map[index]
