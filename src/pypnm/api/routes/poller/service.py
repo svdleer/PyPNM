@@ -73,24 +73,30 @@ class PollerService:
         params = params or ()
         with self._db_lock:
             conn = self._connect()
-            cur = conn.cursor()
-            cur.execute(sql, params)
             try:
-                last_id = cur.lastrowid
-            except Exception:
-                last_id = None
-            conn.close()
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                try:
+                    last_id = cur.lastrowid
+                except Exception:
+                    last_id = None
+            finally:
+                conn.close()
             return last_id
 
     def _query(self, sql: str, params=None):
+        # No lock: each call opens its own connection, so reads never
+        # need to wait behind the write-serialisation lock.  This fixes
+        # multi-second stalls on API reads while the worker is upserting.
         params = params or ()
-        with self._db_lock:
-            conn = self._connect()
+        conn = self._connect()
+        try:
             cur = conn.cursor()
             cur.execute(sql, params)
             rows = self._rows(cur)
+        finally:
             conn.close()
-            return rows
+        return rows
 
     def _init_db(self) -> None:
         self._execute(
