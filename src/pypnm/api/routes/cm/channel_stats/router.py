@@ -562,8 +562,10 @@ class ChannelStatsRouter:
 
                 is_cmts_vccap = False
                 try:
-                    sysdescr_payload = cmts_sysdescr_result.get('result', {}) if isinstance(cmts_sysdescr_result, dict) else {}
-                    sysdescr_value = str(sysdescr_payload.get('value') or '').lower()
+                    sysdescr_payload = cmts_sysdescr_result.get('result', cmts_sysdescr_result) if isinstance(cmts_sysdescr_result, dict) else {}
+                    sysdescr_value = str(sysdescr_payload.get('value') or sysdescr_payload.get('output') or '').lower()
+                    if not sysdescr_value and isinstance(sysdescr_payload.get('results'), list) and sysdescr_payload.get('results'):
+                        sysdescr_value = str((sysdescr_payload.get('results')[0] or {}).get('value') or '').lower()
                     is_cmts_vccap = any(token in sysdescr_value for token in ('vccap', 'dcts vccap', 'casa-vnf'))
                 except Exception:
                     is_cmts_vccap = False
@@ -686,7 +688,9 @@ class ChannelStatsRouter:
                                                     entry_cm_index = int(parts[0])
                                                     ifindex = int(parts[1])
                                                     val = int(entry.get('value') or 0)
-                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0:
+                                                    # OFDMA channels on vCCAP are in 160xxxxxx ifIndex range.
+                                                    # Filter out ATDMA/SC-QAM rows to keep channel mapping stable.
+                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0 and ifindex >= 160000000:
                                                         snr_by_ifindex[ifindex] = round(val / 10, 2)
                                                 except (ValueError, TypeError):
                                                     pass
@@ -719,7 +723,7 @@ class ChannelStatsRouter:
                                                     entry_cm_index = int(parts[0])
                                                     ifindex = int(parts[1])
                                                     val = int(entry.get('value') or 0)
-                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0:
+                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0 and ifindex >= 160000000:
                                                         snr_by_ifindex[ifindex] = round(val / 10, 2)
                                                 except (ValueError, TypeError):
                                                     pass
