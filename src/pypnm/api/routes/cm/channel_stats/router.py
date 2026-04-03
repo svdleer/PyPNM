@@ -614,7 +614,7 @@ class ChannelStatsRouter:
                                         ofdma_ifindex = int(parts[1])
                                         if cm_index is None or entry_cm_index == cm_index:
                                             val = entry.get('value')
-                                            if val is not None:
+                                            if val is not None and int(val) > 0:
                                                 cm_rxmer_list.append((ofdma_ifindex, round(int(val) / 100, 2)))
                                     except (ValueError, TypeError):
                                         pass
