@@ -1,6 +1,81 @@
 # Channel Stats Parser - ALL PARSING LOGIC FROM AGENT
 # COPIED 1:1 FROM AGENT
 
+
+def _parse_octet_string_to_bytes(value: object) -> bytes:
+    if value is None:
+        return b''
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, (list, tuple)):
+        try:
+            return bytes(int(part) for part in value)
+        except (TypeError, ValueError):
+            return b''
+
+    text = str(value).strip()
+    if not text:
+        return b''
+    if ' = ' in text:
+        text = text.split(' = ', 1)[1].strip()
+    if text.lower().startswith('hex-string:'):
+        text = text.split(':', 1)[1].strip()
+    if text.lower().startswith('0x'):
+        text = text[2:]
+    compact = text.replace(' ', '').replace(':', '').replace('-', '')
+    if compact and len(compact) % 2 == 0:
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            return b''
+    return b''
+
+
+def _extract_result_entries(result) -> list[dict]:
+    if not result:
+        return []
+    if isinstance(result, dict):
+        payload = result.get('result', result)
+        if isinstance(payload, dict):
+            if payload.get('results'):
+                return payload['results']
+            if payload.get('output') and payload.get('oid'):
+                return [{'oid': payload['oid'], 'value': payload['output']}]
+    return []
+
+
+def _parse_us_profile_iuc_map(result, cm_index: int | None) -> dict[int, list[int]]:
+    if cm_index is None:
+        return {}
+
+    entries = _extract_result_entries(result)
+    parsed: dict[int, list[int]] = {}
+    prefix = '1.3.6.1.4.1.4491.2.1.28.1.3.1.3.'
+    for entry in entries:
+        oid = str(entry.get('oid', ''))
+        if not oid.startswith(prefix):
+            continue
+        try:
+            entry_cm_index = int(oid[len(prefix):].split('.')[0])
+        except (TypeError, ValueError):
+            continue
+        if entry_cm_index != cm_index:
+            continue
+
+        raw_bytes = _parse_octet_string_to_bytes(entry.get('value'))
+        pos = 0
+        while pos + 5 < len(raw_bytes):
+            ifindex = int.from_bytes(raw_bytes[pos:pos + 4], byteorder='big', signed=False)
+            count = raw_bytes[pos + 4]
+            pos += 5
+            if count <= 0 or pos + count > len(raw_bytes):
+                break
+            iucs = [int(raw_bytes[pos + offset]) for offset in range(count)]
+            pos += count
+            if ifindex and iucs:
+                parsed[ifindex] = iucs
+    return parsed
+
 def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: str, modem_ip: str) -> dict:
     """Parse raw SNMP walk results into structured channel stats.
     
@@ -473,13 +548,19 @@ _MODULATION_CODE = {
 
 
 def _extract_result_entries(task_result) -> list:
-    """Safely pull the results list from an agent task response."""
+    """Safely normalize agent walk/get responses into a list of oid/value entries."""
     if not task_result:
         return []
     r = task_result.get('result', {})
     if not r or not r.get('success'):
         return []
-    return r.get('results', []) or []
+    if r.get('results'):
+        return r.get('results', []) or []
+    output = r.get('output')
+    oid = r.get('oid')
+    if output and oid:
+        return [{'oid': oid, 'value': output}]
+    return []
 
 
 def parse_ofdm_stats_raw(
@@ -516,22 +597,10 @@ def parse_ofdm_stats_raw(
             except (ValueError, TypeError):
                 pass
 
-    # ── 0b. Resolve valid ifIndices for this modem from scoped CMTS walks ──
-    # US OFDMA: from cmts_profile_result (walked as .5.1.1.{cm_index}) —
-    #   OID suffix: {cm_index}.{ofdma_ifindex}.{iuc_id}
-    prof_base = '1.3.6.1.4.1.4491.2.1.28.1.5.1.1'
-    valid_us_ifindices: set = set()
-    for e in _extract_result_entries(cmts_profile_result):
-        oid = e.get('oid', '')
-        if oid.startswith(prof_base + '.'):
-            parts = oid[len(prof_base) + 1:].split('.')
-            if len(parts) == 3:
-                try:
-                    entry_cm_index = int(parts[0])
-                    if cm_index is not None and entry_cm_index == cm_index:
-                        valid_us_ifindices.add(int(parts[1]))
-                except (ValueError, TypeError):
-                    pass
+    # ── 0b. Resolve valid OFDMA ifIndices for this modem from the per-modem
+    #        CMTS UsProfileIucList object.
+    us_profile_iuc_map = _parse_us_profile_iuc_map(cmts_profile_result, cm_index)
+    valid_us_ifindices: set = set(us_profile_iuc_map.keys())
 
     # DS OFDM: from partial_reason_result (walked as .7.1.1.{cm_index}) —
     #   OID suffix after col: {cm_index}.{ds_ifindex}.{profile_id}
@@ -690,6 +759,8 @@ def parse_ofdm_stats_raw(
         us_iuc_channels.append({
             'ifindex':  ifidx,
             'ifname':   ifname_map.get(ifidx),
+            'active_iucs': us_profile_iuc_map.get(ifidx, []),
+            'current_iuc': max(us_profile_iuc_map.get(ifidx, [])) if us_profile_iuc_map.get(ifidx) else None,
             'iuc_stats': iucs,
         })
 
