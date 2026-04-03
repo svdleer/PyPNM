@@ -624,6 +624,7 @@ def parse_ofdm_stats_raw(
     ds_profiles = []
     for ch in cm_ds_ofdm_channels:
         entry = {
+            'ifindex': ch.get('index'),  # CMTS OFDM channel ifIndex
             'channel_id': ch.get('channel_id'),
             'plc_freq_mhz': ch.get('plc_freq_mhz'),
             'profiles': [],
@@ -663,20 +664,13 @@ def parse_ofdm_stats_raw(
                 except (ValueError, TypeError):
                     pass
 
-    # Constrain to only the DS ifIndices this modem is registered on (from partial_reason
-    # scoped walk); fall back to positional limit by CM channel count if unknown.
-    n_ds_ch = len(cm_ds_ofdm_channels)
-    all_speed_ifindices = sorted(speed_map.keys())
-    if valid_ds_ifindices:
-        sorted_speed_ifindices = sorted(valid_ds_ifindices & speed_map.keys())
-    else:
-        sorted_speed_ifindices = all_speed_ifindices[:n_ds_ch] if n_ds_ch else all_speed_ifindices
-    for i, ch_entry in enumerate(sorted(ds_profiles, key=lambda c: c.get('channel_id') or 0)):
-        if i < len(sorted_speed_ifindices):
-            ifidx = sorted_speed_ifindices[i]
+    # Inject CMTS DS OFDM profile speed by ifIndex lookup (not position)
+    for ch_entry in ds_profiles:
+        ifidx = ch_entry.get('ifindex')
+        if ifidx and ifidx in speed_map:
             for prof in ch_entry['profiles']:
                 pid = prof['profile_id']
-                if pid in speed_map.get(ifidx, {}):
+                if pid in speed_map[ifidx]:
                     prof['full_channel_speed_bps'] = speed_map[ifidx][pid]
 
     # ── 3. Inject CMTS partial channel reason codes (scoped to cm_index) ──
@@ -702,9 +696,10 @@ def parse_ofdm_stats_raw(
                     except (ValueError, TypeError):
                         pass
 
-    for i, ch_entry in enumerate(sorted(ds_profiles, key=lambda c: c.get('channel_id') or 0)):
-        if i < len(sorted_speed_ifindices):
-            ifidx = sorted_speed_ifindices[i]
+    # Inject CMTS partial reason codes by ifIndex lookup (not position)
+    for ch_entry in ds_profiles:
+        ifidx = ch_entry.get('ifindex')
+        if ifidx:
             for prof in ch_entry['profiles']:
                 pid = prof['profile_id']
                 code = partial_map.get(ifidx, {}).get(pid)
