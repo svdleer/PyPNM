@@ -867,6 +867,18 @@ class CmtsUtscService:
                 )
                 output_format = 2
 
+            # EVO vCCAP firmware 10.10.0: docsPnmCmtsUtscCapabTriggerMode = 0x0000 (all zeros).
+            # freeRunning(2) is NOT supported — SET is rejected with commitFailed.
+            # The CMTS silently stays at idleSid(5), causing a VERIFY MISMATCH.
+            # Override proactively so the probe loop finds the existing row and
+            # all column SETs succeed cleanly.
+            if is_evo and trigger_mode == 2:
+                self.logger.info(
+                    "EVO vCCAP: freeRunning(2) not supported on firmware 10.10.0 "
+                    "— overriding trigger_mode 2 → 5 (idleSid)"
+                )
+                trigger_mode = 5
+
             if is_cisco:
                 # Cisco cBR-8: rows are NOT pre-provisioned per port.
                 # Must destroy existing row then createAndGo to create a fresh active row.
@@ -1327,20 +1339,34 @@ class CmtsUtscService:
         # Must match by TriggerMode to find the row configure() actually wrote to.
         resolved = cfg_index if cfg_index > 0 else 1
         if cfg_index == 0:
-            # Auto-probe: find row matching trigger_mode
-            for probe_idx in range(1, 4):
-                r = await self._snmp_get(
-                    f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
-                )
-                v = self._parse_get_value(r)
-                if v is not None and 'No Such' not in str(v):
-                    try:
-                        if int(v) == trigger_mode:
-                            resolved = probe_idx
-                            self.logger.info(f"start: found TriggerMode={trigger_mode} at cfg_index={probe_idx}")
-                            break
-                    except (ValueError, TypeError):
-                        pass
+            # Auto-probe: find the row matching trigger_mode.
+            # For EVO vCCAP: freeRunning(2) is overridden to idleSid(5) in configure(),
+            # so also probe for idleSid(5) as a fallback when the caller sends
+            # trigger_mode=2 (the GUI default before it knows the applied mode).
+            probe_modes = [trigger_mode]
+            if trigger_mode == 2:
+                probe_modes.append(5)  # idleSid fallback for EVO
+            match_found = False
+            for probe_mode in probe_modes:
+                if match_found:
+                    break
+                for probe_idx in range(1, 4):
+                    r = await self._snmp_get(
+                        f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
+                    )
+                    v = self._parse_get_value(r)
+                    if v is not None and 'No Such' not in str(v):
+                        try:
+                            if int(v) == probe_mode:
+                                resolved = probe_idx
+                                self.logger.info(
+                                    f"start: found TriggerMode={probe_mode} at cfg_index={probe_idx}"
+                                    + (" (EVO idleSid fallback)" if probe_mode != trigger_mode else "")
+                                )
+                                match_found = True
+                                break
+                        except (ValueError, TypeError):
+                            pass
         self.logger.info(f"Starting UTSC for RF port {rf_port_ifindex}")
 
         async def _try_start_on_idx(target_idx: int) -> dict[str, Any]:
