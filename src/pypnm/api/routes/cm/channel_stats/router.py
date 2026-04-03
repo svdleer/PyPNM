@@ -710,8 +710,7 @@ class ChannelStatsRouter:
                     try:
                         ifindex_iuc_map = _parse_us_profile_iuc_map(cmts_profile_result, cm_index)
                         injected = 0
-                        ofdma_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', [])
-                        for ch in ofdma_channels:
+                        for ch in parsed.get('upstream', {}).get('ofdma', {}).get('channels', []):
                             try:
                                 ch_ifindex = int(ch.get('index'))
                             except (TypeError, ValueError):
@@ -722,37 +721,7 @@ class ChannelStatsRouter:
                             ch['active_iucs'] = active_iucs
                             ch['current_iuc'] = max(active_iucs)
                             injected += 1
-
-                        # Some platforms expose CM-side OFDMA indices in a different
-                        # namespace than CMTS-side UsProfileIucList ifIndex values.
-                        # If exact matching injects nothing, fall back to stable
-                        # positional pairing so current_iuc remains visible.
-                        fallback_injected = 0
-                        if injected == 0 and ifindex_iuc_map and ofdma_channels:
-                            sorted_ifindices = sorted(ifindex_iuc_map.keys())
-                            sorted_channels = sorted(
-                                ofdma_channels,
-                                key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0))
-                            )
-                            for i, ch in enumerate(sorted_channels):
-                                if i >= len(sorted_ifindices):
-                                    break
-                                active_iucs = sorted(set(ifindex_iuc_map.get(sorted_ifindices[i], [])))
-                                if not active_iucs:
-                                    continue
-                                ch['active_iucs'] = active_iucs
-                                ch['current_iuc'] = max(active_iucs)
-                                fallback_injected += 1
-                            if fallback_injected:
-                                self.logger.warning(
-                                    'IUC fallback mapping used: injected=%s channels=%s cmts_ifindices=%s',
-                                    fallback_injected,
-                                    len(sorted_channels),
-                                    sorted_ifindices,
-                                )
-
-                        total_injected = injected + fallback_injected
-                        self.logger.info(f'Injected CMTS assigned IUCs for {total_injected} OFDMA channels')
+                        self.logger.info(f'Injected CMTS assigned IUCs for {injected} OFDMA channels')
                     except Exception as prof_err:
                         self.logger.warning(f'CMTS profile stats collection failed: {prof_err}')
                     except Exception as rxmer_err:
