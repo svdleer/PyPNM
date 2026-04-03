@@ -937,12 +937,21 @@ class CMTSModemService:
             if sweep_result and sweep_result.get('success'):
                 reachable_set = set(sweep_result.get('reachable', []))
                 before = len(online_modems)
-                online_modems = [m for m in online_modems if m.get('ip_address') in reachable_set]
-                skipped = before - len(online_modems)
-                self.logger.info(
-                    f"Ping sweep: {len(reachable_set)}/{before} reachable, "
-                    f"skipping {skipped} unreachable modems"
-                )
+                if reachable_set:
+                    online_modems = [m for m in online_modems if m.get('ip_address') in reachable_set]
+                    skipped = before - len(online_modems)
+                    self.logger.info(
+                        f"Ping sweep: {len(reachable_set)}/{before} reachable, "
+                        f"skipping {skipped} unreachable modems"
+                    )
+                else:
+                    # Some agents can return success with an empty reachable list
+                    # when ping_sweep is unsupported/misconfigured. Do not drop all
+                    # modems in that case; continue with SNMP enrichment.
+                    self.logger.warning(
+                        "Ping sweep returned success but zero reachable targets; "
+                        "proceeding with all modems"
+                    )
             else:
                 self.logger.warning(
                     f"Ping sweep failed ({sweep_result.get('error') if sweep_result else 'no result'}), "
