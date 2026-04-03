@@ -667,11 +667,11 @@ class ChannelStatsRouter:
                             if cm_rxmer_list:
                                 self.logger.info(f'Injected CMTS MeanRxMer for {injected_rxmer} OFDMA channels (positional, zero-suppressed)')
 
-                            # Fallback: docsIf3CmtsCmUsStatusSignalNoise (tenths of dB)
-                            # Used on Casa/EVO when docsIf31CmtsCmMeanRxMer returns 0 for some channels.
-                            # Only fills channels still missing rx_mer after the primary source.
+                            # vCCAP: prefer docsIf3CmtsCmUsStatusSignalNoise for OFDMA RxMER.
+                            # docsIf31CmtsCmMeanRxMer can return 0 on some vCCAP OFDMA rows.
+                            # For non-vCCAP, keep docsIf31 as primary and use docsIf3 only as fallback.
                             channels_needing_fallback = [ch for ch in ofdma_channels if ch.get('rx_mer') is None]
-                            if channels_needing_fallback and cmts_snr_result and is_cmts_vccap:
+                            if cmts_snr_result and is_cmts_vccap:
                                 try:
                                     snr_payload = cmts_snr_result.get('result', cmts_snr_result) if isinstance(cmts_snr_result, dict) else {}
                                     if snr_payload.get('success'):
@@ -691,7 +691,39 @@ class ChannelStatsRouter:
                                                 except (ValueError, TypeError):
                                                     pass
                                         if snr_by_ifindex:
-                                            # Positional match: sorted OFDMA ifindex → sorted channel index
+                                            # Positional match: sorted OFDMA ifindex -> sorted channel index.
+                                            # On vCCAP this is the authoritative source for both OFDMA channels.
+                                            sorted_snr = [snr_by_ifindex[k] for k in sorted(snr_by_ifindex.keys())]
+                                            sorted_channels = sorted(ofdma_channels, key=lambda c: c.get('index', 0))
+                                            fallback_snr = 0
+                                            for i, ch in enumerate(sorted_channels):
+                                                if i < len(sorted_snr):
+                                                    ch['rx_mer'] = sorted_snr[i]
+                                                    fallback_snr += 1
+                                            if fallback_snr:
+                                                self.logger.info(f'Injected vCCAP SNR (docsIf3) for {fallback_snr} OFDMA channels')
+                                except Exception as snr_err:
+                                    self.logger.warning(f'CMTS SNR fallback failed: {snr_err}')
+                            elif channels_needing_fallback and cmts_snr_result:
+                                try:
+                                    snr_payload = cmts_snr_result.get('result', cmts_snr_result) if isinstance(cmts_snr_result, dict) else {}
+                                    if snr_payload.get('success'):
+                                        snr_base = '1.3.6.1.4.1.4491.2.1.20.1.4.1.4'
+                                        snr_by_ifindex: dict[int, float] = {}
+                                        for entry in snr_payload.get('results', []):
+                                            oid = entry.get('oid', '')
+                                            suffix = oid.replace(snr_base + '.', '').lstrip('.')
+                                            parts = suffix.split('.')
+                                            if len(parts) == 2:
+                                                try:
+                                                    entry_cm_index = int(parts[0])
+                                                    ifindex = int(parts[1])
+                                                    val = int(entry.get('value') or 0)
+                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0:
+                                                        snr_by_ifindex[ifindex] = round(val / 10, 2)
+                                                except (ValueError, TypeError):
+                                                    pass
+                                        if snr_by_ifindex:
                                             sorted_snr = [snr_by_ifindex[k] for k in sorted(snr_by_ifindex.keys())]
                                             sorted_need = sorted(channels_needing_fallback, key=lambda c: c.get('index', 0))
                                             fallback_snr = 0
