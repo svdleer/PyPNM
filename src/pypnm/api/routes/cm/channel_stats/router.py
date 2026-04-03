@@ -239,6 +239,8 @@ class ChannelStatsRouter:
                 # parallel so it adds zero extra wall-clock time)
                 cmts_ofdma_task_id = None
                 cmts_rxmer_task_id = None
+                cmts_snr_task_id = None
+                cmts_sysdescr_task_id = None
                 cmts_cmindex_task_id = None
                 cmts_chanid_task_id = None
                 cmts_profile_task_id = None
@@ -292,6 +294,15 @@ class ChannelStatsRouter:
 
                 if request.cmts_ip and request.cmts_stats and cmts_agent_id:
                     try:
+                        cmts_sysdescr_task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_get",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": '1.3.6.1.2.1.1.1.0',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=5.0,
+                        )
                         if cached_cm_index is None:
                             cmts_ofdma_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_walk",
@@ -309,6 +320,17 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=cmts_task_timeout,
+                            )
+                            # Fallback SNR source (docsIf3CmtsCmUsStatusSignalNoise)
+                            # used when docsIf31CmtsCmMeanRxMer returns 0 (Casa/EVO)
+                            cmts_snr_task_id = await agent_manager.send_task(
+                                cmts_agent_id, "snmp_walk",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.20.1.4.1.4.{cached_cm_index}',
                                     "community": request.cmts_community or "public",
                                 },
                                 timeout=cmts_task_timeout,
@@ -508,8 +530,10 @@ class ChannelStatsRouter:
                 # Await CMTS tasks concurrently so slow paths don't add linearly.
                 (
                     cmts_ofdma_result,
+                    cmts_sysdescr_result,
                     cmts_cmindex_result,
                     cmts_rxmer_result,
+                    cmts_snr_result,
                     cmts_profile_result,
                     cmts_partial_reason_result,
                     cmts_us_iuc_stats_result,
@@ -518,8 +542,10 @@ class ChannelStatsRouter:
                     cmts_ifname_result,
                 ) = await asyncio.gather(
                     _safe_wait_task(cmts_ofdma_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_sysdescr_task_id, 5.0),
                     _safe_wait_task(cmts_cmindex_task_id, max(cmts_task_timeout, 45.0)),  # MAC table is large (~9k entries, ~33s)
                     _safe_wait_task(cmts_rxmer_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_snr_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_profile_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_partial_reason_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_us_iuc_stats_task_id, cmts_task_timeout),
@@ -533,6 +559,14 @@ class ChannelStatsRouter:
                     and isinstance(cmts_cmindex_result, dict)
                     and 'timeout' in str(cmts_cmindex_result.get('error', '')).lower()
                 )
+
+                is_cmts_vccap = False
+                try:
+                    sysdescr_payload = cmts_sysdescr_result.get('result', {}) if isinstance(cmts_sysdescr_result, dict) else {}
+                    sysdescr_value = str(sysdescr_payload.get('value') or '').lower()
+                    is_cmts_vccap = any(token in sysdescr_value for token in ('vccap', 'dcts vccap', 'casa-vnf'))
+                except Exception:
+                    is_cmts_vccap = False
 
                 # Collect CMTS OFDMA result (already running in parallel)
                 ofdma_oid = '1.3.6.1.4.1.4491.2.1.28.1.13'
@@ -632,6 +666,43 @@ class ChannelStatsRouter:
                                         injected_rxmer += 1
                             if cm_rxmer_list:
                                 self.logger.info(f'Injected CMTS MeanRxMer for {injected_rxmer} OFDMA channels (positional, zero-suppressed)')
+
+                            # Fallback: docsIf3CmtsCmUsStatusSignalNoise (tenths of dB)
+                            # Used on Casa/EVO when docsIf31CmtsCmMeanRxMer returns 0 for some channels.
+                            # Only fills channels still missing rx_mer after the primary source.
+                            channels_needing_fallback = [ch for ch in ofdma_channels if ch.get('rx_mer') is None]
+                            if channels_needing_fallback and cmts_snr_result and is_cmts_vccap:
+                                try:
+                                    snr_payload = cmts_snr_result.get('result', cmts_snr_result) if isinstance(cmts_snr_result, dict) else {}
+                                    if snr_payload.get('success'):
+                                        snr_base = '1.3.6.1.4.1.4491.2.1.20.1.4.1.4'
+                                        snr_by_ifindex: dict[int, float] = {}
+                                        for entry in snr_payload.get('results', []):
+                                            oid = entry.get('oid', '')
+                                            suffix = oid.replace(snr_base + '.', '').lstrip('.')
+                                            parts = suffix.split('.')
+                                            if len(parts) == 2:
+                                                try:
+                                                    entry_cm_index = int(parts[0])
+                                                    ifindex = int(parts[1])
+                                                    val = int(entry.get('value') or 0)
+                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0:
+                                                        snr_by_ifindex[ifindex] = round(val / 10, 2)
+                                                except (ValueError, TypeError):
+                                                    pass
+                                        if snr_by_ifindex:
+                                            # Positional match: sorted OFDMA ifindex → sorted channel index
+                                            sorted_snr = [snr_by_ifindex[k] for k in sorted(snr_by_ifindex.keys())]
+                                            sorted_need = sorted(channels_needing_fallback, key=lambda c: c.get('index', 0))
+                                            fallback_snr = 0
+                                            for i, ch in enumerate(sorted_need):
+                                                if i < len(sorted_snr):
+                                                    ch['rx_mer'] = sorted_snr[i]
+                                                    fallback_snr += 1
+                                            if fallback_snr:
+                                                self.logger.info(f'Injected fallback SNR (docsIf3) for {fallback_snr} OFDMA channels')
+                                except Exception as snr_err:
+                                    self.logger.warning(f'CMTS SNR fallback failed: {snr_err}')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
