@@ -675,7 +675,8 @@ class ChannelStatsRouter:
                         if rxmer_result and rxmer_result.get('result', {}).get('success'):
                             rxmer_entries = rxmer_result.get('result', {}).get('results', [])
                             base_oid = '1.3.6.1.4.1.4491.2.1.28.1.4.1.2'
-                            cm_rxmer_list = []
+                            # Build ifIndex -> rxmer map (exact match, no positional guessing)
+                            rxmer_by_ifindex: dict[int, float] = {}
                             for entry in rxmer_entries:
                                 oid = entry.get('oid', '')
                                 suffix = oid.replace(base_oid + '.', '').lstrip('.')
@@ -687,19 +688,20 @@ class ChannelStatsRouter:
                                         if cm_index is None or entry_cm_index == cm_index:
                                             val = entry.get('value')
                                             if val is not None:
-                                                cm_rxmer_list.append((ofdma_ifindex, round(int(val) / 100, 2)))
+                                                rxmer_by_ifindex[ofdma_ifindex] = round(int(val) / 100, 2)
                                     except (ValueError, TypeError):
                                         pass
-                            cm_rxmer_list.sort(key=lambda x: x[0])
-                            ofdma_channels = sorted(
-                                parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
-                                key=lambda c: c.get('index', 0)
-                            )
-                            for i, ch in enumerate(ofdma_channels):
-                                if i < len(cm_rxmer_list):
-                                    ch['rx_mer'] = cm_rxmer_list[i][1]
-                            if cm_rxmer_list:
-                                self.logger.info(f'Injected CMTS MeanRxMer for {len(cm_rxmer_list)} OFDMA channels (positional)')
+                            injected_rxmer = 0
+                            for ch in parsed.get('upstream', {}).get('ofdma', {}).get('channels', []):
+                                try:
+                                    ch_ifindex = int(ch.get('index'))
+                                except (TypeError, ValueError):
+                                    continue
+                                if ch_ifindex in rxmer_by_ifindex:
+                                    ch['rx_mer'] = rxmer_by_ifindex[ch_ifindex]
+                                    injected_rxmer += 1
+                            if rxmer_by_ifindex:
+                                self.logger.info(f'Injected CMTS MeanRxMer for {injected_rxmer} OFDMA channels (by ifIndex)')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
