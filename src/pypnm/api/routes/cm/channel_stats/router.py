@@ -614,7 +614,7 @@ class ChannelStatsRouter:
                                         ofdma_ifindex = int(parts[1])
                                         if cm_index is None or entry_cm_index == cm_index:
                                             val = entry.get('value')
-                                            if val is not None and int(val) > 0:
+                                            if val is not None:
                                                 cm_rxmer_list.append((ofdma_ifindex, round(int(val) / 100, 2)))
                                     except (ValueError, TypeError):
                                         pass
@@ -623,11 +623,15 @@ class ChannelStatsRouter:
                                 parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
                                 key=lambda c: c.get('index', 0)
                             )
+                            injected_rxmer = 0
                             for i, ch in enumerate(ofdma_channels):
                                 if i < len(cm_rxmer_list):
-                                    ch['rx_mer'] = cm_rxmer_list[i][1]
+                                    sample = cm_rxmer_list[i][1]
+                                    if sample is not None and sample > 0:
+                                        ch['rx_mer'] = sample
+                                        injected_rxmer += 1
                             if cm_rxmer_list:
-                                self.logger.info(f'Injected CMTS MeanRxMer for {len(cm_rxmer_list)} OFDMA channels (positional)')
+                                self.logger.info(f'Injected CMTS MeanRxMer for {injected_rxmer} OFDMA channels (positional, zero-suppressed)')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
