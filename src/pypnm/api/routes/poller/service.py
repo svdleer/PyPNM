@@ -1214,6 +1214,38 @@ class PollerService:
             results.extend(self._map_inventory_row(r) for r in rows)
         return results
 
+    def clear_inventory_modems(self, cmts: Optional[str] = None, cmts_ip: Optional[str] = None) -> int:
+        """Delete inventory rows scoped to a CMTS hostname and/or IP."""
+        cmts_name = str(cmts or "").strip()
+        cmts_addr = str(cmts_ip or "").strip()
+        if not cmts_name and not cmts_addr:
+            return 0
+
+        where_parts: list[str] = []
+        params: list[Any] = []
+        marker = "%s"
+        if cmts_name:
+            where_parts.append(f"LOWER(COALESCE(cmts,'')) = LOWER({marker})")
+            params.append(cmts_name)
+        if cmts_addr:
+            where_parts.append(f"LOWER(COALESCE(cmts_ip,'')) = LOWER({marker})")
+            params.append(cmts_addr)
+
+        where_sql = " OR ".join(where_parts)
+        before_rows = self._query(
+            f"SELECT COUNT(*) AS c FROM modem_inventory_current WHERE {where_sql}",
+            tuple(params),
+        )
+        before_count = int((before_rows[0] or {}).get("c") or 0) if before_rows else 0
+        if before_count <= 0:
+            return 0
+
+        self._execute(
+            f"DELETE FROM modem_inventory_current WHERE {where_sql}",
+            tuple(params),
+        )
+        return before_count
+
     def _map_inventory_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         def _to_bool(value: Any) -> Any:
             if value is None:

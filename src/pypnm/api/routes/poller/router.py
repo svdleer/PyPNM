@@ -98,6 +98,22 @@ def get_inventory_modems_bulk(body: dict) -> dict:
     return {"status": "success", "modems": modems, "count": len(modems)}
 
 
+@router.post("/inventory/modems/clear")
+def clear_inventory_modems(body: dict) -> dict:
+    cmts = str(body.get("cmts") or "").strip()
+    cmts_ip = str(body.get("cmts_ip") or "").strip()
+    if not cmts and not cmts_ip:
+        return {"status": "error", "message": "cmts or cmts_ip required"}
+
+    deleted = poller_service.clear_inventory_modems(cmts=cmts or None, cmts_ip=cmts_ip or None)
+    return {
+        "status": "success",
+        "deleted": deleted,
+        "cmts": cmts,
+        "cmts_ip": cmts_ip,
+    }
+
+
 @router.get("/poller-scheduler/status", response_model=PollerSchedulerStatusResponse)
 def poller_scheduler_status() -> PollerSchedulerStatusResponse:
     scheduler = poller_service.get_scheduler_status()
