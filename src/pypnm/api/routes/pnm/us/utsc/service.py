@@ -867,17 +867,8 @@ class CmtsUtscService:
                 )
                 output_format = 2
 
-            # EVO vCCAP firmware 10.10.0: docsPnmCmtsUtscCapabTriggerMode = 0x0000 (all zeros).
-            # freeRunning(2) is NOT supported — SET is rejected with commitFailed.
-            # The CMTS silently stays at idleSid(5), causing a VERIFY MISMATCH.
-            # Override proactively so the probe loop finds the existing row and
-            # all column SETs succeed cleanly.
-            if is_evo and trigger_mode == 2:
-                self.logger.info(
-                    "EVO vCCAP: freeRunning(2) not supported on firmware 10.10.0 "
-                    "— overriding trigger_mode 2 → 5 (idleSid)"
-                )
-                trigger_mode = 5
+            # Keep the caller-requested trigger mode. Some EVO deployments do
+            # support freeRunning(2), and forcing idleSid(5) masks valid configs.
 
             if is_cisco:
                 # Cisco cBR-8: rows are NOT pre-provisioned per port.
