@@ -980,6 +980,28 @@ class CmtsUtscService:
                 else:
                     self.logger.info(f"Writing columns in-place at cfg_index={target_idx} (no RowStatus touch)...")
 
+                transitioned_not_in_service = False
+                if row_found:
+                    try:
+                        row_status_read = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
+                        row_status_val = self._parse_get_value(row_status_read)
+                        row_status_int = int(row_status_val) if row_status_val and 'No Such' not in str(row_status_val) else None
+                    except (ValueError, TypeError):
+                        row_status_int = None
+
+                    # vCCAP/Casa can reject TriggerMode updates on active rows.
+                    # Put row in notInService(2) before in-place parameter writes.
+                    if row_status_int == 1:
+                        self.logger.info(f"cfg_index={target_idx} RowStatus=active -> set notInService(2) before configure writes")
+                        to_inactive = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 2, 'i')
+                        if to_inactive.get('success'):
+                            transitioned_not_in_service = True
+                            await asyncio.sleep(0.2)
+                        else:
+                            self.logger.warning(
+                                f"Failed to set RowStatus notInService before configure: {to_inactive.get('error')}"
+                            )
+
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
             # 0. LogicalChIfIndex (.2)
@@ -1226,6 +1248,13 @@ class CmtsUtscService:
                     )
 
             # ===== Verify RowStatus =====
+            if transitioned_not_in_service:
+                reactivate_result = await self._snmp_set(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}", 1, 'i')
+                if not reactivate_result.get('success'):
+                    self.logger.warning(
+                        f"Failed to restore RowStatus active after configure: {reactivate_result.get('error')}"
+                    )
+
             await asyncio.sleep(0.3)
             status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
             row_status = self._parse_get_value(status_result)
