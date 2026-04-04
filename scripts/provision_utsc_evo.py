@@ -4,10 +4,12 @@
 """
 UTSC provisioning script for CommScope EVO vCCAP (CASA DCTS VCCAP, HW=CASA-VNF).
 
-Key differences from E6000:
-    - No pre-provisioned rows — must create with createAndWait(5), set all params, then active(1)
-    - createAndGo(4) returns commitFailed (mandatory objects must be set before activation)
-    - Row index: physicalIfIndex  (e.g. 40001280)
+Validated vCCAP behavior on 10.10.0:
+    - UTSC row key uses RF port ifIndex (12000xxxx), cfgIndex commonly 1
+    - TriggerMode object type is INTEGER (not OctetString)
+    - TriggerMode freeRunning(2) may return commitFailed on some rows; idleSid(5) works
+    - RowStatus can read back createAndWait(5) while InitiateTest still runs successfully
+    - Bulk upload is controlled via docsPnmCcapBulkDataControlTable
     - Uses local snmpget/snmpset binaries from PATH
 
 Interface types on EVO:
@@ -23,16 +25,15 @@ Interface types on EVO:
     120001280+  RPHY Upstream RF Port (physical RF — used for UTSC)
     160001280+  RPHY OFDMA Upstream logical channels
 
-  IMPORTANT: docsPnmCmtsUtscCapabTriggerMode = BITS: 00 00 on ALL ports.
-  This means UTSC is NOT supported / not licensed on this EVO firmware (10.10.0).
-  All createAndWait/createAndGo attempts will fail with commitFailed.
-  This script runs the attempt anyway to document the exact failure mode.
+    NOTE: Capability bits may advertise freeRunning, but the active row can still
+    reject TriggerMode=2 with commitFailed. This script reports the effective mode
+    from readback and continues with working settings.
 Device: MND-GT0002-CCAPV001  172.16.6.160
 
 Usage:
-    python3 provision_utsc_evo.py [physical_ifindex [logical_ifindex]]
-    python3 provision_utsc_evo.py 40001280              # any logical channel
-    python3 provision_utsc_evo.py 40001280 160001280    # pin to specific OFDMA channel
+    python3 provision_utsc_evo.py [rf_ifindex [logical_ifindex]]
+    python3 provision_utsc_evo.py 120001728              # any logical channel
+    python3 provision_utsc_evo.py 120001728 160001728    # pin to specific OFDMA channel
 """
 
 import subprocess
@@ -40,6 +41,7 @@ import sys
 import os
 import time
 import shlex
+import re
 
 # ============================================================
 # CONFIGURATION  (override via environment variables)
@@ -53,11 +55,12 @@ SSH_USER   = os.environ.get("SSH_USER",   "svdleer")
 SSH_PORT   = os.environ.get("SSH_PORT",   "65001")
 
 RF_ARG_GIVEN = len(sys.argv) > 1
-RF_PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 120001280  # RPHY Upstream RF Port
+RF_PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 120001728  # RPHY Upstream RF Port
 LOGICAL_CH = int(sys.argv[2]) if len(sys.argv) > 2 else 0           # 0 = any channel
+CFG_INDEX  = int(os.environ.get("UTSC_CFG_INDEX", "1"))
 
-# EVO compound index: {ifIndex}.{cfgIndex} — cfgIndex=2 for 120001280 RF port
-IDX_CANDIDATES = [f".{RF_PORT}.2"]
+# EVO compound index: {ifIndex}.{cfgIndex}
+IDX_CANDIDATES = [f".{RF_PORT}.{CFG_INDEX}"]
 
 
 # TFTP
@@ -65,9 +68,9 @@ TFTP_IP    = os.environ.get("TFTP_IP", "172.16.6.101")
 TFTP_HEX   = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))  # AC100665
 TFTP_URI   = f"tftp://{TFTP_IP}/"
 
-# BDT row (destination table)
-BDT_ROW    = 1
-BDT_BASE   = "1.3.6.1.4.1.4491.2.1.27.1.1.3.1.1"
+# CCAP bulk row (destination table)
+CCAP_ROW   = 1
+CCAP_BASE  = "1.3.6.1.4.1.4491.2.1.27.1.1.1.5.1"
 
 # UTSC tables
 UTSC_BASE  = "1.3.6.1.4.1.4491.2.1.27.1.3.10.2.1"
@@ -76,12 +79,12 @@ STAT_BASE  = "1.3.6.1.4.1.4491.2.1.27.1.3.10.4.1.1"
 
 # RowStatus values
 RS_ACTIVE        = 1
-RS_CREATE_GO     = 4   # createAndGo — EVO accepts this for UTSC rows
+RS_CREATE_GO     = 4
 RS_CREATE_WAIT   = 5   # createAndWait
 RS_DESTROY       = 6
 
 # Capture parameters — start conservative to find EVO limits
-TRIGGER_MODE     = 2        # freeRunning
+TRIGGER_MODE     = int(os.environ.get("UTSC_TRIGGER_MODE", "5"))
 CENTER_FREQ      = 16000000 # 16 MHz
 SPAN             = 30000000 # 30 MHz
 NUM_BINS         = 800
@@ -97,6 +100,16 @@ SKIP_UTSC_DESTROY = os.environ.get("SKIP_UTSC_DESTROY", "1") == "1"
 MEAS_STATUS = {
     1: "other", 2: "inactive", 3: "triggered",
     4: "sampleReady", 5: "error", 6: "measurementBusy", 7: "sampleTruncated"
+}
+
+TRIGGER_MODE_NAMES = {
+    1: "other",
+    2: "freeRunning",
+    3: "minislotCount",
+    4: "sid",
+    5: "idleSid",
+    6: "cmMac",
+    7: "cmMac",
 }
 
 POLL_INTERVAL = 3
@@ -132,30 +145,46 @@ def snmpwalk(oid: str) -> str:
 
 
 def val(raw: str) -> int:
-    try:
-        return int(raw.split(":")[-1].strip())
-    except (ValueError, IndexError):
+    if not raw:
         return -1
+    txt = str(raw).strip()
+    # Handles values like "sampleReady(4)" / "INTEGER: active(1)".
+    m = re.search(r"\((-?\d+)\)", txt)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"-?\d+", txt)
+    if m:
+        return int(m.group(0))
+    return -1
 
 
 def step(name: str):
     print(f"\n{'='*60}\n  {name}\n{'='*60}")
 
 
-CAPAB_OID  = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1.2"  # docsPnmCmtsUtscCapabTriggerMode
+def has_hex_pair(raw: str, pair: str) -> bool:
+    """Return True if a hex pair string (e.g. '00 80') appears in SNMP output."""
+    if not raw:
+        return False
+    normalized = raw.replace("Hex-STRING:", "").replace("BITS:", "")
+    normalized = " ".join(normalized.split()).upper()
+    return pair.upper() in normalized
+
+
+CAPAB_OID  = "1.3.6.1.4.1.4491.2.1.27.1.3.10.1.1.1"  # docsPnmCmtsUtscCapabTriggerMode
 SYS_DESCR_OID = "1.3.6.1.2.1.1.1.0"
 
 
 def auto_select_vccap_rf_port():
-    """If user did not pass RF index and device is vCCAP, default to 120001280 (RPHY Upstream RF Port)."""
+    """If user did not pass RF index and device is vCCAP, use known RF port default."""
     global RF_PORT, IDX_CANDIDATES
     if RF_ARG_GIVEN:
         return
     raw = snmpget(SYS_DESCR_OID)
     sysdescr = raw.lower()
     if "vccap" in sysdescr or "dcts vccap" in sysdescr:
-        RF_PORT = 120001280
-        IDX_CANDIDATES = [f".{RF_PORT}.2"]
+        RF_PORT = 120001728
+        IDX_CANDIDATES = [f".{RF_PORT}.{CFG_INDEX}"]
         print(f"  Auto-detected vCCAP from sysDescr; using RF port {RF_PORT}")
 
 
@@ -183,34 +212,27 @@ def check_capability():
 
 # ============================================================
 
-def provision_bdt():
-    step(f"1. BDT Row {BDT_ROW} — TFTP {TFTP_IP}")
-
-    # destroy existing row first (ignore error if it doesn't exist)
-    print(f"  RowStatus.{BDT_ROW} = destroy(6)")
-    snmpset(f"{BDT_BASE}.9.{BDT_ROW}", "i", RS_DESTROY)
-    time.sleep(1)
-
-    # createAndWait, then set fields, then active
-    print(f"  RowStatus.{BDT_ROW} = createAndWait(5)")
-    r = snmpset(f"{BDT_BASE}.9.{BDT_ROW}", "i", RS_CREATE_WAIT)
-    print(f"    {r}")
-    time.sleep(0.5)
-
+def provision_ccap_bulk():
+    step(f"1. CCAP Bulk Row {CCAP_ROW} — TFTP {TFTP_IP}")
     fields = [
-        (f"{BDT_BASE}.3.{BDT_ROW}", "i", 1,         "DestHostIpAddrType = ipv4(1)"),
-        (f"{BDT_BASE}.4.{BDT_ROW}", "x", TFTP_HEX,  f"DestHostIpAddress  = {TFTP_IP}"),
-        (f"{BDT_BASE}.6.{BDT_ROW}", "s", TFTP_URI,  f"DestBaseUri        = {TFTP_URI}"),
-        (f"{BDT_BASE}.7.{BDT_ROW}", "i", 1,          "Protocol           = tftp(1)"),
+        (f"{CCAP_BASE}.2.{CCAP_ROW}", "i", 1,        "DestIpAddrType     = ipv4(1)"),
+        (f"{CCAP_BASE}.3.{CCAP_ROW}", "x", TFTP_HEX, f"DestIpAddr         = {TFTP_IP}"),
+        (f"{CCAP_BASE}.4.{CCAP_ROW}", "s", "/",      "DestPath           = /"),
+        (f"{CCAP_BASE}.5.{CCAP_ROW}", "i", 3,        "UploadControl      = autoUpload(3)"),
+        (f"{CCAP_BASE}.6.{CCAP_ROW}", "x", "0080",   "PnmTestSelector    = UTSC bit (00 80)"),
     ]
     for oid, t, v, desc in fields:
         print(f"  {desc}")
         r = snmpset(oid, t, v)
         print(f"    {r}")
 
-    print(f"  RowStatus.{BDT_ROW} = active(1)")
-    r = snmpset(f"{BDT_BASE}.9.{BDT_ROW}", "i", RS_ACTIVE)
-    print(f"    {r}")
+    # Always print authoritative selector readback (some EVO sets return
+    # commitFailed while row state remains correctly configured).
+    selector_rb = snmpget(f"{CCAP_BASE}.6.{CCAP_ROW}")
+    print(f"  PnmTestSelector readback: {selector_rb}")
+    if not has_hex_pair(selector_rb, "00 80"):
+        print("\n  *** WARNING: UTSC selector bit not confirmed on readback (expected 00 80)")
+        print("  *** Upload row may not be selecting UTSC captures")
 
 # ============================================================
 # UTSC config row
@@ -228,7 +250,7 @@ def configure_utsc_for_idx(idx: str) -> bool:
         else:
             print("  Skipping UTSC RowStatus destroy (SKIP_UTSC_DESTROY=1)")
 
-        # createAndGo — EVO accepts this for UTSC compound-index rows
+        # createAndGo for existing EVO row key
         print(f"  RowStatus{idx} = createAndGo(4)")
         r = snmpset(f"{UTSC_BASE}.21{idx}", "i", RS_CREATE_GO)
         print(f"    {r}")
@@ -247,7 +269,7 @@ def configure_utsc_for_idx(idx: str) -> bool:
     # Set all mandatory + optional parameters while row is notReady/notInService
     params = [
         (f"{UTSC_BASE}.2{idx}",  "i", LOGICAL_CH,      f"LogicalChIfIndex   = {LOGICAL_CH} {'(any channel)' if LOGICAL_CH == 0 else '(pinned OFDMA ch)'}"),
-        (f"{UTSC_BASE}.3{idx}",  "i", TRIGGER_MODE,    f"TriggerMode        = {TRIGGER_MODE} (freeRunning)"),
+        (f"{UTSC_BASE}.3{idx}",  "i", TRIGGER_MODE,    f"TriggerMode        = {TRIGGER_MODE}"),
         (f"{UTSC_BASE}.8{idx}",  "u", CENTER_FREQ,     f"CenterFreq         = {CENTER_FREQ//1000000} MHz"),
         (f"{UTSC_BASE}.9{idx}",  "u", SPAN,            f"Span               = {SPAN//1000000} MHz"),
         (f"{UTSC_BASE}.10{idx}", "u", NUM_BINS,        f"NumBins            = {NUM_BINS}"),
@@ -257,13 +279,22 @@ def configure_utsc_for_idx(idx: str) -> bool:
         (f"{UTSC_BASE}.19{idx}", "u", FREERUN_DURATION,f"FreeRunDuration    = {FREERUN_DURATION} ms"),
         (f"{UTSC_BASE}.20{idx}", "u", TRIGGER_COUNT,   f"TriggerCount       = {TRIGGER_COUNT}"),
         (f"{UTSC_BASE}.12{idx}", "s", FILENAME,        f"Filename           = {FILENAME}"),
-        (f"{UTSC_BASE}.24{idx}", "u", BDT_ROW,         f"DestinationIndex   = {BDT_ROW}"),
+        (f"{UTSC_BASE}.24{idx}", "u", CCAP_ROW,        f"DestinationIndex   = {CCAP_ROW}"),
     ]
     for oid, t, v, desc in params:
         print(f"  {desc}")
         r = snmpset(oid, t, v)
         print(f"    {r}")
         time.sleep(0.05)
+
+    # Print effective trigger mode from CMTS readback.
+    trig_rb = snmpget(f"{UTSC_BASE}.3{idx}")
+    print(f"  TriggerMode readback: {trig_rb}")
+    trig_effective = val(trig_rb)
+    if trig_effective != TRIGGER_MODE:
+        req = TRIGGER_MODE_NAMES.get(TRIGGER_MODE, str(TRIGGER_MODE))
+        eff = TRIGGER_MODE_NAMES.get(trig_effective, str(trig_effective))
+        print(f"\n  *** WARNING: TriggerMode mismatch requested={req}({TRIGGER_MODE}) effective={eff}({trig_effective})")
 
     # Activate row
     print(f"  RowStatus{idx} = active(1)")
@@ -277,6 +308,9 @@ def configure_utsc_for_idx(idx: str) -> bool:
     if "No Such" in rs or rs.strip() == "":
         print("\n  ERROR: UTSC row is still missing after activation attempt.")
         return False
+    rs_int = val(rs)
+    if rs_int != RS_ACTIVE:
+        print(f"  NOTE: RowStatus is {rs_int}, not active(1); EVO may still allow trigger")
     return True
 
 
@@ -300,6 +334,9 @@ def configure_utsc() -> str | None:
 
 def trigger(idx: str):
     step(f"3. Trigger (InitiateTest=1) {idx}")
+    # Clear prior state first to avoid "test already in progress" on vCCAP.
+    snmpset(f"{CTRL_BASE}{idx}", "i", 2)
+    time.sleep(0.2)
     r = snmpset(f"{CTRL_BASE}{idx}", "i", 1)
     print(f"  {r}")
 
@@ -315,14 +352,17 @@ def poll_status(idx: str):
         raw = snmpget(f"{STAT_BASE}{idx}")
         s = val(raw)
         name = MEAS_STATUS.get(s, "unknown")
-        print(f"  [{elapsed:5.1f}s] MeasStatus={s} ({name})")
+        if s < 0:
+            print(f"  [{elapsed:5.1f}s] MeasStatus=unknown raw={raw}")
+        else:
+            print(f"  [{elapsed:5.1f}s] MeasStatus={s} ({name})")
         if s == 4:
             print("\n  sampleReady — check TFTP server!")
             return True
         elif s == 7:
             print("\n  sampleTruncated")
             return True
-        elif s in (5, 6):
+        elif s == 5:
             print(f"\n  {name}!")
             return False
         time.sleep(POLL_INTERVAL)
@@ -339,14 +379,15 @@ def main():
     print(f"  RF port:   {RF_PORT}  (physical, RPHY Upstream Physical Interface)")
     print(f"  LogicalCh: {LOGICAL_CH}  {'(any — no pin)' if LOGICAL_CH == 0 else '(RPHY OFDMA Upstream)'}")
     print(f"  TFTP:      {TFTP_IP}")
-    print(f"  Mode:      freeRunning  duration={FREERUN_DURATION}ms  repeat={REPEAT_PERIOD}µs")
+    mode_name = TRIGGER_MODE_NAMES.get(TRIGGER_MODE, f"mode{TRIGGER_MODE}")
+    print(f"  Mode:      {mode_name}({TRIGGER_MODE})  duration={FREERUN_DURATION}ms  repeat={REPEAT_PERIOD}µs")
     print(f"  Indexes:   {', '.join(IDX_CANDIDATES)}")
     print("=" * 60)
 
     selected_idx: str | None = None
     try:
         check_capability()
-        provision_bdt()
+        provision_ccap_bulk()
         selected_idx = configure_utsc()
         if not selected_idx:
             print("\nStopping before trigger/poll because UTSC config row is unavailable.")
