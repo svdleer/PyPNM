@@ -992,40 +992,20 @@ class CmtsUtscService:
             # ===== Set parameters (Cisco uses Gauge32/'u' for most values) =====
 
             # 0. LogicalChIfIndex (.2)
-            # Per UTSC behavior notes: only needed for IdleSID/CM-MAC trigger modes.
-            # Skip for freeRunning and other trigger modes to avoid inconsistentValue.
-            needs_logical_ch = trigger_mode in (5, 6, 7)  # 5=idleSid, 6/7=cmMac (vendor-specific)
-            if needs_logical_ch:
-                logical_candidates = []
-                if logical_ch_ifindex:
-                    logical_candidates.append(logical_ch_ifindex)
-                if rf_port_ifindex not in logical_candidates:
-                    logical_candidates.append(rf_port_ifindex)
-                if 0 not in logical_candidates:
-                    logical_candidates.append(0)
-
-                logical_set_ok = False
-                logical_set_error = None
-                for logical_value in logical_candidates:
-                    logical_result = await self._snmp_set(
-                        f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", logical_value, 'i'
+            # UTSC must stay anchored to the physical RF port. Logical channel ifIndex
+            # is optional for this flow and should only be set when explicitly provided.
+            # Do NOT fallback to RF/0 placeholders here.
+            if logical_ch_ifindex is not None:
+                logical_result = await self._snmp_set(
+                    f"{self.OID_UTSC_CFG_LOGICAL_CH}{idx}", int(logical_ch_ifindex), 'i'
+                )
+                if not logical_result.get('success'):
+                    self.logger.warning(
+                        f"LogicalChIfIndex set failed value={logical_ch_ifindex} on {vendor}; "
+                        f"continuing without overriding logical channel: {logical_result.get('error')}"
                     )
-                    if logical_result.get('success'):
-                        logical_set_ok = True
-                        break
-
-                    logical_set_error = logical_result.get('error', 'Unknown error')
-                    if 'inconsistentValue' in str(logical_set_error):
-                        self.logger.warning(
-                            f"LogicalChIfIndex rejected value={logical_value} on {vendor}; trying fallback"
-                        )
-                        continue
-                    break
-
-                if not logical_set_ok:
-                    raise RuntimeError(f"Failed to set LogicalChIfIndex: {logical_set_error}")
             else:
-                self.logger.info(f"Skipping LogicalChIfIndex for trigger_mode={trigger_mode}")
+                self.logger.info("LogicalChIfIndex not provided for UTSC configure; leaving existing value unchanged")
 
             # 1. Trigger mode (INTEGER)
             await self._snmp_set(f"{self.OID_UTSC_CFG_TRIGGER_MODE}{idx}", trigger_mode, 'i')
