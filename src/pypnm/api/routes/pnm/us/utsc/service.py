@@ -1304,6 +1304,8 @@ class CmtsUtscService:
             Dict with success status
         """
         import asyncio
+        requested_cfg_index = cfg_index
+
         # Probe for the row by TriggerMode — same logic as configure().
         # Casa pre-provisions rows 1-3 with fixed TriggerModes; RowStatus is
         # always createAndWait so probing by RowStatus=active never finds anything.
@@ -1364,11 +1366,26 @@ class CmtsUtscService:
                     return activate_result
                 await asyncio.sleep(1)  # give CMTS time to transition row to active
 
+            # vCCAP reliability: explicitly clear InitiateTest before starting.
+            # Some firmware rejects direct 1->1 transitions with commitFailed.
+            _ = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 2, 'i')
+            await asyncio.sleep(0.2)
+            start_result = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
+            if start_result.get('success'):
+                return start_result
+
+            # One immediate retry after a second clear for transient CMTS state.
+            _ = await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 2, 'i')
+            await asyncio.sleep(0.2)
             return await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
 
         try:
-            # Prefer resolved row, then fall back across the standard row set.
-            candidate_indices = [resolved] + [i for i in (1, 2, 3) if i != resolved]
+            # If caller explicitly requested a cfg index, do not probe others.
+            # Avoid hiding real failures with unrelated "cfg_index=2 unreadable" noise.
+            if requested_cfg_index and int(requested_cfg_index) > 0:
+                candidate_indices = [resolved]
+            else:
+                candidate_indices = [resolved] + [i for i in (1, 2, 3) if i != resolved]
             last_error = None
 
             for target_idx in candidate_indices:
