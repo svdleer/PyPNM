@@ -891,10 +891,14 @@ class CmtsUtscService:
                 # NOTE: on Casa C100G destroying a row removes the DestinationIndex managed
                 # internally — prefer in-place when a row exists.
                 # TODO: verify EVO vCCAP restores DestinationIndex after createAndGo (untested)
-                target_idx = cfg_index
+                # EVO vCCAP: valid cfg indices are 2, 3 (sometimes 1) — probe in that order.
+                # Casa C100G / Arris E6000: standard indices 1, 2, 3.
+                probe_order = [2, 3, 1] if is_evo else [1, 2, 3]
+                # Default creation index if no row found: first candidate for the vendor.
+                target_idx = probe_order[0] if cfg_index <= 0 else cfg_index
                 row_found = False
                 first_existing_idx: Optional[int] = None
-                for probe_idx in range(1, 4):
+                for probe_idx in probe_order:
                     # Probe TriggerMode first (original approach)
                     r = await self._snmp_get(
                         f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
@@ -1348,11 +1352,13 @@ class CmtsUtscService:
             probe_modes = [trigger_mode]
             if trigger_mode == 2:
                 probe_modes.append(5)  # idleSid fallback for EVO
+            # EVO vCCAP: valid cfg indices are 2, 3 (sometimes 1) — probe in that order.
+            start_probe_order = [2, 3, 1] if is_evo else [1, 2, 3]
             match_found = False
             for probe_mode in probe_modes:
                 if match_found:
                     break
-                for probe_idx in range(1, 4):
+                for probe_idx in start_probe_order:
                     r = await self._snmp_get(
                         f"{self.OID_UTSC_CFG_TRIGGER_MODE}.{rf_port_ifindex}.{probe_idx}"
                     )
@@ -1426,7 +1432,8 @@ class CmtsUtscService:
             if requested_cfg_index and int(requested_cfg_index) > 0:
                 candidate_indices = [resolved]
             else:
-                candidate_indices = [resolved] + [i for i in (1, 2, 3) if i != resolved]
+                fallback_order = [2, 3, 1] if is_evo else [1, 2, 3]
+                candidate_indices = [resolved] + [i for i in fallback_order if i != resolved]
             last_error = None
 
             for target_idx in candidate_indices:
