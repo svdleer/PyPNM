@@ -55,12 +55,16 @@ SSH_USER   = os.environ.get("SSH_USER",   "svdleer")
 SSH_PORT   = os.environ.get("SSH_PORT",   "65001")
 
 RF_ARG_GIVEN = len(sys.argv) > 1
-RF_PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 120001728  # RPHY Upstream RF Port
+RF_PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 120001280  # RPHY Upstream Physical RF Port
 LOGICAL_CH = int(sys.argv[2]) if len(sys.argv) > 2 else 0           # 0 = any channel
-CFG_INDEX  = int(os.environ.get("UTSC_CFG_INDEX", "1"))
+CFG_INDEX  = int(os.environ.get("UTSC_CFG_INDEX", ""))
 
 # EVO compound index: {ifIndex}.{cfgIndex}
-IDX_CANDIDATES = [f".{RF_PORT}.{CFG_INDEX}"]
+# Try multiple indices if not explicitly set; Casa/EVO may have index 1 or 2 or 3
+if CFG_INDEX:
+    IDX_CANDIDATES = [f".{RF_PORT}.{CFG_INDEX}"]
+else:
+    IDX_CANDIDATES = [f".{RF_PORT}.{i}" for i in [2, 3, 1]]  # Try 2, 3 (newer), then 1 (older)
 
 
 # TFTP
@@ -90,7 +94,7 @@ SPAN             = 30000000 # 30 MHz
 NUM_BINS         = 800
 OUTPUT_FORMAT    = 5        # fftAmplitude (same as Casa)
 WINDOW           = 2        # rectangular (safe default)
-REPEAT_PERIOD    = 100000   # 100 ms (100000 µs)
+REPEAT_PERIOD    = 400000   # 400 ms (400000 µs) — keep files <= 300: 120s/400ms = 300 files max
 FREERUN_DURATION = 120000   # 120 s (120 000 ms) — Casa/EVO minimum
 TRIGGER_COUNT    = 1
 FILENAME         = "utsc_evo"

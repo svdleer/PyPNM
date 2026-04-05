@@ -84,8 +84,8 @@ SPAN             = 80000000 # 80 MHz
 NUM_BINS         = 800   # E6000 non-TimeIQ valid: 200/400/800/1600/3200
 OUTPUT_FORMAT    = 2        # fftPower — safe default for all vendors
 WINDOW           = 2        # rectangular
-REPEAT_PERIOD    = 100000   # 100 ms (µs)
-FREERUN_DURATION = 120000   # 120 s (ms)
+REPEAT_PERIOD    = 400000   # 400 ms (µs) — CRITICAL: 120s / 400ms = 300 files (Casa/EVO max)
+FREERUN_DURATION = 120000   # 120 s (ms) — Casa/EVO minimum
 TRIGGER_COUNT    = 1
 # E6000: must be non-empty — E6000 rejects InitiateTest if filename is "".
 # Per MIB docs: must be "", "/pnm/utsc/filename", or "filename" (no dirs).

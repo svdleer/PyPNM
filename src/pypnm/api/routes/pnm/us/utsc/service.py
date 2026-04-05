@@ -1374,6 +1374,18 @@ class CmtsUtscService:
         async def _try_start_on_idx(target_idx: int) -> dict[str, Any]:
             idx = f".{rf_port_ifindex}.{target_idx}"
 
+            # If the CMTS already reports BUSY, do not re-trigger InitiateTest.
+            # vCCAP logs this as "test already in progress" and may return commitFailed.
+            meas_status_result = await self._snmp_get(f"{self.OID_UTSC_STATUS_MEAS}{idx}")
+            meas_status_val = self._parse_get_value(meas_status_result)
+            try:
+                meas_status_int = int(meas_status_val) if meas_status_val and 'No Such' not in str(meas_status_val) else None
+            except (ValueError, TypeError):
+                meas_status_int = None
+            if meas_status_int == 3:
+                self.logger.info(f"cfg_index={target_idx} already BUSY; skipping InitiateTest retrigger")
+                return {"success": True, "already_running": True}
+
             # CMTS returns inconsistentValue on InitiateTest if RowStatus != active(1).
             # Always check and set active before triggering (matches provision_utsc.py).
             row_status_result = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
@@ -1420,9 +1432,10 @@ class CmtsUtscService:
             for target_idx in candidate_indices:
                 result = await _try_start_on_idx(target_idx)
                 if result.get('success'):
+                    message = "UTSC already running" if result.get('already_running') else "UTSC test started"
                     return {
                         "success": True,
-                        "message": "UTSC test started",
+                        "message": message,
                         "rf_port_ifindex": rf_port_ifindex,
                         "cfg_index": target_idx
                     }
