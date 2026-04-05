@@ -886,16 +886,20 @@ class CmtsUtscService:
                 await asyncio.sleep(1)
             else:
                 # Casa C100G / CommScope EVO vCCAP / Arris E6000:
-                # Probe cfg_index 1-3 for a row matching trigger_mode and write in-place.
+                # Probe cfg_index rows for a row matching trigger_mode and write in-place.
                 # If no row found (e.g. after reboot or first run), fall back to row creation.
                 # NOTE: on Casa C100G destroying a row removes the DestinationIndex managed
                 # internally — prefer in-place when a row exists.
                 # TODO: verify EVO vCCAP restores DestinationIndex after createAndGo (untested)
-                # EVO vCCAP: valid cfg indices are 2, 3 (sometimes 1) — probe in that order.
+                # EVO vCCAP: field-validated row index is 3; honor an explicit caller index,
+                # otherwise pin EVO to 3 rather than drifting to 1 based on stale rows.
                 # Casa C100G / Arris E6000: standard indices 1, 2, 3.
-                probe_order = [2, 3, 1] if is_evo else [1, 2, 3]
-                # Default creation index if no row found: first candidate for the vendor.
-                target_idx = probe_order[0] if cfg_index <= 0 else cfg_index
+                if is_evo:
+                    target_idx = cfg_index if cfg_index > 0 else 3
+                    probe_order = [target_idx]
+                else:
+                    probe_order = [1, 2, 3]
+                    target_idx = cfg_index if cfg_index > 0 else probe_order[0]
                 row_found = False
                 first_existing_idx: Optional[int] = None
                 for probe_idx in probe_order:
@@ -1343,7 +1347,7 @@ class CmtsUtscService:
         # Casa pre-provisions rows 1-3 with fixed TriggerModes; RowStatus is
         # always createAndWait so probing by RowStatus=active never finds anything.
         # Must match by TriggerMode to find the row configure() actually wrote to.
-        resolved = cfg_index if cfg_index > 0 else 1
+        resolved = cfg_index if cfg_index > 0 else (3 if is_evo else 1)
         if cfg_index == 0:
             # Auto-probe: find the row matching trigger_mode.
             # For EVO vCCAP: freeRunning(2) is overridden to idleSid(5) in configure(),
@@ -1352,8 +1356,8 @@ class CmtsUtscService:
             probe_modes = [trigger_mode]
             if trigger_mode == 2:
                 probe_modes.append(5)  # idleSid fallback for EVO
-            # EVO vCCAP: valid cfg indices are 2, 3 (sometimes 1) — probe in that order.
-            start_probe_order = [2, 3, 1] if is_evo else [1, 2, 3]
+            # EVO vCCAP: pin to cfg_index 3 unless caller explicitly overrides.
+            start_probe_order = [3] if is_evo else [1, 2, 3]
             match_found = False
             for probe_mode in probe_modes:
                 if match_found:
@@ -1432,7 +1436,7 @@ class CmtsUtscService:
             if requested_cfg_index and int(requested_cfg_index) > 0:
                 candidate_indices = [resolved]
             else:
-                fallback_order = [2, 3, 1] if is_evo else [1, 2, 3]
+                fallback_order = [3] if is_evo else [1, 2, 3]
                 candidate_indices = [resolved] + [i for i in fallback_order if i != resolved]
             last_error = None
 
