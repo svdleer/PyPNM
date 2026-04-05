@@ -321,6 +321,16 @@ class CmtsUtscService:
             import asyncio
             import ipaddress
 
+            vendor = await self.detect_vendor()
+
+            # EVO vCCAP behaves better with the standard bulk-destination table
+            # than with direct CCAP selector writes.
+            if vendor == 'evo':
+                self.logger.info(
+                    f"EVO detected — using standard BDT table for bulk upload to {dest_ip}:{dest_path}"
+                )
+                return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
+
             self.logger.info(f"Configuring bulk data control for {pnm_types} upload to {dest_ip}:{dest_path}")
             
             # Convert IP to hex string
@@ -365,7 +375,6 @@ class CmtsUtscService:
             # standard docsPnmBulkDataTransferCfgTable with destroy+recreate.
             probe = await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
             if not probe.get('success') and 'notWritable' in str(probe.get('error', '')):
-                vendor = await self.detect_vendor()
                 self.logger.info(
                     f"CCAP bulk data table is notWritable — using standard BDT table "
                     f"(docsPnmBulkDataTransferCfgTable) with destroy+recreate (vendor={vendor})"
@@ -444,6 +453,8 @@ class CmtsUtscService:
                 except Exception:
                     pass
             val = val.upper()
+            if 'DCTS VCCAP' in val or 'CASA DCTS VCCAP' in val:
+                return 'evo'
             if 'CASA' in val:
                 return 'casa'
             if 'ARRIS' in val or 'COMMSCOPE' in val:
@@ -921,6 +932,20 @@ class CmtsUtscService:
                                 break
                         except (ValueError, TypeError):
                             pass
+
+                    # EVO row 3 may already exist while TriggerMode is unreadable or stale.
+                    if is_evo and not row_found:
+                        rs = await self._snmp_get(
+                            f"{self.OID_UTSC_CFG_ROW_STATUS}.{rf_port_ifindex}.{probe_idx}"
+                        )
+                        rs_v = self._parse_get_value(rs)
+                        if rs_v is not None and 'No Such' not in str(rs_v):
+                            target_idx = probe_idx
+                            row_found = True
+                            self.logger.info(
+                                f"EVO: reusing cfg_index={probe_idx} based on readable RowStatus"
+                            )
+                            break
                     else:
                         # TriggerMode not readable — check RowStatus as fallback.
                         # Arris E6000 may have an active row where TriggerMode reads
@@ -1239,7 +1264,7 @@ class CmtsUtscService:
             )
             
             # 13. Set destination index if > 0 (Unsigned32)
-            if destination_index > 0:
+            if destination_index > 0 and not is_evo:
                 await self._snmp_set(
                     f"{self.OID_UTSC_CFG_DEST_INDEX}{idx}", destination_index, 'u'
                 )
