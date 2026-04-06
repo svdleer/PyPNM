@@ -887,12 +887,22 @@ class ChannelStatsRouter:
                                     iuc_stats = [
                                         {'iuc': iuc_id, 'codewords': cw}
                                         for iuc_id, cw in sorted(iuc_data.items())
-                                        if cw > 0
                                     ]
                                     if iuc_stats:
                                         ch['iuc_stats'] = iuc_stats
                                         ch['active_iucs'] = [s['iuc'] for s in iuc_stats]
                                         ch['current_iuc'] = iuc_stats[-1]['iuc']  # highest active IUC
+                            # Mirror active/current IUC into OFDM stats US rows.
+                            for row in parsed.get('ofdm_stats', {}).get('us_iuc_stats', []) or []:
+                                try:
+                                    row_ifindex = int(row.get('ifindex'))
+                                except (TypeError, ValueError):
+                                    continue
+                                iuc_data = ifindex_iuc_map.get(row_ifindex, {})
+                                if iuc_data:
+                                    active_iucs = sorted(iuc_data.keys())
+                                    row['active_iucs'] = active_iucs
+                                    row['current_iuc'] = active_iucs[-1]
                             self.logger.info(f'Injected CMTS IUC stats for {len(sorted_ifindices)} OFDMA channels')
                     except Exception as prof_err:
                         self.logger.warning(f'CMTS profile stats collection failed: {prof_err}')
