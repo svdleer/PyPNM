@@ -1028,6 +1028,8 @@ class ChannelStatsRouter:
                                     injected_fallback += 1
 
                             # Mirror into ofdm_stats.us_iuc_stats rows by ifIndex.
+                            rows_exact = 0
+                            rows_fallback = 0
                             for row in parsed.get('ofdm_stats', {}).get('us_iuc_stats', []) or []:
                                 try:
                                     row_ifindex = int(row.get('ifindex'))
@@ -1037,15 +1039,38 @@ class ChannelStatsRouter:
                                 if active_iucs:
                                     row['active_iucs'] = active_iucs
                                     row['current_iuc'] = max(active_iucs)
+                                    rows_exact += 1
+
+                            # Namespace mismatch fallback for stats rows too.
+                            stats_rows = parsed.get('ofdm_stats', {}).get('us_iuc_stats', []) or []
+                            if rows_exact == 0 and stats_rows:
+                                sorted_ifindices = sorted(us_profile_iuc_map.keys())
+                                sorted_rows = sorted(
+                                    stats_rows,
+                                    key=lambda r: int(r.get('ifindex') or 0),
+                                )
+                                for i, row in enumerate(sorted_rows):
+                                    if i >= len(sorted_ifindices):
+                                        break
+                                    active_iucs = sorted(set(us_profile_iuc_map.get(sorted_ifindices[i], [])))
+                                    if not active_iucs:
+                                        continue
+                                    row['active_iucs'] = active_iucs
+                                    row['current_iuc'] = max(active_iucs)
+                                    rows_fallback += 1
 
                             total_injected = injected_exact + injected_fallback
                             if total_injected:
                                 self.logger.info(
                                     'Injected per-modem UsProfileIucList for %s OFDMA channels '
+                                    '(exact=%s, fallback=%s) and %s stats rows '
                                     '(exact=%s, fallback=%s)',
                                     total_injected,
                                     injected_exact,
                                     injected_fallback,
+                                    rows_exact + rows_fallback,
+                                    rows_exact,
+                                    rows_fallback,
                                 )
                     except Exception as iuc_map_err:
                         self.logger.warning(f'UsProfileIucList injection failed: {iuc_map_err}')
@@ -1090,13 +1115,38 @@ class ChannelStatsRouter:
                                     injected_fallback += 1
 
                             total_injected = injected_exact + injected_fallback
+
+                            # Mirror channel current_profile into OFDM stats rows by channel_id
+                            # (these rows drive the OFDM/OFDMA stats page badges).
+                            row_mapped = 0
+                            ds_rows = parsed.get('ofdm_stats', {}).get('ds_profiles', []) or []
+                            if ds_rows and ds_channels:
+                                current_by_channel = {}
+                                for ch in ds_channels:
+                                    try:
+                                        chid = int(ch.get('channel_id'))
+                                        cur = ch.get('current_profile')
+                                        if cur is not None:
+                                            current_by_channel[chid] = int(cur)
+                                    except (TypeError, ValueError):
+                                        continue
+                                for row in ds_rows:
+                                    try:
+                                        chid = int(row.get('channel_id'))
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if chid in current_by_channel:
+                                        row['current_profile'] = current_by_channel[chid]
+                                        row_mapped += 1
+
                             if total_injected:
                                 self.logger.info(
                                     'Injected per-modem DsProfileIdList for %s OFDM channels '
-                                    '(exact=%s, fallback=%s)',
+                                    '(exact=%s, fallback=%s) and %s stats rows',
                                     total_injected,
                                     injected_exact,
                                     injected_fallback,
+                                    row_mapped,
                                 )
                     except Exception as ds_profile_err:
                         self.logger.warning(f'DsProfileIdList injection failed: {ds_profile_err}')
