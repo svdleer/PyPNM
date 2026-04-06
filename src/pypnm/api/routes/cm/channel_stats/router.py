@@ -984,6 +984,9 @@ class ChannelStatsRouter:
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
+                us_profile_iuc_map: dict[int, list[int]] = {}
+                ds_profile_id_map: dict[int, list[int]] = {}
+
                 # Prefer per-modem UsProfileIucList for active/current IUC mapping.
                 # This remains valid even when per-IUC codeword counters are all zero.
                 if parsed.get('success'):
@@ -1097,6 +1100,26 @@ class ChannelStatsRouter:
                                 )
                     except Exception as ds_profile_err:
                         self.logger.warning(f'DsProfileIdList injection failed: {ds_profile_err}')
+
+                # Log-only observability: when authoritative registration lists
+                # are unavailable or fail to populate active/current values.
+                if parsed.get('success'):
+                    ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', []) or []
+                    us_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', []) or []
+                    missing_ds = bool(ds_channels) and not any(ch.get('current_profile') is not None for ch in ds_channels)
+                    missing_us = bool(us_channels) and not any(ch.get('current_iuc') is not None for ch in us_channels)
+                    if missing_ds or missing_us:
+                        self.logger.warning(
+                            'Authoritative profile assignment missing: cmts=%s mac=%s cm_index=%s '
+                            'ds_channels=%s us_channels=%s ds_profile_rows=%s us_iuc_rows=%s',
+                            request.cmts_ip,
+                            request.mac_address,
+                            cm_index,
+                            len(ds_channels),
+                            len(us_channels),
+                            len(ds_profile_id_map),
+                            len(us_profile_iuc_map),
+                        )
 
                 # Resolve fiber node
                 fiber_node = None
