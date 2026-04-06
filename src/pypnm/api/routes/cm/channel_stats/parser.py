@@ -289,9 +289,11 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
                                 profile_num = byte_idx * 8 + bit
                                 profiles.append(profile_num)
                 
-                # Current profile is typically the lowest numbered active profile
+                # For summary/UI, treat the highest active profile as current
+                # (e.g. profile D over A when 0..3 are all active).
                 if profiles:
-                    current_profile = min(profiles)
+                    non_zero_profiles = [p for p in profiles if p > 0]
+                    current_profile = max(non_zero_profiles) if non_zero_profiles else max(profiles)
             except (ValueError, TypeError):
                 pass
         

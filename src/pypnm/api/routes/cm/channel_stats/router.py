@@ -53,6 +53,78 @@ from .parser import parse_channel_stats_raw
 logger = logging.getLogger(__name__)
 
 
+def _parse_octet_string_to_bytes(value: object) -> bytes:
+    """Convert common SNMP octet-string representations to raw bytes."""
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, (list, tuple)):
+        try:
+            return bytes(int(part) for part in value)
+        except (TypeError, ValueError):
+            return b""
+
+    text = str(value).strip()
+    if not text:
+        return b""
+    if " = " in text:
+        text = text.split(" = ", 1)[1].strip()
+    if text.lower().startswith("hex-string:"):
+        text = text.split(":", 1)[1].strip()
+    if text.lower().startswith("0x"):
+        text = text[2:]
+
+    compact = text.replace(" ", "").replace(":", "").replace("-", "")
+    if compact and len(compact) % 2 == 0:
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            return b""
+    return b""
+
+
+def _parse_us_profile_iuc_map(result: dict | None, cm_index: int | None) -> dict[int, list[int]]:
+    """Parse docsIf31CmtsCmRegStatusUsProfileIucList into {ifindex: [iuc, ...]}."""
+    if not result or cm_index is None:
+        return {}
+
+    payload = result.get("result", {}) if isinstance(result, dict) else {}
+    entries = payload.get("results") or []
+    if not entries and payload.get("output"):
+        entries = [{
+            "oid": f"1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cm_index}",
+            "value": payload.get("output"),
+        }]
+
+    parsed: dict[int, list[int]] = {}
+    prefix = "1.3.6.1.4.1.4491.2.1.28.1.3.1.3."
+    for entry in entries:
+        oid = str(entry.get("oid", ""))
+        if not oid.startswith(prefix):
+            continue
+        try:
+            entry_cm_index = int(oid[len(prefix):].split(".")[0])
+        except (TypeError, ValueError):
+            continue
+        if entry_cm_index != cm_index:
+            continue
+
+        raw_bytes = _parse_octet_string_to_bytes(entry.get("value"))
+        pos = 0
+        while pos + 5 < len(raw_bytes):
+            ifindex = int.from_bytes(raw_bytes[pos:pos + 4], byteorder="big", signed=False)
+            count = raw_bytes[pos + 4]
+            pos += 5
+            if count <= 0 or pos + count > len(raw_bytes):
+                break
+            iucs = [int(raw_bytes[pos + offset]) for offset in range(count)]
+            pos += count
+            if ifindex and iucs:
+                parsed[ifindex] = iucs
+    return parsed
+
+
 class ChannelStatsRequest(BaseModel):
     """Request model for channel stats."""
     mac_address: str = Field(..., description="Cable modem MAC address")
@@ -247,6 +319,7 @@ class ChannelStatsRouter:
                 fiber_node_sg_task_id = None
                 cmts_partial_reason_task_id = None
                 cmts_us_iuc_stats_task_id = None
+                cmts_us_profile_iuc_list_task_id = None
                 cmts_ds_ofdm_speed_task_id = None
                 cmts_ds_subcarrier_task_id = None
                 cmts_ifname_task_id = None
@@ -340,6 +413,15 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.5.1.1.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=cmts_task_timeout,
+                            )
+                            cmts_us_profile_iuc_list_task_id = await agent_manager.send_task(
+                                cmts_agent_id, "snmp_get",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cached_cm_index}',
                                     "community": request.cmts_community or "public",
                                 },
                                 timeout=cmts_task_timeout,
@@ -537,6 +619,7 @@ class ChannelStatsRouter:
                     cmts_profile_result,
                     cmts_partial_reason_result,
                     cmts_us_iuc_stats_result,
+                    cmts_us_profile_iuc_list_result,
                     cmts_ds_ofdm_speed_result,
                     cmts_ds_subcarrier_result,
                     cmts_ifname_result,
@@ -549,6 +632,7 @@ class ChannelStatsRouter:
                     _safe_wait_task(cmts_profile_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_partial_reason_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_us_iuc_stats_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_us_profile_iuc_list_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_ds_ofdm_speed_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_ds_subcarrier_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_ifname_task_id, cmts_task_timeout),
@@ -632,6 +716,28 @@ class ChannelStatsRouter:
                                 pass
                     except Exception as e:
                         self.logger.debug(f'cm_index resolution failed: {e}')
+
+                # When cm_index was resolved late (not cached), fetch per-modem
+                # UsProfileIucList now so current_iuc can be derived reliably.
+                if (
+                    cm_index is not None
+                    and request.cmts_ip
+                    and cmts_agent_id
+                    and cmts_us_profile_iuc_list_result is None
+                ):
+                    try:
+                        _task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_get",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cm_index}',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
+                        cmts_us_profile_iuc_list_result = await _safe_wait_task(_task_id, cmts_task_timeout)
+                    except Exception as _iuc_list_err:
+                        self.logger.debug(f'UsProfileIucList late fetch failed: {_iuc_list_err}')
 
                 if cmts_rxmer_result and parsed.get('success'):
                     try:
@@ -792,6 +898,69 @@ class ChannelStatsRouter:
                         self.logger.warning(f'CMTS profile stats collection failed: {prof_err}')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
+
+                # Prefer per-modem UsProfileIucList for active/current IUC mapping.
+                # This remains valid even when per-IUC codeword counters are all zero.
+                if parsed.get('success'):
+                    try:
+                        us_profile_iuc_map = _parse_us_profile_iuc_map(cmts_us_profile_iuc_list_result, cm_index)
+                        if us_profile_iuc_map:
+                            injected_exact = 0
+                            injected_fallback = 0
+
+                            ofdma_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', [])
+                            # Exact ifIndex match first.
+                            for ch in ofdma_channels:
+                                try:
+                                    ch_ifindex = int(ch.get('index'))
+                                except (TypeError, ValueError):
+                                    continue
+                                active_iucs = sorted(set(us_profile_iuc_map.get(ch_ifindex, [])))
+                                if not active_iucs:
+                                    continue
+                                ch['active_iucs'] = active_iucs
+                                ch['current_iuc'] = max(active_iucs)
+                                injected_exact += 1
+
+                            # Namespace mismatch fallback: pair sorted channels with sorted CMTS ifIndices.
+                            if injected_exact == 0 and ofdma_channels:
+                                sorted_ifindices = sorted(us_profile_iuc_map.keys())
+                                sorted_channels = sorted(
+                                    ofdma_channels,
+                                    key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0)),
+                                )
+                                for i, ch in enumerate(sorted_channels):
+                                    if i >= len(sorted_ifindices):
+                                        break
+                                    active_iucs = sorted(set(us_profile_iuc_map.get(sorted_ifindices[i], [])))
+                                    if not active_iucs:
+                                        continue
+                                    ch['active_iucs'] = active_iucs
+                                    ch['current_iuc'] = max(active_iucs)
+                                    injected_fallback += 1
+
+                            # Mirror into ofdm_stats.us_iuc_stats rows by ifIndex.
+                            for row in parsed.get('ofdm_stats', {}).get('us_iuc_stats', []) or []:
+                                try:
+                                    row_ifindex = int(row.get('ifindex'))
+                                except (TypeError, ValueError):
+                                    continue
+                                active_iucs = sorted(set(us_profile_iuc_map.get(row_ifindex, [])))
+                                if active_iucs:
+                                    row['active_iucs'] = active_iucs
+                                    row['current_iuc'] = max(active_iucs)
+
+                            total_injected = injected_exact + injected_fallback
+                            if total_injected:
+                                self.logger.info(
+                                    'Injected per-modem UsProfileIucList for %s OFDMA channels '
+                                    '(exact=%s, fallback=%s)',
+                                    total_injected,
+                                    injected_exact,
+                                    injected_fallback,
+                                )
+                    except Exception as iuc_map_err:
+                        self.logger.warning(f'UsProfileIucList injection failed: {iuc_map_err}')
 
                 # Resolve fiber node
                 fiber_node = None
