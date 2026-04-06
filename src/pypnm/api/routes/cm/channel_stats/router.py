@@ -698,32 +698,8 @@ class ChannelStatsRouter:
                     and 'timeout' in str(cmts_cmindex_result.get('error', '')).lower()
                 )
 
-                is_cmts_vccap = False
-                try:
-                    sysdescr_payload = cmts_sysdescr_result.get('result', cmts_sysdescr_result) if isinstance(cmts_sysdescr_result, dict) else {}
-                    sysdescr_value = str(sysdescr_payload.get('value') or sysdescr_payload.get('output') or '').lower()
-                    if not sysdescr_value and isinstance(sysdescr_payload.get('results'), list) and sysdescr_payload.get('results'):
-                        sysdescr_value = str((sysdescr_payload.get('results')[0] or {}).get('value') or '').lower()
-                    is_cmts_vccap = any(token in sysdescr_value for token in ('vccap', 'dcts vccap', 'casa-vnf'))
-                except Exception:
-                    is_cmts_vccap = False
-
-                # Collect CMTS OFDMA result (already running in parallel)
-                ofdma_oid = '1.3.6.1.4.1.4491.2.1.28.1.13'
-                modem_ofdma_empty = not raw_results.get(ofdma_oid)
-                if modem_ofdma_empty and cmts_ofdma_result:
-                    try:
-                        cmts_result = cmts_ofdma_result
-                        if cmts_result and cmts_result.get("result", {}).get("success"):
-                            cmts_ofdma_entries = cmts_result.get("result", {}).get("results", [])
-                            if cmts_ofdma_entries:
-                                raw_results[ofdma_oid] = cmts_ofdma_entries
-                                self.logger.info(
-                                    f"Injected {len(cmts_ofdma_entries)} CMTS OFDMA entries "
-                                    f"(Cisco fallback, ran in parallel)"
-                                )
-                    except Exception as cmts_ofdma_err:
-                        self.logger.warning(f"CMTS OFDMA fallback failed: {cmts_ofdma_err}")
+                # No fallback injection here. If authoritative data is missing,
+                # we rely on one explicit retry of registration list reads later.
 
                 # Parse results in API (NOT in agent)
                 parsed = parse_channel_stats_raw(
@@ -849,45 +825,7 @@ class ChannelStatsRouter:
                             if cm_rxmer_list:
                                 self.logger.info(f'Injected CMTS MeanRxMer for {injected_rxmer} OFDMA channels (positional, zero-suppressed)')
 
-                            # vCCAP: prefer docsIf3CmtsCmUsStatusSignalNoise for OFDMA RxMER.
-                            # docsIf31CmtsCmMeanRxMer can return 0 on some vCCAP OFDMA rows.
-                            # For non-vCCAP, keep docsIf31 as primary and use docsIf3 only as fallback.
-                            channels_needing_fallback = [ch for ch in ofdma_channels if ch.get('rx_mer') is None]
-                            if cmts_snr_result and is_cmts_vccap:
-                                try:
-                                    snr_payload = cmts_snr_result.get('result', cmts_snr_result) if isinstance(cmts_snr_result, dict) else {}
-                                    if snr_payload.get('success'):
-                                        snr_base = '1.3.6.1.4.1.4491.2.1.20.1.4.1.4'
-                                        snr_by_ifindex: dict[int, float] = {}
-                                        for entry in snr_payload.get('results', []):
-                                            oid = entry.get('oid', '')
-                                            suffix = oid.replace(snr_base + '.', '').lstrip('.')
-                                            parts = suffix.split('.')
-                                            if len(parts) == 2:
-                                                try:
-                                                    entry_cm_index = int(parts[0])
-                                                    ifindex = int(parts[1])
-                                                    val = int(entry.get('value') or 0)
-                                                    # OFDMA channels on vCCAP are in 160xxxxxx ifIndex range.
-                                                    # Filter out ATDMA/SC-QAM rows to keep channel mapping stable.
-                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0 and ifindex >= 160000000:
-                                                        snr_by_ifindex[ifindex] = round(val / 10, 2)
-                                                except (ValueError, TypeError):
-                                                    pass
-                                        if snr_by_ifindex:
-                                            # Positional match: sorted OFDMA ifindex -> sorted channel index.
-                                            # On vCCAP this is the authoritative source for both OFDMA channels.
-                                            sorted_snr = [snr_by_ifindex[k] for k in sorted(snr_by_ifindex.keys())]
-                                            sorted_channels = sorted(ofdma_channels, key=lambda c: c.get('index', 0))
-                                            fallback_snr = 0
-                                            for i, ch in enumerate(sorted_channels):
-                                                if i < len(sorted_snr):
-                                                    ch['rx_mer'] = sorted_snr[i]
-                                                    fallback_snr += 1
-                                            if fallback_snr:
-                                                self.logger.info(f'Injected vCCAP SNR (docsIf3) for {fallback_snr} OFDMA channels')
-                                except Exception as snr_err:
-                                    self.logger.warning(f'CMTS SNR fallback failed: {snr_err}')
+                            # No vendor fallback injection for RxMER.
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
@@ -961,9 +899,26 @@ class ChannelStatsRouter:
                 if parsed.get('success'):
                     try:
                         us_profile_iuc_map = _parse_us_profile_iuc_map(cmts_us_profile_iuc_list_result, cm_index)
+                        if not us_profile_iuc_map and cm_index is not None and request.cmts_ip and cmts_agent_id:
+                            try:
+                                retry_task_id = await agent_manager.send_task(
+                                    cmts_agent_id,
+                                    "snmp_get",
+                                    {
+                                        "target_ip": request.cmts_ip,
+                                        "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cm_index}',
+                                        "community": request.cmts_community or "public",
+                                    },
+                                    timeout=cmts_task_timeout,
+                                )
+                                retry_result = await _safe_wait_task(retry_task_id, cmts_task_timeout)
+                                us_profile_iuc_map = _parse_us_profile_iuc_map(retry_result, cm_index)
+                                if us_profile_iuc_map:
+                                    self.logger.info('UsProfileIucList retry succeeded for cm_index=%s', cm_index)
+                            except Exception as retry_err:
+                                self.logger.debug(f'UsProfileIucList retry failed: {retry_err}')
                         if us_profile_iuc_map:
                             injected_exact = 0
-                            injected_fallback = 0
 
                             ofdma_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', [])
                             # Exact ifIndex match first.
@@ -979,31 +934,11 @@ class ChannelStatsRouter:
                                 ch['current_iuc'] = max(active_iucs)
                                 injected_exact += 1
 
-                            # Namespace mismatch fallback: pair sorted channels with sorted CMTS ifIndices.
-                            if injected_exact == 0 and ofdma_channels:
-                                sorted_ifindices = sorted(us_profile_iuc_map.keys())
-                                sorted_channels = sorted(
-                                    ofdma_channels,
-                                    key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0)),
-                                )
-                                for i, ch in enumerate(sorted_channels):
-                                    if i >= len(sorted_ifindices):
-                                        break
-                                    active_iucs = sorted(set(us_profile_iuc_map.get(sorted_ifindices[i], [])))
-                                    if not active_iucs:
-                                        continue
-                                    ch['active_iucs'] = active_iucs
-                                    ch['current_iuc'] = max(active_iucs)
-                                    injected_fallback += 1
-
-                            total_injected = injected_exact + injected_fallback
+                            total_injected = injected_exact
                             if total_injected:
                                 self.logger.info(
-                                    'Injected per-modem UsProfileIucList for %s OFDMA channels '
-                                    '(exact=%s, fallback=%s)',
+                                    'Injected per-modem UsProfileIucList for %s OFDMA channels (exact match)',
                                     total_injected,
-                                    injected_exact,
-                                    injected_fallback,
                                 )
                     except Exception as iuc_map_err:
                         self.logger.warning(f'UsProfileIucList injection failed: {iuc_map_err}')
@@ -1012,9 +947,26 @@ class ChannelStatsRouter:
                 if parsed.get('success'):
                     try:
                         ds_profile_id_map = _parse_ds_profile_id_map(cmts_ds_profile_id_list_result, cm_index)
+                        if not ds_profile_id_map and cm_index is not None and request.cmts_ip and cmts_agent_id:
+                            try:
+                                retry_task_id = await agent_manager.send_task(
+                                    cmts_agent_id,
+                                    "snmp_get",
+                                    {
+                                        "target_ip": request.cmts_ip,
+                                        "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cm_index}',
+                                        "community": request.cmts_community or "public",
+                                    },
+                                    timeout=cmts_task_timeout,
+                                )
+                                retry_result = await _safe_wait_task(retry_task_id, cmts_task_timeout)
+                                ds_profile_id_map = _parse_ds_profile_id_map(retry_result, cm_index)
+                                if ds_profile_id_map:
+                                    self.logger.info('DsProfileIdList retry succeeded for cm_index=%s', cm_index)
+                            except Exception as retry_err:
+                                self.logger.debug(f'DsProfileIdList retry failed: {retry_err}')
                         if ds_profile_id_map:
                             injected_exact = 0
-                            injected_fallback = 0
                             ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', [])
 
                             for ch in ds_channels:
@@ -1030,32 +982,12 @@ class ChannelStatsRouter:
                                 ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
                                 injected_exact += 1
 
-                            if injected_exact == 0 and ds_channels:
-                                sorted_ifindices = sorted(ds_profile_id_map.keys())
-                                sorted_channels = sorted(
-                                    ds_channels,
-                                    key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0)),
-                                )
-                                for i, ch in enumerate(sorted_channels):
-                                    if i >= len(sorted_ifindices):
-                                        break
-                                    profiles = sorted(set(ds_profile_id_map.get(sorted_ifindices[i], [])))
-                                    if not profiles:
-                                        continue
-                                    ch['profiles'] = profiles
-                                    non_zero = [p for p in profiles if p > 0]
-                                    ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
-                                    injected_fallback += 1
-
-                            total_injected = injected_exact + injected_fallback
+                            total_injected = injected_exact
 
                             if total_injected:
                                 self.logger.info(
-                                    'Injected per-modem DsProfileIdList for %s OFDM channels '
-                                    '(exact=%s, fallback=%s)',
+                                    'Injected per-modem DsProfileIdList for %s OFDM channels (exact match)',
                                     total_injected,
-                                    injected_exact,
-                                    injected_fallback,
                                 )
                     except Exception as ds_profile_err:
                         self.logger.warning(f'DsProfileIdList injection failed: {ds_profile_err}')
@@ -1190,7 +1122,6 @@ class ChannelStatsRouter:
                         us_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', []) or []
                         us_rows = ofdm_stats.get('us_iuc_stats', []) or []
                         if us_channels and us_rows:
-                            mapped_exact = 0
                             # Exact namespace match (rare): row.ifindex == channel.index
                             for row in us_rows:
                                 try:
@@ -1206,25 +1137,6 @@ class ChannelStatsRouter:
                                     row['active_iucs'] = active_iucs
                                 if current_iuc is not None:
                                     row['current_iuc'] = current_iuc
-                                mapped_exact += 1
-
-                            # Namespace mismatch fallback: stable positional pairing.
-                            if mapped_exact == 0:
-                                sorted_rows = sorted(us_rows, key=lambda r: int(r.get('ifindex') or 0))
-                                sorted_channels = sorted(
-                                    us_channels,
-                                    key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0)),
-                                )
-                                for i, row in enumerate(sorted_rows):
-                                    if i >= len(sorted_channels):
-                                        break
-                                    ch = sorted_channels[i]
-                                    active_iucs = ch.get('active_iucs')
-                                    current_iuc = ch.get('current_iuc')
-                                    if active_iucs:
-                                        row['active_iucs'] = active_iucs
-                                    if current_iuc is not None:
-                                        row['current_iuc'] = current_iuc
 
                 if parsed.get("success"):
                     timing = parsed.get("timing", {})
