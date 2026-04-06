@@ -18,6 +18,9 @@ dist/
 .idea/
 *.code-workspace
 
+# GitHub metadata
+.github/
+
 # Logs
 *.log
 
