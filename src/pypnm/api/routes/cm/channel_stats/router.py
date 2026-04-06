@@ -894,6 +894,41 @@ class ChannelStatsRouter:
                 us_profile_iuc_map: dict[int, list[int]] = {}
                 ds_profile_id_map: dict[int, list[int]] = {}
 
+                async def _fetch_channel_id_map(base_col_oid: str, ifindices: list[int]) -> dict[int, int]:
+                    """Resolve CMTS channelId by ifIndex via explicit SNMP GETs."""
+                    out: dict[int, int] = {}
+                    if not ifindices or not request.cmts_ip or not cmts_agent_id:
+                        return out
+                    task_pairs: list[tuple[int, str]] = []
+                    for ifidx in sorted(set(ifindices)):
+                        try:
+                            task_id = await agent_manager.send_task(
+                                cmts_agent_id,
+                                "snmp_get",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f"{base_col_oid}.{ifidx}",
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=cmts_task_timeout,
+                            )
+                            task_pairs.append((ifidx, task_id))
+                        except Exception:
+                            continue
+                    for ifidx, task_id in task_pairs:
+                        resp = await _safe_wait_task(task_id, cmts_task_timeout)
+                        payload = resp.get('result', resp) if isinstance(resp, dict) else {}
+                        if not isinstance(payload, dict) or not payload.get('success'):
+                            continue
+                        value = payload.get('value') or payload.get('output')
+                        if value is None and isinstance(payload.get('results'), list) and payload.get('results'):
+                            value = (payload.get('results')[0] or {}).get('value')
+                        try:
+                            out[ifidx] = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                    return out
+
                 # Prefer per-modem UsProfileIucList for active/current IUC mapping.
                 # This remains valid even when per-IUC codeword counters are all zero.
                 if parsed.get('success'):
@@ -919,6 +954,7 @@ class ChannelStatsRouter:
                                 self.logger.debug(f'UsProfileIucList retry failed: {retry_err}')
                         if us_profile_iuc_map:
                             injected_exact = 0
+                            injected_second_pass = 0
 
                             ofdma_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', [])
                             # Exact ifIndex match first.
@@ -934,11 +970,44 @@ class ChannelStatsRouter:
                                 ch['current_iuc'] = max(active_iucs)
                                 injected_exact += 1
 
-                            total_injected = injected_exact
+                            # Deterministic second pass: explicit channelId lookup by CMTS ifIndex.
+                            if injected_exact == 0 and ofdma_channels:
+                                cmts_chid_by_ifindex = await _fetch_channel_id_map(
+                                    '1.3.6.1.4.1.4491.2.1.28.1.13.1.12',
+                                    list(us_profile_iuc_map.keys()),
+                                )
+                                if cmts_chid_by_ifindex:
+                                    ifindex_by_chid: dict[int, int] = {}
+                                    for ifidx, chid in cmts_chid_by_ifindex.items():
+                                        # Keep only unique channel_id mappings.
+                                        if chid in ifindex_by_chid and ifindex_by_chid[chid] != ifidx:
+                                            ifindex_by_chid[chid] = -1
+                                        else:
+                                            ifindex_by_chid[chid] = ifidx
+
+                                    for ch in ofdma_channels:
+                                        try:
+                                            chid = int(ch.get('channel_id'))
+                                        except (TypeError, ValueError):
+                                            continue
+                                        ifidx = ifindex_by_chid.get(chid)
+                                        if ifidx is None or ifidx <= 0:
+                                            continue
+                                        active_iucs = sorted(set(us_profile_iuc_map.get(ifidx, [])))
+                                        if not active_iucs:
+                                            continue
+                                        ch['active_iucs'] = active_iucs
+                                        ch['current_iuc'] = max(active_iucs)
+                                        injected_second_pass += 1
+
+                            total_injected = injected_exact + injected_second_pass
                             if total_injected:
                                 self.logger.info(
-                                    'Injected per-modem UsProfileIucList for %s OFDMA channels (exact match)',
+                                    'Injected per-modem UsProfileIucList for %s OFDMA channels '
+                                    '(exact=%s, second_pass=%s)',
                                     total_injected,
+                                    injected_exact,
+                                    injected_second_pass,
                                 )
                     except Exception as iuc_map_err:
                         self.logger.warning(f'UsProfileIucList injection failed: {iuc_map_err}')
@@ -967,6 +1036,7 @@ class ChannelStatsRouter:
                                 self.logger.debug(f'DsProfileIdList retry failed: {retry_err}')
                         if ds_profile_id_map:
                             injected_exact = 0
+                            injected_second_pass = 0
                             ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', [])
 
                             for ch in ds_channels:
@@ -982,12 +1052,45 @@ class ChannelStatsRouter:
                                 ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
                                 injected_exact += 1
 
-                            total_injected = injected_exact
+                            # Deterministic second pass: explicit channelId lookup by CMTS ifIndex.
+                            if injected_exact == 0 and ds_channels:
+                                cmts_chid_by_ifindex = await _fetch_channel_id_map(
+                                    '1.3.6.1.4.1.4491.2.1.28.1.9.1.1',
+                                    list(ds_profile_id_map.keys()),
+                                )
+                                if cmts_chid_by_ifindex:
+                                    ifindex_by_chid: dict[int, int] = {}
+                                    for ifidx, chid in cmts_chid_by_ifindex.items():
+                                        if chid in ifindex_by_chid and ifindex_by_chid[chid] != ifidx:
+                                            ifindex_by_chid[chid] = -1
+                                        else:
+                                            ifindex_by_chid[chid] = ifidx
+
+                                    for ch in ds_channels:
+                                        try:
+                                            chid = int(ch.get('channel_id'))
+                                        except (TypeError, ValueError):
+                                            continue
+                                        ifidx = ifindex_by_chid.get(chid)
+                                        if ifidx is None or ifidx <= 0:
+                                            continue
+                                        profiles = sorted(set(ds_profile_id_map.get(ifidx, [])))
+                                        if not profiles:
+                                            continue
+                                        ch['profiles'] = profiles
+                                        non_zero = [p for p in profiles if p > 0]
+                                        ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
+                                        injected_second_pass += 1
+
+                            total_injected = injected_exact + injected_second_pass
 
                             if total_injected:
                                 self.logger.info(
-                                    'Injected per-modem DsProfileIdList for %s OFDM channels (exact match)',
+                                    'Injected per-modem DsProfileIdList for %s OFDM channels '
+                                    '(exact=%s, second_pass=%s)',
                                     total_injected,
+                                    injected_exact,
+                                    injected_second_pass,
                                 )
                     except Exception as ds_profile_err:
                         self.logger.warning(f'DsProfileIdList injection failed: {ds_profile_err}')
@@ -1122,6 +1225,17 @@ class ChannelStatsRouter:
                         us_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', []) or []
                         us_rows = ofdm_stats.get('us_iuc_stats', []) or []
                         if us_channels and us_rows:
+                            # Authoritative direct mapping by CMTS ifindex from UsProfileIucList.
+                            for row in us_rows:
+                                try:
+                                    row_ifindex = int(row.get('ifindex'))
+                                except (TypeError, ValueError):
+                                    continue
+                                active_iucs = sorted(set(us_profile_iuc_map.get(row_ifindex, [])))
+                                if active_iucs:
+                                    row['active_iucs'] = active_iucs
+                                    row['current_iuc'] = max(active_iucs)
+
                             # Exact namespace match (rare): row.ifindex == channel.index
                             for row in us_rows:
                                 try:
