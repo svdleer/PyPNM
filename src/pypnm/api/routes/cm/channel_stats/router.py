@@ -954,6 +954,7 @@ class ChannelStatsRouter:
                                 self.logger.debug(f'UsProfileIucList retry failed: {retry_err}')
                         if us_profile_iuc_map:
                             injected_exact = 0
+                            injected_signature = 0
                             injected_second_pass = 0
 
                             ofdma_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', [])
@@ -970,8 +971,44 @@ class ChannelStatsRouter:
                                 ch['current_iuc'] = max(active_iucs)
                                 injected_exact += 1
 
-                            # Deterministic second pass: explicit channelId lookup by CMTS ifIndex.
+                            # Deterministic identity match by active-IUC signature.
                             if injected_exact == 0 and ofdma_channels:
+                                sig_to_ifidx: dict[tuple[int, ...], int] = {}
+                                ambiguous_sigs: set[tuple[int, ...]] = set()
+                                for ifidx, iucs in us_profile_iuc_map.items():
+                                    sig = tuple(sorted(set(iucs)))
+                                    if not sig:
+                                        continue
+                                    if sig in sig_to_ifidx and sig_to_ifidx[sig] != ifidx:
+                                        ambiguous_sigs.add(sig)
+                                    else:
+                                        sig_to_ifidx[sig] = ifidx
+                                for ch in ofdma_channels:
+                                    codeword_rows = ch.get('iuc_stats') or []
+                                    nonzero_iucs = sorted(
+                                        {
+                                            int(r.get('iuc'))
+                                            for r in codeword_rows
+                                            if int(r.get('codewords') or 0) > 0
+                                        }
+                                    )
+                                    if not nonzero_iucs:
+                                        continue
+                                    sig = tuple(nonzero_iucs)
+                                    if sig in ambiguous_sigs:
+                                        continue
+                                    ifidx = sig_to_ifidx.get(sig)
+                                    if not ifidx:
+                                        continue
+                                    active_iucs = sorted(set(us_profile_iuc_map.get(ifidx, [])))
+                                    if not active_iucs:
+                                        continue
+                                    ch['active_iucs'] = active_iucs
+                                    ch['current_iuc'] = max(active_iucs)
+                                    injected_signature += 1
+
+                            # Deterministic second pass: explicit channelId lookup by CMTS ifIndex.
+                            if (injected_exact + injected_signature) == 0 and ofdma_channels:
                                 cmts_chid_by_ifindex = await _fetch_channel_id_map(
                                     '1.3.6.1.4.1.4491.2.1.28.1.13.1.12',
                                     list(us_profile_iuc_map.keys()),
@@ -1000,13 +1037,14 @@ class ChannelStatsRouter:
                                         ch['current_iuc'] = max(active_iucs)
                                         injected_second_pass += 1
 
-                            total_injected = injected_exact + injected_second_pass
+                            total_injected = injected_exact + injected_signature + injected_second_pass
                             if total_injected:
                                 self.logger.info(
                                     'Injected per-modem UsProfileIucList for %s OFDMA channels '
-                                    '(exact=%s, second_pass=%s)',
+                                    '(exact=%s, signature=%s, second_pass=%s)',
                                     total_injected,
                                     injected_exact,
+                                    injected_signature,
                                     injected_second_pass,
                                 )
                     except Exception as iuc_map_err:
@@ -1036,6 +1074,7 @@ class ChannelStatsRouter:
                                 self.logger.debug(f'DsProfileIdList retry failed: {retry_err}')
                         if ds_profile_id_map:
                             injected_exact = 0
+                            injected_signature = 0
                             injected_second_pass = 0
                             ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', [])
 
@@ -1052,8 +1091,35 @@ class ChannelStatsRouter:
                                 ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
                                 injected_exact += 1
 
-                            # Deterministic second pass: explicit channelId lookup by CMTS ifIndex.
+                            # Deterministic identity match by assigned-profile signature.
                             if injected_exact == 0 and ds_channels:
+                                sig_to_ifidx: dict[tuple[int, ...], int] = {}
+                                ambiguous_sigs: set[tuple[int, ...]] = set()
+                                for ifidx, pids in ds_profile_id_map.items():
+                                    sig = tuple(sorted(set(pids)))
+                                    if not sig:
+                                        continue
+                                    if sig in sig_to_ifidx and sig_to_ifidx[sig] != ifidx:
+                                        ambiguous_sigs.add(sig)
+                                    else:
+                                        sig_to_ifidx[sig] = ifidx
+                                for ch in ds_channels:
+                                    sig = tuple(sorted(set(int(p) for p in (ch.get('profiles') or []))))
+                                    if not sig or sig in ambiguous_sigs:
+                                        continue
+                                    ifidx = sig_to_ifidx.get(sig)
+                                    if not ifidx:
+                                        continue
+                                    profiles = sorted(set(ds_profile_id_map.get(ifidx, [])))
+                                    if not profiles:
+                                        continue
+                                    ch['profiles'] = profiles
+                                    non_zero = [p for p in profiles if p > 0]
+                                    ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
+                                    injected_signature += 1
+
+                            # Deterministic second pass: explicit channelId lookup by CMTS ifIndex.
+                            if (injected_exact + injected_signature) == 0 and ds_channels:
                                 cmts_chid_by_ifindex = await _fetch_channel_id_map(
                                     '1.3.6.1.4.1.4491.2.1.28.1.9.1.1',
                                     list(ds_profile_id_map.keys()),
@@ -1082,14 +1148,15 @@ class ChannelStatsRouter:
                                         ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
                                         injected_second_pass += 1
 
-                            total_injected = injected_exact + injected_second_pass
+                            total_injected = injected_exact + injected_signature + injected_second_pass
 
                             if total_injected:
                                 self.logger.info(
                                     'Injected per-modem DsProfileIdList for %s OFDM channels '
-                                    '(exact=%s, second_pass=%s)',
+                                    '(exact=%s, signature=%s, second_pass=%s)',
                                     total_injected,
                                     injected_exact,
+                                    injected_signature,
                                     injected_second_pass,
                                 )
                     except Exception as ds_profile_err:
