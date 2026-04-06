@@ -1255,6 +1255,68 @@ class ChannelStatsRouter:
                         cm_us_ofdma_channels=parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
                     )
 
+                    # Align stats-page rows with authoritative current markers
+                    # already resolved on parsed downstream/upstream channel rows.
+                    if isinstance(ofdm_stats, dict):
+                        ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', []) or []
+                        ds_rows = ofdm_stats.get('ds_profiles', []) or []
+                        if ds_channels and ds_rows:
+                            current_by_channel = {}
+                            for ch in ds_channels:
+                                try:
+                                    chid = int(ch.get('channel_id'))
+                                    cur = ch.get('current_profile')
+                                    if cur is not None:
+                                        current_by_channel[chid] = int(cur)
+                                except (TypeError, ValueError):
+                                    continue
+                            for row in ds_rows:
+                                try:
+                                    chid = int(row.get('channel_id'))
+                                except (TypeError, ValueError):
+                                    continue
+                                if chid in current_by_channel:
+                                    row['current_profile'] = current_by_channel[chid]
+
+                        us_channels = parsed.get('upstream', {}).get('ofdma', {}).get('channels', []) or []
+                        us_rows = ofdm_stats.get('us_iuc_stats', []) or []
+                        if us_channels and us_rows:
+                            mapped_exact = 0
+                            # Exact namespace match (rare): row.ifindex == channel.index
+                            for row in us_rows:
+                                try:
+                                    row_ifindex = int(row.get('ifindex'))
+                                except (TypeError, ValueError):
+                                    continue
+                                match = next((c for c in us_channels if int(c.get('index') or -1) == row_ifindex), None)
+                                if not match:
+                                    continue
+                                active_iucs = match.get('active_iucs')
+                                current_iuc = match.get('current_iuc')
+                                if active_iucs:
+                                    row['active_iucs'] = active_iucs
+                                if current_iuc is not None:
+                                    row['current_iuc'] = current_iuc
+                                mapped_exact += 1
+
+                            # Namespace mismatch fallback: stable positional pairing.
+                            if mapped_exact == 0:
+                                sorted_rows = sorted(us_rows, key=lambda r: int(r.get('ifindex') or 0))
+                                sorted_channels = sorted(
+                                    us_channels,
+                                    key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0)),
+                                )
+                                for i, row in enumerate(sorted_rows):
+                                    if i >= len(sorted_channels):
+                                        break
+                                    ch = sorted_channels[i]
+                                    active_iucs = ch.get('active_iucs')
+                                    current_iuc = ch.get('current_iuc')
+                                    if active_iucs:
+                                        row['active_iucs'] = active_iucs
+                                    if current_iuc is not None:
+                                        row['current_iuc'] = current_iuc
+
                 if parsed.get("success"):
                     timing = parsed.get("timing", {})
                     if walk_durations:
