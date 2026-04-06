@@ -125,6 +125,47 @@ def _parse_us_profile_iuc_map(result: dict | None, cm_index: int | None) -> dict
     return parsed
 
 
+def _parse_ds_profile_id_map(result: dict | None, cm_index: int | None) -> dict[int, list[int]]:
+    """Parse docsIf31CmtsCmRegStatusDsProfileIdList into {ifindex: [profile_id, ...]}."""
+    if not result or cm_index is None:
+        return {}
+
+    payload = result.get("result", {}) if isinstance(result, dict) else {}
+    entries = payload.get("results") or []
+    if not entries and payload.get("output"):
+        entries = [{
+            "oid": f"1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cm_index}",
+            "value": payload.get("output"),
+        }]
+
+    parsed: dict[int, list[int]] = {}
+    prefix = "1.3.6.1.4.1.4491.2.1.28.1.3.1.2."
+    for entry in entries:
+        oid = str(entry.get("oid", ""))
+        if not oid.startswith(prefix):
+            continue
+        try:
+            entry_cm_index = int(oid[len(prefix):].split(".")[0])
+        except (TypeError, ValueError):
+            continue
+        if entry_cm_index != cm_index:
+            continue
+
+        raw_bytes = _parse_octet_string_to_bytes(entry.get("value"))
+        pos = 0
+        while pos + 5 < len(raw_bytes):
+            ifindex = int.from_bytes(raw_bytes[pos:pos + 4], byteorder="big", signed=False)
+            count = raw_bytes[pos + 4]
+            pos += 5
+            if count <= 0 or pos + count > len(raw_bytes):
+                break
+            profile_ids = [int(raw_bytes[pos + offset]) for offset in range(count)]
+            pos += count
+            if ifindex and profile_ids:
+                parsed[ifindex] = profile_ids
+    return parsed
+
+
 class ChannelStatsRequest(BaseModel):
     """Request model for channel stats."""
     mac_address: str = Field(..., description="Cable modem MAC address")
@@ -320,6 +361,7 @@ class ChannelStatsRouter:
                 cmts_partial_reason_task_id = None
                 cmts_us_iuc_stats_task_id = None
                 cmts_us_profile_iuc_list_task_id = None
+                cmts_ds_profile_id_list_task_id = None
                 cmts_ds_ofdm_speed_task_id = None
                 cmts_ds_subcarrier_task_id = None
                 cmts_ifname_task_id = None
@@ -422,6 +464,15 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cached_cm_index}',
+                                    "community": request.cmts_community or "public",
+                                },
+                                timeout=cmts_task_timeout,
+                            )
+                            cmts_ds_profile_id_list_task_id = await agent_manager.send_task(
+                                cmts_agent_id, "snmp_get",
+                                {
+                                    "target_ip": request.cmts_ip,
+                                    "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cached_cm_index}',
                                     "community": request.cmts_community or "public",
                                 },
                                 timeout=cmts_task_timeout,
@@ -620,6 +671,7 @@ class ChannelStatsRouter:
                     cmts_partial_reason_result,
                     cmts_us_iuc_stats_result,
                     cmts_us_profile_iuc_list_result,
+                    cmts_ds_profile_id_list_result,
                     cmts_ds_ofdm_speed_result,
                     cmts_ds_subcarrier_result,
                     cmts_ifname_result,
@@ -633,6 +685,7 @@ class ChannelStatsRouter:
                     _safe_wait_task(cmts_partial_reason_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_us_iuc_stats_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_us_profile_iuc_list_task_id, cmts_task_timeout),
+                    _safe_wait_task(cmts_ds_profile_id_list_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_ds_ofdm_speed_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_ds_subcarrier_task_id, cmts_task_timeout),
                     _safe_wait_task(cmts_ifname_task_id, cmts_task_timeout),
@@ -738,6 +791,26 @@ class ChannelStatsRouter:
                         cmts_us_profile_iuc_list_result = await _safe_wait_task(_task_id, cmts_task_timeout)
                     except Exception as _iuc_list_err:
                         self.logger.debug(f'UsProfileIucList late fetch failed: {_iuc_list_err}')
+
+                if (
+                    cm_index is not None
+                    and request.cmts_ip
+                    and cmts_agent_id
+                    and cmts_ds_profile_id_list_result is None
+                ):
+                    try:
+                        _task_id = await agent_manager.send_task(
+                            cmts_agent_id, "snmp_get",
+                            {
+                                "target_ip": request.cmts_ip,
+                                "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cm_index}',
+                                "community": request.cmts_community or "public",
+                            },
+                            timeout=cmts_task_timeout,
+                        )
+                        cmts_ds_profile_id_list_result = await _safe_wait_task(_task_id, cmts_task_timeout)
+                    except Exception as _ds_list_err:
+                        self.logger.debug(f'DsProfileIdList late fetch failed: {_ds_list_err}')
 
                 if cmts_rxmer_result and parsed.get('success'):
                     try:
@@ -971,6 +1044,57 @@ class ChannelStatsRouter:
                                 )
                     except Exception as iuc_map_err:
                         self.logger.warning(f'UsProfileIucList injection failed: {iuc_map_err}')
+
+                # Prefer per-modem DsProfileIdList for active/current DS profile mapping.
+                if parsed.get('success'):
+                    try:
+                        ds_profile_id_map = _parse_ds_profile_id_map(cmts_ds_profile_id_list_result, cm_index)
+                        if ds_profile_id_map:
+                            injected_exact = 0
+                            injected_fallback = 0
+
+                            ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', [])
+                            for ch in ds_channels:
+                                try:
+                                    ch_ifindex = int(ch.get('index'))
+                                except (TypeError, ValueError):
+                                    continue
+                                profiles = sorted(set(ds_profile_id_map.get(ch_ifindex, [])))
+                                if not profiles:
+                                    continue
+                                ch['profiles'] = profiles
+                                non_zero_profiles = [p for p in profiles if p > 0]
+                                ch['current_profile'] = max(non_zero_profiles) if non_zero_profiles else max(profiles)
+                                injected_exact += 1
+
+                            if injected_exact == 0 and ds_channels:
+                                sorted_ifindices = sorted(ds_profile_id_map.keys())
+                                sorted_channels = sorted(
+                                    ds_channels,
+                                    key=lambda c: (int(c.get('channel_id') or 0), int(c.get('index') or 0)),
+                                )
+                                for i, ch in enumerate(sorted_channels):
+                                    if i >= len(sorted_ifindices):
+                                        break
+                                    profiles = sorted(set(ds_profile_id_map.get(sorted_ifindices[i], [])))
+                                    if not profiles:
+                                        continue
+                                    ch['profiles'] = profiles
+                                    non_zero_profiles = [p for p in profiles if p > 0]
+                                    ch['current_profile'] = max(non_zero_profiles) if non_zero_profiles else max(profiles)
+                                    injected_fallback += 1
+
+                            total_injected = injected_exact + injected_fallback
+                            if total_injected:
+                                self.logger.info(
+                                    'Injected per-modem DsProfileIdList for %s OFDM channels '
+                                    '(exact=%s, fallback=%s)',
+                                    total_injected,
+                                    injected_exact,
+                                    injected_fallback,
+                                )
+                    except Exception as ds_map_err:
+                        self.logger.warning(f'DsProfileIdList injection failed: {ds_map_err}')
 
                 # Resolve fiber node
                 fiber_node = None
