@@ -161,8 +161,9 @@ def _parse_ds_profile_id_map(result: dict | None, cm_index: int | None) -> dict[
                 break
             profile_ids = [int(raw_bytes[pos + offset]) for offset in range(count)]
             pos += count
-            if ifindex and profile_ids:
-                parsed[ifindex] = profile_ids
+            valid_ids = [p for p in profile_ids if 0 <= p <= 15]
+            if ifindex and valid_ids:
+                parsed[ifindex] = valid_ids
     return parsed
 
 
@@ -809,8 +810,8 @@ class ChannelStatsRouter:
                             timeout=cmts_task_timeout,
                         )
                         cmts_ds_profile_id_list_result = await _safe_wait_task(_task_id, cmts_task_timeout)
-                    except Exception as _ds_list_err:
-                        self.logger.debug(f'DsProfileIdList late fetch failed: {_ds_list_err}')
+                    except Exception as _ds_profile_list_err:
+                        self.logger.debug(f'DsProfileIdList late fetch failed: {_ds_profile_list_err}')
 
                 if cmts_rxmer_result and parsed.get('success'):
                     try:
@@ -1052,8 +1053,8 @@ class ChannelStatsRouter:
                         if ds_profile_id_map:
                             injected_exact = 0
                             injected_fallback = 0
-
                             ds_channels = parsed.get('downstream', {}).get('ofdm', {}).get('channels', [])
+
                             for ch in ds_channels:
                                 try:
                                     ch_ifindex = int(ch.get('index'))
@@ -1063,8 +1064,8 @@ class ChannelStatsRouter:
                                 if not profiles:
                                     continue
                                 ch['profiles'] = profiles
-                                non_zero_profiles = [p for p in profiles if p > 0]
-                                ch['current_profile'] = max(non_zero_profiles) if non_zero_profiles else max(profiles)
+                                non_zero = [p for p in profiles if p > 0]
+                                ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
                                 injected_exact += 1
 
                             if injected_exact == 0 and ds_channels:
@@ -1080,8 +1081,8 @@ class ChannelStatsRouter:
                                     if not profiles:
                                         continue
                                     ch['profiles'] = profiles
-                                    non_zero_profiles = [p for p in profiles if p > 0]
-                                    ch['current_profile'] = max(non_zero_profiles) if non_zero_profiles else max(profiles)
+                                    non_zero = [p for p in profiles if p > 0]
+                                    ch['current_profile'] = max(non_zero) if non_zero else max(profiles)
                                     injected_fallback += 1
 
                             total_injected = injected_exact + injected_fallback
@@ -1093,8 +1094,8 @@ class ChannelStatsRouter:
                                     injected_exact,
                                     injected_fallback,
                                 )
-                    except Exception as ds_map_err:
-                        self.logger.warning(f'DsProfileIdList injection failed: {ds_map_err}')
+                    except Exception as ds_profile_err:
+                        self.logger.warning(f'DsProfileIdList injection failed: {ds_profile_err}')
 
                 # Resolve fiber node
                 fiber_node = None
