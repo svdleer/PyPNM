@@ -888,37 +888,6 @@ class ChannelStatsRouter:
                                                 self.logger.info(f'Injected vCCAP SNR (docsIf3) for {fallback_snr} OFDMA channels')
                                 except Exception as snr_err:
                                     self.logger.warning(f'CMTS SNR fallback failed: {snr_err}')
-                            elif channels_needing_fallback and cmts_snr_result:
-                                try:
-                                    snr_payload = cmts_snr_result.get('result', cmts_snr_result) if isinstance(cmts_snr_result, dict) else {}
-                                    if snr_payload.get('success'):
-                                        snr_base = '1.3.6.1.4.1.4491.2.1.20.1.4.1.4'
-                                        snr_by_ifindex: dict[int, float] = {}
-                                        for entry in snr_payload.get('results', []):
-                                            oid = entry.get('oid', '')
-                                            suffix = oid.replace(snr_base + '.', '').lstrip('.')
-                                            parts = suffix.split('.')
-                                            if len(parts) == 2:
-                                                try:
-                                                    entry_cm_index = int(parts[0])
-                                                    ifindex = int(parts[1])
-                                                    val = int(entry.get('value') or 0)
-                                                    if (cm_index is None or entry_cm_index == cm_index) and val > 0 and ifindex >= 160000000:
-                                                        snr_by_ifindex[ifindex] = round(val / 10, 2)
-                                                except (ValueError, TypeError):
-                                                    pass
-                                        if snr_by_ifindex:
-                                            sorted_snr = [snr_by_ifindex[k] for k in sorted(snr_by_ifindex.keys())]
-                                            sorted_need = sorted(channels_needing_fallback, key=lambda c: c.get('index', 0))
-                                            fallback_snr = 0
-                                            for i, ch in enumerate(sorted_need):
-                                                if i < len(sorted_snr):
-                                                    ch['rx_mer'] = sorted_snr[i]
-                                                    fallback_snr += 1
-                                            if fallback_snr:
-                                                self.logger.info(f'Injected fallback SNR (docsIf3) for {fallback_snr} OFDMA channels')
-                                except Exception as snr_err:
-                                    self.logger.warning(f'CMTS SNR fallback failed: {snr_err}')
                     except Exception as rxmer_err:
                         self.logger.warning(f'CMTS MeanRxMer collection failed: {rxmer_err}')
 
@@ -1027,50 +996,14 @@ class ChannelStatsRouter:
                                     ch['current_iuc'] = max(active_iucs)
                                     injected_fallback += 1
 
-                            # Mirror into ofdm_stats.us_iuc_stats rows by ifIndex.
-                            rows_exact = 0
-                            rows_fallback = 0
-                            for row in parsed.get('ofdm_stats', {}).get('us_iuc_stats', []) or []:
-                                try:
-                                    row_ifindex = int(row.get('ifindex'))
-                                except (TypeError, ValueError):
-                                    continue
-                                active_iucs = sorted(set(us_profile_iuc_map.get(row_ifindex, [])))
-                                if active_iucs:
-                                    row['active_iucs'] = active_iucs
-                                    row['current_iuc'] = max(active_iucs)
-                                    rows_exact += 1
-
-                            # Namespace mismatch fallback for stats rows too.
-                            stats_rows = parsed.get('ofdm_stats', {}).get('us_iuc_stats', []) or []
-                            if rows_exact == 0 and stats_rows:
-                                sorted_ifindices = sorted(us_profile_iuc_map.keys())
-                                sorted_rows = sorted(
-                                    stats_rows,
-                                    key=lambda r: int(r.get('ifindex') or 0),
-                                )
-                                for i, row in enumerate(sorted_rows):
-                                    if i >= len(sorted_ifindices):
-                                        break
-                                    active_iucs = sorted(set(us_profile_iuc_map.get(sorted_ifindices[i], [])))
-                                    if not active_iucs:
-                                        continue
-                                    row['active_iucs'] = active_iucs
-                                    row['current_iuc'] = max(active_iucs)
-                                    rows_fallback += 1
-
                             total_injected = injected_exact + injected_fallback
                             if total_injected:
                                 self.logger.info(
                                     'Injected per-modem UsProfileIucList for %s OFDMA channels '
-                                    '(exact=%s, fallback=%s) and %s stats rows '
                                     '(exact=%s, fallback=%s)',
                                     total_injected,
                                     injected_exact,
                                     injected_fallback,
-                                    rows_exact + rows_fallback,
-                                    rows_exact,
-                                    rows_fallback,
                                 )
                     except Exception as iuc_map_err:
                         self.logger.warning(f'UsProfileIucList injection failed: {iuc_map_err}')
@@ -1116,37 +1049,13 @@ class ChannelStatsRouter:
 
                             total_injected = injected_exact + injected_fallback
 
-                            # Mirror channel current_profile into OFDM stats rows by channel_id
-                            # (these rows drive the OFDM/OFDMA stats page badges).
-                            row_mapped = 0
-                            ds_rows = parsed.get('ofdm_stats', {}).get('ds_profiles', []) or []
-                            if ds_rows and ds_channels:
-                                current_by_channel = {}
-                                for ch in ds_channels:
-                                    try:
-                                        chid = int(ch.get('channel_id'))
-                                        cur = ch.get('current_profile')
-                                        if cur is not None:
-                                            current_by_channel[chid] = int(cur)
-                                    except (TypeError, ValueError):
-                                        continue
-                                for row in ds_rows:
-                                    try:
-                                        chid = int(row.get('channel_id'))
-                                    except (TypeError, ValueError):
-                                        continue
-                                    if chid in current_by_channel:
-                                        row['current_profile'] = current_by_channel[chid]
-                                        row_mapped += 1
-
                             if total_injected:
                                 self.logger.info(
                                     'Injected per-modem DsProfileIdList for %s OFDM channels '
-                                    '(exact=%s, fallback=%s) and %s stats rows',
+                                    '(exact=%s, fallback=%s)',
                                     total_injected,
                                     injected_exact,
                                     injected_fallback,
-                                    row_mapped,
                                 )
                     except Exception as ds_profile_err:
                         self.logger.warning(f'DsProfileIdList injection failed: {ds_profile_err}')
