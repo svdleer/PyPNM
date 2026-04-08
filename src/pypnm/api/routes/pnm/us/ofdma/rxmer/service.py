@@ -133,12 +133,12 @@ class CmtsUsOfdmaRxMerService:
             low = val.lower()
             if 'cisco' in low or 'cbr' in low:
                 return 'cisco'
-            if 'evo' in low or 'vcmts' in low or 'vccap' in low:
-                return 'evo'
-            if 'arris' in low or 'cer_v' in low or 'commscope' in low:
-                return 'e6000'
             if 'casa' in low:
                 return 'casa'
+            if 'arris' in low or 'cer_v' in low or 'commscope' in low:
+                return 'e6000'
+            if 'evo' in low or 'vcmts' in low:
+                return 'evo'
             return 'unknown'
         except Exception as e:
             self.logger.warning(f"Vendor detection failed: {e}")
@@ -765,23 +765,7 @@ class CmtsUsOfdmaRxMerService:
         except Exception as e:
             self.logger.error(f"Failed to start US RxMER: {e}")
             return {"success": False, "error": str(e)}
-
-    async def disable_measurement(self, ofdma_ifindex: int) -> dict[str, Any]:
-        """Disable (release) the PNM measurement resource on the given OFDMA channel.
-
-        Sets docsPnmCmtsUsOfdmaRxMerEnable to 2 (false) so subsequent captures
-        on the same channel can start immediately without RESOURCE_UNAVAILABLE.
-        """
-        try:
-            await self._snmp_set(
-                f"{self.OID_US_RXMER_ENABLE}.{ofdma_ifindex}", 2, 'i'
-            )
-            self.logger.info(f"Disabled US RxMER on ifIndex {ofdma_ifindex}")
-            return {"success": True, "ofdma_ifindex": ofdma_ifindex}
-        except Exception as e:
-            self.logger.warning(f"Failed to disable US RxMER on {ofdma_ifindex}: {e}")
-            return {"success": False, "error": str(e)}
-
+    
     async def get_status(self, ofdma_ifindex: int) -> dict[str, Any]:
         """
         Get US OFDMA RxMER measurement status.
