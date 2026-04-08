@@ -133,12 +133,12 @@ class CmtsUsOfdmaRxMerService:
             low = val.lower()
             if 'cisco' in low or 'cbr' in low:
                 return 'cisco'
-            if 'casa' in low:
-                return 'casa'
+            if 'evo' in low or 'vcmts' in low or 'vccap' in low:
+                return 'evo'
             if 'arris' in low or 'cer_v' in low or 'commscope' in low:
                 return 'e6000'
-            if 'evo' in low or 'vcmts' in low:
-                return 'evo'
+            if 'casa' in low:
+                return 'casa'
             return 'unknown'
         except Exception as e:
             self.logger.warning(f"Vendor detection failed: {e}")
