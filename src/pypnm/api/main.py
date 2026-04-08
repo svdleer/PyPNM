@@ -58,6 +58,9 @@ SNMP walks and raw binary files.
 Use it from dashboards, CI pipelines, or engineering tools to inspect plant
 health, track impairments over time, and validate DOCSIS device behavior.
 
+**Credits**
+- Original PyPNM author and project foundation: Maurice Garcia
+
 [**PyPNM Homepage**](https://github.com/PyPNMApps/PyPNM)
 """
 

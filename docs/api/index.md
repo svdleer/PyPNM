@@ -9,3 +9,8 @@ This section contains two parts:
 
 Use the FastAPI docs if you’re calling the service over HTTP.  
 Use the Python docs if you’re importing PyPNM in your own scripts or tools.
+
+## Credits
+
+PyPNM was originally created by Maurice Garcia.
+This repository continues on top of that foundation.

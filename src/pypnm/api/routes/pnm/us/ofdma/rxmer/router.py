@@ -933,6 +933,27 @@ class UsOfdmaRxMerRouter:
                 service.close()
 
         @self.router.post(
+            "/stop",
+            summary="Disable (release) US OFDMA RxMER measurement resource",
+        )
+        async def stop_measurement(
+            cmts_ip: str,
+            ofdma_ifindex: int,
+            community: str = "public",
+            write_community: Optional[str] = None
+        ) -> dict:
+            """Disable the PNM measurement on the given OFDMA channel to free the resource."""
+            service = CmtsUsOfdmaRxMerService(
+                cmts_ip=cmts_ip,
+                community=community,
+                write_community=write_community or community
+            )
+            try:
+                return await service.disable_measurement(ofdma_ifindex)
+            finally:
+                service.close()
+
+        @self.router.post(
             "/getCapture",
             summary="Get and plot US OFDMA RxMER capture",
             response_model=None,
