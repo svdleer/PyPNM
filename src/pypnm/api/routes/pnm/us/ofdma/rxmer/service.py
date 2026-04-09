@@ -130,15 +130,17 @@ class CmtsUsOfdmaRxMerService:
                     val = bytes.fromhex(val[2:]).decode('utf-8', errors='replace')
                 except Exception:
                     pass
-            low = val.lower()
-            if 'cisco' in low or 'cbr' in low:
-                return 'cisco'
-            if 'casa' in low:
-                return 'casa'
-            if 'arris' in low or 'cer_v' in low or 'commscope' in low:
-                return 'e6000'
-            if 'evo' in low or 'vcmts' in low:
+            up = val.upper()
+            # Keep this in sync with UTSC vendor detection so bulk-destination
+            # and RxMER measurement flows never diverge on EVO vCCAP systems.
+            if 'DCTS VCCAP' in up or 'CASA DCTS VCCAP' in up or 'EVO' in up or 'VCMTS' in up:
                 return 'evo'
+            if 'CASA' in up:
+                return 'casa'
+            if 'CISCO' in up or 'CBR' in up:
+                return 'cisco'
+            if 'ARRIS' in up or 'COMMSCOPE' in up or 'CER_V' in up:
+                return 'e6000'
             return 'unknown'
         except Exception as e:
             self.logger.warning(f"Vendor detection failed: {e}")
