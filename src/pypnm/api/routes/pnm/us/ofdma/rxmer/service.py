@@ -1122,6 +1122,35 @@ class CmtsUsOfdmaRxMerService:
             else:
                 self.logger.warning(f"BDT row {dest_index} did not confirm active after 5s — proceeding anyway")
 
+            # Strict readback verification: do not report success unless the
+            # row points to the requested TFTP IP and destination URI/path.
+            ip_probe = await self._snmp_get(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}")
+            ip_value = self._parse_get_value(ip_probe)
+            actual_ip = self._parse_ip_from_octetstring(ip_value) if ip_value else None
+
+            uri_probe = await self._snmp_get(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}")
+            uri_value = str(self._parse_get_value(uri_probe) or '').strip()
+
+            ip_ok = (actual_ip == tftp_ip)
+            if vendor == 'cisco':
+                uri_ok = (tftp_ip in uri_value) if uri_value else False
+            else:
+                # Non-Cisco stores path only (e.g. "access/pnmupload/" or "/").
+                uri_ok = (uri_value == _uri_value)
+
+            if not (ip_ok and uri_ok):
+                msg = (
+                    f"BDT verification failed row {dest_index}: "
+                    f"expected ip={tftp_ip}, uri='{_uri_value}' got ip={actual_ip}, uri='{uri_value}'"
+                )
+                self.logger.error(msg)
+                return {
+                    "success": False,
+                    "destination_index": dest_index,
+                    "error": msg,
+                    "created": False,
+                }
+
             self.logger.info(f"Successfully created bulk destination {dest_index} -> {tftp_ip}:{port}")
             
             return {
