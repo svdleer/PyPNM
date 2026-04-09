@@ -904,7 +904,10 @@ class CmtsUsOfdmaRxMerService:
                     port_result = await self._snmp_get(f"{self.OID_BULK_CFG_PORT}.{dest_index}")
                     port_value = self._parse_get_value(port_result)
                     if port_value:
-                        dest_info["port"] = int(port_value)
+                        parsed_port = int(port_value)
+                        # Several CMTS implementations report 0 to indicate the
+                        # default TFTP port. Present that as 69 for operator clarity.
+                        dest_info["port"] = 69 if parsed_port == 0 else parsed_port
                 except Exception:
                     pass
                 
@@ -1082,6 +1085,11 @@ class CmtsUsOfdmaRxMerService:
 
                 await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
                 await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
+                # Explicitly set TFTP port; some platforms may keep default 0 otherwise.
+                try:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_PORT}.{dest_index}", port, 'u')
+                except Exception as e:
+                    self.logger.warning(f"Failed to set DestPort on row {dest_index}: {e}")
                 if _uri_value:
                     await self._snmp_set(f"{self.OID_BULK_CFG_BASE_URI}.{dest_index}", _uri_value, 's')
                     self.logger.info(f"Set BaseUri for destination {dest_index}: '{_uri_value}'")
@@ -1093,6 +1101,10 @@ class CmtsUsOfdmaRxMerService:
 
                 await self._snmp_set(f"{self.OID_BULK_CFG_IP_TYPE}.{dest_index}", 1, 'i')
                 await self._snmp_set(f"{self.OID_BULK_CFG_IP_ADDR}.{dest_index}", ip_hex, 'x')
+                try:
+                    await self._snmp_set(f"{self.OID_BULK_CFG_PORT}.{dest_index}", port, 'u')
+                except Exception as e:
+                    self.logger.warning(f"Failed to set DestPort on row {dest_index}: {e}")
                 # Protocol = tftp(1) — E6000/Arris requires explicit SET
                 try:
                     await self._snmp_set(f"{self.OID_BULK_CFG_PROTOCOL}.{dest_index}", 1, 'i')
