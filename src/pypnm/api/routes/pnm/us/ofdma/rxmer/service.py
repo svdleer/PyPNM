@@ -733,6 +733,16 @@ class CmtsUsOfdmaRxMerService:
                         f"Reusing preconfigured bulk destination index {destination_index} (no reprovision)"
                     )
 
+                # EVO vCCAP: also configure docsPnmCcapBulkDataControlTable
+                # (same practical upload behavior as Casa on this platform).
+                if vendor == 'evo' and tftp_server:
+                    ccap_row = destination_index if destination_index > 0 else 1
+                    self.logger.info(
+                        f"EVO: configuring CCAP bulk-data-control row {ccap_row} "
+                        f"for TFTP {tftp_server} path={dest_path}"
+                    )
+                    await self._configure_bdt_casa(ccap_row, tftp_server, dest_path)
+
             # 2. Set CM MAC address (CMTS uses this to identify the modem)
             mac_hex = self.mac_to_hex_string(cm_mac)
             await self._snmp_set(f"{self.OID_US_RXMER_CM_MAC}{idx}", mac_hex, 'x')

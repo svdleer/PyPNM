@@ -176,8 +176,8 @@ class BulkDestinationRouter:
                 else:
                     response.standard_dest_index = std_result.get('destination_index', request.index)
 
-                # 3. Casa-only: docsPnmCcapBulkDataControlTable + PnmTestSelector
-                if vendor == 'casa':
+                # 3. Casa/EVO: docsPnmCcapBulkDataControlTable + PnmTestSelector
+                if vendor in ('casa', 'evo'):
                     casa_result = await utsc_svc.configure_bulk_data_control(
                         dest_ip=request.dest_ip,
                         dest_path=request.dest_path,
@@ -185,7 +185,7 @@ class BulkDestinationRouter:
                         pnm_types=request.pnm_types
                     )
                     if not casa_result.get('success'):
-                        self.logger.warning(f"Casa bulk control failed: {casa_result.get('error')}")
+                        self.logger.warning(f"CCAP bulk control failed: {casa_result.get('error')}")
                     else:
                         response.casa_index = casa_result.get('index', request.index)
                         response.pnm_test_selector_hex = casa_result.get('pnm_test_selector_hex')

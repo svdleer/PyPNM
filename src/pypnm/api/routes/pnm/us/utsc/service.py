@@ -323,14 +323,6 @@ class CmtsUtscService:
 
             vendor = await self.detect_vendor()
 
-            # EVO vCCAP behaves better with the standard bulk-destination table
-            # than with direct CCAP selector writes.
-            if vendor == 'evo':
-                self.logger.info(
-                    f"EVO detected — using standard BDT table for bulk upload to {dest_ip}:{dest_path}"
-                )
-                return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
-
             self.logger.info(f"Configuring bulk data control for {pnm_types} upload to {dest_ip}:{dest_path}")
             
             # Convert IP to hex string
