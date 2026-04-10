@@ -939,8 +939,14 @@ class PollerService:
         if active_count > 0:
             return {"deleted": 0, "state": "active_jobs", "active_jobs": active_count}
 
+        # Remove historical jobs first to satisfy FK fk_poller_job_setting.
+        jobs_rows = self._query("SELECT COUNT(*) AS c FROM poller_job WHERE poller_id=%s", (pid,))
+        jobs_count = int((jobs_rows[0] or {}).get("c") or 0) if jobs_rows else 0
+        if jobs_count > 0:
+            self._execute("DELETE FROM poller_job WHERE poller_id=%s", (pid,))
+
         self._execute("DELETE FROM poller_setting WHERE id=%s", (pid,))
-        return {"deleted": 1, "state": "deleted"}
+        return {"deleted": 1, "state": "deleted", "deleted_jobs": jobs_count}
 
     def enqueue_run(self, poller_id: int, source: Optional[str] = None) -> int:
         active = self._query(
