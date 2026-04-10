@@ -924,6 +924,24 @@ class PollerService:
         self._execute(sql, tuple(params))
         return poller_id
 
+    def delete_poller(self, poller_id: int) -> Dict[str, Any]:
+        pid = int(poller_id)
+
+        exists = self._query("SELECT id FROM poller_setting WHERE id=%s", (pid,))
+        if not exists:
+            return {"deleted": 0, "state": "not_found"}
+
+        active = self._query(
+            "SELECT COUNT(*) AS c FROM poller_job WHERE poller_id=%s AND status IN ('queued','running')",
+            (pid,),
+        )
+        active_count = int((active[0] or {}).get("c") or 0) if active else 0
+        if active_count > 0:
+            return {"deleted": 0, "state": "active_jobs", "active_jobs": active_count}
+
+        self._execute("DELETE FROM poller_setting WHERE id=%s", (pid,))
+        return {"deleted": 1, "state": "deleted"}
+
     def enqueue_run(self, poller_id: int, source: Optional[str] = None) -> int:
         active = self._query(
             "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",

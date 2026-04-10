@@ -37,6 +37,16 @@ def run_poller_setting(poller_id: int, payload: PollerRunRequest) -> dict:
     return {"status": "success", "job_id": job_id}
 
 
+@router.delete("/poller-settings/{poller_id}")
+def delete_poller_setting(poller_id: int) -> dict:
+    out = poller_service.delete_poller(poller_id=poller_id)
+    if out.get("state") == "not_found":
+        return {"status": "error", "message": "Poller not found", **out}
+    if out.get("state") == "active_jobs":
+        return {"status": "error", "message": "Poller has active jobs", **out}
+    return {"status": "success", **out}
+
+
 @router.get("/poller-jobs", response_model=PollerJobsResponse)
 def list_poller_jobs(limit: int = Query(default=30, ge=1, le=500)) -> PollerJobsResponse:
     jobs = poller_service.list_jobs(limit=limit)
