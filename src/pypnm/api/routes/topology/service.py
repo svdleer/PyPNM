@@ -1078,6 +1078,23 @@ class TopologyService:
         st = path.stat()
         return f"{st.st_size}:{int(st.st_mtime)}"
 
+    @staticmethod
+    def _clean_csv_cell(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return " ".join(str(item).strip() for item in value if str(item).strip())
+        return str(value).strip()
+
+    def _clean_csv_row(self, row: dict[object, object]) -> dict[str, str]:
+        cleaned: dict[str, str] = {}
+        for key, value in row.items():
+            key_text = self._clean_csv_cell(key)
+            if not key_text:
+                continue
+            cleaned[key_text] = self._clean_csv_cell(value)
+        return cleaned
+
     def _to_float(self, value: str | None) -> float | None:
         if value is None or value == "":
             return None
@@ -1125,7 +1142,7 @@ class TopologyService:
             for row in reader:
                 if not row:
                     continue
-                rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
+                rows.append(self._clean_csv_row(row))
         return rows
 
     def _iter_csv_rows(self, path: Path) -> Iterator[dict[str, str]]:
@@ -1144,7 +1161,7 @@ class TopologyService:
             for row in reader:
                 if not row:
                     continue
-                yield {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+                yield self._clean_csv_row(row)
 
     def _parse_modem_address(self, address1_raw: str, address2_raw: str, locality_raw: str = "") -> tuple[str, str, str]:
         """Parse modemlocation ADDRESS1 variants into (street, house_number, house_number_extension)."""
@@ -1423,7 +1440,7 @@ class TopologyService:
             for row in reader:
                 if not row:
                     continue
-                rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
+                rows.append(self._clean_csv_row(row))
         return rows
 
     def _parse_payload(self, topology_file: Path, modemlocation_file: Path, hierarchy_file: Path | None = None) -> dict[str, Any]:
