@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import os
 import re
@@ -1078,6 +1079,11 @@ class TopologyService:
         st = path.stat()
         return f"{st.st_size}:{int(st.st_mtime)}"
 
+    def _open_csv_text(self, path: Path):
+        if path.suffix.lower() == ".gz":
+            return gzip.open(path, "rt", encoding="utf-8", errors="replace", newline="")
+        return path.open("r", encoding="utf-8", errors="replace", newline="")
+
     @staticmethod
     def _clean_csv_cell(value: object) -> str:
         if value is None:
@@ -1128,7 +1134,7 @@ class TopologyService:
 
     def _read_csv(self, path: Path) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        with self._open_csv_text(path) as fh:
             while True:
                 pos = fh.tell()
                 line = fh.readline()
@@ -1147,7 +1153,7 @@ class TopologyService:
 
     def _iter_csv_rows(self, path: Path) -> Iterator[dict[str, str]]:
         """Stream CSV rows while skipping optional vendor preamble lines (%%...)."""
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        with self._open_csv_text(path) as fh:
             while True:
                 pos = fh.tell()
                 line = fh.readline()
@@ -1435,7 +1441,7 @@ class TopologyService:
         if not hierarchy_file.exists():
             return rows
         
-        with hierarchy_file.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        with self._open_csv_text(hierarchy_file) as fh:
             reader = csv.DictReader(fh)
             for row in reader:
                 if not row:
