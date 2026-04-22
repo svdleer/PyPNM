@@ -898,8 +898,8 @@ class CmtsUtscService:
                 # otherwise pin EVO to 3 rather than drifting to 1 based on stale rows.
                 # Casa C100G / Arris E6000: standard indices 1, 2, 3.
                 if is_evo:
-                    target_idx = cfg_index if cfg_index > 0 else 3
-                    probe_order = [target_idx]
+                    probe_order = [cfg_index] if cfg_index > 0 else [2, 3, 1]
+                    target_idx = probe_order[0]
                 else:
                     probe_order = [1, 2, 3]
                     target_idx = cfg_index if cfg_index > 0 else probe_order[0]
@@ -1358,13 +1358,16 @@ class CmtsUtscService:
             Dict with success status
         """
         import asyncio
+        vendor = await self.detect_vendor()
+        is_evo = vendor == 'evo'
         requested_cfg_index = cfg_index
 
         # Probe for the row by TriggerMode — same logic as configure().
         # Casa pre-provisions rows 1-3 with fixed TriggerModes; RowStatus is
         # always createAndWait so probing by RowStatus=active never finds anything.
         # Must match by TriggerMode to find the row configure() actually wrote to.
-        resolved = cfg_index if cfg_index > 0 else (3 if is_evo else 1)
+        fallback_order = [2, 3, 1] if is_evo else [1, 2, 3]
+        resolved = cfg_index if cfg_index > 0 else fallback_order[0]
         if cfg_index == 0:
             # Auto-probe: find the row matching trigger_mode.
             # For EVO vCCAP: freeRunning(2) is overridden to idleSid(5) in configure(),
@@ -1373,8 +1376,7 @@ class CmtsUtscService:
             probe_modes = [trigger_mode]
             if trigger_mode == 2:
                 probe_modes.append(5)  # idleSid fallback for EVO
-            # EVO vCCAP: pin to cfg_index 3 unless caller explicitly overrides.
-            start_probe_order = [3] if is_evo else [1, 2, 3]
+            start_probe_order = fallback_order
             match_found = False
             for probe_mode in probe_modes:
                 if match_found:
@@ -1448,12 +1450,11 @@ class CmtsUtscService:
             return await self._snmp_set(f"{self.OID_UTSC_CTRL_INITIATE}{idx}", 1, 'i')
 
         try:
-            # If caller explicitly requested a cfg index, do not probe others.
-            # Avoid hiding real failures with unrelated "cfg_index=2 unreadable" noise.
-            if requested_cfg_index and int(requested_cfg_index) > 0:
+            # For EVO, probe validated fallback order (2,3,1) even when caller
+            # passes an explicit cfg index to avoid sticky row failures.
+            if requested_cfg_index and int(requested_cfg_index) > 0 and not is_evo:
                 candidate_indices = [resolved]
             else:
-                fallback_order = [3] if is_evo else [1, 2, 3]
                 candidate_indices = [resolved] + [i for i in fallback_order if i != resolved]
             last_error = None
 
