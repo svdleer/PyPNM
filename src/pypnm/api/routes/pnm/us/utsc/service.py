@@ -1472,12 +1472,6 @@ class CmtsUtscService:
                 last_error = result.get('error', 'Failed to start UTSC')
                 self.logger.warning(f"UTSC start failed on cfg_index={target_idx}: {last_error}")
 
-                # EVO fallback: an unreadable row likely means this cfg_index
-                # does not exist on this RF port. Continue probing remaining
-                # candidate indices instead of aborting early.
-                if is_evo and 'RowStatus unreadable' in str(last_error):
-                    continue
-
                 # If failure is not row/state related, stop retrying immediately.
                 if 'inconsistentValue' not in str(last_error) and 'commitFailed' not in str(last_error):
                     break
