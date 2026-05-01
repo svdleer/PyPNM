@@ -38,6 +38,15 @@ class PollerService:
     def _db_name(self) -> str:
         return os.environ.get("DATA_DB_NAME") or os.environ.get("AUTH_DB_NAME") or "pypnm_auth"
 
+    @staticmethod
+    def _cm_modem_limit_default() -> int:
+        raw = os.environ.get("CM_MODEM_LIMIT", "10000")
+        try:
+            value = int(raw)
+            return max(1, min(value, 50000))
+        except (TypeError, ValueError):
+            return 10000
+
     def _connect(self):
         return pymysql.connect(
             host=os.environ.get("DATA_DB_HOST") or os.environ.get("AUTH_DB_HOST", "127.0.0.1"),
@@ -616,7 +625,7 @@ class PollerService:
         params = {
             "cmts_ip": cmts_ip,
             "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
-            "limit": 10000,
+            "limit": self._cm_modem_limit_default(),
             "enrich": "true",
             "modem_community": os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private",
         }
@@ -1145,9 +1154,11 @@ class PollerService:
         search_type: Optional[str] = None,
         search_value: Optional[str] = None,
         interface_filter: Optional[str] = None,
-        limit: int = 10000,
+        limit: int | None = None,
     ) -> List[Dict[str, Any]]:
-        limit = max(1, min(int(limit or 10000), 50000))
+        if limit is None:
+            limit = self._cm_modem_limit_default()
+        limit = max(1, min(int(limit or self._cm_modem_limit_default()), 50000))
         where = []
         params: List[Any] = []
 
@@ -1379,7 +1390,7 @@ class PollerService:
                     "community": cmts_community,
                     "modem_community": modem_community,
                     "enrich": "false",
-                    "limit": 10000,
+                    "limit": self._cm_modem_limit_default(),
                 },
                 timeout=120,
                 verify=False,

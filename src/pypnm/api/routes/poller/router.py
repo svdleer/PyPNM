@@ -77,8 +77,11 @@ def list_inventory_modems(
     search_type: str | None = None,
     search_value: str | None = None,
     interface: str | None = None,
-    limit: int = Query(default=10000, ge=1, le=50000),
+    limit: int | None = Query(default=None, ge=1, le=50000),
 ) -> dict:
+    if limit is None:
+        limit = poller_service._cm_modem_limit_default()
+
     modems = poller_service.list_inventory_modems(
         cmts=cmts,
         search_type=search_type,

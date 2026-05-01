@@ -3,15 +3,25 @@
 
 from __future__ import annotations
 
+import os
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+
+
+def _cm_modem_limit_default() -> int:
+    raw = os.environ.get("CM_MODEM_LIMIT", "10000")
+    try:
+        value = int(raw)
+        return max(1, min(value, 50000))
+    except (TypeError, ValueError):
+        return 10000
 
 
 class CMTSModemRequest(BaseModel):
     """Request model for CMTS modem discovery."""
     cmts_ip: str = Field(..., description="CMTS IP address")
     community: str = Field(default="public", description="SNMP community for CMTS")
-    limit: int = Field(default=10000, description="Maximum number of modems to return")
+    limit: int = Field(default_factory=_cm_modem_limit_default, description="Maximum number of modems to return")
     enrich: bool = Field(default=False, description="Whether to enrich modems with firmware/model from sysDescr")
     modem_community: str = Field(default="private", description="SNMP community for modem enrichment")
 

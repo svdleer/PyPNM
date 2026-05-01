@@ -25,7 +25,7 @@ init_agent_manager(_auth_token)
 async def get_cmts_modems(
     cmts_ip: str,
     community: str = "public",
-    limit: int = 10000,
+    limit: int | None = None,
     enrich: bool = False,
     modem_community: str = "private",
     cmts_hostname: str = "",
@@ -65,6 +65,13 @@ async def get_cmts_modems(
     logger.info(f"CMTS modem discovery request: {cmts_ip} (enrich={enrich})")
 
     service = CMTSModemService()
+
+    if limit is None:
+        raw = os.environ.get("CM_MODEM_LIMIT", "10000")
+        try:
+            limit = max(1, min(int(raw), 50000))
+        except (TypeError, ValueError):
+            limit = 10000
 
     try:
         result = await service.discover_modems(
