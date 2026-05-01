@@ -17,6 +17,17 @@ _enrichment_cache: Dict[str, Dict[str, Any]] = {}
 _enrichment_lock = asyncio.Lock()
 
 
+def _int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    if maximum is not None:
+        value = min(value, maximum)
+    return max(minimum, value)
+
+
 def cancel_enrichment(cmts_ip: str) -> bool:
     """Signal a running background enrichment to stop. Returns True if one was running."""
     entry = _enrichment_cache.get(cmts_ip)
@@ -912,11 +923,20 @@ class CMTSModemService:
                          and not m.get('ip_address', '').startswith(skip_prefixes)
                          and m.get('status') in online_statuses]
 
-        MAX_CONCURRENT = 20  # 2 cm-agents × 10 bulk threads each, round-robin balanced
-        FLUSH_EVERY = 40      # flush enriched data to cache every N completions
-        MAX_ENRICHMENT_SECS = 600  # hard cap: 10 min — finish with partial results
+        MAX_CONCURRENT = _int_env('CM_ENRICH_MAX_CONCURRENT', 8, minimum=1, maximum=64)
+        FLUSH_EVERY = _int_env('CM_ENRICH_FLUSH_EVERY', 40, minimum=1, maximum=1000)
+        MAX_ENRICHMENT_SECS = _int_env('CM_ENRICH_MAX_SECS', 1800, minimum=60, maximum=7200)
+        AGENT_WAIT_TIMEOUT_SECS = _int_env('CM_ENRICH_AGENT_WAIT_TIMEOUT_SECS', 20, minimum=5, maximum=120)
+        SNMP_TIMEOUT_SECS = _int_env('CM_ENRICH_SNMP_TIMEOUT_SECS', 3, minimum=1, maximum=30)
+        SNMP_MAX_CONCURRENT = _int_env('CM_ENRICH_SNMP_MAX_CONCURRENT', 2, minimum=1, maximum=10)
 
-        self.logger.info(f"Direct enrichment: {len(online_modems)} modems (max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, community={modem_community})")
+        self.logger.info(
+            f"Direct enrichment: {len(online_modems)} modems "
+            f"(max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, "
+            f"max_secs={MAX_ENRICHMENT_SECS}, agent_wait_timeout={AGENT_WAIT_TIMEOUT_SECS}, "
+            f"snmp_timeout={SNMP_TIMEOUT_SECS}, snmp_max_concurrent={SNMP_MAX_CONCURRENT}, "
+            f"community={modem_community})"
+        )
         if not online_modems:
             return modems
 
@@ -985,11 +1005,11 @@ class CMTSModemService:
                         # Do NOT pass community — let the CM agent use its own
                         # configured cm_community (the API-side modem_community
                         # is the BFF/CMTS community, not the modem community).
-                        'timeout': 2,   # ping sweep pre-filtered; 2s enough for reachable modems
+                        'timeout': SNMP_TIMEOUT_SECS,
                         'retries': 0,   # enrichment — don't retry; skip and move on
-                        'max_concurrent': 3,
+                        'max_concurrent': SNMP_MAX_CONCURRENT,
                     },
-                    timeout=15,
+                    timeout=AGENT_WAIT_TIMEOUT_SECS,
                 )
                 if not result or not result.get('success'):
                     if not _first_failure_logged:

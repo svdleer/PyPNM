@@ -31,8 +31,8 @@ class AgentManager:
         self._rr_counters: dict[str, int] = {}  # round-robin index per capability
         self._agent_timeouts: dict[str, int] = {}  # consecutive timeout count per agent
         self._agent_quarantine: dict[str, float] = {}  # agent_id → quarantine-until timestamp
-        self.QUARANTINE_AFTER = 3   # consecutive timeouts before quarantine
-        self.QUARANTINE_SECS = 60   # seconds to skip a quarantined agent
+        self.QUARANTINE_AFTER = max(1, int(os.environ.get('PYPNM_AGENT_QUARANTINE_AFTER', '6')))
+        self.QUARANTINE_SECS = max(1, int(os.environ.get('PYPNM_AGENT_QUARANTINE_SECS', '30')))
         self.logger = logging.getLogger(f'{__name__}.AgentManager')
         # Commands that involve large file transfers or long SNMP captures.
         # These get a higher default timeout and are routed to the agent's
