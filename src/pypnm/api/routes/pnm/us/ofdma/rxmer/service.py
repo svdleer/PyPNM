@@ -53,7 +53,8 @@ class CmtsUsOfdmaRxMerService:
     
     # OID definitions
     OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
-    OID_CM_REG_MAC = "1.3.6.1.2.1.10.127.1.3.3.1.2"  # docsIfCmtsCmStatusMacAddress (works on E6000)
+    OID_CM_REG_MAC    = "1.3.6.1.4.1.4491.2.1.20.1.3.1.2"  # docsIf3CmtsCmRegStatusMacAddr (DOCS-IF3; index matches OFDMA timing table)
+    OID_CM_REG_MAC_D2 = "1.3.6.1.2.1.10.127.1.3.3.1.2"    # docsIfCmtsCmStatusMacAddress (DOCS-IF old; fallback for E6000)
     OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"  # docsIf31CmtsCmUsOfdmaChannelTimingOffset (has cm_index.ofdma_ifindex)
     
     # Pre-equalization data (ATDMA upstream)
@@ -347,44 +348,52 @@ class CmtsUsOfdmaRxMerService:
     async def discover_cm_index(self, cm_mac: str) -> Optional[int]:
         """
         Find CM index on CMTS from MAC address.
-        
+
+        Tries docsIf3CmtsCmRegStatusMacAddr (DOCS-IF3, same index space as
+        docsIf31CmtsCmUsOfdmaChannelTimingOffset) first. Falls back to the
+        older docsIfCmtsCmStatusMacAddress if the IF3 walk returns nothing
+        (CommScope E6000 compatibility).
+
         Args:
             cm_mac: Cable modem MAC address
-            
+
         Returns:
             CM index (docsIf3CmtsCmRegStatusIndex) or None
         """
         mac_normalized = self.normalize_mac(cm_mac)
-        
         self.logger.info(f"Looking for CM MAC {mac_normalized} on CMTS {self.cmts_ip}")
-        
-        try:
-            result = await self._snmp_walk(self.OID_CM_REG_MAC, timeout=60)
-            
-            if not result.get('success') or not result.get('results'):
-                self.logger.warning("No CM registration entries found")
-                return None
-            
-            for entry in result['results']:
-                oid_str = str(entry.get('oid', ''))
-                value = str(entry.get('value', ''))
-                
-                # Agent returns MAC addresses as "C8:B5:AD:3A:9D:C7" (uppercase colon-sep)
-                # for 6-byte OctetStrings via _parse_snmp_value
-                found_mac = self.normalize_mac(value)
-                
-                if found_mac == mac_normalized:
-                    # Extract CM index from OID suffix
-                    cm_index = int(oid_str.split(".")[-1])
-                    self.logger.info(f"Found CM index: {cm_index}")
-                    return cm_index
-            
-            self.logger.warning(f"CM MAC {mac_normalized} not found on CMTS")
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Error discovering CM index: {e}")
-            return None
+
+        for oid_label, oid in [
+            ("DOCS-IF3 docsIf3CmtsCmRegStatusMacAddr", self.OID_CM_REG_MAC),
+            ("DOCS-IF2 docsIfCmtsCmStatusMacAddress",  self.OID_CM_REG_MAC_D2),
+        ]:
+            try:
+                result = await self._snmp_walk(oid, timeout=60)
+
+                if not result.get('success') or not result.get('results'):
+                    self.logger.debug(f"{oid_label}: walk returned no results, trying fallback")
+                    continue
+
+                for entry in result['results']:
+                    oid_str = str(entry.get('oid', ''))
+                    value = str(entry.get('value', ''))
+
+                    # Agent returns MAC addresses as "C8:B5:AD:3A:9D:C7" (uppercase colon-sep)
+                    found_mac = self.normalize_mac(value)
+
+                    if found_mac == mac_normalized:
+                        # Extract CM index from OID suffix
+                        cm_index = int(oid_str.split(".")[-1])
+                        self.logger.info(f"Found CM index {cm_index} via {oid_label}")
+                        return cm_index
+
+                self.logger.debug(f"{oid_label}: MAC {mac_normalized} not found, trying fallback")
+
+            except Exception as e:
+                self.logger.warning(f"{oid_label}: walk error ({e}), trying fallback")
+
+        self.logger.warning(f"CM MAC {mac_normalized} not found on CMTS {self.cmts_ip} via any OID")
+        return None
     
     async def discover_ofdma_ifindex(self, cm_index: int) -> list[int]:
         """

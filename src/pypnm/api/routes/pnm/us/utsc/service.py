@@ -798,6 +798,7 @@ class CmtsUtscService:
         
         try:
             import asyncio
+            transitioned_not_in_service = False
 
             # Detect vendor via sysDescr (1.3.6.1.2.1.1.1.0)
             # Casa DCTS:          "CASA DCTS ..."
@@ -1009,7 +1010,6 @@ class CmtsUtscService:
                 else:
                     self.logger.info(f"Writing columns in-place at cfg_index={target_idx} (no RowStatus touch)...")
 
-                transitioned_not_in_service = False
                 if row_found:
                     try:
                         row_status_read = await self._snmp_get(f"{self.OID_UTSC_CFG_ROW_STATUS}{idx}")
