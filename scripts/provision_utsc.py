@@ -39,13 +39,13 @@ Usage:
     python3 provision_utsc.py <cmts_ip> <rf_port_ifindex> [cfg_index]
 
     python3 provision_utsc.py 172.16.6.202 488046         # Cisco cBR-8
-    python3 provision_utsc.py 172.16.6.101 150994984 1    # E6000
+    python3 provision_utsc.py 212.178.218.234 150994984 1    # E6000
     python3 provision_utsc.py 172.16.6.160 838860800 1    # Casa 100G
 
 Environment variables (override defaults):
     SNMP_READ       SNMP read community  (default: public)
     SNMP_WRITE      SNMP write community (default: private)
-    TFTP_IP         TFTP server IP       (default: 172.16.6.101)
+    TFTP_IP         TFTP server IP       (default: 212.178.218.234)
     TFTP_PATH       TFTP upload path     (default: ./)
     SSH_HOST        Jump server hostname (default: access-engineering.nl)
     AGENT_CMD       Docker exec prefix   (default: docker exec pypnm-agent-lab)
@@ -71,7 +71,7 @@ CFG_INDEX  = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 
 SNMP_READ  = os.environ.get("SNMP_READ",  "public")
 SNMP_WRITE = os.environ.get("SNMP_WRITE", "private")
-TFTP_IP    = os.environ.get("TFTP_IP",    "172.16.6.101")
+TFTP_IP    = os.environ.get("TFTP_IP",    "212.178.218.234")
 TFTP_IP_CCAP  = os.environ.get("TFTP_IP_CCAP",  "127.0.0.1")  # CCAP (Casa/Cisco) use separate TFTP reachable from device
 TFTP_PATH  = os.environ.get("TFTP_PATH",  "./")
 SSH_HOST   = os.environ.get("SSH_HOST",   "access-engineering.nl")

@@ -68,8 +68,8 @@ else:
 
 
 # TFTP
-TFTP_IP    = os.environ.get("TFTP_IP", "172.16.6.101")
-TFTP_HEX   = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))  # AC100665
+TFTP_IP    = os.environ.get("TFTP_IP", "212.178.218.234")
+TFTP_HEX   = "".join(f"{int(o):02X}" for o in TFTP_IP.split("."))  # D4B2DAEA
 TFTP_URI   = f"tftp://{TFTP_IP}/"
 
 # CCAP bulk row (destination table)
