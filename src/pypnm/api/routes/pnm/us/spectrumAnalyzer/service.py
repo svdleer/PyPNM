@@ -1073,6 +1073,47 @@ class UtscRfPortDiscoveryService:
                             self.logger.info(f"Casa physical RF port (pattern): {descr} ({ifidx})")
                             return result
 
+        # --- Cisco cBR-8: map logical upstream ifDescr to physical US port ---
+        # Typical logical channel ifDescr:
+        #   Cable8/0/0-upstream3
+        #   Integrated-Cable8/0/0-upstream3
+        # Typical physical UTSC RF port ifDescr:
+        #   Cable8/0/0/US3
+        #   Integrated-Cable8/0/0/US3
+        if ofdma_ifindex:
+            ofdma_descr = if_descr_map.get(ofdma_ifindex, '')
+            cisco_patterns = [
+                re.match(r'^Cable(\d+/\d+/\d+)-upstream(\d+)$', ofdma_descr, re.I),
+                re.match(r'^Integrated-Cable(\d+/\d+/\d+)-upstream(\d+)$', ofdma_descr, re.I),
+            ]
+            cisco_match = next((m for m in cisco_patterns if m), None)
+            if cisco_match:
+                slot_path = cisco_match.group(1)
+                us_port = cisco_match.group(2)
+                candidates: list[tuple[int, str]] = []
+                for ifidx, descr in if_descr_map.items():
+                    d = str(descr)
+                    if re.match(rf'^Cable{re.escape(slot_path)}/US{re.escape(us_port)}$', d, re.I):
+                        candidates.append((ifidx, d))
+                    elif re.match(rf'^Integrated-Cable{re.escape(slot_path)}/US{re.escape(us_port)}$', d, re.I):
+                        candidates.append((ifidx, d))
+
+                # Prefer physical ifIndexes (exclude Cisco logical channel space).
+                physical = [c for c in candidates if c[0] < 840000000]
+                picked_pool = physical if physical else candidates
+                if picked_pool:
+                    picked_pool.sort(key=lambda x: x[0])
+                    picked_ifindex, picked_descr = picked_pool[0]
+                    result["success"] = True
+                    result["rf_port_ifindex"] = picked_ifindex
+                    result["rf_port_description"] = picked_descr
+                    result["logical_channel"] = ofdma_ifindex
+                    self.logger.info(
+                        f"Cisco mapping: {ofdma_descr} (ifIndex {ofdma_ifindex}) "
+                        f"-> {picked_descr} (ifIndex {picked_ifindex})"
+                    )
+                    return result
+
         if ofdma_ifindex:
             result["error"] = (
                 f"Unable to map OFDMA ifIndex {ofdma_ifindex} to a UTSC RF port; "
