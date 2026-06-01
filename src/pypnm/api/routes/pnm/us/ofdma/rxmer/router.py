@@ -23,6 +23,7 @@ Deprecated/removed:
 from __future__ import annotations
 
 import io
+import asyncio
 import logging
 import os
 import time
@@ -31,6 +32,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import Response
+from pypnm.api.agent.manager import get_agent_manager
 
 from pypnm.lib.pnm_file_source import (
     fetch_pnm_files as _fetch_pnm_files,
@@ -92,6 +94,80 @@ class UsOfdmaRxMerRouter:
         self.__routes()
     
     def __routes(self) -> None:
+
+        async def _prefetch_via_agent_if_enabled(filename: str) -> bool:
+            """Attempt agent-based file prefetch when enabled via environment.
+
+            Enables runtime control from .env:
+              - CMTS_TFTP=agent
+              - or CMTS_TFTP_CISCO=agent
+            """
+            mode_cmts = (os.environ.get('CMTS_TFTP', '') or os.environ.get('PNM_FILE_SOURCE_CMTS', '')).strip().lower()
+            mode_cisco = (os.environ.get('CMTS_TFTP_CISCO', '') or os.environ.get('PNM_FILE_SOURCE_CMTS_CISCO', '')).strip().lower()
+            if mode_cmts != 'agent' and mode_cisco != 'agent':
+                return False
+
+            agent_manager = get_agent_manager()
+            if not agent_manager:
+                self.logger.warning("Agent prefetch enabled but agent manager is not available")
+                return False
+
+            candidate_ids = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
+            if not candidate_ids:
+                self.logger.warning("Agent prefetch enabled but no agent with pnm_file_get capability is connected")
+                return False
+
+            async def _try_agent(aid: str) -> tuple[str, dict | None]:
+                try:
+                    tid = await agent_manager.send_task(
+                        agent_id=aid,
+                        command='file_get',
+                        params={'filename': filename, 'glob': True},
+                    )
+                    res = await agent_manager.wait_for_task_async(
+                        tid,
+                        timeout=agent_manager.LONG_TASK_TIMEOUT,
+                    )
+                    return aid, res
+                except Exception as exc:
+                    self.logger.debug(f"Agent '{aid}' file_get error for '{filename}': {exc}")
+                    return aid, None
+
+            pending = {asyncio.ensure_future(_try_agent(aid)): aid for aid in candidate_ids}
+            winner: dict | None = None
+            winner_agent: str | None = None
+            try:
+                while pending:
+                    done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+                    for fut in done:
+                        aid, result = fut.result()
+                        pending.pop(fut, None)
+                        result_inner = (result or {}).get('result') or result or {}
+                        if result_inner and result_inner.get('success'):
+                            winner = result_inner
+                            winner_agent = aid
+                            break
+                    if winner:
+                        break
+            finally:
+                for fut in pending:
+                    fut.cancel()
+
+            if not winner:
+                return False
+
+            try:
+                import base64
+                cache_dir = Path(_get_cache_dir())
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                out_name = winner.get('filename', Path(filename).name)
+                out_path = cache_dir / Path(out_name).name
+                out_path.write_bytes(base64.b64decode(winner['content_base64']))
+                self.logger.info(f"Agent prefetch succeeded via '{winner_agent}' -> {out_path.name}")
+                return True
+            except Exception as exc:
+                self.logger.warning(f"Agent prefetch decode/write failed for '{filename}': {exc}")
+                return False
         
         @self.router.post(
             "/discover",
@@ -980,10 +1056,12 @@ class UsOfdmaRxMerRouter:
             if not filepath.exists():
                 filepath = cache_dir / filename
             if not filepath.exists():
-                try:
-                    _fetch_pnm_files(basename, allow_when_local=True)
-                except Exception as e:
-                    self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
+                fetched_via_agent = await _prefetch_via_agent_if_enabled(basename)
+                if not fetched_via_agent:
+                    try:
+                        _fetch_pnm_files(basename, allow_when_local=True)
+                    except Exception as e:
+                        self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
                 filepath = cache_dir / basename
 
             if not filepath.exists():
@@ -1124,10 +1202,12 @@ class UsOfdmaRxMerRouter:
             if not filepath.exists():
                 filepath = cache_dir / filename
             if not filepath.exists():
-                try:
-                    _fetch_pnm_files(basename, allow_when_local=True)
-                except Exception as e:
-                    self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
+                fetched_via_agent = await _prefetch_via_agent_if_enabled(basename)
+                if not fetched_via_agent:
+                    try:
+                        _fetch_pnm_files(basename, allow_when_local=True)
+                    except Exception as e:
+                        self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
                 filepath = cache_dir / basename
 
             if not filepath.exists():
@@ -1221,10 +1301,12 @@ class UsOfdmaRxMerRouter:
             if not filepath.exists():
                 filepath = cache_dir / filename
             if not filepath.exists():
-                try:
-                    _fetch_pnm_files(basename, allow_when_local=True)
-                except Exception as e:
-                    self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
+                fetched_via_agent = await _prefetch_via_agent_if_enabled(basename)
+                if not fetched_via_agent:
+                    try:
+                        _fetch_pnm_files(basename, allow_when_local=True)
+                    except Exception as e:
+                        self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
                 filepath = cache_dir / basename
 
             if not filepath.exists():
@@ -1358,10 +1440,11 @@ class UsOfdmaRxMerRouter:
             # CMTS RxMER capture retrieval belongs in API, also for hybrid setups
             # where other flows remain local/agent-based.
             if fp is None:
+                basename = Path(fn).name
                 try:
-                    _fetch_pnm_files(Path(fn).name, allow_when_local=True)
+                    _fetch_pnm_files(basename, allow_when_local=True)
                 except Exception as e:
-                    self.logger.warning(f"FTP fetch skipped for {Path(fn).name}: {e}")
+                    self.logger.warning(f"FTP fetch skipped for {basename}: {e}")
                 cache_dir = Path(_get_cache_dir())
                 fp = _find_capture(cache_dir, fn)
 
