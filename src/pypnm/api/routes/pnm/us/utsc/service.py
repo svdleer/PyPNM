@@ -599,6 +599,8 @@ class CmtsUtscService:
                 re.compile(r'Cable\d+/\d+/\d+/US\d+', re.I),                      # Cisco cBR-8 (3-level)
                 re.compile(r'Integrated-Cable\d+/\d+/US\d+', re.I),                # Cisco cBR-8 integrated (2-level)
                 re.compile(r'Integrated-Cable\d+/\d+/\d+/US\d+', re.I),           # Cisco cBR-8 integrated (3-level)
+                re.compile(r'Cable\d+/\d+/\d+-upstream\d+', re.I),                # Cisco upstream ifIndex form
+                re.compile(r'Integrated-Cable\d+/\d+/\d+-upstream\d+', re.I),     # Cisco integrated upstream form
                 re.compile(r'Upstream-Cable\d+', re.I),                             # Cisco legacy
                 re.compile(r'us-conn\s+\d+/\d+', re.I),                             # CommScope E6000
                 re.compile(r'cable-upstream\s+\d+/\d+\.\d+', re.I),                # Casa / Generic

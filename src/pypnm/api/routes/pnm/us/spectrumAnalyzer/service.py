@@ -1114,6 +1114,19 @@ class UtscRfPortDiscoveryService:
                     )
                     return result
 
+                # Some Cisco deployments expose UTSC-capable upstream ifIndexes
+                # directly as "CableX/Y/Z-upstreamN" without separate /US ifDescr rows.
+                # In that case, use the discovered OFDMA ifIndex as RF port index.
+                result["success"] = True
+                result["rf_port_ifindex"] = ofdma_ifindex
+                result["rf_port_description"] = ofdma_descr
+                result["logical_channel"] = ofdma_ifindex
+                self.logger.info(
+                    f"Cisco fallback mapping: using OFDMA ifIndex {ofdma_ifindex} as RF port "
+                    f"({ofdma_descr})"
+                )
+                return result
+
         if ofdma_ifindex:
             result["error"] = (
                 f"Unable to map OFDMA ifIndex {ofdma_ifindex} to a UTSC RF port; "
