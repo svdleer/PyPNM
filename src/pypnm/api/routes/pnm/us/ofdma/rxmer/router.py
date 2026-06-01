@@ -2157,10 +2157,16 @@ class UsOfdmaRxMerRouter:
                 # This is the DOCSIS 3.1 OFDMA-specific table (not the D3.0 SC-QAM table!)
                 OID_CM_OFDMA_STATUS = "1.3.6.1.4.1.4491.2.1.28.1.4.1.2"
                 modem_counts: dict = {ch['ifindex']: 0 for ch in channels}
+                has_cisco_candidates = any(
+                    str(ch.get('description', '')).startswith('Cable')
+                    and '-upstream' in str(ch.get('description', '')).lower()
+                    for ch in channels
+                )
                 # Track unique cm_index per mac_domain to avoid double-counting
                 # modems that appear on multiple channels of the same fiber node.
                 ifidx_to_domain = {ch['ifindex']: ch['mac_domain'] for ch in channels}
                 domain_unique_cms: dict = {}   # mac_domain -> set of cm_index
+                seen_ifidx: set[int] = set()
                 try:
                     cm_walk = await service._snmp_walk(OID_CM_OFDMA_STATUS, timeout=30)
                     self.logger.info(f"CM OFDMA walk: success={cm_walk.get('success') if isinstance(cm_walk, dict) else False}, "
@@ -2168,7 +2174,6 @@ class UsOfdmaRxMerRouter:
                     if isinstance(cm_walk, dict) and cm_walk.get('success'):
                         cm_raw = cm_walk.get('results') or []
                         matched = 0
-                        seen_ifidx: set = set()
                         for item in cm_raw:
                             if isinstance(item, dict) and 'oid' in item:
                                 try:
@@ -2192,6 +2197,19 @@ class UsOfdmaRxMerRouter:
                                          f"cm_ifidx sample: {list(seen_ifidx)[:5]}")
                 except Exception as _cm_err:
                     self.logger.warning(f"Modem count walk failed: {_cm_err}")
+
+                # Cisco cBR-8 descriptors often include both OFDMA and non-OFDMA
+                # upstream names in ifDescr. Keep only ifIndexes actually present
+                # in docsIf31CmtsCmUsOfdmaChannelStatus.
+                if has_cisco_candidates and seen_ifidx:
+                    before = len(channels)
+                    channels = [ch for ch in channels if ch['ifindex'] in seen_ifidx]
+                    ifidx_to_domain = {ch['ifindex']: ch['mac_domain'] for ch in channels}
+                    modem_counts = {ifidx: modem_counts.get(ifidx, 0) for ifidx in ifidx_to_domain.keys()}
+                    self.logger.info(
+                        f"Cisco OFDMA filter applied: {before} -> {len(channels)} channels "
+                        f"(based on docsIf31CmtsCmUsOfdmaChannelStatus)"
+                    )
 
                 # Add modem_count to each channel
                 for ch in channels:
