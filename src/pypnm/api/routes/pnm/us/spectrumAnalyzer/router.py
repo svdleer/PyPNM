@@ -556,15 +556,11 @@ async def _stream_spectrum_data(
         f"output={output_format}, window={window}, runtime={runtime}s"
     )
 
-    stream_vendor = ''
-    try:
-        vendor_service = CmtsUtscService(cmts_ip=cmts_ip, community=community, write_community=community)
-        stream_vendor = await vendor_service.detect_vendor()
-        vendor_service.close()
-    except Exception:
-        stream_vendor = ''
-    stream_mode = _resolve_cmts_tftp_mode(stream_vendor)
-    logger.info(f"UTSC stream retrieval vendor={stream_vendor or 'unknown'} mode={stream_mode}")
+    # Resolve retrieval mode from env only — no live SNMP probe needed.
+    # To override per vendor set CISCO_TFTP=, COMMSCOPE_TFTP=, or CASA_TFTP=
+    # in the environment.  Fallback: CMTS_TFTP -> PNM_FILE_SOURCE.
+    stream_mode = _resolve_cmts_tftp_mode('')
+    logger.info(f"UTSC stream retrieval mode={stream_mode}")
     
     try:
         # Clean all old UTSC files before starting a new capture
@@ -623,12 +619,13 @@ async def _stream_spectrum_data(
                 break
             
             try:
-                # Fetch files via agent (WebSocket) with FTP fallback in hybrid mode,
+                # Fetch files via agent (WebSocket) or FTP depending on mode,
                 # then discover local files from both cache and local TFTP mount.
                 if stream_mode == 'agent':
                     await _agent_fetch_utsc_files(processed_files, mode=stream_mode)
                 elif _mode_uses_ftp(stream_mode):
                     _ftp_fetch_utsc_files(stream_mode)
+                # local mode: files arrive directly on TFTP_BASE — discovered below
                 roots = []
                 for root in (_get_utsc_base(), TFTP_BASE):
                     if root and root not in roots and os.path.isdir(root):
