@@ -42,6 +42,55 @@ FTP_DIR = os.environ.get('FTP_TFTPBOOT_DIR', '/var/lib/tftpboot')
 _USE_FTP = os.environ.get('PNM_FILE_SOURCE', 'local').lower() in ('ftp', 'agent') or os.environ.get('CMTS_TFTP', '').lower() == 'ftp'
 
 
+def _resolve_cmts_tftp_mode(vendor: str = '') -> str:
+    """Resolve retrieval mode for a CMTS vendor.
+
+    Supported values: ftp | agent | local
+    Vendor env aliases:
+      - CISCO_TFTP
+      - COMMSCOPE_TFTP
+      - CASA_TFTP
+    If vendor key is not set, falls back to CMTS_TFTP.
+    """
+    vendor_lc = (vendor or '').strip().lower()
+
+    vendor_values: list[str] = []
+    if 'cisco' in vendor_lc or 'cbr' in vendor_lc:
+        vendor_values = [
+            os.environ.get('CISCO_TFTP', ''),
+            os.environ.get('CMTS_TFTP_CISCO', ''),
+            os.environ.get('PNM_FILE_SOURCE_CMTS_CISCO', ''),
+        ]
+    elif 'arris' in vendor_lc or 'commscope' in vendor_lc or 'e6000' in vendor_lc:
+        vendor_values = [
+            os.environ.get('COMMSCOPE_TFTP', ''),
+            os.environ.get('CMTS_TFTP_COMMSCOPE', ''),
+            os.environ.get('PNM_FILE_SOURCE_CMTS_COMMSCOPE', ''),
+        ]
+    elif 'casa' in vendor_lc or 'evo' in vendor_lc or 'vccap' in vendor_lc:
+        vendor_values = [
+            os.environ.get('CASA_TFTP', ''),
+            os.environ.get('CMTS_TFTP_CASA', ''),
+            os.environ.get('PNM_FILE_SOURCE_CMTS_CASA', ''),
+        ]
+
+    for raw in vendor_values:
+        mode = (raw or '').strip().lower()
+        if mode in ('ftp', 'agent', 'local'):
+            return mode
+
+    fallback = (
+        os.environ.get('CMTS_TFTP', '')
+        or os.environ.get('PNM_FILE_SOURCE_CMTS', '')
+        or os.environ.get('PNM_FILE_SOURCE', 'local')
+    ).strip().lower()
+    return fallback if fallback in ('ftp', 'agent', 'local') else 'local'
+
+
+def _mode_uses_ftp(mode: str) -> bool:
+    return (mode or '').strip().lower() == 'ftp'
+
+
 def _get_utsc_base() -> str:
     """Return the primary directory to read UTSC files from.
 
@@ -53,9 +102,9 @@ def _get_utsc_base() -> str:
     return _CACHE_DIR
 
 
-def _ftp_fetch_utsc_files() -> list[str]:
+def _ftp_fetch_utsc_files(mode: str = '') -> list[str]:
     """Fetch all UTSC files from FTP server into local cache. Returns list of local paths."""
-    if not _USE_FTP:
+    if not _mode_uses_ftp(mode):
         return []
     os.makedirs(_CACHE_DIR, exist_ok=True)
     fetched = []
@@ -90,7 +139,7 @@ def _ftp_fetch_utsc_files() -> list[str]:
     return fetched
 
 
-async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
+async def _agent_fetch_utsc_files(processed_files: set[str], mode: str = '') -> list[str]:
     """Fetch new UTSC files via file-agent WebSocket (bypasses FTP overhead).
 
     Two-step approach:
@@ -98,14 +147,14 @@ async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
        (fast: no file content transferred)
     2. ``file_get`` — fetch only the files not yet processed (returns base64)
 
-    Falls back to FTP when no file-agent is available.
+    Falls back to FTP when mode is ftp and no file-agent is available.
     """
     import base64
     from pypnm.api.agent.manager import get_agent_manager
 
     agent_manager = get_agent_manager()
     if not agent_manager:
-        return _ftp_fetch_utsc_files()
+        return _ftp_fetch_utsc_files(mode)
 
     file_list_ids = agent_manager.get_all_agent_ids_for_capability('file_list')
     pnm_file_ids = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
@@ -116,7 +165,7 @@ async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
     candidate_ids.extend([aid for aid in pnm_file_ids if aid not in candidate_ids])
 
     if not candidate_ids:
-        return _ftp_fetch_utsc_files()
+        return _ftp_fetch_utsc_files(mode)
     os.makedirs(_CACHE_DIR, exist_ok=True)
 
     # Step 1: list matching files on candidate agents' TFTP roots.
@@ -147,9 +196,11 @@ async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
             logger.debug(f"Agent file_list failed for {candidate_id}: {e}")
 
     if agent_id is None:
-        if had_list_success:
-            return []
-        return _ftp_fetch_utsc_files()
+        # Hybrid mode: some CMTS types still land files on FTP/TFTP paths.
+        # If agent listing had no matches, also try FTP fetch when enabled.
+        if _mode_uses_ftp(mode):
+            return _ftp_fetch_utsc_files(mode)
+        return []
 
     # Filter to only files we haven't processed yet
     processed_basenames = {os.path.basename(p) for p in processed_files}
@@ -190,7 +241,7 @@ async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
     return fetched
 
 
-def _delete_utsc_files_via_ftp(filenames: list[str]) -> int:
+def _delete_utsc_files_via_ftp(filenames: list[str], mode: str = '') -> int:
     """Delete UTSC files from FTP server and local cache."""
     if not filenames:
         return 0
@@ -206,7 +257,7 @@ def _delete_utsc_files_via_ftp(filenames: list[str]) -> int:
         except OSError:
             pass
     # Delete from FTP server
-    if _USE_FTP:
+    if _mode_uses_ftp(mode):
         try:
             ftp = FTP()
             ftp.connect(FTP_SERVER, 21, timeout=10)
@@ -504,13 +555,23 @@ async def _stream_spectrum_data(
         f"center={center_freq_hz}Hz, span={span_hz}Hz, bins={num_bins}, "
         f"output={output_format}, window={window}, runtime={runtime}s"
     )
+
+    stream_vendor = ''
+    try:
+        vendor_service = CmtsUtscService(cmts_ip=cmts_ip, community=community, write_community=community)
+        stream_vendor = await vendor_service.detect_vendor()
+        vendor_service.close()
+    except Exception:
+        stream_vendor = ''
+    stream_mode = _resolve_cmts_tftp_mode(stream_vendor)
+    logger.info(f"UTSC stream retrieval vendor={stream_vendor or 'unknown'} mode={stream_mode}")
     
     try:
         # Clean all old UTSC files before starting a new capture
         utsc_base = _get_utsc_base()
         old_files = glob.glob(f"{utsc_base}/utsc_*") + glob.glob(f"{utsc_base}/PNMCcapUsSpecAn_*")
         if old_files:
-            _delete_utsc_files_via_ftp([os.path.basename(f) for f in old_files])
+            _delete_utsc_files_via_ftp([os.path.basename(f) for f in old_files], mode=stream_mode)
             logger.info(f"Cleaned {len(old_files)} old UTSC files")
         
         await websocket.send_json({
@@ -562,13 +623,21 @@ async def _stream_spectrum_data(
                 break
             
             try:
-                # Fetch files via agent (WebSocket) or FTP fallback, then find local copies
-                await _agent_fetch_utsc_files(processed_files)
-                utsc_base = _get_utsc_base()
-                files = sorted(
-                    glob.glob(f"{utsc_base}/utsc_*") + glob.glob(f"{utsc_base}/PNMCcapUsSpecAn_*"),
-                    key=os.path.getmtime
-                )  # Oldest first
+                # Fetch files via agent (WebSocket) with FTP fallback in hybrid mode,
+                # then discover local files from both cache and local TFTP mount.
+                if stream_mode == 'agent':
+                    await _agent_fetch_utsc_files(processed_files, mode=stream_mode)
+                elif _mode_uses_ftp(stream_mode):
+                    _ftp_fetch_utsc_files(stream_mode)
+                roots = []
+                for root in (_get_utsc_base(), TFTP_BASE):
+                    if root and root not in roots and os.path.isdir(root):
+                        roots.append(root)
+                all_files = []
+                for root in roots:
+                    all_files.extend(glob.glob(f"{root}/utsc_*"))
+                    all_files.extend(glob.glob(f"{root}/PNMCcapUsSpecAn_*"))
+                files = sorted(set(all_files), key=os.path.getmtime)  # Oldest first
                 
                 new_files = [f for f in files if f not in processed_files]
                 
