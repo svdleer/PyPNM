@@ -319,78 +319,13 @@ class CmtsUtscService:
 
         try:
             import asyncio
-            import ipaddress
 
             vendor = await self.detect_vendor()
-            if vendor == 'cisco':
-                self.logger.info(
-                    f"Cisco UTSC bulk destination follows RxMER standard BDT path for {dest_ip}:{dest_path}"
-                )
-                return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
-
-            self.logger.info(f"Configuring bulk data control for {pnm_types} upload to {dest_ip}:{dest_path}")
-            
-            # Convert IP to hex string
-            ip_obj = ipaddress.ip_address(dest_ip)
-            ip_hex = ip_obj.packed.hex()
-            ip_hex_formatted = ' '.join([ip_hex[i:i+2] for i in range(0, len(ip_hex), 2)]).upper()
-
-            # Calculate selector before any SETs
-            byte0 = 0x00
-            byte1 = 0x00
-            for t in (pnm_types or ['utsc']):
-                t = t.lower()
-                if t in ('utsc', 'both'):
-                    byte1 |= 0x80  # bit8
-                if t in ('rxmer', 'both'):
-                    byte0 |= 0x04  # bit5
-            selector_hex = f"{byte0:02X} {byte1:02X}"
-
-            # Read current DestIpAddr to check if already configured correctly.
-            # Casa CMTS rejects SET on active rows → skip if already set to same values.
-            existing_ip = await self._snmp_get(f"{self.OID_BULK_DATA_DEST_IP}.{index}")
-            existing_path = await self._snmp_get(f"{self.OID_BULK_DATA_DEST_PATH}.{index}")
-            existing_selector = await self._snmp_get(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}")
-
-            def _normalize(v):
-                if v and isinstance(v, dict):
-                    v = v.get('value', '')
-                return str(v or '').strip().upper().replace(' ', '').replace('0X', '')
-
-            already_set = (
-                _normalize(existing_ip) == ip_hex.upper() and
-                str(existing_path.get('value', '') if isinstance(existing_path, dict) else existing_path or '').strip() == dest_path and
-                _normalize(existing_selector) == selector_hex.replace(' ', '')
+            self.logger.info(
+                f"UTSC bulk destination delegating to RxMER helper for {dest_ip}:{dest_path} "
+                f"(vendor={vendor})"
             )
-
-            if already_set:
-                self.logger.info(f"Bulk data control already configured correctly for index {index}, skipping SETs")
-                return {"success": True, "index": index, "dest_ip": dest_ip, "pnm_test_selector_hex": selector_hex, "skipped": True}
-
-            # Probe with the first SET.  If the CMTS returns notWritable the
-            # CCAP table is read-only (non-Casa) — fall through to the
-            # standard docsPnmBulkDataTransferCfgTable with destroy+recreate.
-            probe = await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
-            if not probe.get('success') and 'notWritable' in str(probe.get('error', '')):
-                self.logger.info(
-                    f"CCAP bulk data table is notWritable — using standard BDT table "
-                    f"(docsPnmBulkDataTransferCfgTable) with destroy+recreate (vendor={vendor})"
-                )
-                return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
-
-            # CCAP table is writable (Casa) — direct SETs on columns.
-            # Casa CCAP table has NO RowStatus — just overwrite columns directly.
-            import asyncio
-
-            self.logger.info(f"CCAP bulk data: direct SET for {dest_ip}:{dest_path}")
-            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')  # ipv4
-            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP}.{index}", ip_hex_formatted, 'x')
-            await self._snmp_set(f"{self.OID_BULK_DATA_DEST_PATH}.{index}", dest_path, 's')
-            await self._snmp_set(f"{self.OID_BULK_DATA_UPLOAD_CTRL}.{index}", 3, 'i')  # autoUpload
-            await self._snmp_set(f"{self.OID_BULK_DATA_TEST_SELECTOR}.{index}", selector_hex, 'x')
-
-            self.logger.info(f"Bulk data control configured: selector={selector_hex}")
-            return {"success": True, "index": index, "dest_ip": dest_ip, "pnm_test_selector_hex": selector_hex}
+            return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
             
         except Exception as e:
             self.logger.error(f"Failed to configure bulk data control: {e}")
