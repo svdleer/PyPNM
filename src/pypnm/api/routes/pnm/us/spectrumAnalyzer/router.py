@@ -107,30 +107,50 @@ async def _agent_fetch_utsc_files(processed_files: set[str]) -> list[str]:
     if not agent_manager:
         return _ftp_fetch_utsc_files()
 
-    candidate_ids = agent_manager.get_all_agent_ids_for_capability('file_list')
+    file_list_ids = agent_manager.get_all_agent_ids_for_capability('file_list')
+    pnm_file_ids = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
+
+    # Prefer agents explicitly advertising pnm_file_get, then fall back to generic file_list.
+    candidate_ids: list[str] = [aid for aid in file_list_ids if aid in pnm_file_ids]
+    candidate_ids.extend([aid for aid in file_list_ids if aid not in candidate_ids])
+    candidate_ids.extend([aid for aid in pnm_file_ids if aid not in candidate_ids])
+
     if not candidate_ids:
         return _ftp_fetch_utsc_files()
-
-    agent_id = candidate_ids[0]
     os.makedirs(_CACHE_DIR, exist_ok=True)
 
-    # Step 1: list matching files on the agent's TFTP root
-    try:
-        task_id = await agent_manager.send_task(
-            agent_id=agent_id,
-            command='file_list',
-            params={'prefixes': ['utsc_', 'PNMCcapUsSpecAn_']},
-            timeout=10,
-        )
-        result = await agent_manager.wait_for_task_async(task_id, timeout=10)
-        result_inner = (result or {}).get('result') or result or {}
-        if not result_inner.get('success'):
-            return _ftp_fetch_utsc_files()
-    except Exception as e:
-        logger.debug(f"Agent file_list failed: {e}")
+    # Step 1: list matching files on candidate agents' TFTP roots.
+    # Try multiple candidates to avoid selecting a connected agent with no file access.
+    remote_files: list[str] = []
+    agent_id: str | None = None
+    had_list_success = False
+    for candidate_id in candidate_ids:
+        try:
+            task_id = await agent_manager.send_task(
+                agent_id=candidate_id,
+                command='file_list',
+                params={'prefixes': ['utsc_', 'PNMCcapUsSpecAn_']},
+                timeout=10,
+            )
+            result = await agent_manager.wait_for_task_async(task_id, timeout=10)
+            result_inner = (result or {}).get('result') or result or {}
+            if not result_inner.get('success'):
+                continue
+            had_list_success = True
+
+            files = result_inner.get('files', []) or []
+            if files:
+                agent_id = candidate_id
+                remote_files = files
+                break
+        except Exception as e:
+            logger.debug(f"Agent file_list failed for {candidate_id}: {e}")
+
+    if agent_id is None:
+        if had_list_success:
+            return []
         return _ftp_fetch_utsc_files()
 
-    remote_files = result_inner.get('files', [])
     # Filter to only files we haven't processed yet
     processed_basenames = {os.path.basename(p) for p in processed_files}
     new_files = [f for f in remote_files
