@@ -322,6 +322,11 @@ class CmtsUtscService:
             import ipaddress
 
             vendor = await self.detect_vendor()
+            if vendor == 'cisco':
+                self.logger.info(
+                    f"Cisco UTSC bulk destination follows RxMER standard BDT path for {dest_ip}:{dest_path}"
+                )
+                return await self._configure_bdt_standard(dest_ip, dest_path, index, vendor=vendor)
 
             self.logger.info(f"Configuring bulk data control for {pnm_types} upload to {dest_ip}:{dest_path}")
             
@@ -363,7 +368,7 @@ class CmtsUtscService:
                 return {"success": True, "index": index, "dest_ip": dest_ip, "pnm_test_selector_hex": selector_hex, "skipped": True}
 
             # Probe with the first SET.  If the CMTS returns notWritable the
-            # CCAP table is read-only (E6000/Cisco) — fall through to the
+            # CCAP table is read-only (non-Casa) — fall through to the
             # standard docsPnmBulkDataTransferCfgTable with destroy+recreate.
             probe = await self._snmp_set(f"{self.OID_BULK_DATA_DEST_IP_TYPE}.{index}", 1, 'i')
             if not probe.get('success') and 'notWritable' in str(probe.get('error', '')):
