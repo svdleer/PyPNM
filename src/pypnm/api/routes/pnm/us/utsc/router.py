@@ -601,6 +601,7 @@ class UtscRouter:
                 try:
                     from pypnm.lib.pnm_file_source import get_ftp_config
                     import ftplib
+                    import base64
                     ftp_cfg = get_ftp_config()
                     
                     ftp = ftplib.FTP()
@@ -631,6 +632,8 @@ class UtscRouter:
                     with open(cache_path, 'wb') as f:
                         ftp.retrbinary(f'RETR {actual_filename}', f.write)
                     ftp.quit()
+
+                    content_bytes = cache_path.read_bytes()
                     
                     file_size = cache_path.stat().st_size
                     self.logger.info(f"Retrieved UTSC file via FTP: {actual_filename} ({file_size} bytes) -> {cache_path}")
@@ -640,7 +643,8 @@ class UtscRouter:
                         filename=actual_filename,
                         cache_path=str(cache_path),
                         file_size=file_size,
-                        agent_id="ftp"
+                        agent_id="ftp",
+                        content_base64=base64.b64encode(content_bytes).decode(),
                     )
                 except Exception as exc:
                     self.logger.error(f"FTP retrieval error: {exc}")
@@ -738,7 +742,8 @@ class UtscRouter:
                     filename=filename,
                     cache_path=str(out_path),
                     file_size=len(content_bytes),
-                    agent_id=winner_agent
+                    agent_id=winner_agent,
+                    content_base64=content_b64
                 )
             except Exception as exc:
                 self.logger.error(f"Failed to decode/write UTSC file: {exc}")
