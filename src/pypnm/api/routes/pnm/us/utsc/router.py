@@ -76,6 +76,28 @@ class UtscRouter:
         self.__routes()
     
     def __routes(self) -> None:
+
+        def _resolve_utsc_file_mode(vendor: Optional[str] = None) -> str:
+            vendor_lc = (vendor or '').strip().lower()
+            vendor_keys: list[str] = []
+            if 'cisco' in vendor_lc or 'cbr' in vendor_lc:
+                vendor_keys = ['CISCO_TFTP', 'CMTS_TFTP_CISCO', 'PNM_FILE_SOURCE_CMTS_CISCO']
+            elif 'commscope' in vendor_lc or 'arris' in vendor_lc or 'e6000' in vendor_lc:
+                vendor_keys = ['COMMSCOPE_TFTP', 'CMTS_TFTP_COMMSCOPE', 'PNM_FILE_SOURCE_CMTS_COMMSCOPE']
+            elif 'casa' in vendor_lc or 'evo' in vendor_lc or 'vccap' in vendor_lc:
+                vendor_keys = ['CASA_TFTP', 'CMTS_TFTP_CASA', 'PNM_FILE_SOURCE_CMTS_CASA']
+
+            for key in vendor_keys:
+                mode = (os.environ.get(key, '') or '').strip().lower()
+                if mode in ('ftp', 'agent', 'local'):
+                    return mode
+
+            fallback = (
+                os.environ.get('CMTS_TFTP', '')
+                or os.environ.get('PNM_FILE_SOURCE_CMTS', '')
+                or os.environ.get('PNM_FILE_SOURCE', 'local')
+            ).strip().lower()
+            return fallback if fallback in ('ftp', 'agent', 'local') else 'local'
         
         @self.router.get(
             "/ports",
@@ -457,6 +479,10 @@ class UtscRouter:
             
             Returns filenames only (basenames), so caller can decide which to fetch.
             """
+            mode = _resolve_utsc_file_mode(request.vendor)
+            self.logger.info(
+                f"UTSC file_list request for cmts={request.rf_port_ifindex or 'n/a'} vendor={request.vendor or 'unknown'} mode={mode}"
+            )
             # Determine prefix to use
             prefix = request.prefix
             if not prefix:
@@ -477,7 +503,7 @@ class UtscRouter:
             self.logger.debug(f"Listing UTSC files with prefix: {prefix}")
 
             # FTP mode: scan directly on FTP server
-            if _is_ftp_mode():
+            if mode == 'ftp':
                 import ftplib
                 try:
                     from pypnm.lib.pnm_file_source import get_ftp_config
@@ -524,6 +550,10 @@ class UtscRouter:
                     success=False,
                     error="No agent with file_list capability is connected"
                 )
+
+            self.logger.info(
+                f"UTSC file_list using agent mode via {len(candidate_ids)} candidate(s) for prefix={prefix}"
+            )
 
             # Try agents in parallel, take first result
             async def _try_agent(aid: str) -> tuple[str, dict | None]:
@@ -596,8 +626,12 @@ class UtscRouter:
             
             In FTP mode, file is cached in PNM_CACHE_DIR before being returned.
             """
+            mode = _resolve_utsc_file_mode(request.vendor)
+            self.logger.info(
+                f"UTSC file_retrieve request filename={request.filename} vendor={request.vendor or 'unknown'} mode={mode} glob={request.glob}"
+            )
             # FTP mode: download directly from FTP server
-            if _is_ftp_mode():
+            if mode == 'ftp':
                 try:
                     from pypnm.lib.pnm_file_source import get_ftp_config
                     import ftplib
@@ -667,6 +701,10 @@ class UtscRouter:
                     success=False,
                     error="No agent with pnm_file_get capability is connected"
                 )
+
+            self.logger.info(
+                f"UTSC file_retrieve using agent mode via {len(candidate_ids)} candidate(s) for filename={request.filename}"
+            )
 
             self.logger.info(f"Retrieving UTSC file: {request.filename} (glob={request.glob})")
 

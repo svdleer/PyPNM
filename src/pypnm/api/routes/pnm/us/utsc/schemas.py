@@ -289,6 +289,10 @@ class UtscFileListRequest(BaseModel):
         default=None,
         description="If provided, auto-builds CommScope glob pattern: utsc_{mac_clean}_*"
     )
+    vendor: Optional[str] = Field(
+        default=None,
+        description="Optional CMTS vendor hint (cisco, commscope, casa, arris)"
+    )
 
 
 class UtscFileListResponse(BaseModel):
@@ -309,6 +313,10 @@ class UtscFileRetrieveRequest(BaseModel):
     """
     filename: str = Field(..., description="Filename to fetch (bare name or glob prefix)")
     glob: bool = Field(default=True, description="If True, treats filename as glob pattern and fetches newest match")
+    vendor: Optional[str] = Field(
+        default=None,
+        description="Optional CMTS vendor hint (cisco, commscope, casa, arris)"
+    )
 
 
 class UtscFileRetrieveResponse(BaseModel):
