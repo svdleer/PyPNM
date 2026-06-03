@@ -270,3 +270,53 @@ class UtscGetConfigResponse(BaseModel):
     destination_index: Optional[int] = None
     row_status: Optional[int] = None
     error: Optional[str] = None
+
+
+class UtscFileListRequest(BaseModel):
+    """Request to list UTSC files on agent TFTP server.
+    
+    Uses agent 'file_list' command to discover files matching a glob prefix.
+    """
+    prefix: Optional[str] = Field(
+        default=None,
+        description="Filename prefix to glob-match (e.g., 'PNMCcapUsSpecAn_*' for Cisco)"
+    )
+    rf_port_ifindex: Optional[int] = Field(
+        default=None,
+        description="If provided, auto-builds Cisco glob pattern: PNMCcapUsSpecAn_*_{ifindex}"
+    )
+    mac_address: Optional[str] = Field(
+        default=None,
+        description="If provided, auto-builds CommScope glob pattern: utsc_{mac_clean}_*"
+    )
+
+
+class UtscFileListResponse(BaseModel):
+    """Response with list of UTSC files."""
+    success: bool
+    files: List[str] = Field(default_factory=list, description="Matching filenames (basenames only)")
+    count: int = Field(default=0, description="Number of files found")
+    prefix_used: Optional[str] = Field(None, description="Actual prefix used for glob")
+    error: Optional[str] = None
+
+
+class UtscFileRetrieveRequest(BaseModel):
+    """Request to retrieve and parse a UTSC file from agent.
+    
+    The agent's file_get command fetches from local TFTP root (configurable
+    via TFTP_ROOT, PYPNM_TFTP_PATH env vars). File is returned as base64
+    and decoded into the cache directory.
+    """
+    filename: str = Field(..., description="Filename to fetch (bare name or glob prefix)")
+    glob: bool = Field(default=True, description="If True, treats filename as glob pattern and fetches newest match")
+
+
+class UtscFileRetrieveResponse(BaseModel):
+    """Response from file retrieval."""
+    success: bool
+    filename: Optional[str] = Field(None, description="Actual filename retrieved")
+    cache_path: Optional[str] = Field(None, description="Local cache path where file was written")
+    file_size: Optional[int] = Field(None, description="Size of retrieved file in bytes")
+    agent_id: Optional[str] = Field(None, description="Agent ID that served the file")
+    content_base64: Optional[str] = Field(None, description="File content as base64 (only if return_content=True)")
+    error: Optional[str] = None
