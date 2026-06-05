@@ -608,10 +608,17 @@ class UtscRouter:
                     error="No agent returned file_list results"
                 )
 
+            raw_files: list[str] = winner.get('files', []) or []
+            # Filter out basenames the caller already has so they don't re-fetch them.
+            exclude_set: set[str] = {
+                os.path.basename(f) for f in (request.exclude or [])
+            }
+            if exclude_set:
+                raw_files = [f for f in raw_files if os.path.basename(f) not in exclude_set]
             return UtscFileListResponse(
                 success=True,
-                files=winner.get('files', []),
-                count=winner.get('count', 0),
+                files=raw_files,
+                count=len(raw_files),
                 prefix_used=prefix
             )
         
@@ -640,6 +647,26 @@ class UtscRouter:
             self.logger.info(
                 f"UTSC file_retrieve request filename={request.filename} vendor={request.vendor or 'unknown'} mode={mode} glob={request.glob}"
             )
+
+            # Cache-hit: if file already exists locally, return it without agent/FTP call.
+            if not request.glob:
+                cache_dir = Path(_get_cache_dir())
+                cache_path = cache_dir / Path(request.filename).name
+                if cache_path.exists():
+                    import base64 as _b64
+                    content_bytes = cache_path.read_bytes()
+                    self.logger.info(
+                        f"UTSC file_retrieve cache hit: {cache_path.name} ({len(content_bytes)} bytes)"
+                    )
+                    return UtscFileRetrieveResponse(
+                        success=True,
+                        filename=cache_path.name,
+                        cache_path=str(cache_path),
+                        file_size=len(content_bytes),
+                        agent_id='cache',
+                        content_base64=_b64.b64encode(content_bytes).decode(),
+                    )
+
             # FTP mode: download directly from FTP server
             if mode == 'ftp':
                 try:

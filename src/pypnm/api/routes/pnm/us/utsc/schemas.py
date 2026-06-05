@@ -293,6 +293,10 @@ class UtscFileListRequest(BaseModel):
         default=None,
         description="Optional CMTS vendor hint (cisco, commscope, casa, arris)"
     )
+    exclude: Optional[List[str]] = Field(
+        default=None,
+        description="Basenames already known to caller — excluded from response to avoid redundant retrieval"
+    )
 
 
 class UtscFileListResponse(BaseModel):
