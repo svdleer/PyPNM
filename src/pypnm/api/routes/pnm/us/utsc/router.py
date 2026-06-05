@@ -404,6 +404,11 @@ class UtscRouter:
                 self.logger.warning("Agent prefetch enabled but no agent with pnm_file_get capability is connected")
                 return False
 
+            # Only file-agents have TFTP root access.
+            file_agent_ids = [a for a in candidate_ids if a.startswith('file-agent')]
+            if file_agent_ids:
+                candidate_ids = file_agent_ids
+
             async def _try_agent(aid: str) -> tuple[str, dict | None]:
                 try:
                     tid = await agent_manager.send_task(
@@ -544,7 +549,11 @@ class UtscRouter:
                     error="Agent manager not available (and not in FTP mode)"
                 )
 
-            candidate_ids = agent_manager.get_all_agent_ids_for_capability('file_list')
+            # Only file-agents have TFTP root access; cmts/cm agents do not.
+            all_capable = agent_manager.get_all_agent_ids_for_capability('file_list')
+            candidate_ids = [a for a in all_capable if a.startswith('file-agent')]
+            if not candidate_ids:
+                candidate_ids = all_capable  # fallback if no file-agent connected
             if not candidate_ids:
                 return UtscFileListResponse(
                     success=False,
@@ -562,6 +571,7 @@ class UtscRouter:
                         agent_id=aid,
                         command='file_list',
                         params={'prefix': prefix},
+                        priority='interactive',
                     )
                     res = await agent_manager.wait_for_task_async(
                         tid,
@@ -695,7 +705,11 @@ class UtscRouter:
                     error="Agent manager not available"
                 )
 
-            candidate_ids = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
+            # Only file-agents have TFTP root access; cmts/cm agents do not.
+            all_capable = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
+            candidate_ids = [a for a in all_capable if a.startswith('file-agent')]
+            if not candidate_ids:
+                candidate_ids = all_capable  # fallback if no file-agent connected
             if not candidate_ids:
                 return UtscFileRetrieveResponse(
                     success=False,
