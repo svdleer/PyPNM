@@ -465,6 +465,58 @@ class CmtsUsOfdmaRxMerService:
         Returns:
             Dict with cm_index, ofdma_ifindex, and success status
         """
+        # ── Fast path 1: in-memory enrichment cache (no I/O) ────────
+        # The enrichment cache is keyed by cmts_ip and holds the full modem
+        # list from the last CMTS walk. Check it before touching MySQL.
+        try:
+            from pypnm.api.routes.cmts.service import _enrichment_cache
+            cached_entry = _enrichment_cache.get(self.cmts_ip, {})
+            if cached_entry.get('cmts_enriched') or cached_entry.get('enriched'):
+                mac_norm = self.normalize_mac(cm_mac)
+                for m in cached_entry.get('modems', []):
+                    if self.normalize_mac(m.get('mac_address', '')) == mac_norm:
+                        ifindex = m.get('ofdma_ifindex')
+                        if ifindex:
+                            self.logger.info(
+                                f"discover_modem_ofdma: memory-cache hit for {cm_mac} → ofdma_ifindex={ifindex}"
+                            )
+                            return {
+                                "success": True,
+                                "cm_mac_address": cm_mac,
+                                "cm_index": m.get('cmts_index'),
+                                "ofdma_ifindex": int(ifindex),
+                                "ofdma_description": m.get('upstream_interface'),
+                                "ofdma_channels": [{"ifindex": int(ifindex), "description": m.get('upstream_interface')}],
+                                "_source": "memory-cache",
+                            }
+                        break
+        except Exception as _mem_err:
+            self.logger.debug(f"discover_modem_ofdma: memory cache lookup failed ({_mem_err})")
+
+        # ── Fast path 2: MySQL inventory ─────────────────────────────
+        # If the modem was previously enriched we have ofdma_ifindex in the DB;
+        # skip both full-table SNMP walks entirely.
+        try:
+            from pypnm.api.routes.poller.service import poller_service
+            inv = poller_service.get_inventory_modem_by_mac(cm_mac)
+            if inv and inv.get('ofdma_ifindex'):
+                ifindex = int(inv['ofdma_ifindex'])
+                self.logger.info(
+                    f"discover_modem_ofdma: inventory hit for {cm_mac} → ofdma_ifindex={ifindex}"
+                )
+                return {
+                    "success": True,
+                    "cm_mac_address": cm_mac,
+                    "cm_index": None,
+                    "ofdma_ifindex": ifindex,
+                    "ofdma_description": inv.get('upstream_interface'),
+                    "ofdma_channels": [{"ifindex": ifindex, "description": inv.get('upstream_interface')}],
+                    "_source": "inventory",
+                }
+        except Exception as _inv_err:
+            self.logger.debug(f"discover_modem_ofdma: inventory lookup failed ({_inv_err}), falling back to SNMP")
+
+        # ── Slow path: SNMP walks ────────────────────────────────────
         cm_index = await self.discover_cm_index(cm_mac)
         if not cm_index:
             return {"success": False, "error": "CM not found on CMTS", "cm_mac_address": cm_mac}
