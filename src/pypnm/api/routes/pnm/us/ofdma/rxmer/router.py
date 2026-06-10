@@ -2226,17 +2226,23 @@ class UsOfdmaRxMerRouter:
                 for md, fn_data in seen.items():
                     fn_data['modem_count'] = len(domain_unique_cms.get(md, set()))
 
-                # Always exclude fallback mac-domain entries — only show
-                # real FN names from DOCS-IF3-MIB resolution.
-                _fallback_prefixes = ('cable-mac', 'OFDMA-', 'RPD-', 'FN-cable-mac', 'FN-OFDMA-', 'FN-RPD-', 'Cable')
-
+                # Show any fiber node that has active modems, regardless of whether
+                # its name came from DOCS-IF3-MIB or from ifDescr fallback.
+                #
+                # Background: on Cisco cBR-8, some MAC domains (e.g. slots 7/8/9)
+                # appear in docsIf3MdChCfg but not in docsIf3MdNodeStatus, so their
+                # channels can't be resolved to real FN names and keep the ifDescr-
+                # derived fallback name (e.g. "Cable7/0/0"). Filtering those out by
+                # prefix silently hides entire linecards that are live with modems.
+                #
+                # The modem_count > 0 condition is sufficient to remove phantom/empty
+                # entries; the prefix filter is redundant and harmful on partial MIBs.
                 result = {
                     "success":     True,
                     "channels":    channels,
                     "fiber_nodes": sorted([
                         f for f in seen.values()
                         if f['modem_count'] > 0
-                        and not f['mac_domain'].startswith(_fallback_prefixes)
                     ], key=lambda f: f['mac_domain']),
                 }
 
