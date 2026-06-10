@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+import logging
+
+from fastapi import APIRouter, HTTPException, Query
+
+logger = logging.getLogger(__name__)
 
 from pypnm.api.routes.poller.schema import (
     PollerJobsResponse,
@@ -82,19 +86,27 @@ def list_inventory_modems(
     if limit is None:
         limit = poller_service._cm_modem_limit_default()
 
-    modems = poller_service.list_inventory_modems(
-        cmts=cmts,
-        search_type=search_type,
-        search_value=search_value,
-        interface_filter=interface,
-        limit=limit,
-    )
+    try:
+        modems = poller_service.list_inventory_modems(
+            cmts=cmts,
+            search_type=search_type,
+            search_value=search_value,
+            interface_filter=interface,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error(f"inventory/modems DB error: {exc}")
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "modems": modems, "count": len(modems), "source": "pypnm-inventory"}
 
 
 @router.get("/inventory/modems/{mac_address}")
 def get_inventory_modem(mac_address: str) -> dict:
-    modem = poller_service.get_inventory_modem_by_mac(mac_address)
+    try:
+        modem = poller_service.get_inventory_modem_by_mac(mac_address)
+    except Exception as exc:
+        logger.error(f"inventory/modems/{mac_address} DB error: {exc}")
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     if not modem:
         return {"status": "error", "message": "Modem not found"}
     return {"status": "success", "modem": modem, "source": "pypnm-inventory"}
@@ -107,7 +119,11 @@ def get_inventory_modems_bulk(body: dict) -> dict:
         return {"status": "error", "message": "mac_addresses list required"}
     if len(mac_addresses) > 5000:
         return {"status": "error", "message": "max 5000 MACs per request"}
-    modems = poller_service.get_inventory_modems_bulk(mac_addresses)
+    try:
+        modems = poller_service.get_inventory_modems_bulk(mac_addresses)
+    except Exception as exc:
+        logger.error(f"inventory/modems/bulk DB error: {exc}")
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "modems": modems, "count": len(modems)}
 
 
@@ -118,7 +134,11 @@ def clear_inventory_modems(body: dict) -> dict:
     if not cmts and not cmts_ip:
         return {"status": "error", "message": "cmts or cmts_ip required"}
 
-    deleted = poller_service.clear_inventory_modems(cmts=cmts or None, cmts_ip=cmts_ip or None)
+    try:
+        deleted = poller_service.clear_inventory_modems(cmts=cmts or None, cmts_ip=cmts_ip or None)
+    except Exception as exc:
+        logger.error(f"inventory/modems/clear DB error: {exc}")
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {
         "status": "success",
         "deleted": deleted,

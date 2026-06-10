@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 class PollerService:
     def __init__(self) -> None:
         self._db_lock = threading.Lock()
+        # Thread-local storage for persistent connections (one per thread).
+        # Avoids the overhead of a new TCP handshake per query while remaining
+        # thread-safe without an external pool library.
+        self._tls = threading.local()
         self.backend = "mysql"
         scheduler_enabled_default = (os.environ.get("DATA_STORE_SCHEDULER_ENABLED", "true").strip().lower() == "true")
 
@@ -56,10 +60,26 @@ class PollerService:
             database=self._db_name(),
             autocommit=True,
             cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=30,
+            connect_timeout=10,
             read_timeout=30,
             write_timeout=30,
         )
+
+    def _get_conn(self):
+        """Return a thread-local persistent connection, reconnecting if stale."""
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            try:
+                conn.ping(reconnect=True)
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._tls.conn = None
+        self._tls.conn = self._connect()
+        return self._tls.conn
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -81,7 +101,7 @@ class PollerService:
     def _execute(self, sql: str, params=None):
         params = params or ()
         with self._db_lock:
-            conn = self._connect()
+            conn = self._get_conn()
             try:
                 cur = conn.cursor()
                 cur.execute(sql, params)
@@ -89,22 +109,33 @@ class PollerService:
                     last_id = cur.lastrowid
                 except Exception:
                     last_id = None
-            finally:
-                conn.close()
+            except Exception:
+                # Discard the thread-local connection on error so next call reconnects.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._tls.conn = None
+                raise
             return last_id
 
     def _query(self, sql: str, params=None):
-        # No lock: each call opens its own connection, so reads never
-        # need to wait behind the write-serialisation lock.  This fixes
-        # multi-second stalls on API reads while the worker is upserting.
+        # Reads use the same thread-local connection (no write lock needed —
+        # each thread has its own connection so reads never contend with writes
+        # happening on a different thread's connection).
         params = params or ()
-        conn = self._connect()
+        conn = self._get_conn()
         try:
             cur = conn.cursor()
             cur.execute(sql, params)
             rows = self._rows(cur)
-        finally:
-            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._tls.conn = None
+            raise
         return rows
 
     def _init_db(self) -> None:
