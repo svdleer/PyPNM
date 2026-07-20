@@ -1207,7 +1207,6 @@ class PollerService:
                 where.append(f"LOWER(COALESCE(ip,'')) LIKE {marker}")
                 params.append(sv)
             elif search_type == "mac":
-                expr = "LOWER(REPLACE(REPLACE(COALESCE(mac,''),':',''),'-',''))"
                 mac_norm = (
                     str(search_value)
                     .lower()
@@ -1216,8 +1215,18 @@ class PollerService:
                     .replace(".", "")
                     .replace(" ", "")
                 )
-                where.append(f"{expr} LIKE {marker}")
-                params.append(f"%{mac_norm}%")
+                marker = "%s"
+                if len(mac_norm) == 12:
+                    # Full MAC — use exact match on the primary key column
+                    # (stored as aa:bb:cc:dd:ee:ff) so the PK index is used.
+                    formatted = ":".join(mac_norm[i:i+2] for i in range(0, 12, 2))
+                    where.append(f"LOWER(mac) = {marker}")
+                    params.append(formatted)
+                else:
+                    # Partial MAC — fall back to normalised LIKE scan
+                    expr = "LOWER(REPLACE(REPLACE(COALESCE(mac,''),':',''),'-',''))"
+                    where.append(f"{expr} LIKE {marker}")
+                    params.append(f"%{mac_norm}%")
             elif search_type == "name":
                 where.append(
                     f"(LOWER(COALESCE(vendor,'')) LIKE {marker} OR LOWER(COALESCE(model,'')) LIKE {marker} OR LOWER(COALESCE(fiber_node,'')) LIKE {marker})"
