@@ -45,12 +45,12 @@ class PollerService:
 
     @staticmethod
     def _cm_modem_limit_default() -> int:
-        raw = os.environ.get("CM_MODEM_LIMIT", "10000")
+        raw = os.environ.get("CM_MODEM_LIMIT", "50000")
         try:
             value = int(raw)
             return max(1, min(value, 50000))
         except (TypeError, ValueError):
-            return 10000
+            return 50000
 
     def _connect(self):
         return pymysql.connect(

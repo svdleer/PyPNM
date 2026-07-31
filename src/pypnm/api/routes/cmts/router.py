@@ -67,11 +67,11 @@ async def get_cmts_modems(
     service = CMTSModemService()
 
     if limit is None:
-        raw = os.environ.get("CM_MODEM_LIMIT", "10000")
+        raw = os.environ.get("CM_MODEM_LIMIT", "50000")
         try:
             limit = max(1, min(int(raw), 50000))
         except (TypeError, ValueError):
-            limit = 10000
+            limit = 50000
 
     try:
         result = await service.discover_modems(
@@ -101,6 +101,11 @@ async def get_cmts_modems(
             enriched=enriched,
             cached=result.get('cached', False),
             enriching=result.get('enriching', False),
+            complete=result.get('complete', False),
+            truncated=result.get('truncated', False),
+            source=result.get('source'),
+            raw_legacy_mac_count=result.get('raw_legacy_mac_count'),
+            raw_d3_mac_count=result.get('raw_d3_mac_count'),
             enrichment_progress=result.get('enrich_progress'),
         )
         

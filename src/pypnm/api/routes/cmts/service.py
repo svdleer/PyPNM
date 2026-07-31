@@ -202,7 +202,11 @@ class CMTSModemService:
             cache_sufficient = (
                 not limit
                 or cached_count >= int(limit)
-                or (cached_req_limit and cached_req_limit >= int(limit))
+                or (
+                    cached.get('complete') is True
+                    and cached_req_limit
+                    and cached_req_limit >= int(limit)
+                )
             )
 
             if cached.get('enriched') and age < 7200 and cache_sufficient:
@@ -215,6 +219,9 @@ class CMTSModemService:
                     'enriched': True,
                     'enriching': False,
                     'cached': True,
+                    'source': cached.get('source', 'snmp-live'),
+                    'complete': cached.get('complete', False),
+                    'truncated': cached.get('truncated', True),
                 }
 
             if cached.get('enriching') and age < 1800 and cache_sufficient:
@@ -228,6 +235,9 @@ class CMTSModemService:
                     'enriching': True,
                     'cmts_enriched': cached.get('cmts_enriched', False),
                     'cached': True,
+                    'source': cached.get('source', 'snmp-live'),
+                    'complete': cached.get('complete', False),
+                    'truncated': cached.get('truncated', True),
                     'enrich_progress': cached.get('enrich_progress', {'completed': 0, 'total': 0}),
                 }
 
@@ -351,6 +361,18 @@ class CMTSModemService:
                         'modems': [], 'count': 0}
 
             raw = walk_result.get('results', {})
+            legacy_mac_rows = len(raw.get(OID_OLD_MAC, []))
+            d3_mac_rows = len(raw.get(OID_D3_MAC, []))
+            inventory_truncated = bool(
+                limit and (legacy_mac_rows >= int(limit) or d3_mac_rows >= int(limit))
+            )
+            inventory_meta = {
+                'source': 'snmp-live',
+                'complete': not inventory_truncated,
+                'truncated': inventory_truncated,
+                'raw_legacy_mac_count': legacy_mac_rows,
+                'raw_d3_mac_count': d3_mac_rows,
+            }
 
             # ── Step 2: Parse raw results into lookup maps ───────────────
             modems = self._correlate_modem_data(raw, limit)
@@ -364,7 +386,11 @@ class CMTSModemService:
                 existing_sufficient = (
                     not limit
                     or len(existing.get('modems', [])) >= int(limit)
-                    or (existing_req_limit and existing_req_limit >= int(limit))
+                    or (
+                        existing.get('complete') is True
+                        and existing_req_limit
+                        and existing_req_limit >= int(limit)
+                    )
                 )
                 if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800 and existing_sufficient:
                     self.logger.info(f"Enrichment already in progress for {cmts_ip}, skipping new launch")
@@ -375,6 +401,9 @@ class CMTSModemService:
                         'cmts_ip': cmts_ip,
                         'enriched': False,
                         'enriching': True,
+                        'source': existing.get('source', 'snmp-live'),
+                        'complete': existing.get('complete', False),
+                        'truncated': existing.get('truncated', True),
                         'enrich_progress': existing.get('enrich_progress', {'completed': 0, 'total': len(modems)}),
                     }
 
@@ -385,6 +414,7 @@ class CMTSModemService:
                     'enriching': True,
                     'timestamp': time.time(),
                     'requested_limit': limit,
+                    **inventory_meta,
                     'enrich_progress': {'completed': 0, 'total': 0},
                 }
                 
@@ -401,6 +431,7 @@ class CMTSModemService:
                     'cmts_ip': cmts_ip,
                     'enriched': False,
                     'enriching': True,
+                    **inventory_meta,
                 }
 
             return {
@@ -410,6 +441,7 @@ class CMTSModemService:
                 'cmts_ip': cmts_ip,
                 'enriched': False,
                 'enriching': False,
+                **inventory_meta,
             }
                 
         except Exception as e:
@@ -425,15 +457,15 @@ class CMTSModemService:
 
             # Step 1: fast CMTS-level enrichment.
             await self._enrich_cmts_interfaces(modems)
-            # Update cache immediately and keep requested_limit intact.
-            _existing_req_limit = _enrichment_cache.get(cmts_ip, {}).get('requested_limit')
+            # Update cache immediately and preserve inventory-completion metadata.
+            existing_cache = _enrichment_cache.get(cmts_ip, {})
             _enrichment_cache[cmts_ip] = {
+                **existing_cache,
                 'modems': modems,
                 'enriched': False,
                 'enriching': True,
                 'cmts_enriched': True,
                 'timestamp': time.time(),
-                'requested_limit': _existing_req_limit,
                 'enrich_progress': {'completed': 0, 'total': len(modems)},
             }
             self.logger.info(f"CMTS interface enrichment done for {cmts_ip} — OFDMA/cable-mac visible")
@@ -441,13 +473,13 @@ class CMTSModemService:
             # Step 2: slower per-modem enrichment.
             await self._enrich_modems_direct(modems, modem_community, cmts_ip=cmts_ip)
 
-            _existing_req_limit = _enrichment_cache.get(cmts_ip, {}).get('requested_limit')
+            existing_cache = _enrichment_cache.get(cmts_ip, {})
             _enrichment_cache[cmts_ip] = {
+                **existing_cache,
                 'modems': modems,
                 'enriched': True,
                 'enriching': False,
                 'timestamp': time.time(),
-                'requested_limit': _existing_req_limit,
             }
             enriched_count = sum(1 for m in modems if m.get('model'))
             self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
@@ -472,13 +504,16 @@ class CMTSModemService:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
             # Stop retry loops and keep partial data.
             if cmts_ip in _enrichment_cache:
+                existing_cache = _enrichment_cache[cmts_ip]
                 _enrichment_cache[cmts_ip] = {
-                    'modems': _enrichment_cache[cmts_ip].get('modems', modems),
+                    **existing_cache,
+                    'modems': existing_cache.get('modems', modems),
                     'enriched': True,
                     'enriching': False,
                     'timestamp': time.time(),
-                    'requested_limit': _enrichment_cache.get(cmts_ip, {}).get('requested_limit'),
                     'partial': True,    # flag so callers can tell data is incomplete
+                    'complete': False,
+                    'truncated': True,
                 }
 
     # ── correlation logic (moved from agent._async_cmts_get_modems) ─────
@@ -609,9 +644,34 @@ class CMTSModemService:
             f"{len(us_ch_map)} D3.1 US-CH"
         )
 
-        # ---- build modem list ----
+        # ---- build modem list from the union of both registration tables ----
+        # Some CMTS platforms expose only DOCSIS 3.1 modems in the docsIf3
+        # table while the legacy docsIf table contains the complete registered
+        # population. Keep each table's index for table-specific lookups, but
+        # deduplicate and correlate the returned inventory by MAC address.
+        d3_index_by_mac = {mac: index for index, mac in mac_map.items()}
+        modem_rows: list[tuple[str, str, str | None]] = []
+        seen_macs: set[str] = set()
+
+        for old_index, mac in old_mac_map.items():
+            if mac in seen_macs:
+                continue
+            seen_macs.add(mac)
+            modem_rows.append((mac, old_index, d3_index_by_mac.get(mac)))
+
+        for d3_index, mac in mac_map.items():
+            if mac in seen_macs:
+                continue
+            seen_macs.add(mac)
+            modem_rows.append((mac, d3_index, d3_index))
+
+        self.logger.info(
+            f"Building inventory from {len(modem_rows)} unique MACs "
+            f"({len(old_mac_map)} legacy rows, {len(mac_map)} docsIf3 rows)"
+        )
+
         modems: list[dict] = []
-        for index, mac in mac_map.items():
+        for mac, index, d3_index in modem_rows:
             modem: dict[str, Any] = {
                 'mac_address': mac,
                 'cmts_index': index,
@@ -628,23 +688,26 @@ class CMTSModemService:
             if mac in mac_to_firmware:
                 modem['firmware'] = mac_to_firmware[mac]
 
-            if index in partial_svc_map:
-                modem['partial_service'] = partial_svc_map[index]
+            if d3_index is not None and d3_index in partial_svc_map:
+                modem['partial_service'] = partial_svc_map[d3_index]
                 # docsIf31CmtsCmRegStatusTable is D3.1-only → modem is DOCSIS 3.1
                 modem['docsis_version'] = 'DOCSIS 3.1'
             else:
                 modem['docsis_version'] = 'Unknown'
 
-            # Upstream interface resolution
-            us_ifindex = mac_to_us_ch_if.get(mac) or us_ch_map.get(index)
+            # Upstream interface resolution. D3 metadata must use the docsIf3
+            # index, which is not guaranteed to match the legacy table index.
+            us_ifindex = mac_to_us_ch_if.get(mac)
+            if not us_ifindex and d3_index is not None:
+                us_ifindex = us_ch_map.get(d3_index)
             if us_ifindex:
                 modem['upstream_ifindex'] = us_ifindex
                 modem['upstream_interface'] = if_name_map.get(us_ifindex, f'US-CH {us_ifindex}')
             else:
                 modem['upstream_interface'] = None
 
-            if index in us_ch_map:
-                modem['upstream_channel_id'] = us_ch_map[index]
+            if d3_index is not None and d3_index in us_ch_map:
+                modem['upstream_channel_id'] = us_ch_map[d3_index]
 
             # Skip modems that are offline: status=other(1) with no IP assigned.
             # Casa CCAP and some other vendors report status=1 for all unreachable

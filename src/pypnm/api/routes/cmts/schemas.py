@@ -9,12 +9,12 @@ from pydantic import BaseModel, Field
 
 
 def _cm_modem_limit_default() -> int:
-    raw = os.environ.get("CM_MODEM_LIMIT", "10000")
+    raw = os.environ.get("CM_MODEM_LIMIT", "50000")
     try:
         value = int(raw)
         return max(1, min(value, 50000))
     except (TypeError, ValueError):
-        return 10000
+        return 50000
 
 
 class CMTSModemRequest(BaseModel):
@@ -57,6 +57,11 @@ class CMTSModemResponse(BaseModel):
     enriched: bool = Field(default=False, description="Whether modems have been enriched")
     cached: bool = Field(default=False, description="Whether result came from cache")
     enriching: bool = Field(default=False, description="Whether enrichment is in progress")
+    complete: bool = Field(default=False, description="Whether the inventory walk reached the end of both MAC tables")
+    truncated: bool = Field(default=False, description="Whether a MAC table reached the requested walk limit")
+    source: Optional[str] = Field(default=None, description="Inventory source")
+    raw_legacy_mac_count: Optional[int] = Field(default=None, description="Rows returned by the legacy registration MAC table")
+    raw_d3_mac_count: Optional[int] = Field(default=None, description="Rows returned by the DOCSIS 3.x registration MAC table")
     enrichment_progress: Optional[Dict[str, int]] = Field(default=None, description="Live enrichment progress: {completed, total}")
 
 
