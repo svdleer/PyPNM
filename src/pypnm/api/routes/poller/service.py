@@ -300,17 +300,6 @@ class PollerService:
             except Exception:
                 pass
 
-        try:
-            self._execute(
-                "CREATE INDEX idx_inv_snapshot ON modem_inventory_current (snapshot_id)"
-            )
-        except Exception as exc:
-            if not self._query(
-                "SHOW INDEX FROM modem_inventory_current WHERE Key_name=%s",
-                ("idx_inv_snapshot",),
-            ):
-                raise RuntimeError("Failed to create required snapshot_id index") from exc
-
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS modem_rf_snapshot (
