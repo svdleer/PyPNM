@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import ipaddress
 import logging
 import threading
 import time
@@ -629,6 +630,9 @@ class PollerService:
                     return False
             return True
 
+        def _is_vcas_hostname(value: Any) -> bool:
+            return "-vcas" in _norm(value).casefold()
+
         appdb_rows = self._fetch_appdb_cmts()
         if not appdb_rows:
             appdb_rows = self._fetch_gui_cmts()
@@ -638,13 +642,24 @@ class PollerService:
             appdb_rows = self._fetch_env_cmts()
         by_name: Dict[str, str] = {}
         all_from_appdb: List[Dict[str, str]] = []
+        excluded_vcas_count = 0
         for c in appdb_rows:
+            name = _norm(c.get("HostName") or c.get("hostname") or c.get("name"))
+            if _is_vcas_hostname(name):
+                excluded_vcas_count += 1
+                continue
             ip = _norm(c.get("IPAddress") or c.get("ip") or c.get("ip_address"))
             if not ip:
                 continue
-            name = _norm(c.get("HostName") or c.get("hostname") or c.get("name") or ip)
+            name = name or ip
             all_from_appdb.append({"name": name, "ip": ip})
             by_name[name.lower()] = ip
+
+        if excluded_vcas_count:
+            logger.info(
+                "Filtered %s VCAS non-CMTS devices from poller targets",
+                excluded_vcas_count,
+            )
 
         scope_type = _norm(poller.get("scope_type") or "all_cmts").lower()
         if scope_type in {"all_cmts", "all", "all-cmts", "all_cmts_list"}:
@@ -690,10 +705,14 @@ class PollerService:
             seen.add(ipn)
             out.append({"name": _norm(name) or ipn, "ip": ipn})
 
+        excluded_scope_vcas_count = 0
         for item in scope_items:
             if isinstance(item, str):
                 token = _norm(item)
                 if not token:
+                    continue
+                if _is_vcas_hostname(token):
+                    excluded_scope_vcas_count += 1
                     continue
                 if _is_ip_literal(token):
                     _push(token, token)
@@ -707,10 +726,19 @@ class PollerService:
             elif isinstance(item, dict):
                 ip = _norm(item.get("ip") or item.get("cmts_ip") or item.get("IPAddress"))
                 name = _norm(item.get("name") or item.get("HostName") or item.get("hostname"))
+                if _is_vcas_hostname(name):
+                    excluded_scope_vcas_count += 1
+                    continue
                 if not ip and name:
                     ip = by_name.get(name.lower()) or ""
                 if ip:
                     _push(name or ip, ip)
+
+        if excluded_scope_vcas_count:
+            logger.info(
+                "Filtered %s VCAS non-CMTS devices from explicit poller scope",
+                excluded_scope_vcas_count,
+            )
 
         if out:
             return out
@@ -1267,10 +1295,16 @@ class PollerService:
 
         if cmts:
             marker = "%s"
-            where.append(
-                f"(LOWER(COALESCE(cmts,'')) = LOWER({marker}) OR LOWER(COALESCE(cmts_ip,'')) = LOWER({marker}))"
-            )
-            params.extend([cmts, cmts])
+            cmts_value = str(cmts).strip()
+            try:
+                ipaddress.ip_address(cmts_value)
+                cmts_column = "cmts_ip"
+            except ValueError:
+                cmts_column = "cmts"
+            # Both columns use a case-insensitive collation in production. Direct
+            # equality keeps the predicate sargable so the existing indexes are used.
+            where.append(f"{cmts_column} = {marker}")
+            params.append(cmts_value)
 
         if search_value:
             sv = f"%{str(search_value).lower()}%"

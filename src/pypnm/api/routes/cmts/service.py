@@ -261,6 +261,11 @@ class CMTSModemService:
                     age_s = float('inf')
 
                 is_fresh = age_s < 7200
+                requested_limit = int(limit or 0)
+                inventory_covers_request = (
+                    requested_limit <= 200
+                    or len(inv_modems) >= requested_limit
+                )
                 sample = inv_modems[:200]
                 enriched_count = sum(
                     1 for m in sample
@@ -269,8 +274,15 @@ class CMTSModemService:
                 )
                 is_enriched = (enriched_count / max(len(sample), 1)) >= 0.40
 
-                # Non-enrich requests can use any fresh inventory snapshot.
-                if is_fresh and not enrich:
+                if is_fresh and not inventory_covers_request:
+                    self.logger.info(
+                        f"MySQL inventory for {cmts_ip} has {len(inv_modems)} rows, "
+                        f"below requested limit {requested_limit} — falling through to SNMP"
+                    )
+
+                # Preview requests can use a smaller fresh snapshot. Larger
+                # requests require enough rows to cover the requested footprint.
+                if is_fresh and inventory_covers_request and not enrich:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, non-enrich request)"
@@ -286,8 +298,8 @@ class CMTSModemService:
                         'source': 'mysql-inventory',
                     }
 
-                # Enrich requests require quality threshold from inventory.
-                if is_fresh and enrich and is_enriched:
+                # Enrich requests require both inventory coverage and quality.
+                if is_fresh and inventory_covers_request and enrich and is_enriched:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, enriched)"
@@ -311,7 +323,7 @@ class CMTSModemService:
                         'source': 'mysql-inventory',
                     }
 
-                if is_fresh and enrich and not is_enriched:
+                if is_fresh and inventory_covers_request and enrich and not is_enriched:
                     self.logger.info(
                         f"MySQL inventory for {cmts_ip} is fresh but not enriched "
                         f"({enriched_count}/{len(sample)}) — falling through to SNMP"
