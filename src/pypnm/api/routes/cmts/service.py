@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Any
 
 from pypnm.api.agent.manager import get_agent_manager
@@ -165,6 +166,7 @@ class CMTSModemService:
         community: str = "public", 
         limit: int = 10000,
         enrich: bool = False,
+        refresh: bool = False,
         modem_community: str = "private",
         cmts_hostname: str = "",
     ) -> Dict[str, Any]:
@@ -194,18 +196,16 @@ class CMTSModemService:
                     'modems': [], 'count': 0}
 
         # ── Tier 1: In-memory cache (Redis-like speed) ─────────────────
-        if enrich and cmts_ip in _enrichment_cache:
+        if enrich and not refresh and cmts_ip in _enrichment_cache:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
             cached_count = len(cached.get('modems', []))
-            cached_req_limit = cached.get('requested_limit') or 0
             cache_sufficient = (
                 not limit
                 or cached_count >= int(limit)
                 or (
                     cached.get('complete') is True
-                    and cached_req_limit
-                    and cached_req_limit >= int(limit)
+                    and cached.get('truncated') is not True
                 )
             )
 
@@ -244,38 +244,66 @@ class CMTSModemService:
         # ── Tier 2: MySQL inventory (survives restarts) ──────────────
         try:
             from pypnm.api.routes.poller.service import poller_service
-            inv_modems = poller_service.list_inventory_modems(
+            snapshot = None if refresh else poller_service.get_inventory_snapshot(cmts_ip)
+            inv_modems = [] if refresh else poller_service.list_inventory_modems(
                 cmts=cmts_ip, limit=limit,
             )
             if inv_modems:
-                # Check freshness: oldest updated_at within 2 hours
                 from datetime import datetime, timezone as tz
-                timestamps = []
-                for m in inv_modems:
-                    ts = m.get('updated_at') or m.get('last_seen_at')
-                    if ts:
+
+                # Prefer the generation timestamp persisted with the inventory.
+                # Legacy rows without snapshot metadata remain usable for the
+                # 200-row preview but cannot prove a complete full inventory.
+                age_s = float('inf')
+                snapshot_collected_at = (snapshot or {}).get('collected_at')
+                if snapshot_collected_at:
+                    try:
+                        collected = datetime.fromisoformat(
+                            str(snapshot_collected_at).replace('Z', '+00:00')
+                        )
+                        if collected.tzinfo is None:
+                            collected = collected.replace(tzinfo=tz.utc)
+                        age_s = (datetime.now(tz.utc) - collected).total_seconds()
+                    except Exception:
+                        pass
+                if age_s == float('inf'):
+                    timestamps = []
+                    for m in inv_modems:
+                        ts = m.get('updated_at') or m.get('last_seen_at')
+                        if not ts:
+                            continue
                         try:
-                            if isinstance(ts, str):
-                                dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
-                            else:
-                                dt = ts
+                            dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00')) if isinstance(ts, str) else ts
                             if dt.tzinfo is None:
                                 dt = dt.replace(tzinfo=tz.utc)
                             timestamps.append(dt)
                         except Exception:
                             pass
-                if timestamps:
-                    oldest = min(timestamps)
-                    age_s = (datetime.now(tz.utc) - oldest).total_seconds()
-                else:
-                    age_s = float('inf')
+                    if timestamps:
+                        age_s = (datetime.now(tz.utc) - min(timestamps)).total_seconds()
 
                 is_fresh = age_s < 7200
                 requested_limit = int(limit or 0)
+                snapshot_complete = bool(
+                    snapshot
+                    and snapshot.get('complete') is True
+                    and snapshot.get('truncated') is not True
+                )
                 inventory_covers_request = (
-                    requested_limit <= 200
+                    snapshot_complete
+                    or requested_limit <= 200
                     or len(inv_modems) >= requested_limit
                 )
+                inventory_meta = {
+                    'source': 'mysql-inventory',
+                    'complete': snapshot_complete,
+                    'truncated': (snapshot or {}).get('truncated') is True,
+                    'requested_limit': (snapshot or {}).get('requested_limit'),
+                    'collected_at': snapshot_collected_at,
+                    'critical_oid_errors': (snapshot or {}).get('critical_oid_errors') or {},
+                    'raw_legacy_mac_count': (snapshot or {}).get('raw_legacy_mac_count'),
+                    'raw_d3_mac_count': (snapshot or {}).get('raw_d3_mac_count'),
+                }
                 sample = inv_modems[:200]
                 enriched_count = sum(
                     1 for m in sample
@@ -286,16 +314,15 @@ class CMTSModemService:
 
                 if is_fresh and not inventory_covers_request:
                     self.logger.info(
-                        f"MySQL inventory for {cmts_ip} has {len(inv_modems)} rows, "
-                        f"below requested limit {requested_limit} — falling through to SNMP"
+                        f"MySQL inventory for {cmts_ip} has {len(inv_modems)} rows "
+                        f"without a complete snapshot below requested limit {requested_limit}; "
+                        "falling through to SNMP"
                     )
 
-                # Preview requests can use a smaller fresh snapshot. Larger
-                # requests require enough rows to cover the requested footprint.
                 if is_fresh and inventory_covers_request and not enrich:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
-                        f"from MySQL inventory (age={age_s:.0f}s, non-enrich request)"
+                        f"from MySQL inventory (age={age_s:.0f}s, complete={snapshot_complete})"
                     )
                     return {
                         'success': True,
@@ -305,22 +332,20 @@ class CMTSModemService:
                         'enriched': False,
                         'enriching': False,
                         'cached': True,
-                        'source': 'mysql-inventory',
+                        **inventory_meta,
                     }
 
-                # Enrich requests require both inventory coverage and quality.
                 if is_fresh and inventory_covers_request and enrich and is_enriched:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, enriched)"
                     )
-                    # Warm the in-memory cache so next hit is Tier 1
                     _enrichment_cache[cmts_ip] = {
                         'modems': inv_modems,
                         'enriched': True,
                         'enriching': False,
                         'timestamp': time.time(),
-                        'requested_limit': limit,
+                        **inventory_meta,
                     }
                     return {
                         'success': True,
@@ -330,7 +355,7 @@ class CMTSModemService:
                         'enriched': True,
                         'enriching': False,
                         'cached': True,
-                        'source': 'mysql-inventory',
+                        **inventory_meta,
                     }
 
                 if is_fresh and inventory_covers_request and enrich and not is_enriched:
@@ -352,8 +377,9 @@ class CMTSModemService:
             walk_result = await self._send_agent_command(
                 'snmp_parallel_walk',
                 {'ip': cmts_ip, 'oids': walk_oids,
-                 'community': community, 'timeout': 5, 'limit': limit},  # apply limit at walk source for fast preload
-                timeout=300,  # 300s server wait — 9 concurrent trees each up to 120s
+                 'community': community, 'timeout': 5, 'limit': limit,
+                 'overall_timeout': 270},
+                timeout=300,
             )
             if not walk_result.get('success'):
                 return {'success': False,
@@ -363,16 +389,48 @@ class CMTSModemService:
             raw = walk_result.get('results', {})
             legacy_mac_rows = len(raw.get(OID_OLD_MAC, []))
             d3_mac_rows = len(raw.get(OID_D3_MAC, []))
+            walk_errors = walk_result.get('errors') or {}
+            critical_oids = (OID_OLD_MAC, OID_D3_MAC)
+            critical_oid_errors = {
+                oid: str(walk_errors[oid])
+                for oid in critical_oids
+                if oid in walk_errors
+            }
+            completed_oids = set(walk_result.get('completed_oids') or [])
+            has_completion_metadata = 'completed_oids' in walk_result
+            critical_walks_complete = (
+                has_completion_metadata
+                and not critical_oid_errors
+                and all(oid in completed_oids for oid in critical_oids)
+            )
+            truncated_oids = set(walk_result.get('truncated_oids') or [])
             inventory_truncated = bool(
-                limit and (legacy_mac_rows >= int(limit) or d3_mac_rows >= int(limit))
+                OID_OLD_MAC in truncated_oids
+                or OID_D3_MAC in truncated_oids
+                or (
+                    limit
+                    and (legacy_mac_rows >= int(limit) or d3_mac_rows >= int(limit))
+                )
             )
             inventory_meta = {
                 'source': 'snmp-live',
-                'complete': not inventory_truncated,
+                'complete': critical_walks_complete and not inventory_truncated,
                 'truncated': inventory_truncated,
+                'requested_limit': int(limit or 0),
+                'collected_at': datetime.now(timezone.utc).isoformat(),
+                'critical_oid_errors': critical_oid_errors,
                 'raw_legacy_mac_count': legacy_mac_rows,
                 'raw_d3_mac_count': d3_mac_rows,
             }
+            if not has_completion_metadata:
+                self.logger.warning(
+                    "CMTS inventory completion is unknown because the agent did not return per-OID completion metadata"
+                )
+            if critical_oid_errors:
+                self.logger.warning(
+                    "CMTS inventory is partial because critical MAC walks failed: %s",
+                    list(critical_oid_errors),
+                )
 
             # ── Step 2: Parse raw results into lookup maps ───────────────
             modems = self._correlate_modem_data(raw, limit)
@@ -382,14 +440,12 @@ class CMTSModemService:
             if enrich and modems:
                 # Guard: don't start a second enrichment if one is already running
                 existing = _enrichment_cache.get(cmts_ip, {})
-                existing_req_limit = existing.get('requested_limit') or 0
                 existing_sufficient = (
                     not limit
                     or len(existing.get('modems', [])) >= int(limit)
                     or (
                         existing.get('complete') is True
-                        and existing_req_limit
-                        and existing_req_limit >= int(limit)
+                        and existing.get('truncated') is not True
                     )
                 )
                 if existing.get('enriching') and (time.time() - existing.get('timestamp', 0)) < 1800 and existing_sufficient:

@@ -8,6 +8,7 @@ import ipaddress
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -166,6 +167,7 @@ class PollerService:
                 last_seen_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
                 source_poller VARCHAR(64) NULL,
+                snapshot_id CHAR(36) NULL,
                 PRIMARY KEY (mac)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
@@ -223,6 +225,28 @@ class PollerService:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS cmts_inventory_snapshot (
+                cmts_ip VARCHAR(45) NOT NULL,
+                cmts VARCHAR(128) NOT NULL,
+                snapshot_id CHAR(36) NOT NULL,
+                complete BOOLEAN NOT NULL DEFAULT FALSE,
+                truncated BOOLEAN NOT NULL DEFAULT FALSE,
+                requested_limit INT NOT NULL,
+                row_count INT NOT NULL DEFAULT 0,
+                collected_at DATETIME NOT NULL,
+                source VARCHAR(32) NOT NULL DEFAULT 'snmp-live',
+                source_poller VARCHAR(64) NULL,
+                critical_oid_errors JSON NULL,
+                raw_legacy_mac_count INT NULL,
+                raw_d3_mac_count INT NULL,
+                PRIMARY KEY (cmts_ip),
+                INDEX idx_inventory_snapshot_cmts (cmts),
+                INDEX idx_inventory_snapshot_collected (collected_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS scheduler_decision_log (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 tick_at DATETIME NOT NULL,
@@ -253,7 +277,19 @@ class PollerService:
                 self._execute(ddl)
             except Exception:
                 pass
-        # Indexes for listing/filtering (idempotent CREATE IF NOT EXISTS)
+
+        try:
+            self._execute(
+                "ALTER TABLE modem_inventory_current ADD COLUMN snapshot_id CHAR(36) NULL"
+            )
+        except Exception as exc:
+            if not self._query(
+                "SHOW COLUMNS FROM modem_inventory_current LIKE %s",
+                ("snapshot_id",),
+            ):
+                raise RuntimeError("Failed to add required snapshot_id column") from exc
+
+        # Indexes for listing/filtering (duplicate-index errors are harmless).
         for idx_ddl in [
             "CREATE INDEX idx_inv_cmts ON modem_inventory_current (cmts, mac)",
             "CREATE INDEX idx_inv_cmts_ip ON modem_inventory_current (cmts_ip)",
@@ -263,6 +299,18 @@ class PollerService:
                 self._execute(idx_ddl)
             except Exception:
                 pass
+
+        try:
+            self._execute(
+                "CREATE INDEX idx_inv_snapshot ON modem_inventory_current (snapshot_id)"
+            )
+        except Exception as exc:
+            if not self._query(
+                "SHOW INDEX FROM modem_inventory_current WHERE Key_name=%s",
+                ("idx_inv_snapshot",),
+            ):
+                raise RuntimeError("Failed to create required snapshot_id index") from exc
+
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS modem_rf_snapshot (
@@ -746,16 +794,18 @@ class PollerService:
         # Final fallback: use all appdb targets if scope parse failed/empty.
         return all_from_appdb
 
-    def _fetch_cmts_modems(self, cmts_ip: str, timeout_sec: int = 300) -> List[Dict[str, Any]]:
-        """Fetch base CMTS inventory without launching per-modem enrichment."""
+    def _fetch_cmts_modems(self, cmts_ip: str, timeout_sec: int = 300) -> Dict[str, Any]:
+        """Fetch a fresh base CMTS inventory and its completeness metadata."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
+        requested_limit = self._cm_modem_limit_default()
         payload = {
             "cmts_ip": cmts_ip,
             "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
-            "limit": self._cm_modem_limit_default(),
+            "limit": requested_limit,
             "enrich": False,
+            "refresh": True,
         }
-        request_timeout = max(30, int(timeout_sec or 300))
+        request_timeout = max(330, int(timeout_sec or 300) + 30)
         r = requests.post(
             f"{base}/cmts/modems/query",
             json=payload,
@@ -766,10 +816,27 @@ class PollerService:
         response_payload = r.json() if r.content else {}
         if isinstance(response_payload, dict) and response_payload.get("success"):
             modems = response_payload.get("modems") or []
-            return modems if isinstance(modems, list) else []
+            if not isinstance(modems, list):
+                modems = []
+            return {
+                "modems": modems,
+                "complete": response_payload.get("complete") is True,
+                "truncated": response_payload.get("truncated") is True,
+                "requested_limit": int(response_payload.get("requested_limit") or requested_limit),
+                "collected_at": response_payload.get("collected_at") or self._now(),
+                "source": response_payload.get("source") or "snmp-live",
+                "critical_oid_errors": response_payload.get("critical_oid_errors") or {},
+                "raw_legacy_mac_count": response_payload.get("raw_legacy_mac_count"),
+                "raw_d3_mac_count": response_payload.get("raw_d3_mac_count"),
+            }
         raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {response_payload}")
 
-    def _upsert_inventory_rows(self, rows: List[Dict[str, Any]], source_poller: Optional[str]) -> int:
+    def _upsert_inventory_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        source_poller: Optional[str],
+        snapshot_id: Optional[str] = None,
+    ) -> int:
         if not rows:
             return 0
         now = self._now()
@@ -813,14 +880,15 @@ class PollerService:
                 now,
                 now,
                 source_poller,
+                snapshot_id,
             ))
 
         sql = """
             INSERT INTO modem_inventory_current
                 (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
                  upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
-                 software_version, first_seen_at, last_seen_at, updated_at, source_poller)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 software_version, first_seen_at, last_seen_at, updated_at, source_poller, snapshot_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON DUPLICATE KEY UPDATE
               ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
               cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
@@ -830,7 +898,8 @@ class PollerService:
               ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
               partial_service=VALUES(partial_service), software_version=VALUES(software_version),
               last_seen_at=VALUES(last_seen_at),
-              updated_at=VALUES(updated_at), source_poller=VALUES(source_poller)
+              updated_at=VALUES(updated_at), source_poller=VALUES(source_poller),
+              snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id)
         """
 
         # Process in batches of 500, releasing the lock between batches
@@ -846,6 +915,102 @@ class PollerService:
             inserted += len(batch)
 
         return inserted
+
+    def _record_inventory_snapshot(
+        self,
+        *,
+        cmts: str,
+        cmts_ip: str,
+        snapshot_id: str,
+        metadata: Dict[str, Any],
+        row_count: int,
+        source_poller: Optional[str],
+    ) -> None:
+        collected_at = metadata.get("collected_at")
+        try:
+            parsed = datetime.fromisoformat(str(collected_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            collected_at = parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            collected_at = self._now()
+
+        # A complete generation is authoritative. Prune stale rows before
+        # publishing its metadata; readers do not filter by generation, so a
+        # failed batch or metadata write cannot hide the previous inventory.
+        if metadata.get("complete") is True and metadata.get("truncated") is not True:
+            self._execute(
+                "DELETE FROM modem_inventory_current "
+                "WHERE cmts_ip=%s AND (snapshot_id IS NULL OR snapshot_id<>%s)",
+                (cmts_ip, snapshot_id),
+            )
+
+        self._execute(
+            """
+            INSERT INTO cmts_inventory_snapshot
+                (cmts_ip, cmts, snapshot_id, complete, truncated, requested_limit,
+                 row_count, collected_at, source, source_poller, critical_oid_errors,
+                 raw_legacy_mac_count, raw_d3_mac_count)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+                cmts=VALUES(cmts), snapshot_id=VALUES(snapshot_id),
+                complete=VALUES(complete), truncated=VALUES(truncated),
+                requested_limit=VALUES(requested_limit), row_count=VALUES(row_count),
+                collected_at=VALUES(collected_at), source=VALUES(source),
+                source_poller=VALUES(source_poller),
+                critical_oid_errors=VALUES(critical_oid_errors),
+                raw_legacy_mac_count=VALUES(raw_legacy_mac_count),
+                raw_d3_mac_count=VALUES(raw_d3_mac_count)
+            """,
+            (
+                cmts_ip,
+                cmts,
+                snapshot_id,
+                1 if metadata.get("complete") is True else 0,
+                1 if metadata.get("truncated") is True else 0,
+                int(metadata.get("requested_limit") or self._cm_modem_limit_default()),
+                int(row_count),
+                collected_at,
+                metadata.get("source") or "snmp-live",
+                source_poller,
+                json.dumps(metadata.get("critical_oid_errors") or {}),
+                metadata.get("raw_legacy_mac_count"),
+                metadata.get("raw_d3_mac_count"),
+            ),
+        )
+
+    def get_inventory_snapshot(self, cmts: str) -> Optional[Dict[str, Any]]:
+        cmts_value = str(cmts or "").strip()
+        if not cmts_value:
+            return None
+        try:
+            ipaddress.ip_address(cmts_value)
+            column = "cmts_ip"
+        except ValueError:
+            column = "cmts"
+        rows = self._query(
+            f"SELECT * FROM cmts_inventory_snapshot WHERE {column}=%s "
+            "ORDER BY collected_at DESC LIMIT 1",
+            (cmts_value,),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        row["complete"] = bool(row.get("complete"))
+        row["truncated"] = bool(row.get("truncated"))
+        errors = row.get("critical_oid_errors")
+        if isinstance(errors, str):
+            try:
+                errors = json.loads(errors)
+            except Exception:
+                errors = {}
+        row["critical_oid_errors"] = errors if isinstance(errors, dict) else {}
+        collected = row.get("collected_at")
+        if isinstance(collected, datetime):
+            row["collected_at"] = collected.replace(tzinfo=timezone.utc).isoformat()
+        elif collected is not None:
+            row["collected_at"] = str(collected)
+        return row
 
     def _purge_stale_inventory(self, retention_days: int) -> int:
         days = max(1, int(retention_days or 30))
@@ -883,6 +1048,7 @@ class PollerService:
         modems_failed = 0
         error_text = None
         all_rows = []  # kept for potential future use; upserts are now per-CMTS
+        cmts_breakdown: List[Dict[str, Any]] = []
         self._update_running_job_progress(
             job_id,
             "Starting poller job: loading settings",
@@ -952,11 +1118,11 @@ class PollerService:
                         modems_succeeded=modems_succeeded,
                         modems_failed=modems_failed,
                     )
-                    modems = None
+                    fetch_result = None
                     last_target_error = None
                     for attempt in range(subtask_retries + 1):
                         try:
-                            modems = self._fetch_cmts_modems(cmts_ip, timeout_sec=subtask_timeout_sec)
+                            fetch_result = self._fetch_cmts_modems(cmts_ip, timeout_sec=subtask_timeout_sec)
                             break
                         except Exception as exc:
                             last_target_error = exc
@@ -968,7 +1134,7 @@ class PollerService:
                                 modems_succeeded=modems_succeeded,
                                 modems_failed=modems_failed,
                             )
-                    if modems is None:
+                    if fetch_result is None:
                         self._execute(
                             "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
                             (idx - 1, self._now(), poller_id),
@@ -977,13 +1143,44 @@ class PollerService:
                         modems_failed = max(modems_failed, 1)
                         break
 
+                    modems = fetch_result.get("modems") or []
                     modems_attempted += len(modems)
                     for m in modems:
                         m["cmts"] = cmts_name
                         m["cmts_ip"] = cmts_ip
-                    # Upsert each CMTS batch immediately so partial progress
-                    # is committed to DB even if the job is killed or times out.
-                    written = self._upsert_inventory_rows(modems, source_poller=poller.get("name"))
+
+                    # Every collection receives an immutable generation ID. The
+                    # snapshot row proves whether fewer rows than the safety cap
+                    # represents a complete walk or a partial result.
+                    snapshot_id = str(uuid.uuid4())
+                    written = self._upsert_inventory_rows(
+                        modems,
+                        source_poller=poller.get("name"),
+                        snapshot_id=snapshot_id,
+                    )
+                    self._record_inventory_snapshot(
+                        cmts=cmts_name,
+                        cmts_ip=cmts_ip,
+                        snapshot_id=snapshot_id,
+                        metadata=fetch_result,
+                        row_count=written,
+                        source_poller=poller.get("name"),
+                    )
+                    breakdown_entry = {
+                        "cmts": cmts_name,
+                        "cmts_ip": cmts_ip,
+                        "row_count": written,
+                        "complete": fetch_result.get("complete") is True,
+                        "truncated": fetch_result.get("truncated") is True,
+                        "requested_limit": fetch_result.get("requested_limit"),
+                        "collected_at": fetch_result.get("collected_at"),
+                        "critical_oid_errors": fetch_result.get("critical_oid_errors") or {},
+                    }
+                    cmts_breakdown.append(breakdown_entry)
+                    self._execute(
+                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                        (json.dumps(cmts_breakdown), job_id),
+                    )
                     rows_collected += written
                     modems_succeeded += len(modems)
                     all_rows.extend(modems)
@@ -1418,11 +1615,13 @@ class PollerService:
             tuple(params),
         )
         before_count = int((before_rows[0] or {}).get("c") or 0) if before_rows else 0
-        if before_count <= 0:
-            return 0
-
+        if before_count > 0:
+            self._execute(
+                f"DELETE FROM modem_inventory_current WHERE {where_sql}",
+                tuple(params),
+            )
         self._execute(
-            f"DELETE FROM modem_inventory_current WHERE {where_sql}",
+            f"DELETE FROM cmts_inventory_snapshot WHERE {where_sql}",
             tuple(params),
         )
         return before_count

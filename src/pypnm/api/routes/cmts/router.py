@@ -27,6 +27,7 @@ async def get_cmts_modems(
     community: str = "public",
     limit: int | None = None,
     enrich: bool = False,
+    refresh: bool = False,
     modem_community: str = "private",
     cmts_hostname: str = "",
 ) -> CMTSModemResponse:
@@ -36,7 +37,7 @@ async def get_cmts_modems(
     Discover all cable modems registered on a CMTS via SNMP bulk walk.
 
     The request is routed to an available PyPNM agent which performs
-    parallel SNMP walks of the DOCSIS modem registration tables.
+    bounded SNMP walks of the DOCSIS modem registration tables.
 
     **Returns for each modem:**
     - MAC address, IP address, registration status
@@ -79,6 +80,7 @@ async def get_cmts_modems(
             community=community,
             limit=limit,
             enrich=enrich,
+            refresh=refresh,
             modem_community=modem_community,
             cmts_hostname=cmts_hostname or "",
         )
@@ -104,6 +106,9 @@ async def get_cmts_modems(
             complete=result.get('complete', False),
             truncated=result.get('truncated', False),
             source=result.get('source'),
+            requested_limit=result.get('requested_limit'),
+            collected_at=result.get('collected_at'),
+            critical_oid_errors=result.get('critical_oid_errors') or {},
             raw_legacy_mac_count=result.get('raw_legacy_mac_count'),
             raw_d3_mac_count=result.get('raw_d3_mac_count'),
             enrichment_progress=result.get('enrich_progress'),
@@ -127,6 +132,7 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         community=payload.community,
         limit=payload.limit,
         enrich=payload.enrich,
+        refresh=payload.refresh,
         modem_community=payload.modem_community,
         cmts_hostname=payload.cmts_hostname,
     )

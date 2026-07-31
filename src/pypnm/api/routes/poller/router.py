@@ -97,7 +97,26 @@ def list_inventory_modems(
     except Exception as exc:
         logger.error(f"inventory/modems DB error: {exc}")
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
-    return {"status": "success", "modems": modems, "count": len(modems), "source": "pypnm-inventory"}
+    snapshot = poller_service.get_inventory_snapshot(cmts) if cmts else None
+    response = {
+        "status": "success",
+        "modems": modems,
+        "count": len(modems),
+        "source": "pypnm-inventory",
+    }
+    if snapshot:
+        response.update({
+            "complete": snapshot.get("complete") is True,
+            "truncated": snapshot.get("truncated") is True,
+            "requested_limit": snapshot.get("requested_limit"),
+            "row_count": snapshot.get("row_count"),
+            "collected_at": snapshot.get("collected_at"),
+            "inventory_source": snapshot.get("source"),
+            "critical_oid_errors": snapshot.get("critical_oid_errors") or {},
+            "raw_legacy_mac_count": snapshot.get("raw_legacy_mac_count"),
+            "raw_d3_mac_count": snapshot.get("raw_d3_mac_count"),
+        })
+    return response
 
 
 @router.get("/inventory/modems/{mac_address}")
