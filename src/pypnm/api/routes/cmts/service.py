@@ -249,8 +249,6 @@ class CMTSModemService:
                 cmts=cmts_ip, limit=limit,
             )
             if inv_modems:
-                from datetime import datetime, timezone as tz
-
                 # Prefer the generation timestamp persisted with the inventory.
                 # Legacy rows without snapshot metadata remain usable for the
                 # 200-row preview but cannot prove a complete full inventory.
@@ -262,8 +260,8 @@ class CMTSModemService:
                             str(snapshot_collected_at).replace('Z', '+00:00')
                         )
                         if collected.tzinfo is None:
-                            collected = collected.replace(tzinfo=tz.utc)
-                        age_s = (datetime.now(tz.utc) - collected).total_seconds()
+                            collected = collected.replace(tzinfo=timezone.utc)
+                        age_s = (datetime.now(timezone.utc) - collected).total_seconds()
                     except Exception:
                         pass
                 if age_s == float('inf'):
@@ -275,12 +273,12 @@ class CMTSModemService:
                         try:
                             dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00')) if isinstance(ts, str) else ts
                             if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=tz.utc)
+                                dt = dt.replace(tzinfo=timezone.utc)
                             timestamps.append(dt)
                         except Exception:
                             pass
                     if timestamps:
-                        age_s = (datetime.now(tz.utc) - min(timestamps)).total_seconds()
+                        age_s = (datetime.now(timezone.utc) - min(timestamps)).total_seconds()
 
                 is_fresh = age_s < 7200
                 requested_limit = int(limit or 0)
