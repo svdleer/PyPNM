@@ -325,34 +325,42 @@ def test_api_health(api: str, vendor: str, cfg: Dict):
 
 def test_modem_enrichment(api: str, vendor: str, cfg: Dict):
     """
-    Regression: GET /cmts/modems must return enriched fields.
+    Regression: POST /cmts/modems/query must return enriched fields.
     Catches: wrong HTTP method (405), fields dropped in modem map,
     Redis intercepting enrichment poll.
     """
     print(f"\n  --- modem enrichment ---")
 
-    # 1. Base call — must succeed (no 405)
-    path = (f"/cmts/modems?cmts_ip={cfg['cmts_ip']}"
-            f"&community={cfg['community_read']}&limit=3&enrich=false")
-    r = api_get(api, path)
+    # 1. Base call — credentials belong in the body, never in the URL.
+    base_payload = {
+        "cmts_ip": cfg["cmts_ip"],
+        "community": cfg["community_read"],
+        "limit": 3,
+        "enrich": False,
+    }
+    r = api_post(api, "/cmts/modems/query", base_payload)
     passed = r.get("success") is True and "_http_error" not in r
-    record(vendor, "enrichment", "GET /cmts/modems (base)", passed,
+    record(vendor, "enrichment", "POST /cmts/modems/query (base)", passed,
            f"http_error={r.get('_http_error', 'none')}")
 
     # 2. Enriched call — wait up to 90s for enrichment to complete
-    path_enrich = (f"/cmts/modems?cmts_ip={cfg['cmts_ip']}"
-                   f"&community={cfg['community_read']}&limit=5"
-                   f"&enrich=true&modem_community={cfg['modem_community']}")
+    enrich_payload = {
+        "cmts_ip": cfg["cmts_ip"],
+        "community": cfg["community_read"],
+        "limit": 5,
+        "enrich": True,
+        "modem_community": cfg["modem_community"],
+    }
     enriched = False
     for attempt in range(6):
-        r2 = api_get(api, path_enrich, timeout=30)
+        r2 = api_post(api, "/cmts/modems/query", enrich_payload, timeout=30)
         if r2.get("enriched"):
             enriched = True
             break
         if attempt < 5:
             time.sleep(15)
 
-    record(vendor, "enrichment", "GET /cmts/modems enriched=True", enriched,
+    record(vendor, "enrichment", "POST /cmts/modems/query enriched=True", enriched,
            f"enriched={r2.get('enriched')} enriching={r2.get('enriching')}")
 
     if enriched:

@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 # Initialize agent manager on module import
 _auth_token = os.environ.get("PYPNM_AGENT_TOKEN", "dev-token-change-me")
 init_agent_manager(_auth_token)
-logger.info(f"Agent manager initialized with token: {_auth_token[:8]}...")
+logger.info("Agent manager initialized")
 
 
 @router.websocket("/ws")

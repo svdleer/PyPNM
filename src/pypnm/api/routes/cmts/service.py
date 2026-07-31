@@ -935,8 +935,7 @@ class CMTSModemService:
             f"Direct enrichment: {len(online_modems)} modems "
             f"(max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, "
             f"max_secs={MAX_ENRICHMENT_SECS}, agent_wait_timeout={AGENT_WAIT_TIMEOUT_SECS}, "
-            f"snmp_timeout={SNMP_TIMEOUT_SECS}, snmp_max_concurrent={SNMP_MAX_CONCURRENT}, "
-            f"community={modem_community})"
+            f"snmp_timeout={SNMP_TIMEOUT_SECS}, snmp_max_concurrent={SNMP_MAX_CONCURRENT})"
         )
         if not online_modems:
             return modems
@@ -1017,8 +1016,7 @@ class CMTSModemService:
                         _first_failure_logged = True
                         self.logger.warning(
                             f"Direct enrichment snmp_bulk_get failed for first sample modem {ip}: "
-                            f"{result.get('error') if result else 'no result/timeout'} "
-                            f"(community={modem_community})"
+                            f"{result.get('error') if result else 'no result/timeout'}"
                         )
                     return
 

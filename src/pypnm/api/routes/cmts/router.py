@@ -9,7 +9,7 @@ import os
 from fastapi import APIRouter, HTTPException
 
 from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
-from pypnm.api.routes.cmts.schemas import CMTSModemResponse
+from pypnm.api.routes.cmts.schemas import CMTSModemRequest, CMTSModemResponse
 from pypnm.api.routes.cmts.service import CMTSModemService, cancel_enrichment
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,19 @@ async def get_cmts_modems(
             count=0,
             error=str(e)
         )
+
+
+@router.post("/modems/query", response_model=CMTSModemResponse)
+async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
+    """Discover CMTS modems without placing SNMP credentials in the URL."""
+    return await get_cmts_modems(
+        cmts_ip=payload.cmts_ip,
+        community=payload.community,
+        limit=payload.limit,
+        enrich=payload.enrich,
+        modem_community=payload.modem_community,
+        cmts_hostname=payload.cmts_hostname,
+    )
 
 
 @router.post("/enrich/cancel")

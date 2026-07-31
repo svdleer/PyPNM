@@ -24,6 +24,7 @@ class CMTSModemRequest(BaseModel):
     limit: int = Field(default_factory=_cm_modem_limit_default, description="Maximum number of modems to return")
     enrich: bool = Field(default=False, description="Whether to enrich modems with firmware/model from sysDescr")
     modem_community: str = Field(default="private", description="SNMP community for modem enrichment")
+    cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
 
 
 class ModemInfo(BaseModel):

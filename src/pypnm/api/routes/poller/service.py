@@ -301,8 +301,75 @@ class PollerService:
         t.start()
         self._worker_started = True
 
+    def _try_acquire_worker_lock(self):
+        """Return a dedicated connection holding the singleton worker lock."""
+        conn = self._connect()
+        lock_name = f"pypnm-poller-worker:{self._db_name()}"[:64]
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT GET_LOCK(%s, 0) AS acquired", (lock_name,))
+            row = cur.fetchone() or {}
+            cur.close()
+            if int(row.get("acquired") or 0) == 1:
+                logger.info("Acquired poller worker lock for database %s", self._db_name())
+                return conn
+        except Exception:
+            conn.close()
+            raise
+        conn.close()
+        return None
+
+    def _recover_interrupted_work(self) -> None:
+        """Requeue work orphaned when the previous lock owner stopped."""
+        self._execute(
+            """
+            UPDATE poller_job
+            SET status='queued', started_at=NULL, finished_at=NULL,
+                error_text='Recovered after poller worker restart'
+            WHERE status='running'
+            """
+        )
+        self._execute(
+            """
+            UPDATE modem_refresh_request
+            SET status='queued', started_at=NULL, finished_at=NULL,
+                error_text='Recovered after poller worker restart'
+            WHERE status='running'
+            """
+        )
+
     def _worker_loop(self) -> None:
+        lock_conn = None
         while True:
+            if lock_conn is None:
+                try:
+                    lock_conn = self._try_acquire_worker_lock()
+                    if lock_conn is not None:
+                        self._recover_interrupted_work()
+                except Exception as exc:
+                    logger.warning("Poller worker lock/recovery failed: %s", exc)
+                    if lock_conn is not None:
+                        try:
+                            lock_conn.close()
+                        except Exception:
+                            pass
+                        lock_conn = None
+                if lock_conn is None:
+                    time.sleep(2)
+                    continue
+
+            try:
+                # Never reconnect this connection implicitly: a reconnect would
+                # lose the MySQL advisory lock and could create two workers.
+                lock_conn.ping(reconnect=False)
+            except Exception:
+                try:
+                    lock_conn.close()
+                except Exception:
+                    pass
+                lock_conn = None
+                continue
+
             try:
                 self._timeout_stale_jobs()
             except Exception as exc:
@@ -652,22 +719,27 @@ class PollerService:
         return all_from_appdb
 
     def _fetch_cmts_modems(self, cmts_ip: str, timeout_sec: int = 300) -> List[Dict[str, Any]]:
+        """Fetch base CMTS inventory without launching per-modem enrichment."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
-        params = {
+        payload = {
             "cmts_ip": cmts_ip,
             "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
             "limit": self._cm_modem_limit_default(),
-            "enrich": "true",
-            "modem_community": os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private",
+            "enrich": False,
         }
         request_timeout = max(30, int(timeout_sec or 300))
-        r = requests.get(f"{base}/cmts/modems", params=params, timeout=request_timeout, verify=False)
+        r = requests.post(
+            f"{base}/cmts/modems/query",
+            json=payload,
+            timeout=request_timeout,
+            verify=False,
+        )
         r.raise_for_status()
-        payload = r.json() if r.content else {}
-        if isinstance(payload, dict) and payload.get("success"):
-            modems = payload.get("modems") or []
+        response_payload = r.json() if r.content else {}
+        if isinstance(response_payload, dict) and response_payload.get("success"):
+            modems = response_payload.get("modems") or []
             return modems if isinstance(modems, list) else []
-        raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {payload}")
+        raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {response_payload}")
 
     def _upsert_inventory_rows(self, rows: List[Dict[str, Any]], source_poller: Optional[str]) -> int:
         if not rows:
@@ -1421,15 +1493,13 @@ class PollerService:
         if not cmts_ip:
             return None
         cmts_community = os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public"
-        modem_community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
         try:
-            r = requests.get(
-                f"{base}/cmts/modems",
-                params={
+            r = requests.post(
+                f"{base}/cmts/modems/query",
+                json={
                     "cmts_ip": cmts_ip,
                     "community": cmts_community,
-                    "modem_community": modem_community,
-                    "enrich": "false",
+                    "enrich": False,
                     "limit": self._cm_modem_limit_default(),
                 },
                 timeout=120,

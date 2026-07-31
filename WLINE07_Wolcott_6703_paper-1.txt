@@ -1,0 +1,1225 @@
+  The Proactive Network Maintenance Comeback
+
+OFDM and OFDMA Bring New, Laser-Guided Precision for
+             Plant Fault Distancing
+
+       A technical paper prepared for presentation at SCTE TechExpo24
+
+
+
+                               Larry Wolcott
+                             Engineering Fellow
+                            Comcast Corporation
+                      Larry_Wolcott@cable.comcast.com
+
+                                  Jason Rupe
+                               Principal Architect
+                                   CableLabs
+                            j.rupe@cablelabs.com
+
+                               Tom Kolze
+             R & D Advanced Technology Development Engineer
+                                Broadcom
+                        tom.kolze@broadcom.com
+
+                       Alexander (Shony) Podarevsky
+                        Architect and Technical Leader
+                       Promptlink Communications, Inc
+                           shony@promptlink.com
+
+                              Mike Spaulding
+                      Vice President, Plant Maintenance
+                            Comcast Corporation
+                   Michael_Spaulding@cable.comcast.com
+
+
+
+
+         Presented and first published at SCTE TechExpo24               1
+                                                   Table of Contents
+Title                                                                                                                                  Page Number
+  1.     Introduction .......................................................................................................................................... 4
+  2.     Background ......................................................................................................................................... 4
+  3.     PNM Data ............................................................................................................................................ 7
+         3.1.    Specifications ......................................................................................................................... 8
+         3.2.    Processing.............................................................................................................................. 9
+                 3.2.1.          Frequency Domain Analysis Without Processing .................................................. 9
+                 3.2.2.          Time Domain Analysis Without Processing ......................................................... 11
+  4.     Analysis ............................................................................................................................................. 12
+         4.1.    Outlier Data .......................................................................................................................... 12
+                 4.1.1.          Channel Noise and Ingress .................................................................................. 12
+                 4.1.2.          Channel Tilt .......................................................................................................... 14
+         4.2.    Impulse Response ............................................................................................................... 16
+         4.3.    Magnitude............................................................................................................................. 16
+         4.4.    Time and Distance ............................................................................................................... 17
+                 4.4.1.          OFDM Downstream Channel Estimate Coefficients ............................................ 18
+                 4.4.2.          OFDMA Upstream Pre-Equalization Coefficients ................................................ 18
+         4.5.    Frequency Response Matching and Other DSP Techniques .............................................. 19
+  5.     Benefits ............................................................................................................................................. 21
+         5.1.    Increased Resolution and Accuracy .................................................................................... 21
+                 5.1.1.          Upstream Pre-Equalization Coefficients .............................................................. 22
+                 5.1.2.          Downstream Channel Estimates .......................................................................... 24
+         5.2.    Greater Sensitivity ................................................................................................................ 24
+         5.3.    Determining Open Circuit vs. Short Circuit Faults ............................................................... 25
+         5.4.    Cyclic Prefix Tuning ............................................................................................................. 28
+         5.5.    Detecting Cable Lengths ...................................................................................................... 29
+  6.     Field Results ...................................................................................................................................... 31
+         6.1.    Cracked trunk cable, causing egress (leakage) and ingress ............................................... 31
+         6.2.    Loose connector with egress (leakage) and ingress............................................................ 34
+  7.     Conclusion ......................................................................................................................................... 35
+Appendix A .................................................................................................................................................. 36
+ 8. Decoding ........................................................................................................................................... 36
+     8.1.      CmDsOfdmChanEstimateCoef Decoding Details ................................................................ 36
+     8.2.      CmUsPreEq Decoding Details ............................................................................................. 37
+Abbreviations .............................................................................................................................................. 38
+Bibliography & References.......................................................................................................................... 39
+
+
+                                                               List of Figures
+Title                                                                                                                                  Page Number
+Figure 1 – Impedance Mismatches, Return Loss, Reflections and Standing Waves ................................... 5
+Figure 2 – DOCSIS Transmistter and Receiver Block Diagrams; Courtesy of Alberto Campos,
+     CableLabs ............................................................................................................................................. 6
+Figure 3 – Data Collection Sequence Diagram, From [2] ............................................................................. 8
+Figure 4 – Corrected Amplitude vs. Frequency Response ......................................................................... 10
+Figure 5 – Uncorrected Amplitude vs. Frequency Response ..................................................................... 10
+Figure 6 – Corrected Time Domain Impulse Echo Relative Distance ........................................................ 11
+
+
+
+                             © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                                                          2
+Figure 7 – Uncorrected Time Domain Impulse Echo Relative Distance ..................................................... 12
+Figure 8 – LTE Ingress Interference Within a Downstream OFDM Channel, Frequency Domain ............. 13
+Figure 9 – LTE Ingress Interference Within a Downstream OFDM Channel, Time Domain ...................... 13
+Figure 10 – Ingress Interference Within a Downstream OFDM Channel, FBC Frequency Spectrum ....... 14
+Figure 11 – 14 dB of Tilt Within Downstream OFDM Channel, Frequency Domain................................... 14
+Figure 12 – 14 dB of Tilt Within Downstream OFDM Channel, Time Domain ............................................ 15
+Figure 13 – 14 dB of Tilt Within Downstream OFDM Channel, Time Domain ............................................ 15
+Figure 14 – Corrected vs. Uncorrected Impulse Response Quantization .................................................. 16
+Figure 15 – Example of Complex Division for Signature Matching............................................................. 19
+Figure 16 – Complex Division of Two Phase Corrected OFDM Samples .................................................. 20
+Figure 17 – Complex Division with Mismatched Phase Components ........................................................ 21
+Figure 18 – SC-QAM Impuse Response Distance Example (6.4 MHz Wide Channels) ............................ 22
+Figure 19 – 24-Tap SC-QAM Pre-Equalizer Fault Distance Example ........................................................ 23
+Figure 20 – OFDMA Pre-Equalizer Time Domain Fault Distance Example ............................................... 24
+Figure 21 – Time and Frequency Domain Sensitivity ................................................................................. 25
+Figure 22 – Open Circuit vs. Short Circuit Reflections ............................................................................... 26
+Figure 23 – Phase Polar (left) vs. Wave (right) Displays ............................................................................ 27
+Figure 24 – Echo Phase Rotations Relative to Main Tap Phase ................................................................ 27
+Figure 25 – Open Circuit vs. Short Circuit TDR Response......................................................................... 28
+Figure 26 – OFDM Time Domain Impulse Response ................................................................................. 29
+Figure 27 – Superposition of Four Constituent Amplitude Ripples ............................................................. 30
+Figure 28 – Coaxial Interconnection Distances and Reflection Cavities .................................................... 31
+Figure 29 – Cracked Aerial Cable on Side of Bridge .................................................................................. 32
+Figure 30 – Small Amounts of FM Ingress Visible in FBC Beyond the Damage ........................................ 32
+Figure 31 – 9T Reflection (~1dB) in SC-QAM Upstream Pre-EQ Response ............................................. 33
+Figure 32 – Multiple Discrete Time Domain Echoes ................................................................................... 34
+Figure 33 – FBC from 6 MHz to 1026 MHz Showing Example of Spectrum Affected by a Loose
+     Connector, Allowing Significant Ingress .............................................................................................. 35
+Figure 34 – LTE Interference in the OFDMA Channel Estimates ............................................................... 35
+
+
+
+
+                         © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                                           3
+1. Introduction
+Proactive network maintenance (PNM) has been a cornerstone in detecting and locating faults in cable
+and plant infrastructure since 2009. Despite its long history, the deployment of downstream (DS)
+orthogonal frequency-division multiplexing (OFDM) and upstream (US) orthogonal frequency-division
+multiple access (OFDMA) technologies bring revolutionary enhancements over legacy single carrier
+quadrature amplitude modulation (SC-QAM) channels which use 24-tap pre-equalizers (Pre-EQ) in the
+upstream. The introduction of 25 kilohertz (kHz) and 50 kHz subcarrier spacing, along with a
+significantly wider channel width and higher sample rates, dramatically improves resolution and
+sensitivity. This advancement enables the precise location of damaged cable faults to within just a few
+feet.
+
+In the 2021 Society of Cable Telecommunications Engineers (SCTE) paper, “OFDMA Predistortion
+Coefficient and OFDM Channel Estimation Decoding and Analysis” [1], the authors of the paper were
+right. With the introduction of OFDM and OFDMA in the DOCSIS® 3.1 specification, channel estimation
+coefficients and pre-equalization telemetry respectively become increasingly important. They provide
+high-resolution information useful for troubleshooting the cable plant: “This wider bandwidth provides
+high-resolution time responses, enabling cable problems to be identified with high accuracy.” While these
+data elements from the PNM catalog have been known and used for over a decade, an individual SC-
+QAM channel was too narrow of a frequency band to provide detailed information. Operators employed
+some methods that used the information from SC-QAM signals to interpolate coarse responses in channel
+estimation and pre-equalization data, thus approximating the information from a wider frequency.
+However, these approaches were less accurate than the capabilities offered by DOCSIS 3.1. Fault
+localization and repair still require digging, but with DOCSIS 3.1 technology, localization can be done
+with greater precision. As Tom Williams put it, “dig a hole, not a trench.” Instead of just eight or 24
+complex values of data, we get many times more.
+
+Thankfully, the paper’s authors also outlined the process by which one can remove unwanted components
+from the telemetry to provide a clean view of reflected energy in the time domain, thus revealing details
+about the plant between the node and the cable modem (CM). A clear view of the signal can be found by
+removing a linear phase delay component from the data, converting to the time domain, correcting the
+phase data by adjusting the phase at time zero to be zero, then transforming to the frequency domain (FD)
+for comparisons.
+
+This paper presents an in-depth analysis of actual plant conditions, demonstrating that leaks, ingress
+points, cracked cables, and damaged drops can no longer evade the laser-like precision of this new high-
+resolution PNM analysis. The paper guides readers through the entire process of collecting, decoding, and
+analyzing PNM data, including a simplified approach to Tom Williams’s OFDM phase correction routine.
+
+2. Background
+Impedance mismatches cause reflections in a transmission line, such as a coaxial cable. Reflected waves
+will interact with the incident wave, producing a distribution of fields along the transmission line, known
+as standing waves. The presence of two or more reflections in a transmission line can result in amplitude
+ripple in the frequency response. While the term “standing wave” is often used to describe amplitude
+ripple, they are not the same. A standing wave exists in the radio frequency (RF) signal along the
+transmission line, while amplitude ripple describes the plot of amplitude data of the frequency response at
+a particular location, such as the input to a cable modem.
+
+Amplitude ripple can indicate an RF impairment but can also exist in healthy cable systems caused by
+normal imperfections in the impedance characteristics found therein. Consider a scenario in which two
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                4
+impedance mismatches exist in the coax part of the plant – say, the output of an amplifier and a water-
+filled tap some distance downstream from the amplifier. In the downstream, energy reflects off the second
+impairment (e.g., the water-filled tap), back to the first (e.g., the amplifier output), and then some of that
+energy continues downstream; it is an attenuated version of the first signal but delayed. This causes an
+impact on the signal that appears as an amplitude ripple in the spectrum data, such as at a cable modem
+connected to the cable. The standing wave will appear as a periodic amplitude change along the length of
+the cable (Figure 1). The graphic in the figure shows three sections of coaxial cable with the middle
+section having impedance mismatches on both sides. The area within the middle section is where the
+signals are interfering constructively and destructively between two impedance mismatches, sometimes
+called the impedance or echo cavity. The impedance cavity has directional properties, with the input
+coming from the direction of the transmitter and the output towards the receiver. At the output of the
+impedance cavity, one or more additional copies of the signal are present, with additional delay and
+attenuation. This is illustrated by the large arrow indicating the flow of the incident signal through the
+cable and the second smaller arrow trailing behind it. This second signal in the figure is intended to
+represent a delayed copy of the incident signal, created by the impedance cavity.
+
+
+
+
+     Figure 1 – Impedance Mismatches, Return Loss, Reflections and Standing Waves
+
+
+
+In the Data-Over-Cable Service Interface Specifications (DOCSIS®) 3.1 specifications, both OFDM and
+OFDMA were standardized, including an optional pre-distortion for upstream OFDMA carriers. For both
+modulation types, management information base (MIB) objects were specified to reveal the frequency
+domain complex coefficients associated with each of the potentially thousands of active subcarriers. A
+MIB object request is sent to the CM, and the CM performs a Trivial File Transfer Protocol (TFTP)
+transfer of a file containing the requested in-phase (I) and quadrature (Q) coefficients. Note that the
+upstream coefficients returned are for the corrections to mitigate non-flat frequency response due to
+impairments, not for the impairments themselves; the coefficients describe the CM pre-equalizer, which
+has a frequency response which is approximately the inverse of the plant frequency response. For the
+downstream OFDM channels, the CM can report channel estimation coefficients, also as complex
+coefficients. Those channel estimation coefficients approximate the network frequency response, and
+therefore can also indicate any impairments.
+
+For both upstream and downstream SC-QAM signals, the returned complex coefficients are in the time
+domain. Conversely, in multi-carrier systems such as DOCSIS OFDM and OFDMA channels, the
+returned coefficients are in the frequency domain. The fast Fourier transform (FFT) and inverse fast
+Fourier transform (IFFT) can be used to convert between time and frequency domains.
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                 5
+Figure 2 from Alberto Campos shows block diagrams of the transmitter and receiver processes where the
+pre-equalization (at the upstream transmitter) and channel estimates (at the downstream receiver) are
+used. The transmitter process is shown in the upper portion of the diagram, with the pre-equalization
+frequency points (in red) being implemented just after the frequency points are generated by the symbol
+mapper and before the IFFT process, occurring in the frequency domain. The lower part of the figure
+shows the receiver process with the downstream equalization occurring after the FFT and before the
+symbol mapping (in red), also in the frequency domain.
+
+
+
+
+   Figure 2 – DOCSIS Transmistter and Receiver Block Diagrams; Courtesy of Alberto
+                                Campos, CableLabs
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE             6
+3. PNM Data
+In DOCSIS 3.0 systems, pre-equalization coefficient and full-band capture (FBC) data are obtained using
+Simple Network Management Protocol (SNMP) to request information from CMs and converged cable
+access platforms (CCAPs). The requested information is described in [2], and the SNMP MIB objects are
+defined in [3].
+
+DOCSIS 3.1 technology introduced new requirements for CMs and cable modem termination systems
+(CMTSs) related to the collection and reporting of PNM data (see [4], Section 9, “Proactive Network
+Maintenance”). DOCSIS 3.1 also introduced a new bulk-data transfer mechanism that uses TFTP to
+upload PNM data to a destination TFTP server. Configuration of the PNM test execution parameters, file
+storage, and TFTP destination uses SNMP as defined in [5] and [6].
+
+Figure 3 shows the steps and communication paths involved in collecting PNM data from a CM or CCAP
+device. This flow chart was originally published in the PNM Best Practices document [2]. The figure
+shows a sequence diagram between three processes: starting on the left is the PNM server, then the TFTP
+server, and the CM/CCAP on the right. There are seven sequential operations:
+
+   1.   The PNM server will use SNMP to SET the bulk file control parameters on the CM/CCAP.
+   2.   The PNM server will use SNMP to SET the test operation on the CM/CCAP.
+   3.   The PNM server will use SNMP to GET the test operation status from the CM/CCAP.
+   4.   Optionally: the CM/CCAP may initiate the TFTP file transfer if requested (to TFTP server).
+   5.   Optionally: the CM/CCAP may transfer the PNM file containing the measurements.
+   6.   The PNM server will use SNMP to GET the test operation results from the CM/CCAP.
+   7.   The PNM server will use TFTP to retrieve the PNM file from the TFTP server.
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE               7
+                    Figure 3 – Data Collection Sequence Diagram, From [2]
+
+
+
+When complete, a PNM test result file is produced and uploaded, that a PNM application can decode and
+analyze. Unless explicitly changed, the default PNM test result file name contains the PNM test name, a
+unique identifier like the CM MAC address, and a timestamp. The PNM test file is a binary data file
+containing a header and a data section as defined in [5] and [6].
+
+    3.1. Specifications
+The DOCSIS PNM Best Practices [2] document describes many capabilities. While the PNM Best
+Practices [2] document focuses on SC-QAM equalization techniques, this paper focuses on the improved
+capabilities associated with OFDM and OFDMA. Further details are provided in the DOCSIS 3.1
+specifications [5], which applies to DOCSIS 4.0 technology as well.
+
+In sections D 2.6 (channel estimation coefficients) and D 2.13 (pre-equalization) of [5], there are
+explanations of how these tests work and are executed, including the MIB definitions, and how to read the
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE             8
+tables that are delivered. The specification also provides definitions for the results delivered by the tests;
+the object attributes are defined and listed in tables to make it easier to decode the files that provide the
+test results. For decoding details and examples please refer to Appendix A.
+
+    3.2. Processing
+Much work on coefficient processing has been done by Tom Williams et al, described in his 2021 paper
+[1], and by others including Roger Fish and Tom Kolze. Tom Williams presented the processing steps for
+correcting raw phase data (directly from the CM and CMTS) to remove the arbitrary addition of linear
+phase delay from the coefficients. In addition to a thorough explanation in his paper, Tom Williams and
+co-authors generously included C++ code examples to facilitate the implementation.
+
+While this processing is helpful and explanatory, it isn’t entirely necessary to make use of the information
+contained in the coefficients. Simplified alternative methods are described later in sections 3.2.1 and
+3.2.2. However, by correcting the phase of the complex values, more powerful digital signal processing
+(DSP) techniques can be used to analyze the data. Section 4 of this paper covers different analysis
+methods and section 4.5 covers some of the more advanced techniques using DSP.
+
+Preprocessing of the frequency response coefficients corrects two major aspects: linear phase rotation
+over frequency in frequency domain and impulse response at time equal 0 in time domain is real (phase is
+0º). This method involves two main steps:
+
+Coarse Delay Removal: This step is performed in the frequency domain. Average phase rotation over
+frequency is calculated and removed. This step affects only the phase component in the frequency
+domain. Performing coarse delay removal effectively brings the main bin of the impulse response to time
+equal 0 in the time domain.
+
+Fine Phase Adjustment: This step is performed in the time domain. The phase of the impulse response
+shifted such a way that the main bin of the impulse response is real (phase is 0º at time equal 0). Results
+of this adjustment needs to be transformed back to the frequency domain to obtain the corrected channel
+estimate.
+
+With this calibration, the remaining signal more accurately reflects the plant condition in a uniform way,
+allowing for precise data processing and analysis and comparison across multiple modems.
+
+        3.2.1. Frequency Domain Analysis Without Processing
+It is possible and sometimes useful to use the equalizer and channel estimate coefficients without
+processing. Tom Williams’s routine for removing the linear phase delay allows samples to be directly
+compared on a complex plane because it normalizes their phase components. However, the linear phase
+delay in the time domain is uniform and thus shifts all the frequency components by the same amount
+without changing the magnitude of those components. Because the amplitude vs. frequency response
+doesn’t require phase correction, the complex coefficients may be used directly without processing to
+evaluate the approximate frequency response of the channel. This is useful for doing frequency domain
+analysis of the equalizer responses, such as peak-to-valley, ripple detection and tilt measurements. By
+eliminating the processing step, some computational time and complexity may be saved. While this might
+seem trivial, large cable systems may have tens of millions of samples to process so even small
+improvements can provide compounding savings to the implementer. Figure 4 and Figure 5 show a
+comparison of corrected and uncorrected values in the frequency domain. Notice that the amplitudes are
+identical, with and without correcting the linear phase delay.
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                   9
+ Figure 4 – Corrected Amplitude vs. Frequency Response
+
+
+
+
+Figure 5 – Uncorrected Amplitude vs. Frequency Response
+
+
+
+
+ © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE   10
+        3.2.2. Time Domain Analysis Without Processing
+It is also possible to use the raw time domain coefficients after inverse Fourier transformation from the
+frequency domain. There may be an arbitrary linear phase delay in the time domain, which shifts the main
+tap position to the right some amount of time (bins). The impulse response components (time intervals) in
+the time domain remain consistently spaced from the main tap position, regardless of the main tap
+position. For example, Figure 6 shows an impulse response with an echo that is spaced at 78 bins from the
+main tap position of 0. The same response using the uncorrected coefficients that contain the linear phase
+delay can be seen in Figure 7. Notice the main tap location is shifted by 55 bin positions to the right, but
+the echo component maintains its relative spacing of 78 bins, which is position 133.
+
+
+
+
+             Figure 6 – Corrected Time Domain Impulse Echo Relative Distance
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                11
+           Figure 7 – Uncorrected Time Domain Impulse Echo Relative Distance
+
+
+
+4. Analysis
+   4.1. Outlier Data
+Occasionally, while evaluating the upstream OFDMA adaptive pre-equalizer coefficients and downstream
+OFDM channel estimates from live plant data, some anomalous examples were observed. These examples
+contained larger-than-usual amounts of energy in the time domain that were not explainable by expected
+or rational amounts of reflected energy caused by degraded return loss.
+
+       4.1.1. Channel Noise and Ingress
+When significant noise-like interference was present within the downstream OFDM channel, amplitude
+variation was observed in the frequency domain components, seen circled in red in Figure 8.
+
+
+
+
+                  © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE            12
+  Figure 8 – LTE Ingress Interference Within a Downstream OFDM Channel, Frequency
+                                        Domain
+
+After the inverse Fourier transformation, these additional frequency components result in dispersion over
+a longer period. The interference within the channel becomes spurious energy that is spread over time,
+making it more difficult to analyze when looking for echoes in time domain (Figure 9). Because it is
+limited to a certain frequency band, we can be confident that the cause is ingress.
+
+
+
+
+ Figure 9 – LTE Ingress Interference Within a Downstream OFDM Channel, Time Domain
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE               13
+The ingress can be confirmed using a PNM FBC spectrum display, showing unwanted signals within and
+outside of the OFDM occupied spectrum, appearing as interference over a range of frequencies. Figure 10
+shows the uneven OFDM channel spectrum circled in red. Notice additional ingress in the FM band (from
+88 MHz to 108 MHz), and in between 800 MHz and 900 MHz.
+
+
+
+
+ Figure 10 – Ingress Interference Within a Downstream OFDM Channel, FBC Frequency
+                                        Spectrum
+
+
+
+        4.1.2. Channel Tilt
+There are examples where significant tilt was present within the channel, indicating a strong drop off in
+signal strength as the frequencies increase (Figure 11).
+
+
+
+
+     Figure 11 – 14 dB of Tilt Within Downstream OFDM Channel, Frequency Domain
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                14
+When applying the inverse Fourier transformation, the result is a right-sided exponential decay in time
+(Figure 12) indicated by the red line, sloping downward. This is analogous to an “input” impulse signal
+spreading out and decaying over time, analogous to a lowpass filter time domain response. The frequency
+domain down tilt represents the signal losing strength at higher frequencies.
+
+
+
+
+        Figure 12 – 14 dB of Tilt Within Downstream OFDM Channel, Time Domain
+
+
+
+Again, confirming the power spectrum using PNM FBC, the tilt within the OFDM spectrum can be
+observed in Figure 13, circled in red. Notice approximately 14 dB of tilt within the 96 MHz occupied
+bandwidth of the OFDM spectrum, compared to the approximately 32 dB of tilt across the entire occupied
+spectrum.
+
+
+
+
+        Figure 13 – 14 dB of Tilt Within Downstream OFDM Channel, Time Domain
+
+
+
+
+                  © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE             15
+    4.2. Impulse Response
+One common method for echo detection is locating peaks within the time domain impulse response. The
+magnitude of the peak can be calculated, and the time delay converted to distance. Sections 4.3 and 4.4
+describe the magnitude and time-to-distance calculations. Together, these values can provide an
+approximate measurement of impedance cavities caused by impedance mismatches within the
+transmission lines such as coaxial cables and passive components.
+
+    4.3. Magnitude
+The impulse response magnitude is calculated in the time domain as the square root of the vector sum of
+the real and imaginary components. It was shown in section 3.2.1 that the magnitude in the frequency
+domain is the same, regardless of the linear phase delay being present or removed. However, the
+magnitude of the impulse response bins is dependent on the phase angles which can be variable, given the
+arbitrary nature of the linear delay. The two charts in Figure 14 illustrate the issue, with the corrected time
+domain bins in the chart on the left and the raw bins on the right. Notice the reflection on the left has
+energy quantized between bins 78 and 79, while the chart on the right has the energy concentrated 79 bins
+away from the main tap position. This is because the correction routine removes a linear phase delay and
+rotates the main tap phase to 0 degrees. This process results in some potential phase change in all the
+subsequent time domain components. In our example, the phasor ends up in a position closer to the
+middle of bins 78 and 79 (0 or 180 degrees) rather than something closer to 90 or 270 degrees of bin 79.
+
+
+
+
+           Figure 14 – Corrected vs. Uncorrected Impulse Response Quantization
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                  16
+       4.4. Time and Distance
+In DOCSIS systems, the downstream sampling rate is 204.8 MHz, and the upstream sampling rate is
+102.4 MHz. The FFT/IFFT size depends on the sampling rate and subcarrier spacing. For downstream
+OFDM channels, the FFT size is 8192 for 25 kHz subcarrier spacing and 4096 for 50 kHz subcarrier
+spacing. Respectively for upstream OFDMA channels FFT size is 4096 for 25 kHz and 2048 for 50 kHz.
+This means that, in the downstream after performing the IFFT on the frequency response, the time domain
+will span 20 µs or 40 µs (for 50 kHz and 25 kHz subcarrier spacing respectively), with a time granularity
+of 1/204.8 MHz or 4.8828 ns.
+
+So, in theory, after you take the inverse Fourier transform to obtain the time domain response, the
+difference in bins between the main tap and the reflection is 4.8828 ns per bin. This is the round-trip delay
+of the signal traversing the reflection cavity. Then, multiply the previous result by the propagation factor
+of the cable and the speed of light to obtain the round-trip time. Finally, divide the round-trip time by two
+for the impedance cavity length.
+
+                                                          1
+                                           𝑐𝑐 ⋅ 𝑉𝑉𝑉𝑉𝑉𝑉 ⋅ 𝑅𝑅
+                                                            𝑠𝑠
+                                    𝐿𝐿 =                         ⋅ 𝑡𝑡 = 𝑐𝑐 ⋅ 𝑉𝑉𝑉𝑉𝑉𝑉 ⋅ 𝑇𝑇𝑟𝑟 ⋅ 𝑡𝑡 = 𝐿𝐿𝑟𝑟 ⋅ 𝑡𝑡
+                                                  2
+                                                        1
+                                            𝑇𝑇𝑟𝑟 =             ,         𝐿𝐿𝑟𝑟 = 𝑐𝑐 ⋅ 𝑉𝑉𝑉𝑉𝑉𝑉 ⋅ 𝑇𝑇𝑟𝑟
+                                                      2 ⋅ 𝑅𝑅𝑠𝑠
+
+       •   L – estimated length of the resonant cavity (not round-trip 1), ft
+       •   c – the speed of light in a vacuum in feet per second (983,571,088 ft/s)
+       •   Rs – sampling rate, Hz. 204.8 MHz for ODFM and 102.4 MHz for OFDMA channels
+       •   Tr – theoretical time resolution for each bin (not round-trip), s
+       •   Lr – theoretical cable distance resolution for each bin (not round-trip), ft
+       •   VoP – velocity of propagation (VoP). 85% (or 0.85 c) typical of series 11 cable
+       •   t – number of bins from main tap
+
+The following values represent the theoretical time resolutions for each bin:
+
+●      204.8 MHz downstream sample rate of OFDM is 2.4414 ns (or 4.8828 ns round-trip)
+●      102.4 MHz upstream sample rate of OFDMA is 4.8828 ns (or 9.7656 ns round-trip)
+
+In practical application, additional factors must be considered. The number of active subcarriers in the
+OFDM/OFDMA channel is not equal to the FFT size and depends on the configured OFDM/OFDMA
+channel width. Because of this, when taking the inverse Fourier transform of channel, the estimated time
+resolution changes with the ratio of the number of active subcarriers and the FFT size.
+
+                                                                         1
+                                                           𝑇𝑇 ′ 𝑟𝑟 =            ⋅ 𝐾𝐾
+                                                                       2 ⋅ 𝑅𝑅𝑠𝑠
+
+                                                           𝐹𝐹𝐹𝐹𝐹𝐹𝑠𝑠𝑠𝑠𝑠𝑠𝑠𝑠      𝑅𝑅𝑠𝑠
+                                                  𝐾𝐾 =                    =
+                                                           𝑁𝑁𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎 𝐵𝐵𝐵𝐵𝑐𝑐ℎ𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎𝑎
+
+       •   T’r – adjusted time resolution for each bin (not round-trip), s
+       •   K – FFT correction factor
+
+1
+    The signal travels through a resonant cavity at least two extra times (as described in section 2).
+
+
+                        © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                   17
+    •   FFTsize – FFT size used for the channel, as described above
+    •   Nactive – number of active subcarriers
+    •   Rs – sampling rate, Hz
+    •   Bwchannel – bandwidth occupied by the channel, Hz
+
+This correction coefficient (FFTsize/Nactive) is then applied to the theoretical distance to obtain real distance
+of the resonant cavity:
+
+                                              𝐿𝐿′ = 𝐿𝐿𝑟𝑟 ⋅ 𝑡𝑡 ⋅ 𝐾𝐾 = 𝐿𝐿 ⋅ 𝐾𝐾
+
+        4.4.1. OFDM Downstream Channel Estimate Coefficients
+As established earlier, theoretical time resolution for the OFDM channel is 2.4414 ns for each channel
+estimate bin. For series 6 cable, this translates to about 2.04 ft for each bin (assuming velocity factor of
+0.85):
+
+                                        983,571,088 (𝑓𝑓𝑓𝑓/𝑠𝑠) ⋅ 0.85
+                               𝐿𝐿𝑟𝑟 =                                ≈ 2.0411 𝑓𝑓𝑓𝑓
+                                            2 ⋅ 204.8 (𝑀𝑀𝑀𝑀𝑀𝑀)
+
+This value must be corrected based on the number of active subcarriers. For example: for a 192 MHz
+wide OFDM channel with 190 MHz active bandwidth there will be 3800 active subcarriers for 4096 FFT
+(50 kHz spacing) and 7600 active subcarriers for 8192 FFT (25 kHz spacing). Thus, the FFT correction
+factor will be the same for either FFT size or equal to:
+
+                                        8192 4096 204.8 𝑀𝑀𝑀𝑀𝑀𝑀
+                                𝐾𝐾 =        =     =            ≈ 1.0779
+                                        7600 3800   190 𝑀𝑀𝑀𝑀𝑀𝑀
+
+The actual channel estimate time domain bin cable length resolution for this configuration will be:
+
+                                        𝐿𝐿 = 2.0411 𝑓𝑓𝑓𝑓 ⋅ 1.0799 ≈ 2.2 𝑓𝑓𝑓𝑓
+
+This value would change slightly for cables having a different velocity of propagation.
+
+
+        4.4.2. OFDMA Upstream Pre-Equalization Coefficients
+The theoretical time resolution for each OFDMA channel is 4.8828 ns for each pre-equalization time
+domain bin. This translates to about 4.08 ft over series 6 cable (assuming velocity factor 0.85):
+
+                                                     𝑓𝑓𝑓𝑓
+                                       983,571,088 � � ⋅ 0.85
+                                                      𝑠𝑠
+                                𝐿𝐿𝑟𝑟 =                        ≈ 4.0822 𝑓𝑓𝑓𝑓
+                                          2 ⋅ 102.4 (𝑀𝑀𝑀𝑀𝑀𝑀)
+
+Based on the number of active subcarriers this value must be corrected. For example: for 24 MHz wide
+OFDMA channel with 22 MHz active bandwidth there will be 440 active subcarriers for 2048 FFT
+(50 kHz spacing) and 880 active subcarriers for 4096 FFT (25 kHz spacing). Thus, the FFT correction
+factor will be the same for either FFT size equal to:
+
+                                        4096 2048 102.4 𝑀𝑀𝑀𝑀𝑀𝑀
+                                𝐾𝐾 =        =     =            ≈ 4.6545
+                                        880   440   22 𝑀𝑀𝑀𝑀𝑀𝑀
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                    18
+The actual pre-equalization time domain bin cable resolution for this configuration will be
+
+                                    𝐿𝐿 = 4.0822 𝑓𝑓𝑓𝑓 ⋅ 4.6545 ≈ 19.0 𝑓𝑓𝑓𝑓
+
+This value might change slightly for cables having a different velocity of propagation.
+
+
+    4.5. Frequency Response Matching and Other DSP Techniques
+One of the primary benefits of using Tom Williams’s phase correction routine is that it removes the
+arbitrary linear delay that is added to the measurements, resulting in uniform phase values across a
+population of measurements. Without this correction, a random delay may be added to samples, making
+them unusable for complex analysis using common DSP techniques such as complex products, quotients
+and other operations that include comparison of phase components of the signal. Figure 15 shows an
+example of complex division for matching frequency response signatures using SC-QAM coefficients.
+
+
+
+
+               Figure 15 – Example of Complex Division for Signature Matching
+
+
+
+Figure 16 shows the results of a complex division operation comparing two identical OFDM channel
+estimates that have the phase components corrected. Note that the complex division results in an exact
+match in the quotient. The frequency vs. amplitude of the quotient is a perfectly flat response. Likewise,
+the time domain of the quotient is a single main tap value with no residual components.
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                 19
+            Figure 16 – Complex Division of Two Phase Corrected OFDM Samples
+
+
+
+Figure 17 shows the results of complex division of OFDM channel estimates when the phase components
+are not the same (uncorrected). You can see that the frequency responses are the same but the main tap
+locations are different in the time domain. The result of the complex division in this example is a power
+offset in the frequency domain and an irrational impulse response. This is the one of the primary
+motivations for removing the linear phase delay. Still, if one sees a result such as in Figure 17, it is a clue
+to use a better method to remove the linear phase delay.
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                   20
+             Figure 17 – Complex Division with Mismatched Phase Components
+
+
+
+5. Benefits
+Having reviewed the fundamentals of obtaining, decoding, and processing the OFDM and OFDMA PNM
+measurements, this section discusses the potential benefits of the work. For a broader perspective about
+the benefits of PNM tools and techniques, see the 2016 SCTE paper, “A Comprehensive Case Study of
+Proactive Network Maintenance” [7] by Wolcott, Heslip et al.
+
+    5.1. Increased Resolution and Accuracy
+Going back to the PNM roots in DOCSIS 2.0 and 3.0 PNM, there are limits to the time and frequency
+resolution of the SC-QAM measurements. When comparing the upstream SC-QAM distances with those
+of OFDMA, section 5.11 shows the distance calculations being improved from approximately 85 feet per
+tap, to eight feet. This is approximately 10 times better upstream distance resolution. Note that the early
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                21
+PNM implementations generalized the length to 85 feet-per-tap to make it easier for technicians to do the
+calculations. The real length is around 83 feet with a VoP of 87% for typical hard line coaxial cable.
+
+        5.1.1. Upstream Pre-Equalization Coefficients
+Tom Kolze describes the SC-QAM equalizer calculations in the following material adapted from “Pre-
+Equalization Based Upstream Frequency Response Measurements” [8]. Tom states, “In the case of single
+carrier quadrature amplitude modulation (SC-QAM) signals, it can be shown (T. Kolze) that the derived
+equalizer response is a superposition of some number N different filter responses (that is, the number of
+pre-equalizer taps). Each of the N filters’ center frequency is spaced 1/NT Hz from its adjacent filter (in
+frequency, where N is the previously mentioned number of pre-equalizer taps and T is the symbol period
+in seconds). Each filter has an equivalent noise bandwidth (ENBW) of 1/NT Hz. Thus, the equalizer
+response comprises a sum of frequency responses, where each of the N frequency responses has a
+resolution bandwidth (RBW) of 1/NT Hz, providing a very similar, but not exactly the same response. as
+with a conventional sweeping spectrum analyzer.”
+
+•   N = 24 pre-equalizer taps
+•   T = 1/ (5,120,000 symbols per second) = 1.95E-7 second
+•   Solving the equation above gives 1/(24*1.95E-7) = 213.33 kHz
+
+Figure 18 shows a graphic representation of four different cable faults, each having progressively longer
+fault distances. Starting with the graph on the left, a 1T reflection indicates a maximum length of 85 feet.
+Then 2T with 85 feet to 170 feet, 3T with 170 feet to 255 feet, and finally, 4T with 255 feet to 340 feet
+distance. Notice that each time bin, or T, is measured in relative distance from the main tap position (8).
+The first chart shows large bars sticking up at position 9, so that is 9-8=1, hence a 1T reflection. These
+reflections have a distance resolution of approximately 85 feet. Further details about upstream pre-
+equalization coefficients can be found in [9].
+
+
+
+
+    Figure 18 – SC-QAM Impuse Response Distance Example (6.4 MHz Wide Channels)
+
+When considering the coefficients of OFDMA, the resolution is greatly improved. The frequency
+resolution of the OFDMA coefficients is determined by a sample rate. Figure 19 shows an example of a
+damaged coaxial cable at 875 ft distance from the amplifier. The upstream pre-equalizer from one of the
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                  22
+SC-QAM channels centered at 36.5 MHZ has a large echo at tap position 18, which is 10T in distance
+from the main tap at position 8. With 85 ft per T distance resolution, the SC-QAM impulse response
+shows an 850 ft length of the impedance cavity.
+
+
+
+
+              Figure 19 – 24-Tap SC-QAM Pre-Equalizer Fault Distance Example
+
+
+
+Figure 20 is a chart showing the same plant fault using the upstream coefficients obtained from the
+OFDMA channel, which has 51 MHz of contiguous active subcarriers, centered at 58 MHz and with
+50 kHz sub-carrier spacing. In this example, the impulse response echo has 107 bins separating it from
+the main tap position of 0. The math shows that the impedance cavity is calculated at 877 feet, which is
+significantly closer to 875 than the previous estimate of 850.
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE               23
+          Figure 20 – OFDMA Pre-Equalizer Time Domain Fault Distance Example
+
+
+
+        5.1.2. Downstream Channel Estimates
+As for the downstream OFDM channel estimates, there is no pre-existing PNM capability that is directly
+analogous. The downstream SC-QAM equalization coefficients were eventually defined to have a finite
+impulse response (FIR) structure, but prior implementations are not consistent across the many CM
+products and have not been used. The two features of PNM most used for downstream analysis are FBC
+and RxMER per subcarrier. Both capabilities are useful tools for different types of detection and analysis,
+but the channel estimate fills some of the gaps within their usefulness.
+
+FBC is excellent for evaluating large spans within the power spectrum but generally requires averaging to
+produce useful measurements. As a result, small amplitude changes are difficult and sometimes
+impossible to detect in a practical manner. RxMER per subcarrier is probably the most used feature of
+PNM, but the measurement is taken after the subcarrier equalization occurs and lacks I and Q
+information, which is useful for more precise distance calculations.
+
+    5.2. Greater Sensitivity
+There are several factors that contribute to improved sensitivity in DOCSIS 3.1 and 4.0 PNM
+measurements. A number of those are outside the scope of this paper so here we focus on the sensitivity
+improvements associated with using a higher-order FFT and increased sample rate.
+
+As the resolution is increased, the frequency sensitivity is improved because each bin of the FFT results in
+a smaller range of frequencies. The sampling rate is also increased, which improves the ability to
+distinguish between closely spaced frequency components. This is particularly important in coaxial
+networks where there can be multiple frequency components that are closely spaced. The ability to detect
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                24
+these components allows for more fine-grained analysis of the discrete impedance characteristics often
+found in our cable access networks.
+
+It is shown that tiny amplitude ripples can be detected in the frequency domain, some as small as
+1/10th dB (Figure 21) and better. This graph shows a frequency domain chart on the left, having at least
+four dominant wave components that are superimposed. The smallest ripple can be seen at different
+places in the graph, with the example circled in red at the 679.6 MHz marker. In the time domain chart on
+the right, the contributing echo can be isolated in the impulse response.
+
+
+
+
+                      Figure 21 – Time and Frequency Domain Sensitivity
+
+
+
+    5.3. Determining Open Circuit vs. Short Circuit Faults
+Figure 22 through Figure 25 were originally published by Larry Wolcott in PNM presentations from 2013
+[10]. Many environments have recurring problems with certain types of faults such as water flooding,
+lightning strikes, construction damage, animal chews, damaged or missing terminators, and countless
+other issues.
+
+A metallic time domain reflectometer (TDR) is a common diagnostic tool for testing and measuring
+coaxial cables. TDR tools used in the field transmit a defined width pulse and measure the time delay(s)
+of the reflections. When the time delays are used together with the propagational properties of the cable,
+precise distances of the impedance mismatches, faults and lengths can be calculated by the TDR. One of
+the unique and useful functions of a field TDR is that their displays typically show a distinctive raised
+(up) sweep for open circuit and inverted (down) sweep for short circuit faults. This feature can be useful
+for troubleshooting because it helps technicians better understand the nature of the fault.
+
+Here are some examples of how a technician might interpret the information:
+
+•   Missing or damaged terminators show as open circuit.
+•   Radial and other cracks usually show as open circuit.
+•   Cracked cable that is moving (wind) may alternate between open circuit and short circuit.
+•   Buried cable with a ding should show a short circuit.
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                25
+•   Water flooded cable would show repeating short circuits.
+•   Connector or seizure problems could show as open circuit or short circuit.
+    Example: The result may indicate a short circuit if the pin is touching or it may show an open circuit
+    if the seizure is loose.
+
+The TDR measures pulse responses which are a direct measurement of time delay. The OFDM channel
+estimates and OFDMA pre-equalization are built up from steady-state response to a long-lasting signal,
+and not an actual pulse response or a direct measurement of time delay.
+
+The DOCSIS pre-equalization and channel estimates can provide similar information based on the same
+principles that are used by the field TDRs. This function is achieved by evaluating the phase of the echoes
+(impulse response) relative to the phase of the main tap, or DC term. Figure 22 shows three examples of
+impulse response on a coaxial transmission line. The top example shows an ideal response with no
+impedance mismatches, resulting in a relatively flat phase vs. frequency response. The middle example
+shows a short circuit reflection with the phase vs. frequency graph having a negative or downward slope
+(red arrow). Lastly, the lower illustration depicts an open circuit fault where the echo is more positive or
+upward (red arrow), indicating an in-phase reflection.
+
+
+
+
+                      Figure 22 – Open Circuit vs. Short Circuit Reflections
+
+Phase is a component of our signal that most of the other test results (tools) can’t provide. This phase is
+part of the quadrature constellation and can be measured in degrees. Zero degrees from the equalizer’s
+perspective means “in phase” if the coefficients have been corrected. Without correction (having linear
+delay), the echo impulse having the same relative phase as the main tap component is the same as “in
+phase.” Figure 23 and Figure 24 show a phasor with positions of 0 degrees and 180 degrees in red.
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                 26
+   Figure 23 – Phase Polar (left) vs. Wave             Figure 24 – Echo Phase Rotations Relative
+               (right) Displays                                    to Main Tap Phase
+
+
+
+Figure 25 shows a comparison of a cut drop cable, unterminated on the left and soaking in a solution of
+saturated salt water on the right. The saline solution is highly conductive and a reliable way to produce a
+short circuit response the resembles something typically seen in the field. The impulse response of each
+echo contains a phase value, demonstrating that the technique continues to work for OFDM and OFDMA
+coefficient analysis.
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                27
+                    Figure 25 – Open Circuit vs. Short Circuit TDR Response
+
+
+
+Multiple echoes that superimpose causes complications because of the constructive and destructive
+properties of the signal. If there are multiple echoes at the same time, two or more sharing the same phase
+and amplitude will be additive or increase in size. If more than one echo exists at the same time with
+opposing phase and amplitude, they will cancel each other. When examining a single cable in the field
+with a TDR, this isn’t usually a problem because there is only one path for the signal to traverse.
+However, with a connected plant containing splitters, couplers and taps, there are multiple paths for the
+TDR’s test signal and as such, increases the risk of echo responses that overlap.
+
+The PNM community has largely agreed to avoid using direct references to TDRs to avoid confusion
+caused by similarities, with significant differences in the way the tools are used and interpreted. It’s
+important to reinforce here that the echo distances are a measurement of the length of an impedance
+cavity. The distances relative to the CM location, for example, are unrelated. To say that differently, it is
+usually incorrect to say, “the distance from the cable modem.”
+
+    5.4. Cyclic Prefix Tuning
+DOCSIS 3.1 and 4.0 OFDM and OFDMA employ a technique of copying and prepending a portion of the
+symbol called the cyclic prefix (CP). The CP is used to mitigate the effects of reflections within the
+channels, which can result in inter-symbol interference (ISI). The CP is very effective but comes at the
+expense of capacity within the channel because of the unusable time allocated to the CP. By default, a
+typical DOCSIS system might use a CP length of 2.5 microseconds, for example. In the case of a 96 MHz
+wide downstream OFDM channel using 50 kHz subcarrier spacing, assuming a CP value of 512
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                  28
+(2.5 microseconds), this results in an additional impact of 88.89% to the symbol efficiency. (DOCSIS
+OFDM efficiency calculations are addressed in SCTE 270 2021r1, Mathematics of Cable [11].)
+
+Using the PNM adaptive pre-equalization coefficients and OFDM channel estimates offers a valuable tool
+for observation of the (approximate) channel performance including reflected energy and phase response.
+In both cases, the frequency domain estimates of the channel can be converted to the time domain using
+the IFFT. This time domain representation offers an excellent analysis of the echoes present within the
+channel, which may require mitigation using the CP. Figure 26 illustrates the overlaid impulse responses
+of an entire service group containing thousands of CMs.
+
+
+
+
+                      Figure 26 – OFDM Time Domain Impulse Response
+
+The zero position (farthest left) of the graph represents the incident signal at the receiver and OFDM
+channel estimate’s time domain bins extending to the right. The horizontal markers represent 1024-QAM,
+2048-QAM and 4096-QAM RxMER thresholds. These thresholds were taken from the DOCSIS 3.1 PHY
+specification [4], and are 34 dB, 37 dB and 41 dB respectively. The vertical markers represent the time-
+equivalent of the indicated CP values, 192, 256 and 512. These are 0.9375 microseconds,
+1.25 microseconds and 2.5 microseconds, respectively.
+
+In this example, none of the CMs in the population of this analysis require a CP greater than 256 because
+the total integrated power of the bins is well within the desired operational requirements of 4096-QAM.
+Thus, the CP value can be reduced from 512 to 256, or 2.5 microseconds to 1.25 microseconds
+respectively. In the case of a 96 MHz wide downstream OFDM channel using 50 kHz subcarrier spacing,
+assuming a CP value of 256, this results in a contribution of 94.12% to the symbol efficiency. This CP
+reduction results in a total improvement of 5.23% symbol efficiency within the channel. This is free
+bandwidth.
+
+    5.5. Detecting Cable Lengths
+Unlike the predecessor PNM implementations using the limited SC-QAM pre-equalization coefficients
+and full band capture analysis, the improved resolution and sensitivity brings new opportunities to
+analyzing the network. Considering that the sensitivity is good enough to measure impedance cavities
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE              29
+from subtle impedance mismatches, this technique can be useful for measuring unimpaired cables. For
+example, the differences in impedance between the drop cable and tap port, along with the outlet cable
+and input port at the modem can be measured. Likewise, splitters, ground blocks and home amplifiers all
+have imperfect impedance characteristics.
+
+For an OFDM channel with 104.5 MHz of contiguous active subcarriers, the time domain of the channel
+estimate is displayed in Figure 27; there are at least four dominant echoes seen in the impulse response.
+The impulse response graph on the left of the figure shows each of the echoes circled in red with a label
+showing the number of delay bins separating the main tap, 2, 15, 39 and 59 respectively. The middle
+section of the figure shows the frequency domain waveform of each echo when isolated as a discrete
+component. Finally on the right, the frequency response shows the superposition of all four waves
+including all components.
+
+
+
+
+              Figure 27 – Superposition of Four Constituent Amplitude Ripples
+
+This technique allows the distances of the cable interconnections to be measured in some cases. This is
+especially true when the impedances deviate significantly from 75 ohms. Figure 28 shows a coaxial
+topology starting with the CM on the left, connected to the outlet with an 8 ft jumper, then 60 ft of wiring
+to a ground block, 156 ft of drop cable to the tap, then 236 ft of feeder to the line amplifier. Knowing the
+width of the contiguous active subcarriers for OFDM channel (96 MHz in this case) and math described
+in section 4.4.1, each of the cable lengths matches perfectly with the constituent wave components
+identified in Figure 27. This technique has several promising applications for automating cable network
+topology discovery. These concepts are explored further by Lin Cheng and co-authors in their paper
+“Exploring Programmatically Generated HFC Plant Topology” [12].
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                 30
+            Figure 28 – Coaxial Interconnection Distances and Reflection Cavities
+
+
+
+6. Field Results
+The PNM community has been discussing the topic of enhanced resolution and sensitivity in OFDM on
+DOCSIS networks for several years. This paper continues to evaluate the theories and ideas surrounding
+these enhancements. From our previous decade of PNM experience, we know that nothing is truly
+validated until it is proven in the field. These trials represent some of the first real-world tests of these
+advanced PNM capabilities, marking a significant step in their practical implementation. Two of the most
+common PNM troubleshooting scenarios are examined, although there are many more which could be
+explored for further benefit.
+
+    6.1. Cracked trunk cable, causing egress (leakage) and ingress
+A trunk cable was discovered to have a crack in the outside shielding, which was causing a leak. The leak
+was detected with calibrated leakage equipment attached to a network maintenance truck. Figure 29
+shows a red X on the topology map with multiple dot clusters. Dot colors represent unimpaired service in
+blue and errors detected in the others. The red circle in the photograph (right) is the approximate location
+of the radial crack. This cable is suspended over a river, beyond the reach of a typical bucket lift,
+requiring specialized repair equipment.
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                 31
+                       Figure 29 – Cracked Aerial Cable on Side of Bridge
+
+
+
+Figure 30 illustrates another map view of the CM population, relative to the cracked cable which is
+marked with a red X in the middle. The green FBC spectrum display on the left is associated with the
+population of blue dots, which are unaffected by FM ingress. The spectrum region of 88 MHz to
+108 MHz is circled in green, showing a flat noise floor. The display on the right outlined in red is
+representative of the population on the other side of the cable fault, with dots that are not blue. The red
+circle shows the frequency spectrum of 88 MHz to 108 MHz with a spike in the noise floor, consistent
+with FM ingress that is typical with ingress entering the plant at the radial crack.
+
+
+
+
+       Figure 30 – Small Amounts of FM Ingress Visible in FBC Beyond the Damage
+
+
+
+
+                    © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                  32
+The traditional PNM techniques based on SC-QAM pre-equalization coefficients continue to perform as
+expected. Figure 31 is like Figure 30 with the cracked cable marked by a red X. The green bordered
+display on the left side of the marked fault shows a flat frequency response. The display on the right side
+of the marked fault (downstream) shoes a 9T echo in the upstream pre-equalizer response. As these SC-
+QAM channels are configured, this indicates an impedance cavity of approximately 795 feet, with 85 feet
+of potential error.
+
+
+
+
+          Figure 31 – 9T Reflection (~1dB) in SC-QAM Upstream Pre-EQ Response
+
+
+
+When examining the downstream OFDM channel estimates, the impulse response appears more precise,
+showing much greater detail with at least six dominant echoes. Compared to the limited bandwidth and
+resolution of the SC-QAM pre-equalizer response, the OFDM channel provides a dramatic improvement.
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                33
+                       Figure 32 – Multiple Discrete Time Domain Echoes
+
+
+
+    6.2. Loose connector with egress (leakage) and ingress
+Identifying loose connectors was one of PNM’s earliest successes. Does the new enhanced capability add
+value to the existing PNM technology and techniques? By using the OFDM channel estimates, the current
+methods of equalizer response measurement and FM ingress detection can be implemented in a single
+operation. It is also possible that using them together can improve the reliability and confidence in the
+former detection method.
+
+Loose connectors at the input to the CM have distinctive indicators. The FBC graph in Figure 33 shows a
+frequency spectrum that is occupied with downstream SC-QAM channels. High levels of ingress are
+circled in red with indicators of FM, very high frequency (VHF), ultra high frequency (UHF) and LTE at
+their respective frequencies. The first clue is the high levels of FM ingress, relative to the SC-QAM
+channels. This is often caused by the proximity of the ingress location to the receiver, very close to the
+loose connector at the input of the CM. In this case, there is very little attenuation of the FM ingress,
+compared to several hundred feet of coaxial cable.
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE               34
+  Figure 33 – FBC from 6 MHz to 1026 MHz Showing Example of Spectrum Affected by a
+                     Loose Connector, Allowing Significant Ingress
+
+
+
+The OFDM channel estimates show LTE ingress circled in red when looking at the frequency domain
+amplitudes (Figure 34). This same information is confirmed with the FBC chart in Figure 33. A similar
+result would be expected from the downstream RxMER per subcarrier PNM test, so it’s not clear that
+much additional insight would be gained using the new technique.
+
+
+
+
+               Figure 34 – LTE Interference in the OFDMA Channel Estimates
+
+
+
+7. Conclusion
+In this paper, we took the observations and methods reported by Tom Williams et al [1] and demonstrated
+several modifications for important use cases, for PNM and more. By applying the correction methods
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE             35
+where needed, localization is greatly improved through more precise matching of pre-equalization and
+channel estimation results, and through more accurate calculations of the distances to impedance
+mismatches. Due to the large amounts of data obtainable from channel estimation and pre-equalization
+data from OFDM and OFDMA respectively, greater accuracy in distance estimation is possible. While
+work continues to develop repeatable methods for finding and localizing some complex faults in coax
+plant, early results are promising. But one simple and important use case we have demonstrated here is to
+verify entire large populations of CMs where the CP can be reduced, thus adding more bandwidth for use
+on the cable plant.
+
+
+
+
+                                         Appendix A
+8. Decoding
+    8.1. CmDsOfdmChanEstimateCoef Decoding Details
+The downstream OFDM channel estimate files can be decoded using the file format specified in Table 63
+– Channel Estimate Coefficient File Format of [5] in section D 2.6. The following pseudo-code reads the
+channel estimate file in the correct order and byte lengths:
+
+
+channelEstimate.setFileType(readFileType(dataInputStream)); // read 4 bytes
+channelEstimate.setFileVersion(readFileVersion(dataInputStream)); // read 1 + 1 byte
+channelEstimate.setTimestamp(readFileTimestamp(dataInputStream)); // read 4 bytes
+channelEstimate.setDsChannelId(readChannelId(dataInputStream)); // read 1 byte
+channelEstimate.setMacString(readMacString(dataInputStream)); // read 6 bytes
+channelEstimate.setSubcarrierZeroFreq(dataInputStream.readInt()); // read 4 bytes
+channelEstimate.setFirstActiveSubcarrierIndex(dataInputStream.readShort()); // read 2 bytes
+channelEstimate.setSubcarrierSpacing(dataInputStream.readByte()); // read 1 byte
+channelEstimate.setFilesize(dataInputStream.readInt()); // read 4 bytes
+channelEstimate.setIqValues(readIQValues(dataInputStream, channelEstimate.getFilesize()));
+
+
+Note that the I and Q values are manipulated from s2.13 format to accommodate the target language. In
+this example, the language is Java floating point:
+
+
+short iComponentRaw = dataInputStream.readShort();
+int iComponent = iComponentRaw << 3 >> 3; // Sign-extend to 32 bits and shift right to get 16-bit signed
+integer
+short qComponentRaw = dataInputStream.readShort();
+int qComponent = qComponentRaw << 3 >> 3; // Sign-extend to 32 bits and shift right to get 16-bit
+signed integer
+
+// Divide by 2^13 (s2.13 format)
+float iFloat = iComponent / 8192.0f; // 8192.0 = 2^13
+float qFloat = qComponent / 8192.0f; // 8192.0 = 2^13
+
+This pseudo-code ensures that the channel estimate file is read correctly, and the I and Q values are
+properly converted from their s2.13 format to floating point values in Java.
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE                  36
+    8.2. CmUsPreEq Decoding Details
+The upstream OFDMA pre-equalization files can be decoded using the file format specified in Table 77 -
+Last PreEqualization Update File Format from [5], in section D.13. The I and Q values should be scaled
+and processed in a similar manner as described in Section 8.1. Note that there are differences in the
+number format: s2.13 and s2.14 are used in the two operations (as specified).
+
+. The following pseudo-code reads the channel estimate file in the correct order and byte lengths:
+
+preEqCoefficients.setFileType(readFileType(dataInputStream)); // read 4 bytes
+preEqCoefficients.setFileVersion(readFileVersion(dataInputStream)); // read 1 + 1 byte
+preEqCoefficients.setTimestamp(readFileTimestamp(dataInputStream)); // read 4 bytes
+preEqCoefficients.setUsChannelId(readChannelId(dataInputStream)); // read 1 byte
+preEqCoefficients.setMacString(readMacString(dataInputStream)); // read 6 bytes
+preEqCoefficients.setCmtsMacString(readMacString(dataInputStream)); // read 6 bytes
+preEqCoefficients.setSubcarrierZeroFreq(dataInputStream.readInt());// read 4 bytes
+preEqCoefficients.setFirstActiveSubcarrierIndex(dataInputStream.readShort());// read 2 bytes
+preEqCoefficients.setSubcarrierSpacing(dataInputStream.readByte());// read 1 byte
+preEqCoefficients.setFilesize(dataInputStream.readInt());// read 4 bytes
+preEqCoefficients.setIqValues(readIQValues(dataInputStream, preEqCoefficients.getFilesize()));
+
+The I and Q values should be scaled and processed in a similar manner as described in Section 8.1. Note
+that there are differences in the number format: s2.13 and s2.14 are used in the two operations (as
+specified).
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE               37
+                          Abbreviations
+CCAP                  converged cable access platform
+CM                    cable modem
+CMTS                  cable modem termination system
+CP                    cyclic prefix
+dB                    decibel
+dBmV                  decibel millivolt
+DC                    direct current
+DOCSIS                Data-Over-Cable Service Interface Specifications
+DS                    downstream
+DSP                   digital signal processing
+EQ                    equalizer
+ENBW                  equivalent noise bandwidth
+FBC                   full band capture
+FD                    frequency domain
+FFT                   fast Fourier transform
+FIR                   finite impulse response
+FM                    frequency modulation
+ft                    foot or feet
+Hz                    hertz
+I                     in-phase
+IFFT                  inverse fast Fourier transform
+kHz                   kilohertz
+MAC                   media access control
+MAP                   bandwidth allocation map
+MIB                   management information base
+MHz                   megahertz
+ns                    nanosecond
+OFDM                  orthogonal frequency-division multiplexing
+OFDMA                 orthogonal frequency-division multiple access
+PNM                   proactive network maintenance
+Pre-EQ                pre-equalization
+Q                     quadrature
+QAM                   quadrature amplitude modulation
+RBW                   resolution bandwidth
+RF                    radio frequency
+RNG-RSP               ranging response
+RxMER                 receive modulation error ratio
+SC-QAM                single carrier quadrature amplitude modulation
+SCTE                  Society of Cable Telecommunications Engineers
+SNMP                  Simple Network Management Protocol
+TDR                   time domain reflectometer
+TFTP                  Trivial File Transfer Protocol
+UHF                   ultra high frequency
+US                    upstream
+VHF                   very high frequency
+VoP                   velocity of propagation
+
+
+
+          © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE   38
+                        Bibliography & References
+[1] OFDMA Predistortion Coefficient and OFDM Channel Estimation Decoding and Analysis
+Remove the linear delay, examine the group delay, Tom Williams et al, SCTE Cable-Tec Expo 2021
+
+[2] PNM Best Practices: HFC Networks (DOCSIS® 3.0) CM-GL-PNMP-V03-160725, July 25, 2016,
+Cable Television Laboratories, Inc.
+
+[3] Data-Over-Cable Service Interface Specifications DOCSIS® 3.1, DOCS-IF3-MIB-2024-07-05, July
+5, 2024, Cable Television Laboratories, Inc.
+
+[4] DOCSIS® 3.1 Physical Layer Specification CM-SP-PHYv3.1-I20-230419
+
+[5] Data-Over-Cable Service Interface Specifications DOCSIS® 3.1 Cable Modem Operations Support
+System Interface Specification, CM-SP-CM-OSSIv3.1-I26-240615
+
+[6] Data-Over-Cable Service Interface Specifications DOCSIS® 3.1, CCAP™ Operations Support
+System Interface Specification, CM-SP-CCAP-OSSIv3.1-I27-231012
+
+[7] A Comprehensive Case Study of Proactive Network Maintenance, Heslip, Thomas, Gonsalves,
+Wolcott, SCTE Cable-Tec Expo 2016
+
+[8] Pre-Equalization Based Upstream Frequency Response Measurements, SCTE NOS WG7 (Note: At
+the time this paper was written, the listed reference document was undergoing final review and editing.)
+
+[9] Understanding and Troubleshooting Cable Upstream RF Spectrum, SCTE NOS WG7 (Note: At the
+time this paper was written, the listed reference document was in the approval process.)
+
+[10] Scout Flux eTDR Open vs. Short, Larry Wolcott, Comcast PNM Presentation, 2013
+
+[11] SCTE 270 2021r1 Mathematics of Cable
+
+[12] Exploring Programmatically Generated HFC Plant Topology (2023), Cheng, Campos, Riggert and
+Wolcott, SCTE Cable-Tec Expo 2023
+
+
+
+
+                   © 2024 Comcast. SCTE TechExpo24 logo used with permission from SCTE               39
+
