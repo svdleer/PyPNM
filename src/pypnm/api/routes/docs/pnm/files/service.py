@@ -3,10 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
+import secrets
+import time
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
@@ -41,6 +48,11 @@ from pypnm.api.routes.docs.pnm.files.schemas import (
     HexDumpResponse,
     MacAddressSystemDescriptorEntry,
     MacAddressSystemDescriptorResponse,
+    RemoteImpulseAnalysisRequest,
+    RemoteImpulseAnalysisResponse,
+    RemoteImpulseAnalysisResult,
+    RemotePnmFileCatalogResponse,
+    RemotePnmFileEntry,
     UploadFileResponse,
 )
 from pypnm.config.system_config_settings import SystemConfigSettings
@@ -72,6 +84,20 @@ from pypnm.pnm.parser.pnm_parameter import (
     PnmParsers,
 )
 from pypnm.pnm.parser.pnm_type_header_mapper import PnmFileTypeMapper
+
+
+_REMOTE_FILE_ID_SECRET = (
+    os.environ.get("PYPNM_FILE_ID_SECRET")
+    or os.environ.get("PYPNM_AGENT_TOKEN")
+    or secrets.token_hex(32)
+).encode("utf-8")
+_REMOTE_FILE_ID_TTL_SECONDS = 3600
+_REMOTE_FILE_MAX_BYTES = int(os.environ.get("PYPNM_REMOTE_FILE_MAX_BYTES", str(16 * 1024 * 1024)))
+_REMOTE_IMPULSE_TYPES = {
+    PnmFileType.OFDM_CHANNEL_ESTIMATE_COEFFICIENT,
+    PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS,
+    PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS_LAST_UPDATE,
+}
 
 
 class PnmFileService:
@@ -497,6 +523,436 @@ class PnmFileService:
         raise HTTPException(
             status_code=400,
             detail=f"Analysis not implemented for file type: {model.file_type.name}"
+        )
+
+    @staticmethod
+    def _normalize_mac(value: str) -> str:
+        return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+    @staticmethod
+    def _safe_remote_basename(filename: str) -> str:
+        safe = Path(str(filename or "")).name
+        if not safe or safe != filename or safe in {".", ".."} or "\x00" in safe:
+            raise ValueError("Invalid remote filename")
+        return safe
+
+    @staticmethod
+    def _unwrap_agent_result(result: dict | None) -> dict:
+        inner: dict = result or {}
+        for _ in range(3):
+            nested = inner.get("result")
+            if not isinstance(nested, dict):
+                break
+            inner = nested
+        return inner
+
+    @classmethod
+    def _encode_remote_file_id(cls, agent_id: str, filename: str) -> str:
+        payload = json.dumps(
+            {
+                "v": 1,
+                "agent": agent_id,
+                "filename": cls._safe_remote_basename(filename),
+                "exp": int(time.time()) + _REMOTE_FILE_ID_TTL_SECONDS,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        signature = hmac.new(_REMOTE_FILE_ID_SECRET, payload, hashlib.sha256).digest()
+        return ".".join(
+            base64.urlsafe_b64encode(part).decode("ascii").rstrip("=")
+            for part in (payload, signature)
+        )
+
+    @classmethod
+    def _decode_remote_file_id(cls, file_id: str) -> tuple[str, str]:
+        try:
+            payload_token, signature_token = file_id.split(".", 1)
+            payload = base64.urlsafe_b64decode(payload_token + "=" * (-len(payload_token) % 4))
+            signature = base64.urlsafe_b64decode(signature_token + "=" * (-len(signature_token) % 4))
+            expected = hmac.new(_REMOTE_FILE_ID_SECRET, payload, hashlib.sha256).digest()
+            if not hmac.compare_digest(signature, expected):
+                raise ValueError("signature mismatch")
+            decoded = json.loads(payload)
+            if int(decoded.get("exp", 0)) < int(time.time()):
+                raise ValueError("file ID expired")
+            return str(decoded["agent"]), cls._safe_remote_basename(str(decoded["filename"]))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid or expired remote file ID") from exc
+
+    @staticmethod
+    def _remote_agent_ids() -> list[str]:
+        from pypnm.api.agent.manager import get_agent_manager
+
+        manager = get_agent_manager()
+        if manager is None:
+            return []
+        list_ids = manager.get_all_agent_ids_for_capability("file_list")
+        get_ids = set(manager.get_all_agent_ids_for_capability("pnm_file_get"))
+        candidates = [agent_id for agent_id in list_ids if agent_id in get_ids]
+        file_agents = [agent_id for agent_id in candidates if agent_id.startswith("file-agent")]
+        return file_agents or candidates
+
+    @staticmethod
+    def _remote_catalog_agent_ids() -> list[str]:
+        from pypnm.api.agent.manager import get_agent_manager
+
+        manager = get_agent_manager()
+        if manager is None:
+            return []
+        catalog_ids = manager.get_all_agent_ids_for_capability("pnm_file_catalog")
+        get_ids = set(manager.get_all_agent_ids_for_capability("pnm_file_get"))
+        candidates = [agent_id for agent_id in catalog_ids if agent_id in get_ids]
+        file_agents = [agent_id for agent_id in candidates if agent_id.startswith("file-agent")]
+        return file_agents or candidates
+
+    async def _send_remote_file_task(
+        self,
+        agent_id: str,
+        command: str,
+        params: dict[str, Any],
+        timeout: float,
+        priority: str,
+    ) -> dict:
+        from pypnm.api.agent.manager import get_agent_manager
+
+        manager = get_agent_manager()
+        if manager is None:
+            return {"success": False, "error": "Agent manager unavailable"}
+        try:
+            task_id = await manager.send_task(
+                agent_id=agent_id,
+                command=command,
+                params=params,
+                timeout=timeout,
+                priority=priority,
+            )
+            result = await asyncio.wait_for(
+                manager.wait_for_task_async(task_id, timeout=timeout),
+                timeout=timeout + 1,
+            )
+            return self._unwrap_agent_result(result)
+        except Exception as exc:
+            self.logger.debug("Remote file task %s failed via %s: %s", command, agent_id, exc)
+            return {"success": False, "error": str(exc)}
+
+    async def _fetch_remote_file_bytes(self, agent_id: str, filename: str) -> bytes:
+        safe_name = self._safe_remote_basename(filename)
+        result = await self._send_remote_file_task(
+            agent_id,
+            "file_get",
+            {"filename": safe_name, "glob": False},
+            timeout=30,
+            priority="long",
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=404, detail="Remote PNM file could not be retrieved")
+        returned_name = self._safe_remote_basename(str(result.get("filename") or safe_name))
+        if returned_name != safe_name:
+            raise HTTPException(status_code=409, detail="Remote file identity changed during retrieval")
+        content_b64 = result.get("content_base64")
+        if not isinstance(content_b64, str) or len(content_b64) > ((_REMOTE_FILE_MAX_BYTES * 4 // 3) + 8):
+            raise HTTPException(status_code=413, detail="Remote PNM file is missing or too large")
+        try:
+            content = base64.b64decode(content_b64, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Remote agent returned invalid file content") from exc
+        if not content or len(content) > _REMOTE_FILE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Remote PNM file is empty or too large")
+        return content
+
+    def _remote_metadata_from_bytes(
+        self,
+        agent_id: str,
+        filename: str,
+        content: bytes,
+    ) -> RemotePnmFileEntry | None:
+        try:
+            parser, parameters = GetPnmParserAndParameters(content).get_parser()
+            if parameters.file_type not in _REMOTE_IMPULSE_TYPES:
+                return None
+            parsed_model = parser.to_model()
+            parsed_mac = str(getattr(parsed_model, "mac_address", ""))
+            pnm_header = getattr(parsed_model, "pnm_header", None)
+            capture_time = int(getattr(pnm_header, "capture_time", 0) or 0)
+            direction = (
+                "downstream"
+                if parameters.file_type == PnmFileType.OFDM_CHANNEL_ESTIMATE_COEFFICIENT
+                else "upstream"
+            )
+            return RemotePnmFileEntry(
+                file_id=self._encode_remote_file_id(agent_id, filename),
+                filename=cast(FileName, self._safe_remote_basename(filename)),
+                pnm_file_type=parameters.file_type.value,
+                direction=direction,
+                mac_address=cast(MacAddressStr, parsed_mac),
+                channel_id=int(getattr(parsed_model, "channel_id", -1)),
+                capture_time=capture_time,
+                size=len(content),
+            )
+        except Exception as exc:
+            self.logger.debug("Ignoring non-impulse PNM file %s: %s", filename, exc)
+            return None
+
+    def _remote_metadata_from_catalog(
+        self,
+        agent_id: str,
+        raw: Any,
+    ) -> RemotePnmFileEntry | None:
+        """Validate metadata returned by an untrusted file agent."""
+        if not isinstance(raw, dict):
+            return None
+        try:
+            filename = self._safe_remote_basename(str(raw.get("filename") or ""))
+            pnm_file_type = str(raw.get("pnm_file_type") or "").upper()
+            direction_by_type = {
+                "PNN2": "downstream",
+                "PNN6": "upstream",
+                "PNN7": "upstream",
+            }
+            expected_direction = direction_by_type.get(pnm_file_type)
+            if expected_direction is None or raw.get("direction") != expected_direction:
+                return None
+
+            parsed_mac = str(MacAddress(str(raw.get("mac_address") or "")))
+            channel_id = int(raw.get("channel_id"))
+            capture_time = int(raw.get("capture_time") or 0)
+            size = int(raw.get("size"))
+            if not 0 <= channel_id <= 255 or capture_time < 0:
+                return None
+            if size <= 0 or size > _REMOTE_FILE_MAX_BYTES:
+                return None
+
+            return RemotePnmFileEntry(
+                file_id=self._encode_remote_file_id(agent_id, filename),
+                filename=cast(FileName, filename),
+                pnm_file_type=pnm_file_type,
+                direction=expected_direction,
+                mac_address=cast(MacAddressStr, parsed_mac),
+                channel_id=channel_id,
+                capture_time=capture_time,
+                size=size,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    async def get_remote_impulse_files(
+        self,
+        mac_address: MacAddressStr,
+        direction: str = "both",
+    ) -> RemotePnmFileCatalogResponse:
+        if direction not in {"downstream", "upstream", "both"}:
+            raise HTTPException(status_code=400, detail="Invalid direction")
+        requested_mac = self._normalize_mac(str(MacAddress(mac_address)))
+
+        # New agents provide a metadata-only catalog. A successful catalog call,
+        # including an empty result, is authoritative and avoids downloading file
+        # bodies merely to discover their type and modem identity.
+        catalog_agent_ids = self._remote_catalog_agent_ids()
+        if catalog_agent_ids:
+            catalog_results = await asyncio.gather(*[
+                self._send_remote_file_task(
+                    agent_id,
+                    "pnm_file_catalog",
+                    {
+                        "mac_address": str(mac_address),
+                        "direction": direction,
+                        "pnm_types": ["PNN2", "PNN6", "PNN7"],
+                        "limit": 1000,
+                    },
+                    timeout=20,
+                    priority="interactive",
+                )
+                for agent_id in catalog_agent_ids
+            ])
+            successful_catalogs = [
+                (agent_id, result)
+                for agent_id, result in zip(catalog_agent_ids, catalog_results)
+                if result.get("success") is True
+            ]
+            if successful_catalogs:
+                catalog_entries: list[RemotePnmFileEntry] = []
+                for agent_id, result in successful_catalogs:
+                    raw_files = result.get("files")
+                    if not isinstance(raw_files, list):
+                        continue
+                    for raw in raw_files:
+                        entry = self._remote_metadata_from_catalog(agent_id, raw)
+                        if (
+                            entry is not None
+                            and self._normalize_mac(entry.mac_address) == requested_mac
+                            and (direction == "both" or entry.direction == direction)
+                        ):
+                            catalog_entries.append(entry)
+
+                deduped_catalog: dict[tuple[str, str, int], RemotePnmFileEntry] = {}
+                for entry in catalog_entries:
+                    key = (entry.filename, entry.pnm_file_type, entry.capture_time)
+                    deduped_catalog.setdefault(key, entry)
+                ordered_catalog = sorted(
+                    deduped_catalog.values(),
+                    key=lambda entry: (entry.capture_time, entry.filename),
+                    reverse=True,
+                )
+                return RemotePnmFileCatalogResponse(
+                    success=True,
+                    files=ordered_catalog,
+                    count=len(ordered_catalog),
+                )
+
+        # Compatibility fallback for older agents that only expose file_list and
+        # pnm_file_get. This may fetch matching file bodies to inspect metadata.
+        agent_ids = self._remote_agent_ids()
+        if not agent_ids:
+            return RemotePnmFileCatalogResponse(
+                success=False,
+                error="No connected file agent supports PNM retrieval",
+            )
+
+        list_results = await asyncio.gather(*[
+            self._send_remote_file_task(
+                agent_id,
+                "file_list",
+                {"prefixes": [""]},
+                timeout=20,
+                priority="interactive",
+            )
+            for agent_id in agent_ids
+        ])
+
+        refs: list[tuple[str, str]] = []
+        for agent_id, result in zip(agent_ids, list_results):
+            if not result.get("success"):
+                continue
+            for raw_name in result.get("files", []) or []:
+                try:
+                    refs.append((agent_id, self._safe_remote_basename(str(raw_name))))
+                except ValueError:
+                    continue
+
+        if not refs:
+            return RemotePnmFileCatalogResponse(success=True, files=[], count=0)
+
+        # Most CM/CMTS filenames embed the modem MAC. Prefer those candidates,
+        # but retain a parser-based fallback for vendor filenames that do not.
+        named_refs = [
+            ref for ref in refs
+            if requested_mac and requested_mac in self._normalize_mac(ref[1])
+        ]
+        candidates = named_refs
+        if not candidates:
+            # Do not download an unbounded server-wide catalog when a vendor
+            # filename does not identify the requested modem.
+            return RemotePnmFileCatalogResponse(success=True, files=[], count=0)
+        # Bound work and de-duplicate captures exposed by multiple agents,
+        # preferring the first responsive file agent for each basename.
+        unique_by_name: dict[str, tuple[str, str]] = {}
+        for ref in candidates:
+            unique_by_name.setdefault(ref[1], ref)
+        unique_candidates = list(unique_by_name.values())[:500]
+        semaphore = asyncio.Semaphore(6)
+
+        async def _inspect(ref: tuple[str, str]) -> RemotePnmFileEntry | None:
+            async with semaphore:
+                try:
+                    content = await self._fetch_remote_file_bytes(ref[0], ref[1])
+                    return self._remote_metadata_from_bytes(ref[0], ref[1], content)
+                except HTTPException:
+                    return None
+
+        metadata = await asyncio.gather(*[_inspect(ref) for ref in unique_candidates])
+        files = [
+            entry for entry in metadata
+            if entry is not None
+            and self._normalize_mac(entry.mac_address) == requested_mac
+            and (direction == "both" or entry.direction == direction)
+        ]
+        # If multiple agents expose the same capture, return it once.
+        deduped: dict[tuple[str, str, int], RemotePnmFileEntry] = {}
+        for entry in files:
+            key = (entry.filename, entry.pnm_file_type, entry.capture_time)
+            deduped.setdefault(key, entry)
+        ordered = sorted(
+            deduped.values(),
+            key=lambda entry: (entry.capture_time, entry.filename),
+            reverse=True,
+        )
+        return RemotePnmFileCatalogResponse(success=True, files=ordered, count=len(ordered))
+
+    def get_analysis_from_bytes(self, content: bytes) -> tuple[ParserAnalysisModelReturn, PnmFileType]:
+        parser, model = GetPnmParserAndParameters(content).get_parser()
+        if model.file_type not in _REMOTE_IMPULSE_TYPES:
+            raise HTTPException(status_code=400, detail="File is not PNN2, PNN6, or PNN7")
+        return self.__get_analysis(parser, model)
+
+    async def analyze_remote_impulse(
+        self,
+        request: RemoteImpulseAnalysisRequest,
+    ) -> RemoteImpulseAnalysisResponse:
+        requested_mac = self._normalize_mac(str(MacAddress(request.mac_address)))
+        warnings: list[str] = []
+
+        if request.file_id:
+            agent_id, filename = self._decode_remote_file_id(request.file_id)
+            content = await self._fetch_remote_file_bytes(agent_id, filename)
+            entry = self._remote_metadata_from_bytes(agent_id, filename, content)
+            if entry is None:
+                raise HTTPException(status_code=400, detail="Selected file is not impulse-response PNM data")
+            selected = [(entry, content)]
+        else:
+            catalog = await self.get_remote_impulse_files(request.mac_address, request.direction)
+            if not catalog.success:
+                return RemoteImpulseAnalysisResponse(
+                    success=False,
+                    mac_address=request.mac_address,
+                    direction=request.direction,
+                    error=catalog.error,
+                )
+            selected_entries: list[RemotePnmFileEntry] = []
+            for wanted_direction in (
+                [request.direction] if request.direction != "both" else ["downstream", "upstream"]
+            ):
+                latest = next((entry for entry in catalog.files if entry.direction == wanted_direction), None)
+                if latest is None:
+                    warnings.append(f"No existing {wanted_direction} PNN file found")
+                else:
+                    selected_entries.append(latest)
+            selected = []
+            for entry in selected_entries:
+                agent_id, filename = self._decode_remote_file_id(entry.file_id)
+                try:
+                    selected.append((entry, await self._fetch_remote_file_bytes(agent_id, filename)))
+                except HTTPException as exc:
+                    warnings.append(f"{entry.direction} file unavailable: {exc.detail}")
+
+        results: list[RemoteImpulseAnalysisResult] = []
+        for entry, content in selected:
+            if self._normalize_mac(entry.mac_address) != requested_mac:
+                warnings.append(f"Skipped {entry.filename}: MAC address does not match request")
+                continue
+            if request.direction != "both" and entry.direction != request.direction:
+                warnings.append(f"Skipped {entry.filename}: direction does not match request")
+                continue
+            try:
+                analysis, file_type = self.get_analysis_from_bytes(content)
+                results.append(RemoteImpulseAnalysisResult(
+                    file_id=entry.file_id,
+                    filename=entry.filename,
+                    pnm_file_type=file_type.value,
+                    direction=entry.direction,
+                    analysis=analysis.model_dump(),
+                ))
+            except Exception as exc:
+                self.logger.warning("Remote impulse analysis failed for %s: %s", entry.filename, exc)
+                warnings.append(f"Analysis failed for {entry.filename}: {exc}")
+
+        return RemoteImpulseAnalysisResponse(
+            success=bool(results),
+            mac_address=request.mac_address,
+            direction=request.direction,
+            results=results,
+            warnings=warnings,
+            error=None if results else "No matching existing PNM file could be analyzed",
         )
 
     def get_archive(self, request: FileAnalysisRequest) -> FileResponse:

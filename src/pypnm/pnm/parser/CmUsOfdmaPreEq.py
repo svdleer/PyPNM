@@ -82,7 +82,7 @@ class CmUsOfdmaPreEq(PnmHeader):
             raise ValueError(f"PNM File Stream is not file type: {expected}, Error: {got}")
 
         if file_type == PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS:
-            self._sm_n_format = (IntegerBits(1), FractionalBits(14))
+            self._sm_n_format = (IntegerBits(2), FractionalBits(13))
             debug_msg = "Using s2.13 format for Upstream Pre-Equalizer Coefficients PNM data."
         else:
             self._sm_n_format = (IntegerBits(1), FractionalBits(14))

@@ -73,6 +73,7 @@ class TimeResponse(BaseModel):
 
 
 class EchoDetectorReport(BaseModel):
+    algorithm_version: str                    = Field(default="2.0.0", description="Echo detector algorithm/schema version")
     channel_id: int                         = Field(..., description="User-provided channel identifier")
     dataset: EchoDataset                    = Field(..., description="Dataset shape and sampling metadata")
     cable_type: str                         = Field(..., description='Coax type label (e.g., "RG6", "RG59", "RG11")')
@@ -83,6 +84,9 @@ class EchoDetectorReport(BaseModel):
     threshold_frac: float                   = Field(..., description="Fraction of direct-path magnitude used as detection threshold")
     guard_bins: int                         = Field(..., description="Bins skipped immediately after direct path before echo search")
     min_separation_s: float                 = Field(..., description="Minimum separation enforced between accepted echo peaks (seconds)")
+    min_prominence_db: float                = Field(default=0.0, description="Minimum local peak prominence in amplitude dB")
+    window: str                             = Field(default="hann", description="Frequency-domain detector window")
+    response_kind: str                      = Field(default="detector_windowed", description="Semantics of the optional time response")
     max_delay_s: float | None            = Field(..., description="Maximum echo time considered (seconds), None → full span")
     max_peaks: int                          = Field(..., description="Maximum number of echo peaks returned")
     time_response: TimeResponse | None   = Field(default=None, description="Optional time response output for plotting")
@@ -122,6 +126,8 @@ class EchoDetector:
             n_fft = max(MIN_NFFT, 1 << ceil(log2(max(1, N))))
         if n_fft <= 0:
             raise ValueError("n_fft must be positive")
+        if n_fft < N:
+            raise ValueError(f"n_fft ({n_fft}) must be at least the input subcarrier count ({N})")
 
         if channel_id is None:
             channel_id = ChannelId(INVALID_CHANNEL_ID)
@@ -219,6 +225,8 @@ class EchoDetector:
         edge_guard_bins: int = DEFAULT_EDGE_GUARD_BINS,
         fs_time_hz: float | None = None,
         min_detect_distance_ft: float | None = 10.0,
+        min_prominence_db: float = 3.0,
+        adaptive_window_guard: bool = True,
     ) -> EchoDetectorReport:
         """
         Detect echo peaks via IFFT magnitude thresholding and greedy spacing.
@@ -292,11 +300,20 @@ class EchoDetector:
         else:
             raise ValueError('threshold_mode must be "fractional" or "db_down"')
 
-        # Effective guard from explicit bins and minimum detectable distance
+        # Effective guard from explicit bins, minimum detectable distance, and
+        # the frequency-window main-lobe width. For a Hann window the first
+        # null is approximately two IFFT bins per occupied-band sample ratio.
         min_sep_bins = max(0, int(round(min_separation_s * fs)))
         guard_bins_dist = self._bins_for_min_distance(min_detect_distance_ft, fs) if min_detect_distance_ft else 0
-        effective_guard_bins = max(int(guard_bins), int(guard_bins_dist))
+        guard_bins_window = (
+            int(np.ceil(2.0 * n_fft / max(1, self._N)))
+            if adaptive_window_guard and window == "hann"
+            else 0
+        )
+        effective_guard_bins = max(int(guard_bins), int(guard_bins_dist), guard_bins_window)
         start_idx = i0 + max(0, effective_guard_bins)
+        if min_prominence_db < 0.0:
+            raise ValueError("min_prominence_db must be non-negative")
 
         # Stop index (max window), apply edge guard
         if max_delay_s is None:
@@ -312,17 +329,32 @@ class EchoDetector:
             0.0 if (min_detect_distance_ft is None) else float(min_detect_distance_ft),
         )
 
-        # Candidate selection
+        # Candidate selection: threshold first, then require a local maximum and
+        # local prominence. This prevents every sample on a broad main lobe from
+        # being reported as a separate echo.
         if i_stop <= start_idx:
             candidates: list[int] = []
         else:
             thr = thr_frac_resolved * direct_amp
-            idx_range = np.arange(start_idx, i_stop, dtype=int)
-            if edge_guard_bins > 0:
-                idx_range = idx_range[idx_range < (i_stop - edge_guard_bins)]
-            idx_range = idx_range[idx_range != i0]  # keep direct path out even if guard==0
-            candidates = [int(i) for i in idx_range if mag[i] >= thr]
-        self.logger.debug("Candidates above threshold: %d", len(candidates))
+            search_stop = max(start_idx, i_stop - max(0, edge_guard_bins))
+            first_peak = max(start_idx, 1)
+            last_peak_exclusive = min(search_stop, n_fft - 1)
+            prominence_radius = max(2, min_sep_bins, effective_guard_bins // 2)
+            candidates = []
+            for i in range(first_peak, last_peak_exclusive):
+                if i == i0 or mag[i] < thr:
+                    continue
+                if not (mag[i] >= mag[i - 1] and mag[i] > mag[i + 1]):
+                    continue
+                left = mag[max(start_idx, i - prominence_radius):i]
+                right = mag[i + 1:min(search_stop, i + prominence_radius + 1)]
+                if left.size == 0 or right.size == 0:
+                    continue
+                local_base = max(float(np.min(left)), float(np.min(right)), np.finfo(float).tiny)
+                prominence_db = AMP_DB_SCALE * np.log10(float(mag[i]) / local_base)
+                if prominence_db >= min_prominence_db:
+                    candidates.append(i)
+        self.logger.debug("Local peak candidates above threshold/prominence: %d", len(candidates))
 
         # Greedy enforce spacing by amplitude
         candidates.sort(key=lambda i: float(mag[i]), reverse=True)
@@ -374,6 +406,9 @@ class EchoDetector:
             threshold_frac  =   thr_frac_resolved,
             guard_bins      =   effective_guard_bins,
             min_separation_s=   min_separation_s,
+            min_prominence_db=  min_prominence_db,
+            window          =   window,
+            response_kind   =   "detector_windowed",
             max_delay_s     =   max_delay_s,
             max_peaks       =   max_peaks,
             time_response   =   tr,
@@ -401,11 +436,13 @@ class EchoDetector:
         ValueError
             If no echo meets the criteria under the provided settings.
         """
-        rep = self.multi_echo(max_peaks=1, **kwargs)
+        kwargs.pop("max_peaks", None)
+        rep = self.multi_echo(max_peaks=self._n_fft, **kwargs)
         if not rep.echoes:
             raise ValueError("No echo peaks found under current settings.")
-        self.logger.debug("first_echo: bin=%d, amp=%.3f", rep.echoes[0].bin_index, rep.echoes[0].amplitude)
-        return rep.echoes[0]
+        earliest = min(rep.echoes, key=lambda echo: echo.bin_index)
+        self.logger.debug("first_echo: bin=%d, amp=%.3f", earliest.bin_index, earliest.amplitude)
+        return earliest
 
     def ifft_time_series(
         self,

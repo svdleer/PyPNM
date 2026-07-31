@@ -19,6 +19,9 @@ from pypnm.api.routes.docs.pnm.files.schemas import (
     FileQueryResponse,
     HexDumpResponse,
     MacAddressSystemDescriptorResponse,
+    RemoteImpulseAnalysisRequest,
+    RemoteImpulseAnalysisResponse,
+    RemotePnmFileCatalogResponse,
     UploadFileResponse,
 )
 from pypnm.api.routes.docs.pnm.files.service import PnmFileService
@@ -211,8 +214,6 @@ class PnmFileManager:
 
             [API Guide](https://github.com/PyPNMApps/PyPNM/blob/main/docs/api/fast-api/file-manager/file-manager-api.md#6-analyze-pnm-file-via-transaction-id)
             """
-            PnmFileService().get_analysis(request)
-
             output_type = request.analysis.output.type
 
             if output_type == OutputType.JSON:
@@ -228,6 +229,31 @@ class PnmFileManager:
                 return  PnmFileService().get_archive(request)
 
             return JSONResponse(content="Not implemented yet")
+
+        @self.router.get(
+            "/remote/impulseResponse/files/{mac_address}",
+            response_model=RemotePnmFileCatalogResponse,
+            summary="List Existing PNN2/PNN6/PNN7 Files Through File Agents",
+            responses=FAST_API_RESPONSE,
+        )
+        async def list_remote_impulse_files(
+            mac_address: MacAddressStr = Path(..., description="Cable modem MAC address"),
+            direction: str = Query(default="both", pattern="^(downstream|upstream|both)$"),
+        ) -> RemotePnmFileCatalogResponse:
+            """Return sanitized metadata and signed file IDs; no raw paths are exposed."""
+            return await PnmFileService().get_remote_impulse_files(mac_address, direction)
+
+        @self.router.post(
+            "/remote/impulseResponse/analyze",
+            response_model=RemoteImpulseAnalysisResponse,
+            summary="Analyze Existing PNN2/PNN6/PNN7 Data Through File Agents",
+            responses=FAST_API_RESPONSE,
+        )
+        async def analyze_remote_impulse_file(
+            request: RemoteImpulseAnalysisRequest,
+        ) -> RemoteImpulseAnalysisResponse:
+            """Analyze existing file-agent data without modem access, SNMP SETs, or capture side effects."""
+            return await PnmFileService().analyze_remote_impulse(request)
 
         @self.router.get(
             "/getHexdump/transactionID/{transaction_id}",

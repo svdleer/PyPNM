@@ -63,3 +63,46 @@ class MacAddressSystemDescriptorEntry(BaseModel):
 
 class MacAddressSystemDescriptorResponse(BaseModel):
     mac_addresses       : list[MacAddressSystemDescriptorEntry] = Field(..., description="Unique MAC addresses that have registered PNM files.")
+
+
+class RemotePnmFileEntry(BaseModel):
+    """Sanitized metadata for a PNM file available through a file agent."""
+    file_id: str = Field(..., description="Signed opaque identifier used for retrieval")
+    filename: FileName = Field(..., description="Sanitized basename for display")
+    pnm_file_type: str = Field(..., description="PNM type code (PNN2, PNN6, or PNN7)")
+    direction: str = Field(..., description="Signal direction: downstream or upstream")
+    mac_address: MacAddressStr = Field(..., description="MAC address parsed from the PNM payload")
+    channel_id: int = Field(..., description="Channel identifier parsed from the PNM payload")
+    capture_time: int = Field(default=0, description="Capture epoch from the PNM header")
+    size: int = Field(..., ge=0, description="Binary file size in bytes")
+
+
+class RemotePnmFileCatalogResponse(BaseModel):
+    success: bool = Field(..., description="Whether the catalog operation completed")
+    files: list[RemotePnmFileEntry] = Field(default_factory=list)
+    count: int = Field(default=0, ge=0)
+    error: str | None = Field(default=None)
+
+
+class RemoteImpulseAnalysisRequest(BaseModel):
+    mac_address: MacAddressStr = Field(..., description="Cable modem MAC address")
+    direction: str = Field(default="both", pattern="^(downstream|upstream|both)$")
+    file_id: str | None = Field(default=None, description="Optional file ID from the remote catalog; otherwise latest matching file(s) are used")
+
+
+class RemoteImpulseAnalysisResult(BaseModel):
+    file_id: str
+    filename: FileName
+    pnm_file_type: str
+    direction: str
+    analysis: dict
+
+
+class RemoteImpulseAnalysisResponse(BaseModel):
+    success: bool
+    source: str = Field(default="existing_file")
+    mac_address: MacAddressStr
+    direction: str
+    results: list[RemoteImpulseAnalysisResult] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None

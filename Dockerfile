@@ -50,9 +50,10 @@ COPY tools/ /app/tools/
 COPY mibs/ /app/mibs/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 
-# Install package inside venv
+# Install package inside venv. Pin Pydantic explicitly so local and
+# container schema/runtime behavior remain identical.
 RUN pip install --upgrade pip \
- && pip install . \
+ && pip install "pydantic==2.12.5" . \
  && pip install pysnmp-mibs
 
 RUN mkdir -p /app/deploy/config \

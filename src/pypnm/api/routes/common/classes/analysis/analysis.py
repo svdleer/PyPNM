@@ -68,6 +68,7 @@ from pypnm.lib.constants import (
     INVALID_START_VALUE,
     SPEED_OF_LIGHT,
     CableType,
+    CableTypes,
 )
 from pypnm.lib.file_processor import FileProcessor
 from pypnm.lib.log_files import LogFile
@@ -176,6 +177,60 @@ class Analysis:
         propagation velocity factor for distance calculations.
 
     """
+
+    @staticmethod
+    def _docsis_impulse_fft_size(direction: str, spacing_hz: int, carrier_count: int) -> int:
+        """Resolve the physical DOCSIS OFDM/OFDMA FFT size for 25/50 kHz spacing."""
+        matrix = {
+            ("downstream", 25_000): 8192,
+            ("downstream", 50_000): 4096,
+            ("upstream", 25_000): 4096,
+            ("upstream", 50_000): 2048,
+        }
+        n_fft = matrix.get((direction, int(spacing_hz)))
+        if n_fft is None:
+            n_fft = max(1024, 1 << (max(1, carrier_count) - 1).bit_length())
+        if carrier_count > n_fft:
+            raise ValueError(
+                f"{direction} carrier count {carrier_count} exceeds physical FFT size {n_fft} "
+                f"for {spacing_hz} Hz spacing"
+            )
+        return n_fft
+
+    @classmethod
+    def _impulse_echo_report(
+        cls,
+        values: ComplexArray,
+        subcarrier_spacing: FrequencyHz,
+        direction: str,
+        channel_id: ChannelId,
+        cable_type: str = "RG6",
+    ) -> EchoDetectorReport:
+        """Build the detector-windowed response from raw decoded complex coefficients."""
+        n_fft = cls._docsis_impulse_fft_size(direction, int(subcarrier_spacing), len(values))
+        detector = EchoDetector(
+            freq_data=values,
+            subcarrier_spacing_hz=float(subcarrier_spacing),
+            n_fft=n_fft,
+            cable_type=cast(CableTypes, cable_type),
+            channel_id=channel_id,
+        )
+        adaptive_guard = int(np.ceil(2.0 * n_fft / max(1, len(values))))
+        return detector.multi_echo(
+            threshold_mode="db_down",
+            threshold_db_down=60.0,
+            normalize_power=True,
+            guard_bins=adaptive_guard,
+            min_separation_s=8.0 / detector.fs,
+            max_delay_s=3.5e-6,
+            max_peaks=3,
+            include_time_response=True,
+            direct_at_zero=True,
+            window="hann",
+            min_detect_distance_ft=None,
+            min_prominence_db=3.0,
+            adaptive_window_guard=True,
+        )
 
     def __init__(self, analysis_type: AnalysisType,
                  msg_response: MessageResponse,
@@ -735,55 +790,13 @@ class Analysis:
             magnitude        = ComplexArrayOps.to_list(gd_results.group_delay_us),
         )
 
-        magn_linear = np.power(10.0, np.asarray(magnitudes_db, dtype=np.float64) / 20.0)
-        phases      = np.angle(complex_arr)
-        H_smooth    = magn_linear * np.exp(1j * phases)
-
-        N = len(values)
-        n_fft = 1 << (N - 1).bit_length()
-        if n_fft < 1024:
-            n_fft = 1024
-
-        fs = float(N) * float(subcarrier_spacing)
-        max_delay_s = 3.5e-6
-
-        v = SPEED_OF_LIGHT * CABLE_VF.get(cable_type.name, 0.87)
-        max_dist_m = 0.5 * v * max_delay_s
-        i_stop = int(max_delay_s * fs)
-        log.debug(
-            "EchoDetector window: fs=%.3f Hz, n_fft=%d, i_stop=%d bins, max_delay=%.2fus, max_dist≈%.1f m",
-            fs, n_fft, i_stop, max_delay_s * 1e6, max_dist_m
+        echo_report = cls._impulse_echo_report(
+            values=values,
+            subcarrier_spacing=subcarrier_spacing,
+            direction="downstream",
+            channel_id=channel_id,
+            cable_type=cable_type.name,
         )
-
-        det = EchoDetector(
-            freq_data               = H_smooth.tolist(),
-            subcarrier_spacing_hz   = float(subcarrier_spacing),
-            n_fft                   = 4096,
-            cable_type              = cable_type.name,
-            channel_id              = channel_id,
-        )
-
-        max_delay_s_used = 3.5e-6
-        echo_report: EchoDetectorReport = det.multi_echo(
-            threshold_mode        = "db_down",
-            threshold_db_down     = 60.0,
-            normalize_power       = True,
-            guard_bins            = 16,
-            min_separation_s      = 8.0 / det.fs,
-            max_delay_s           = max_delay_s_used,
-            max_peaks             = 3,
-            include_time_response = False,
-            direct_at_zero        = True,
-            window                = "hann",
-        )
-
-        i_stop     = int(np.ceil(max_delay_s_used * det.fs))
-        edge_guard = 8
-        if echo_report.echoes:
-            echo_report.echoes = [
-                e for e in echo_report.echoes
-                if (e.bin_index < (i_stop - edge_guard))
-            ]
 
         echo_rpt = EchoDatasetModel(type = EchoDetectorType.IFFT, report = echo_report)
 
@@ -1068,56 +1081,14 @@ class Analysis:
             magnitude        = ComplexArrayOps.to_list(gd_results.group_delay_us),
         )
 
-        magn_linear = np.power(10.0, np.asarray(magnitudes_db, dtype=np.float64) / 20.0)
-        phases      = np.angle(complex_arr)
-        H_smooth    = magn_linear * np.exp(1j * phases)
-
-        N      = len(values)
-        n_fft  = 1 << (N - 1).bit_length()
-        if n_fft < 1024:
-            n_fft = 1024
-
-        fs = float(N) * float(subcarrier_spacing)
-        max_delay_s_used = 3.5e-6
-
         cable_type_name = "RG6"
-        v               = SPEED_OF_LIGHT * CABLE_VF.get(cable_type_name, 0.87)
-        max_dist_m      = 0.5 * v * max_delay_s_used
-        i_stop          = int(max_delay_s_used * fs)
-        log.debug(
-            "US OFDMA Pre-Eq EchoDetector window: fs=%.3f Hz, n_fft=%d, i_stop=%d bins, "
-            "max_delay=%.2fus, max_dist≈%.1f m",
-            fs, n_fft, i_stop, max_delay_s_used * 1e6, max_dist_m
+        echo_report = cls._impulse_echo_report(
+            values=values,
+            subcarrier_spacing=subcarrier_spacing,
+            direction="upstream",
+            channel_id=channel_id,
+            cable_type=cable_type_name,
         )
-
-        det = EchoDetector(
-            freq_data               = H_smooth.tolist(),
-            subcarrier_spacing_hz   = float(subcarrier_spacing),
-            n_fft                   = 4096,
-            cable_type              = cable_type_name,
-            channel_id              = channel_id,
-        )
-
-        echo_report: EchoDetectorReport = det.multi_echo(
-            threshold_mode        = "db_down",
-            threshold_db_down     = 60.0,
-            normalize_power       = True,
-            guard_bins            = 16,
-            min_separation_s      = 8.0 / det.fs,
-            max_delay_s           = max_delay_s_used,
-            max_peaks             = 3,
-            include_time_response = False,
-            direct_at_zero        = True,
-            window                = "hann",
-        )
-
-        i_stop     = int(np.ceil(max_delay_s_used * det.fs))
-        edge_guard = 8
-        if echo_report.echoes:
-            echo_report.echoes = [
-                e for e in echo_report.echoes
-                if (e.bin_index < (i_stop - edge_guard))
-            ]
 
         echo_rpt = EchoDatasetModel(
             type    = EchoDetectorType.IFFT,
@@ -1738,55 +1709,13 @@ class Analysis:
             magnitude        = ComplexArrayOps.to_list(gd_results.group_delay_us),
         )
 
-        magn_linear = np.power(10.0, np.asarray(magnitudes_db, dtype=np.float64) / 20.0)
-        phases      = np.angle(complex_arr)
-        H_smooth    = magn_linear * np.exp(1j * phases)
-
-        N      = len(values)
-        n_fft  = 1 << (N - 1).bit_length()
-        if n_fft < 1024:
-            n_fft = 1024
-
-        fs = float(N) * float(subcarrier_spacing)
-        max_delay_s_used = 3.5e-6
-
-        v          = SPEED_OF_LIGHT * CABLE_VF.get(cable_type.name, 0.87)
-        max_dist_m = 0.5 * v * max_delay_s_used
-        i_stop     = int(max_delay_s_used * fs)
-        log.debug(
-            "DS ChanEst (model) EchoDetector window: fs=%.3f Hz, n_fft=%d, i_stop=%d bins, "
-            "max_delay=%.2fus, max_dist≈%.1f m, cable_type=%s",
-            fs, n_fft, i_stop, max_delay_s_used * 1e6, max_dist_m, cable_type.name,
+        echo_report = cls._impulse_echo_report(
+            values=values,
+            subcarrier_spacing=subcarrier_spacing,
+            direction="downstream",
+            channel_id=cast(ChannelId, int(getattr(model, "channel_id", INVALID_CHANNEL_ID))),
+            cable_type=cable_type.name,
         )
-
-        det = EchoDetector(
-            freq_data               = H_smooth.tolist(),
-            subcarrier_spacing_hz   = float(subcarrier_spacing),
-            n_fft                   = 4096,
-            cable_type              = cable_type.name,
-            channel_id              = cast(ChannelId, int(getattr(model, "channel_id", INVALID_CHANNEL_ID))),
-        )
-
-        echo_report: EchoDetectorReport = det.multi_echo(
-            threshold_mode        = "db_down",
-            threshold_db_down     = 60.0,
-            normalize_power       = True,
-            guard_bins            = 16,
-            min_separation_s      = 8.0 / det.fs,
-            max_delay_s           = max_delay_s_used,
-            max_peaks             = 3,
-            include_time_response = False,
-            direct_at_zero        = True,
-            window                = "hann",
-        )
-
-        i_stop     = int(np.ceil(max_delay_s_used * det.fs))
-        edge_guard = 8
-        if echo_report.echoes:
-            echo_report.echoes = [
-                e for e in echo_report.echoes
-                if (e.bin_index < (i_stop - edge_guard))
-            ]
 
         echo_rpt = EchoDatasetModel(type=EchoDetectorType.IFFT, report=echo_report)
 
@@ -2182,56 +2111,14 @@ class Analysis:
             magnitude        = ComplexArrayOps.to_list(gd_results.group_delay_us),
         )
 
-        magn_linear = np.power(10.0, np.asarray(magnitudes_db, dtype=np.float64) / 20.0)
-        phases      = np.angle(complex_arr)
-        H_smooth    = magn_linear * np.exp(1j * phases)
-
-        N      = len(values)
-        n_fft  = 1 << (N - 1).bit_length()
-        if n_fft < 1024:
-            n_fft = 1024
-
-        fs = float(N) * float(subcarrier_spacing)
-        max_delay_s_used = 3.5e-6
-
         cable_type_name = "RG6"
-        v               = SPEED_OF_LIGHT * CABLE_VF.get(cable_type_name, 0.87)
-        max_dist_m      = 0.5 * v * max_delay_s_used
-        i_stop          = int(max_delay_s_used * fs)
-        log.debug(
-            "US OFDMA Pre-Eq (model) EchoDetector window: fs=%.3f Hz, n_fft=%d, i_stop=%d bins, "
-            "max_delay=%.2fus, max_dist≈%.1f m",
-            fs, n_fft, i_stop, max_delay_s_used * 1e6, max_dist_m
+        echo_report = cls._impulse_echo_report(
+            values=values,
+            subcarrier_spacing=subcarrier_spacing,
+            direction="upstream",
+            channel_id=ChannelId(getattr(model, "channel_id", INVALID_CHANNEL_ID)),
+            cable_type=cable_type_name,
         )
-
-        det = EchoDetector(
-            freq_data               = H_smooth.tolist(),
-            subcarrier_spacing_hz   = float(subcarrier_spacing),
-            n_fft                   = 4096,
-            cable_type              = cable_type_name,
-            channel_id              = ChannelId(getattr(model, "channel_id", INVALID_CHANNEL_ID)),
-        )
-
-        echo_report: EchoDetectorReport = det.multi_echo(
-            threshold_mode        = "db_down",
-            threshold_db_down     = 60.0,
-            normalize_power       = True,
-            guard_bins            = 16,
-            min_separation_s      = 8.0 / det.fs,
-            max_delay_s           = max_delay_s_used,
-            max_peaks             = 3,
-            include_time_response = False,
-            direct_at_zero        = True,
-            window                = "hann",
-        )
-
-        i_stop     = int(np.ceil(max_delay_s_used * det.fs))
-        edge_guard = 8
-        if echo_report.echoes:
-            echo_report.echoes = [
-                e for e in echo_report.echoes
-                if (e.bin_index < (i_stop - edge_guard))
-            ]
 
         echo_rpt = EchoDatasetModel(
             type    = EchoDetectorType.IFFT,
