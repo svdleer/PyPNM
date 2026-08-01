@@ -66,6 +66,7 @@ class CMTSModemResponse(BaseModel):
     source: Optional[str] = Field(default=None, description="Inventory source")
     requested_limit: Optional[int] = Field(default=None, description="Safety limit used for the inventory walk")
     collected_at: Optional[str] = Field(default=None, description="Inventory collection timestamp")
+    revision_at: Optional[str] = Field(default=None, description="Latest full or targeted inventory revision timestamp")
     critical_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from critical modem MAC tables")
     raw_legacy_mac_count: Optional[int] = Field(default=None, description="Rows returned by the legacy registration MAC table")
     raw_d3_mac_count: Optional[int] = Field(default=None, description="Rows returned by the DOCSIS 3.x registration MAC table")

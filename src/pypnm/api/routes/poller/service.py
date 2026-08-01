@@ -242,6 +242,7 @@ class PollerService:
                 critical_oid_errors JSON NULL,
                 raw_legacy_mac_count INT NULL,
                 raw_d3_mac_count INT NULL,
+                revision_at DATETIME NOT NULL,
                 PRIMARY KEY (cmts_ip),
                 INDEX idx_inventory_snapshot_cmts (cmts),
                 INDEX idx_inventory_snapshot_collected (collected_at)
@@ -326,6 +327,21 @@ class PollerService:
                 ("snapshot_id",),
             ):
                 raise RuntimeError("Failed to add required snapshot_id column") from exc
+
+        try:
+            self._execute(
+                "ALTER TABLE cmts_inventory_snapshot ADD COLUMN revision_at DATETIME NULL"
+            )
+        except Exception as exc:
+            if not self._query(
+                "SHOW COLUMNS FROM cmts_inventory_snapshot LIKE %s",
+                ("revision_at",),
+            ):
+                raise RuntimeError("Failed to add required inventory revision column") from exc
+        self._execute(
+            "UPDATE cmts_inventory_snapshot "
+            "SET revision_at=collected_at WHERE revision_at IS NULL"
+        )
 
         # Indexes for listing/filtering (duplicate-index errors are harmless).
         for idx_ddl in [
@@ -994,13 +1010,14 @@ class PollerService:
                 (cmts_ip, snapshot_id),
             )
 
+        revision_at = self._now()
         self._execute(
             """
             INSERT INTO cmts_inventory_snapshot
                 (cmts_ip, cmts, snapshot_id, complete, truncated, requested_limit,
                  row_count, collected_at, source, source_poller, critical_oid_errors,
-                 raw_legacy_mac_count, raw_d3_mac_count)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 raw_legacy_mac_count, raw_d3_mac_count, revision_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON DUPLICATE KEY UPDATE
                 cmts=VALUES(cmts), snapshot_id=VALUES(snapshot_id),
                 complete=VALUES(complete), truncated=VALUES(truncated),
@@ -1009,7 +1026,8 @@ class PollerService:
                 source_poller=VALUES(source_poller),
                 critical_oid_errors=VALUES(critical_oid_errors),
                 raw_legacy_mac_count=VALUES(raw_legacy_mac_count),
-                raw_d3_mac_count=VALUES(raw_d3_mac_count)
+                raw_d3_mac_count=VALUES(raw_d3_mac_count),
+                revision_at=VALUES(revision_at)
             """,
             (
                 cmts_ip,
@@ -1025,6 +1043,7 @@ class PollerService:
                 json.dumps(metadata.get("critical_oid_errors") or {}),
                 metadata.get("raw_legacy_mac_count"),
                 metadata.get("raw_d3_mac_count"),
+                revision_at,
             ),
         )
 
@@ -1054,12 +1073,47 @@ class PollerService:
             except Exception:
                 errors = {}
         row["critical_oid_errors"] = errors if isinstance(errors, dict) else {}
-        collected = row.get("collected_at")
-        if isinstance(collected, datetime):
-            row["collected_at"] = collected.replace(tzinfo=timezone.utc).isoformat()
-        elif collected is not None:
-            row["collected_at"] = str(collected)
+        for field in ("collected_at", "revision_at"):
+            value = row.get(field)
+            if isinstance(value, datetime):
+                row[field] = value.replace(tzinfo=timezone.utc).isoformat()
+            elif value is not None:
+                row[field] = str(value)
         return row
+
+    def list_inventory_snapshots(self) -> List[Dict[str, Any]]:
+        """Return lightweight revision metadata for all current CMTS inventories."""
+        rows = self._query(
+            "SELECT cmts_ip, cmts, snapshot_id, collected_at, revision_at "
+            "FROM cmts_inventory_snapshot"
+        )
+        snapshots: List[Dict[str, Any]] = []
+        for source in rows:
+            row = dict(source)
+            for field in ("collected_at", "revision_at"):
+                value = row.get(field)
+                if isinstance(value, datetime):
+                    row[field] = value.replace(tzinfo=timezone.utc).isoformat()
+                elif value is not None:
+                    row[field] = str(value)
+            snapshots.append(row)
+        return snapshots
+
+    def _touch_inventory_revision(self, cmts: str | None, cmts_ip: str | None = None) -> None:
+        """Advance cache revision after a targeted inventory-row refresh."""
+        where = []
+        params: List[Any] = [self._now()]
+        if cmts:
+            where.append("LOWER(cmts)=LOWER(%s)")
+            params.append(str(cmts))
+        if cmts_ip:
+            where.append("cmts_ip=%s")
+            params.append(str(cmts_ip))
+        if where:
+            self._execute(
+                f"UPDATE cmts_inventory_snapshot SET revision_at=%s WHERE {' OR '.join(where)}",
+                tuple(params),
+            )
 
     def _purge_stale_inventory(self, retention_days: int) -> int:
         days = max(1, int(retention_days or 30))
@@ -1934,6 +1988,13 @@ class PollerService:
                     "UPDATE modem_inventory_current SET vendor=%s, model=%s, software_version=%s, updated_at=%s WHERE mac=%s",
                     (vendor, model_name, software_ver, self._now(), mac),
                 )
+            # A completed single-modem refresh changes data outside the full
+            # snapshot generation. Advance its CMTS revision so every GUI
+            # Redis entry derived from the prior revision is rejected.
+            self._touch_inventory_revision(
+                cmts or (modem or {}).get("cmts"),
+                (modem or {}).get("cmts_ip"),
+            )
             self._execute(
                 "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s",
                 ("completed", self._now(), req_id),

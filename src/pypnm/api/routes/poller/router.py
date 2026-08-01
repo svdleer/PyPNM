@@ -110,13 +110,26 @@ def list_inventory_modems(
             "truncated": snapshot.get("truncated") is True,
             "requested_limit": snapshot.get("requested_limit"),
             "row_count": snapshot.get("row_count"),
+            "snapshot_id": snapshot.get("snapshot_id"),
             "collected_at": snapshot.get("collected_at"),
+            "revision_at": snapshot.get("revision_at"),
             "inventory_source": snapshot.get("source"),
             "critical_oid_errors": snapshot.get("critical_oid_errors") or {},
             "raw_legacy_mac_count": snapshot.get("raw_legacy_mac_count"),
             "raw_d3_mac_count": snapshot.get("raw_d3_mac_count"),
         })
     return response
+
+
+@router.get("/inventory/snapshots/current")
+def list_current_inventory_snapshots() -> dict:
+    """Return small cache-revision records without loading modem rows."""
+    try:
+        snapshots = poller_service.list_inventory_snapshots()
+    except Exception as exc:
+        logger.error("inventory/snapshots/current DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "snapshots": snapshots}
 
 
 @router.get("/inventory/modems/{mac_address}")

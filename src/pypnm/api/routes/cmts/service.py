@@ -331,6 +331,7 @@ class CMTSModemService:
                     'truncated': (snapshot or {}).get('truncated') is True,
                     'requested_limit': (snapshot or {}).get('requested_limit'),
                     'collected_at': snapshot_collected_at,
+                    'revision_at': (snapshot or {}).get('revision_at'),
                     'critical_oid_errors': (snapshot or {}).get('critical_oid_errors') or {},
                     'raw_legacy_mac_count': (snapshot or {}).get('raw_legacy_mac_count'),
                     'raw_d3_mac_count': (snapshot or {}).get('raw_d3_mac_count'),

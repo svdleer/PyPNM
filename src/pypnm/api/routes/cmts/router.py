@@ -108,6 +108,7 @@ async def get_cmts_modems(
             source=result.get('source'),
             requested_limit=result.get('requested_limit'),
             collected_at=result.get('collected_at'),
+            revision_at=result.get('revision_at'),
             critical_oid_errors=result.get('critical_oid_errors') or {},
             raw_legacy_mac_count=result.get('raw_legacy_mac_count'),
             raw_d3_mac_count=result.get('raw_d3_mac_count'),
