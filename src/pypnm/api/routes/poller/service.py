@@ -148,6 +148,8 @@ class PollerService:
                 ip VARCHAR(45) NULL,
                 cmts VARCHAR(128) NOT NULL,
                 cmts_ip VARCHAR(45) NULL,
+                cmts_index VARCHAR(128) NULL,
+                docsif3_index VARCHAR(128) NULL,
                 fiber_node VARCHAR(128) NULL,
                 cable_mac VARCHAR(128) NULL,
                 mac_domain VARCHAR(128) NULL,
@@ -157,7 +159,10 @@ class PollerService:
                 model VARCHAR(128) NULL,
                 upstream_interface VARCHAR(128) NULL,
                 upstream_ifindex BIGINT NULL,
+                ofdm_ifindex BIGINT NULL,
                 ofdma_ifindex BIGINT NULL,
+                ofdm_channel_count INT NULL,
+                ofdma_channel_count INT NULL,
                 ofdma_rf_port_ifindex BIGINT NULL,
                 ofdm_enabled BOOLEAN NULL,
                 ofdma_enabled BOOLEAN NULL,
@@ -234,6 +239,7 @@ class PollerService:
                 snapshot_id CHAR(36) NOT NULL,
                 complete BOOLEAN NOT NULL DEFAULT FALSE,
                 truncated BOOLEAN NOT NULL DEFAULT FALSE,
+                capability_enriched BOOLEAN NOT NULL DEFAULT FALSE,
                 requested_limit INT NOT NULL,
                 row_count INT NOT NULL DEFAULT 0,
                 collected_at DATETIME NOT NULL,
@@ -274,6 +280,12 @@ class PollerService:
             "partial_service_downstream": "BOOLEAN NULL",
             "partial_service_upstream": "BOOLEAN NULL",
             "partial_service_state": "VARCHAR(16) NULL",
+            "cmts_index": "VARCHAR(128) NULL",
+            "docsif3_index": "VARCHAR(128) NULL",
+            "ofdm_ifindex": "BIGINT NULL",
+            "ofdm_channel_count": "INT NULL",
+            "ofdma_channel_count": "INT NULL",
+            "snapshot_id": "CHAR(36) NULL",
         }
         existing_inventory_columns = {
             str(row.get("Field"))
@@ -317,27 +329,37 @@ class PollerService:
             except Exception:
                 pass
 
-        try:
-            self._execute(
-                "ALTER TABLE modem_inventory_current ADD COLUMN snapshot_id CHAR(36) NULL"
+        snapshot_columns = {
+            "revision_at": "DATETIME NULL",
+            "capability_enriched": "BOOLEAN NOT NULL DEFAULT FALSE",
+        }
+        existing_snapshot_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM cmts_inventory_snapshot")
+        }
+        missing_snapshot_columns = [
+            name for name in snapshot_columns if name not in existing_snapshot_columns
+        ]
+        if missing_snapshot_columns:
+            clauses = ", ".join(
+                f"ADD COLUMN `{name}` {snapshot_columns[name]}"
+                for name in missing_snapshot_columns
             )
-        except Exception as exc:
-            if not self._query(
-                "SHOW COLUMNS FROM modem_inventory_current LIKE %s",
-                ("snapshot_id",),
-            ):
-                raise RuntimeError("Failed to add required snapshot_id column") from exc
-
-        try:
-            self._execute(
-                "ALTER TABLE cmts_inventory_snapshot ADD COLUMN revision_at DATETIME NULL"
-            )
-        except Exception as exc:
-            if not self._query(
-                "SHOW COLUMNS FROM cmts_inventory_snapshot LIKE %s",
-                ("revision_at",),
-            ):
-                raise RuntimeError("Failed to add required inventory revision column") from exc
+            try:
+                self._execute(f"ALTER TABLE cmts_inventory_snapshot {clauses}")
+            except Exception as exc:
+                remaining = {
+                    str(row.get("Field"))
+                    for row in self._query("SHOW COLUMNS FROM cmts_inventory_snapshot")
+                }
+                still_missing = [
+                    name for name in missing_snapshot_columns if name not in remaining
+                ]
+                if still_missing:
+                    raise RuntimeError(
+                        "Failed to add required inventory snapshot columns: "
+                        + ", ".join(still_missing)
+                    ) from exc
         self._execute(
             "UPDATE cmts_inventory_snapshot "
             "SET revision_at=collected_at WHERE revision_at IS NULL"
@@ -868,6 +890,7 @@ class PollerService:
                 "requested_limit": int(response_payload.get("requested_limit") or requested_limit),
                 "collected_at": response_payload.get("collected_at") or self._now(),
                 "source": response_payload.get("source") or "snmp-live",
+                "capability_enriched": response_payload.get("capability_enriched") is True,
                 "critical_oid_errors": response_payload.get("critical_oid_errors") or {},
                 "raw_legacy_mac_count": response_payload.get("raw_legacy_mac_count"),
                 "raw_d3_mac_count": response_payload.get("raw_d3_mac_count"),
@@ -907,7 +930,6 @@ class PollerService:
                 return False
             return None
 
-        # Build all value tuples first (no lock needed)
         all_values = []
         for r in rows:
             mac = (r.get("mac_address") or r.get("mac") or "").lower().replace("-", ":")
@@ -918,6 +940,8 @@ class PollerService:
                 r.get("ip_address") or r.get("ip"),
                 r.get("cmts") or "unknown",
                 r.get("cmts_ip"),
+                r.get("cmts_index"),
+                r.get("docsif3_index"),
                 r.get("fiber_node"),
                 r.get("cable_mac"),
                 r.get("mac_domain"),
@@ -927,7 +951,10 @@ class PollerService:
                 r.get("model"),
                 r.get("upstream_interface"),
                 _to_int(r.get("upstream_ifindex") or r.get("md_if_index")),
+                _to_int(r.get("ofdm_ifindex")),
                 _to_int(r.get("ofdma_ifindex")),
+                _to_int(r.get("ofdm_channel_count")),
+                _to_int(r.get("ofdma_channel_count")),
                 _to_int(r.get("ofdma_rf_port_ifindex") or r.get("rf_port_ifindex")),
                 _to_bool(r.get("ofdm_enabled")),
                 _to_bool(r.get("ofdma_enabled")),
@@ -945,33 +972,65 @@ class PollerService:
 
         sql = """
             INSERT INTO modem_inventory_current
-                (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
-                 upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
+                (mac, ip, cmts, cmts_ip, cmts_index, docsif3_index,
+                 fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
+                 upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex,
+                 ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex,
+                 ofdm_enabled, ofdma_enabled, partial_service,
                  partial_service_downstream, partial_service_upstream, partial_service_state,
-                 software_version, first_seen_at, last_seen_at, updated_at, source_poller, snapshot_id)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 software_version, first_seen_at, last_seen_at, updated_at,
+                 source_poller, snapshot_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON DUPLICATE KEY UPDATE
-              ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
-              cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
-              vendor=VALUES(vendor), model=VALUES(model), upstream_interface=VALUES(upstream_interface),
-              upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
-              ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
-              ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
+              ip=COALESCE(VALUES(ip), ip),
+              cmts=COALESCE(NULLIF(VALUES(cmts), ''), cmts),
+              cmts_ip=COALESCE(VALUES(cmts_ip), cmts_ip),
+              cmts_index=COALESCE(NULLIF(VALUES(cmts_index), ''), cmts_index),
+              docsif3_index=COALESCE(NULLIF(VALUES(docsif3_index), ''), docsif3_index),
+              fiber_node=COALESCE(NULLIF(VALUES(fiber_node), ''), fiber_node),
+              cable_mac=COALESCE(NULLIF(VALUES(cable_mac), ''), cable_mac),
+              mac_domain=COALESCE(NULLIF(VALUES(mac_domain), ''), mac_domain),
+              status=COALESCE(NULLIF(VALUES(status), ''), status),
+              docsis_version=CASE
+                WHEN docsis_version LIKE '%4.0%' THEN docsis_version
+                WHEN VALUES(docsis_version) LIKE '%4.0%' THEN VALUES(docsis_version)
+                WHEN docsis_version LIKE '%3.1%' THEN docsis_version
+                WHEN VALUES(docsis_version) LIKE '%3.1%' THEN VALUES(docsis_version)
+                ELSE COALESCE(NULLIF(VALUES(docsis_version), ''), docsis_version)
+              END,
+              vendor=COALESCE(NULLIF(VALUES(vendor), ''), vendor),
+              model=COALESCE(NULLIF(VALUES(model), ''), model),
+              upstream_interface=COALESCE(NULLIF(VALUES(upstream_interface), ''), upstream_interface),
+              upstream_ifindex=COALESCE(NULLIF(VALUES(upstream_ifindex), 0), upstream_ifindex),
+              ofdm_ifindex=COALESCE(NULLIF(VALUES(ofdm_ifindex), 0), ofdm_ifindex),
+              ofdma_ifindex=COALESCE(NULLIF(VALUES(ofdma_ifindex), 0), ofdma_ifindex),
+              ofdm_channel_count=CASE
+                WHEN VALUES(ofdm_channel_count) > COALESCE(ofdm_channel_count, 0)
+                THEN VALUES(ofdm_channel_count) ELSE ofdm_channel_count END,
+              ofdma_channel_count=CASE
+                WHEN VALUES(ofdma_channel_count) > COALESCE(ofdma_channel_count, 0)
+                THEN VALUES(ofdma_channel_count) ELSE ofdma_channel_count END,
+              ofdma_rf_port_ifindex=COALESCE(NULLIF(VALUES(ofdma_rf_port_ifindex), 0), ofdma_rf_port_ifindex),
+              ofdm_enabled=CASE
+                WHEN ofdm_enabled=TRUE OR VALUES(ofdm_enabled)=TRUE THEN TRUE
+                ELSE COALESCE(VALUES(ofdm_enabled), ofdm_enabled) END,
+              ofdma_enabled=CASE
+                WHEN ofdma_enabled=TRUE OR VALUES(ofdma_enabled)=TRUE THEN TRUE
+                ELSE COALESCE(VALUES(ofdma_enabled), ofdma_enabled) END,
               partial_service=COALESCE(VALUES(partial_service), partial_service),
               partial_service_downstream=COALESCE(VALUES(partial_service_downstream), partial_service_downstream),
               partial_service_upstream=COALESCE(VALUES(partial_service_upstream), partial_service_upstream),
               partial_service_state=COALESCE(VALUES(partial_service_state), partial_service_state),
-              software_version=VALUES(software_version),
+              software_version=COALESCE(NULLIF(VALUES(software_version), ''), software_version),
               last_seen_at=VALUES(last_seen_at),
               updated_at=VALUES(updated_at), source_poller=VALUES(source_poller),
               snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id)
         """
 
-        # Process in batches of 500, releasing the lock between batches
-        # so reads are not starved for tens of seconds.
-        BATCH = 500
-        for i in range(0, len(all_values), BATCH):
-            batch = all_values[i:i + BATCH]
+        batch_size = 500
+        for i in range(0, len(all_values), batch_size):
+            batch = all_values[i:i + batch_size]
             with self._db_lock:
                 conn = self._connect()
                 cur = conn.cursor()
@@ -980,6 +1039,46 @@ class PollerService:
             inserted += len(batch)
 
         return inserted
+
+    def persist_inventory_generation(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        cmts_hostname: str,
+        cmts_ip: str,
+        metadata: Dict[str, Any],
+        source_poller: Optional[str] = "live-gui",
+    ) -> Dict[str, Any]:
+        """Persist one externally collected generation without triggering discovery."""
+        cmts_name = str(cmts_hostname or "").strip()
+        cmts_address = str(cmts_ip or "").strip()
+        if not cmts_name or not cmts_address:
+            raise ValueError("cmts_hostname and cmts_ip are required")
+
+        snapshot_id = str(uuid.uuid4())
+        stamped_rows: List[Dict[str, Any]] = []
+        for source in rows or []:
+            if not isinstance(source, dict):
+                continue
+            row = dict(source)
+            row["cmts"] = cmts_name
+            row["cmts_ip"] = cmts_address
+            stamped_rows.append(row)
+
+        written = self._upsert_inventory_rows(
+            stamped_rows,
+            source_poller=source_poller,
+            snapshot_id=snapshot_id,
+        )
+        self._record_inventory_snapshot(
+            cmts=cmts_name,
+            cmts_ip=cmts_address,
+            snapshot_id=snapshot_id,
+            metadata=metadata,
+            row_count=written,
+            source_poller=source_poller,
+        )
+        return {"snapshot_id": snapshot_id, "row_count": written}
 
     def _record_inventory_snapshot(
         self,
@@ -1014,13 +1113,15 @@ class PollerService:
         self._execute(
             """
             INSERT INTO cmts_inventory_snapshot
-                (cmts_ip, cmts, snapshot_id, complete, truncated, requested_limit,
+                (cmts_ip, cmts, snapshot_id, complete, truncated,
+                 capability_enriched, requested_limit,
                  row_count, collected_at, source, source_poller, critical_oid_errors,
                  raw_legacy_mac_count, raw_d3_mac_count, revision_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON DUPLICATE KEY UPDATE
                 cmts=VALUES(cmts), snapshot_id=VALUES(snapshot_id),
                 complete=VALUES(complete), truncated=VALUES(truncated),
+                capability_enriched=VALUES(capability_enriched),
                 requested_limit=VALUES(requested_limit), row_count=VALUES(row_count),
                 collected_at=VALUES(collected_at), source=VALUES(source),
                 source_poller=VALUES(source_poller),
@@ -1035,6 +1136,7 @@ class PollerService:
                 snapshot_id,
                 1 if metadata.get("complete") is True else 0,
                 1 if metadata.get("truncated") is True else 0,
+                1 if metadata.get("capability_enriched") is True else 0,
                 int(metadata.get("requested_limit") or self._cm_modem_limit_default()),
                 int(row_count),
                 collected_at,
@@ -1066,6 +1168,7 @@ class PollerService:
         row = dict(rows[0])
         row["complete"] = bool(row.get("complete"))
         row["truncated"] = bool(row.get("truncated"))
+        row["capability_enriched"] = bool(row.get("capability_enriched"))
         errors = row.get("critical_oid_errors")
         if isinstance(errors, str):
             try:
@@ -1084,12 +1187,16 @@ class PollerService:
     def list_inventory_snapshots(self) -> List[Dict[str, Any]]:
         """Return lightweight revision metadata for all current CMTS inventories."""
         rows = self._query(
-            "SELECT cmts_ip, cmts, snapshot_id, collected_at, revision_at "
+            "SELECT cmts_ip, cmts, snapshot_id, complete, truncated, "
+            "capability_enriched, requested_limit, row_count, collected_at, revision_at "
             "FROM cmts_inventory_snapshot"
         )
         snapshots: List[Dict[str, Any]] = []
         for source in rows:
             row = dict(source)
+            row["complete"] = bool(row.get("complete"))
+            row["truncated"] = bool(row.get("truncated"))
+            row["capability_enriched"] = bool(row.get("capability_enriched"))
             for field in ("collected_at", "revision_at"):
                 value = row.get(field)
                 if isinstance(value, datetime):
@@ -1275,6 +1382,7 @@ class PollerService:
                         "row_count": written,
                         "complete": fetch_result.get("complete") is True,
                         "truncated": fetch_result.get("truncated") is True,
+                        "capability_enriched": fetch_result.get("capability_enriched") is True,
                         "requested_limit": fetch_result.get("requested_limit"),
                         "collected_at": fetch_result.get("collected_at"),
                         "critical_oid_errors": fetch_result.get("critical_oid_errors") or {},
@@ -1650,9 +1758,12 @@ class PollerService:
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
         marker = "%s"
         rows = self._query(
-            "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, "
-            "partial_service_downstream, partial_service_upstream, partial_service_state, software_version, updated_at "
+            "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
+            "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
+            "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
+            "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
+            "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
+            "partial_service_upstream, partial_service_state, software_version, updated_at "
             f"FROM modem_inventory_current{where_sql} ORDER BY cmts ASC, mac ASC LIMIT {marker}",
             tuple(params + [limit]),
         )
@@ -1662,9 +1773,12 @@ class PollerService:
         marker = "%s"
         mac_norm = (mac_address or "").lower().replace(":", "").replace("-", "")
         rows = self._query(
-            "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, "
-            "partial_service_downstream, partial_service_upstream, partial_service_state, software_version, updated_at "
+            "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
+            "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
+            "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
+            "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
+            "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
+            "partial_service_upstream, partial_service_state, software_version, updated_at "
             f"FROM modem_inventory_current WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = {marker} LIMIT 1",
             (mac_norm,),
         )
@@ -1689,9 +1803,12 @@ class PollerService:
             batch = normalized[i:i+500]
             placeholders = ",".join(["%s"] * len(batch))
             rows = self._query(
-                "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-                "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, "
-                "partial_service_downstream, partial_service_upstream, partial_service_state, software_version, updated_at "
+                "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
+                "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
+                "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
+                "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
+                "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
+                "partial_service_upstream, partial_service_state, software_version, updated_at "
                 f"FROM modem_inventory_current WHERE mac IN ({placeholders})",
                 tuple(batch),
             )
@@ -1752,6 +1869,8 @@ class PollerService:
             "ip_address": row.get("ip"),
             "cmts": row.get("cmts"),
             "cmts_ip": row.get("cmts_ip"),
+            "cmts_index": row.get("cmts_index"),
+            "docsif3_index": row.get("docsif3_index"),
             "fiber_node": row.get("fiber_node"),
             "cable_mac": row.get("cable_mac"),
             "mac_domain": row.get("mac_domain"),
@@ -1761,7 +1880,10 @@ class PollerService:
             "model": row.get("model"),
             "upstream_interface": row.get("upstream_interface"),
             "upstream_ifindex": row.get("upstream_ifindex"),
+            "ofdm_ifindex": row.get("ofdm_ifindex"),
             "ofdma_ifindex": row.get("ofdma_ifindex"),
+            "ofdm_channel_count": row.get("ofdm_channel_count"),
+            "ofdma_channel_count": row.get("ofdma_channel_count"),
             "ofdma_rf_port_ifindex": row.get("ofdma_rf_port_ifindex"),
             "ofdm_enabled": _to_bool(row.get("ofdm_enabled")),
             "ofdma_enabled": _to_bool(row.get("ofdma_enabled")),
@@ -1863,11 +1985,14 @@ class PollerService:
                             "cmts": cmts_name,
                             "cmts_ip": cmts_ip,
                             **{k: m.get(k) for k in (
-                                "fiber_node", "cable_mac", "mac_domain", "status",
+                                "cmts_index", "docsif3_index", "fiber_node",
+                                "cable_mac", "mac_domain", "status",
                                 "docsis_version", "upstream_interface", "upstream_ifindex",
-                                "ofdma_ifindex", "ofdma_rf_port_ifindex",
-                                "ofdm_enabled", "ofdma_enabled", "partial_service",
-                                "partial_service_downstream", "partial_service_upstream", "partial_service_state",
+                                "ofdm_ifindex", "ofdma_ifindex",
+                                "ofdm_channel_count", "ofdma_channel_count",
+                                "ofdma_rf_port_ifindex", "ofdm_enabled", "ofdma_enabled",
+                                "partial_service", "partial_service_downstream",
+                                "partial_service_upstream", "partial_service_state",
                                 "firmware", "software_version", "vendor", "model",
                             )},
                         }], source_poller="refresh-fallback")

@@ -114,6 +114,7 @@ def list_inventory_modems(
             "collected_at": snapshot.get("collected_at"),
             "revision_at": snapshot.get("revision_at"),
             "inventory_source": snapshot.get("source"),
+            "capability_enriched": snapshot.get("capability_enriched") is True,
             "critical_oid_errors": snapshot.get("critical_oid_errors") or {},
             "raw_legacy_mac_count": snapshot.get("raw_legacy_mac_count"),
             "raw_d3_mac_count": snapshot.get("raw_d3_mac_count"),

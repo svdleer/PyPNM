@@ -31,7 +31,8 @@ class CMTSModemRequest(BaseModel):
 class ModemInfo(BaseModel):
     """Modem information from CMTS discovery."""
     mac_address: str = Field(..., description="Modem MAC address")
-    cmts_index: Optional[str] = Field(default=None, description="CMTS registration index")
+    cmts_index: Optional[str] = Field(default=None, description="Legacy/display CMTS registration index")
+    docsif3_index: Optional[str] = Field(default=None, description="DOCS-IF3 registration index used by DOCSIS 3.1 augmentation tables")
     ip_address: Optional[str] = Field(default=None, description="Modem IP address")
     status: Optional[str] = Field(default=None, description="Registration status (operational, ranging, etc)")
     status_code: Optional[int] = Field(default=None, description="Raw status code from CMTS")
@@ -48,7 +49,10 @@ class ModemInfo(BaseModel):
     upstream_ifindex: Optional[int] = Field(default=None, description="Upstream interface ifIndex")
     upstream_channel_id: Optional[int] = Field(default=None, description="Upstream channel ID")
     cable_mac: Optional[str] = Field(default=None, description="Cable MAC interface name")
+    ofdm_ifindex: Optional[int] = Field(default=None, description="OFDM downstream ifIndex (D3.1)")
     ofdma_ifindex: Optional[int] = Field(default=None, description="OFDMA upstream ifIndex (D3.1)")
+    ofdm_channel_count: Optional[int] = Field(default=None, description="Number of assigned OFDM channels")
+    ofdma_channel_count: Optional[int] = Field(default=None, description="Number of assigned OFDMA channels")
 
 
 class CMTSModemResponse(BaseModel):
@@ -58,7 +62,8 @@ class CMTSModemResponse(BaseModel):
     count: int = Field(default=0, description="Number of modems returned")
     timestamp: Optional[str] = Field(default=None, description="Timestamp of the response")
     error: Optional[str] = Field(default=None, description="Error message if failed")
-    enriched: bool = Field(default=False, description="Whether modems have been enriched")
+    enriched: bool = Field(default=False, description="Whether direct per-modem metadata enrichment has completed")
+    capability_enriched: bool = Field(default=False, description="Whether authoritative CMTS capability tables were successfully collected for this generation")
     cached: bool = Field(default=False, description="Whether result came from cache")
     enriching: bool = Field(default=False, description="Whether enrichment is in progress")
     complete: bool = Field(default=False, description="Whether the inventory walk reached the end of both MAC tables")

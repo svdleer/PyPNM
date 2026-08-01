@@ -14,9 +14,23 @@ from pypnm.api.agent.manager import get_agent_manager
 
 
 # ── In-memory enrichment cache ──────────────────────────────────────────────
-# Keyed by cmts_ip → {modems, enriched, enriching, timestamp, cancelled}
+# Keyed by cmts_ip → {modems, enriched, capability_enriched, enriching,
+#                       timestamp, cancelled}
 _enrichment_cache: Dict[str, Dict[str, Any]] = {}
 _enrichment_lock = asyncio.Lock()
+_live_walk_locks: Dict[str, asyncio.Lock] = {}
+_LIVE_CACHE_TTL_SECONDS = 7200
+_LIVE_REFRESH_COOLDOWN_SECONDS = 300
+
+
+async def _get_live_walk_lock(cmts_ip: str) -> asyncio.Lock:
+    """Return the process-local single-flight lock for one CMTS."""
+    async with _enrichment_lock:
+        lock = _live_walk_locks.get(cmts_ip)
+        if lock is None:
+            lock = asyncio.Lock()
+            _live_walk_locks[cmts_ip] = lock
+        return lock
 
 
 def _int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
@@ -52,6 +66,8 @@ OID_SW_REV       = '1.3.6.1.2.1.10.127.1.2.2.1.3'       # docsIfCmtsCmStatusSoft
 # DOCSIS 3.1 supplementary
 OID_US_CH_ID     = '1.3.6.1.4.1.4491.2.1.20.1.4.1.3'    # docsIf3CmtsCmUsStatusChIfIndex
 OID_IF_NAME      = '1.3.6.1.2.1.31.1.1.1.1'              # IF-MIB::ifName
+OID_DS_PROFILE_LIST = '1.3.6.1.4.1.4491.2.1.28.1.3.1.2'  # docsIf31CmtsCmRegStatusDsProfileIdList
+OID_US_PROFILE_LIST = '1.3.6.1.4.1.4491.2.1.28.1.3.1.3'  # docsIf31CmtsCmRegStatusUsProfileIucList
 OID_PARTIAL_SVC  = '1.3.6.1.4.1.4491.2.1.28.1.3.1.9'    # docsIf31CmtsCmRegStatusPartialSvcState
 
 # Status code mapping (docsIfCmtsCmStatusValue)
@@ -191,6 +207,149 @@ class CMTSModemService:
 
         return states.get(code, (False, False, 'unknown'))
 
+    @staticmethod
+    def _parse_profile_assignments(
+        value: Any,
+        *,
+        max_count: int,
+        valid_values: set[int],
+    ) -> list[tuple[int, tuple[int, ...]]] | None:
+        """Decode a DOCS-IF31 per-modem profile-list OCTET STRING.
+
+        Agents may preserve the binary octets in a decoded string or render
+        them as bare/``0x``-prefixed hexadecimal. Empty values are supported
+        and remain neutral; malformed values return ``None`` so they can never
+        become positive OFDM/OFDMA evidence.
+        """
+        if value is None:
+            return []
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            payload = bytes(value)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            lowered = stripped.lower()
+            if 'no such' in lowered or lowered in ('null', 'none'):
+                return None
+
+            explicit_hex = lowered.startswith('hex-string:')
+            separated_hex = False
+            if explicit_hex:
+                hex_text = stripped.split(':', 1)[1]
+                hex_text = ''.join(
+                    ch for ch in hex_text if ch not in ' \t\r\n:-'
+                )
+            else:
+                hex_text = stripped[2:] if lowered.startswith('0x') else stripped
+                separators = {sep for sep in (':', '-') if sep in hex_text}
+                if separators:
+                    if len(separators) != 1:
+                        return None
+                    parts = hex_text.split(separators.pop())
+                    if not all(
+                        len(part) == 2
+                        and all(ch in '0123456789abcdefABCDEF' for ch in part)
+                        for part in parts
+                    ):
+                        return None
+                    hex_text = ''.join(parts)
+                    separated_hex = True
+            if (
+                len(hex_text) % 2 == 0
+                and hex_text
+                and all(ch in '0123456789abcdefABCDEF' for ch in hex_text)
+            ):
+                try:
+                    payload = bytes.fromhex(hex_text)
+                except ValueError:
+                    return None
+            elif explicit_hex or separated_hex:
+                return None
+            else:
+                try:
+                    # Preserve every octet: stripping a binary-decoded string
+                    # could remove valid profile/IUC bytes such as 0x09-0x0d.
+                    payload = value.encode('latin-1')
+                except UnicodeEncodeError:
+                    return None
+        else:
+            return None
+
+        # DOCS-IF31-MIB permits an empty list, otherwise the complete OCTET
+        # STRING is bounded to 6..72 bytes. Reject size violations before any
+        # assignment can become positive capability evidence.
+        if not payload:
+            return []
+        if len(payload) < 6 or len(payload) > 72:
+            return None
+
+        assignments: list[tuple[int, tuple[int, ...]]] = []
+        offset = 0
+        while offset < len(payload):
+            if len(payload) - offset < 5:
+                return None
+            ifindex = int.from_bytes(payload[offset:offset + 4], 'big')
+            count = payload[offset + 4]
+            end = offset + 5 + count
+            if ifindex <= 0 or count < 1 or count > max_count or end > len(payload):
+                return None
+            profiles = tuple(payload[offset + 5:end])
+            if any(profile not in valid_values for profile in profiles):
+                return None
+            assignments.append((ifindex, profiles))
+            offset = end
+        return assignments
+
+    @staticmethod
+    def _upgrade_docsis31(modem: dict[str, Any]) -> None:
+        """Apply positive DOCSIS 3.1 evidence without downgrading DOCSIS 4.0."""
+        current = str(modem.get('docsis_version') or '').lower()
+        if '4.0' not in current:
+            modem['docsis_version'] = 'DOCSIS 3.1'
+
+    @staticmethod
+    def _cache_sufficient(entry: dict[str, Any], limit: int) -> bool:
+        cached_count = len(entry.get('modems') or [])
+        return bool(
+            not limit
+            or cached_count >= int(limit)
+            or (
+                entry.get('complete') is True
+                and entry.get('truncated') is not True
+            )
+        )
+
+    @staticmethod
+    def _cache_response(
+        cmts_ip: str,
+        entry: dict[str, Any],
+        *,
+        enrich: bool,
+        limit: int,
+    ) -> Dict[str, Any]:
+        modems = entry.get('modems') or []
+        returned_modems = modems[:int(limit)] if limit else modems
+        response = {
+            'success': True,
+            'modems': returned_modems,
+            'count': len(returned_modems),
+            'cmts_ip': cmts_ip,
+            'enriched': bool(enrich and entry.get('enriched') is True),
+            'enriching': bool(enrich and entry.get('enriching') is True),
+            'cached': True,
+        }
+        for key in (
+            'capability_enriched', 'source', 'complete', 'truncated',
+            'requested_limit', 'collected_at', 'revision_at',
+            'critical_oid_errors', 'raw_legacy_mac_count',
+            'raw_d3_mac_count', 'cmts_enriched', 'enrich_progress',
+        ):
+            if key in entry:
+                response[key] = entry[key]
+        response['capability_enriched'] = entry.get('capability_enriched') is True
+        return response
+
     # ── core discovery ──────────────────────────────────────────────────────
 
     async def discover_modems(
@@ -229,50 +388,23 @@ class CMTSModemService:
                     'modems': [], 'count': 0}
 
         # ── Tier 1: In-memory cache (Redis-like speed) ─────────────────
-        if enrich and not refresh and cmts_ip in _enrichment_cache:
+        if not refresh and cmts_ip in _enrichment_cache:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
-            cached_count = len(cached.get('modems', []))
-            cache_sufficient = (
-                not limit
-                or cached_count >= int(limit)
-                or (
-                    cached.get('complete') is True
-                    and cached.get('truncated') is not True
-                )
+            cache_sufficient = self._cache_sufficient(cached, limit)
+            cache_usable = (
+                not enrich
+                or cached.get('enriched') is True
+                or cached.get('enriching') is True
             )
-
-            if cached.get('enriched') and age < 7200 and cache_sufficient:
-                self.logger.info(f"Returning cached enriched data for {cmts_ip} (age={age:.0f}s)")
-                return {
-                    'success': True,
-                    'modems': cached['modems'],
-                    'count': len(cached['modems']),
-                    'cmts_ip': cmts_ip,
-                    'enriched': True,
-                    'enriching': False,
-                    'cached': True,
-                    'source': cached.get('source', 'snmp-live'),
-                    'complete': cached.get('complete', False),
-                    'truncated': cached.get('truncated', True),
-                }
-
-            if cached.get('enriching') and age < 1800 and cache_sufficient:
-                self.logger.info(f"Enrichment in progress for {cmts_ip} (age={age:.0f}s)")
-                return {
-                    'success': True,
-                    'modems': cached.get('modems', []),
-                    'count': len(cached.get('modems', [])),
-                    'cmts_ip': cmts_ip,
-                    'enriched': False,
-                    'enriching': True,
-                    'cmts_enriched': cached.get('cmts_enriched', False),
-                    'cached': True,
-                    'source': cached.get('source', 'snmp-live'),
-                    'complete': cached.get('complete', False),
-                    'truncated': cached.get('truncated', True),
-                    'enrich_progress': cached.get('enrich_progress', {'completed': 0, 'total': 0}),
-                }
+            if age < _LIVE_CACHE_TTL_SECONDS and cache_sufficient and cache_usable:
+                self.logger.info(
+                    "Returning cached generation for %s (age=%.0fs, enrich=%s)",
+                    cmts_ip, age, enrich,
+                )
+                return self._cache_response(
+                    cmts_ip, cached, enrich=enrich, limit=limit,
+                )
 
         # ── Tier 2: MySQL inventory (survives restarts) ──────────────
         try:
@@ -327,6 +459,7 @@ class CMTSModemService:
                 )
                 inventory_meta = {
                     'source': 'mysql-inventory',
+                    'capability_enriched': (snapshot or {}).get('capability_enriched') is True,
                     'complete': snapshot_complete,
                     'truncated': (snapshot or {}).get('truncated') is True,
                     'requested_limit': (snapshot or {}).get('requested_limit'),
@@ -399,12 +532,40 @@ class CMTSModemService:
             self.logger.warning(f"MySQL inventory lookup skipped for {cmts_ip}: {exc}")
 
         # ── Tier 3: Live SNMP walk (slow, last resort) ───────────────
+        live_lock = await _get_live_walk_lock(cmts_ip)
+        await live_lock.acquire()
         try:
+            # Re-check after waiting. A recent sufficient generation, including
+            # one whose capability tables completed with errors, starts a short
+            # refresh cooldown so queued force-refresh requests do not walk again.
+            cached = _enrichment_cache.get(cmts_ip)
+            if cached and self._cache_sufficient(cached, limit):
+                age = time.time() - cached.get('timestamp', 0)
+                cache_usable = (
+                    not enrich
+                    or cached.get('enriched') is True
+                    or cached.get('enriching') is True
+                )
+                max_age = (
+                    _LIVE_REFRESH_COOLDOWN_SECONDS
+                    if refresh else _LIVE_CACHE_TTL_SECONDS
+                )
+                if age < max_age and cache_usable:
+                    self.logger.info(
+                        "Reusing single-flight generation for %s "
+                        "(age=%.0fs, refresh=%s)",
+                        cmts_ip, age, refresh,
+                    )
+                    return self._cache_response(
+                        cmts_ip, cached, enrich=enrich, limit=limit,
+                    )
+
             # ── Step 1: Parallel SNMP walks via agent ────────────────────
             walk_oids = [
                 OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
                 OID_OLD_US_CH_IF, OID_SW_REV,
-                OID_US_CH_ID, OID_IF_NAME, OID_PARTIAL_SVC,
+                OID_US_CH_ID, OID_IF_NAME,
+                OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
             ]
             walk_result = await self._send_agent_command(
                 'snmp_parallel_walk',
@@ -435,6 +596,35 @@ class CMTSModemService:
                 and not critical_oid_errors
                 and all(oid in completed_oids for oid in critical_oids)
             )
+            capability_oids = (OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST)
+            capability_oid_errors = {
+                oid: str(walk_errors[oid])
+                for oid in capability_oids
+                if oid in walk_errors
+            }
+            missing_capability_completions = [
+                oid for oid in capability_oids if oid not in completed_oids
+            ]
+            capability_enriched = bool(
+                has_completion_metadata
+                and not capability_oid_errors
+                and not missing_capability_completions
+            )
+            if not has_completion_metadata:
+                self.logger.warning(
+                    "%s capability collection lacks per-OID completion metadata",
+                    cmts_ip,
+                )
+            if capability_oid_errors:
+                self.logger.warning(
+                    "%s capability OID collection errors: %s",
+                    cmts_ip, capability_oid_errors,
+                )
+            if missing_capability_completions:
+                self.logger.warning(
+                    "%s capability OIDs missing completion: %s",
+                    cmts_ip, missing_capability_completions,
+                )
             truncated_oids = set(walk_result.get('truncated_oids') or [])
             inventory_truncated = bool(
                 OID_OLD_MAC in truncated_oids
@@ -446,6 +636,9 @@ class CMTSModemService:
             )
             inventory_meta = {
                 'source': 'snmp-live',
+                # Empty/unsupported tables count when both walks completed
+                # cleanly; errors or absent completion metadata do not.
+                'capability_enriched': capability_enriched,
                 'complete': critical_walks_complete and not inventory_truncated,
                 'truncated': inventory_truncated,
                 'requested_limit': int(limit or 0),
@@ -468,6 +661,35 @@ class CMTSModemService:
             modems = self._correlate_modem_data(raw, limit)
             self.logger.info(f"Discovered {len(modems)} modems from CMTS {cmts_ip}")
 
+            # Cache every live base generation, including non-enrichment and
+            # unsuccessful capability attempts. Completeness metadata prevents
+            # a small partial preview from satisfying a larger request.
+            _enrichment_cache[cmts_ip] = {
+                'modems': modems,
+                'enriched': False,
+                'enriching': False,
+                'timestamp': time.time(),
+                **inventory_meta,
+            }
+
+            # GUI-triggered generations carry a hostname. Scheduled poller
+            # requests intentionally omit it and persist in their own workflow.
+            if str(cmts_hostname or '').strip():
+                try:
+                    from pypnm.api.routes.poller.service import poller_service
+                    poller_service.persist_inventory_generation(
+                        modems,
+                        cmts_hostname=cmts_hostname,
+                        cmts_ip=cmts_ip,
+                        metadata=inventory_meta,
+                        source_poller='live-gui',
+                    )
+                except Exception as db_exc:
+                    self.logger.warning(
+                        "Live inventory persistence failed for %s: %s",
+                        cmts_ip, db_exc,
+                    )
+
             # ── Step 3: Enrichment ───────────────────────────────────────
             if enrich and modems:
                 # Guard: don't start a second enrichment if one is already running
@@ -489,6 +711,7 @@ class CMTSModemService:
                         'cmts_ip': cmts_ip,
                         'enriched': False,
                         'enriching': True,
+                        'capability_enriched': existing.get('capability_enriched') is True,
                         'source': existing.get('source', 'snmp-live'),
                         'complete': existing.get('complete', False),
                         'truncated': existing.get('truncated', True),
@@ -536,6 +759,8 @@ class CMTSModemService:
             self.logger.exception(f"Error discovering modems from CMTS {cmts_ip}")
             return {'success': False, 'error': str(e),
                     'modems': [], 'count': 0}
+        finally:
+            live_lock.release()
 
     async def _background_enrich(self, cmts_ip: str, modems: list, modem_community: str, cmts_hostname: str = ""):
         """Run background enrichment and update the cache in two steps."""
@@ -678,6 +903,28 @@ class CMTSModemService:
             except (ValueError, TypeError):
                 pass
 
+        # ---- authoritative per-modem OFDM/OFDMA profile assignments ----
+        # These DOCS-IF31 augmentation rows use the docsIf3 registration index.
+        # Only fully valid, non-empty assignment lists become positive evidence.
+        ds_profile_map: dict[str, list[tuple[int, tuple[int, ...]]]] = {}
+        for item in raw.get(OID_DS_PROFILE_LIST, []):
+            assignments = self._parse_profile_assignments(
+                item.get('value'), max_count=4, valid_values=set(range(16)),
+            )
+            if assignments:
+                idx = self._extract_index(item.get('oid', ''), OID_DS_PROFILE_LIST)
+                ds_profile_map[idx] = assignments
+
+        us_profile_map: dict[str, list[tuple[int, tuple[int, ...]]]] = {}
+        valid_iucs = {5, 6, 9, 10, 11, 12, 13}
+        for item in raw.get(OID_US_PROFILE_LIST, []):
+            assignments = self._parse_profile_assignments(
+                item.get('value'), max_count=2, valid_values=valid_iucs,
+            )
+            if assignments:
+                idx = self._extract_index(item.get('oid', ''), OID_US_PROFILE_LIST)
+                us_profile_map[idx] = assignments
+
         # ---- US channel mapping (docsIf3, compound index) ----
         us_ch_map: dict[str, int] = {}
         for item in raw.get(OID_US_CH_ID, []):
@@ -745,6 +992,10 @@ class CMTSModemService:
                 'mac_address': mac,
                 'cmts_index': index,
             }
+            if d3_index is not None:
+                # Keep the DOCS-IF3 augmentation index distinct from the
+                # legacy/display registration index used by existing clients.
+                modem['docsif3_index'] = d3_index
 
             if mac in mac_to_ip:
                 modem['ip_address'] = mac_to_ip[mac]
@@ -771,6 +1022,23 @@ class CMTSModemService:
                 modem['partial_service_state'] = partial_state
             elif modem.get('status') == 'operational':
                 modem['docsis_version'] = 'DOCSIS 3.0'
+
+            if d3_index is not None:
+                ds_assignments = ds_profile_map.get(d3_index) or []
+                if ds_assignments:
+                    ds_ifindexes = list(dict.fromkeys(ifindex for ifindex, _ in ds_assignments))
+                    modem['ofdm_enabled'] = True
+                    modem['ofdm_ifindex'] = ds_ifindexes[0]
+                    modem['ofdm_channel_count'] = len(ds_ifindexes)
+                    self._upgrade_docsis31(modem)
+
+                us_assignments = us_profile_map.get(d3_index) or []
+                if us_assignments:
+                    us_ifindexes = list(dict.fromkeys(ifindex for ifindex, _ in us_assignments))
+                    modem['ofdma_enabled'] = True
+                    modem['ofdma_ifindex'] = us_ifindexes[0]
+                    modem['ofdma_channel_count'] = len(us_ifindexes)
+                    self._upgrade_docsis31(modem)
 
             # Upstream interface resolution. D3 metadata must use the docsIf3
             # index, which is not guaranteed to match the legacy table index.
@@ -812,14 +1080,20 @@ class CMTSModemService:
             return 0
 
     async def _enrich_cmts_interfaces(self, modems: list) -> dict:
-        """Enrich modems with cable-mac and OFDMA upstream interfaces from CMTS SNMP walks."""
+        """Join DOCSIS 3.1 CMTS interface tables using each modem's DOCS-IF3 index."""
         if not modems:
             return {'success': True, 'enriched_count': 0, 'total_count': 0}
             
         self.logger.info(f"Enriching cable-mac/upstream for {len(modems)} modems from CMTS {self.cmts_ip}")
         
-        # Build index -> modem map
-        index_to_modem = {str(m.get('cmts_index')): m for m in modems if m.get('cmts_index')}
+        # DOCS-IF3/31 tables share only the docsIf3 registration index.
+        # Legacy indexes are intentionally excluded because cross-table values
+        # can differ and a guessed join can enrich the wrong modem.
+        index_to_modem = {}
+        for modem in modems:
+            index = modem.get('docsif3_index')
+            if index is not None and str(index):
+                index_to_modem[str(index)] = modem
         modem_indexes = set(index_to_modem.keys())
         
         if not modem_indexes:
@@ -1006,7 +1280,8 @@ class CMTSModemService:
         enriched_count = 0
         us_ch_resolved = 0
         for modem in modems:
-            idx = str(modem.get('cmts_index'))
+            index = modem.get('docsif3_index')
+            idx = str(index) if index is not None else ''
             if not idx:
                 continue
             
@@ -1024,22 +1299,9 @@ class CMTSModemService:
                 ofdma_ifidx = ofdma_if_map[idx]
                 modem['ofdma_ifindex'] = ofdma_ifidx
                 modem['ofdma_enabled'] = True
-                # OFDMA upstream is positive upstream and DOCSIS >=3.1
-                # evidence; it does not establish downstream OFDM support.
-                # Explicit positive enrichment upgrades every lower/unknown
-                # version, while preserving stronger DOCSIS 4.0 evidence.
-                current_docsis = str(modem.get('docsis_version') or '').lower()
-                current_rank = (
-                    40 if '4.0' in current_docsis else
-                    31 if '3.1' in current_docsis else
-                    30 if '3.0' in current_docsis else
-                    20 if '2.0' in current_docsis else
-                    11 if '1.1' in current_docsis else
-                    10 if '1.0' in current_docsis else
-                    0
-                )
-                if current_rank < 31:
-                    modem['docsis_version'] = 'DOCSIS 3.1'
+                # OFDMA upstream is positive DOCSIS >=3.1 evidence; it
+                # does not establish downstream OFDM support. Preserve 4.0.
+                self._upgrade_docsis31(modem)
                 if ofdma_ifidx in ofdma_descr_map:
                     descr = ofdma_descr_map[ofdma_ifidx]
                     # Ensure 'ofdma' appears in the interface name so the GUI

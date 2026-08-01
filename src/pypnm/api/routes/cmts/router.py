@@ -101,6 +101,7 @@ async def get_cmts_modems(
             modems=modems,
             count=len(modems),
             enriched=enriched,
+            capability_enriched=result.get('capability_enriched') is True,
             cached=result.get('cached', False),
             enriching=result.get('enriching', False),
             complete=result.get('complete', False),
