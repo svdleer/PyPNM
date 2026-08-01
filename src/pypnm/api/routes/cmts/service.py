@@ -684,6 +684,13 @@ class CMTSModemService:
                         metadata=inventory_meta,
                         source_poller='live-gui',
                     )
+                    persisted_snapshot = poller_service.get_inventory_snapshot(cmts_ip)
+                    persisted_revision = (persisted_snapshot or {}).get('revision_at')
+                    if persisted_revision:
+                        inventory_meta['revision_at'] = persisted_revision
+                        cached_generation = _enrichment_cache.get(cmts_ip)
+                        if cached_generation is not None:
+                            cached_generation['revision_at'] = persisted_revision
                 except Exception as db_exc:
                     self.logger.warning(
                         "Live inventory persistence failed for %s: %s",
