@@ -158,6 +158,39 @@ class CMTSModemService:
             return ':'.join(mac_hex[i:i + 2] for i in range(0, 12, 2)).lower()
         return None
 
+    @staticmethod
+    def _decode_partial_service(value: Any) -> tuple[bool, bool, str]:
+        """Decode DOCS-IF31-MIB PartialServiceType without losing direction."""
+        states = {
+            1: (False, False, 'other'),
+            2: (False, False, 'none'),
+            3: (True, False, 'downstream'),
+            4: (False, True, 'upstream'),
+            5: (True, True, 'both'),
+        }
+        symbols = {
+            'other': 1,
+            'none': 2,
+            'partialsvcdsonlyimpaired': 3,
+            'partialsvcusonlyimpaired': 4,
+            'partialsvcdsandusimpaired': 5,
+        }
+
+        if isinstance(value, bool):
+            code = int(value)
+        elif isinstance(value, int):
+            code = value
+        else:
+            text = str(value or '').strip()
+            if '(' in text and text.endswith(')'):
+                text = text.rsplit('(', 1)[-1][:-1].strip()
+            try:
+                code = int(text, 10)
+            except (TypeError, ValueError):
+                code = symbols.get(text.lower())
+
+        return states.get(code, (False, False, 'unknown'))
+
     # ── core discovery ──────────────────────────────────────────────────────
 
     async def discover_modems(
@@ -632,34 +665,15 @@ class CMTSModemService:
         self.logger.info(f"Resolved {len(if_name_map)} interface names")
 
         # ---- partial service state ----
-        # docsIf31CmtsCmRegStatusPartialSvcState is BITS { dsPartialSvc(0), usPartialSvc(1) }
-        # BITS are encoded as OctetString.  The agent may return:
-        #   - an int (0 = no partial, non-zero = partial)
-        #   - a hex string like '80' (0x80 = dsPartialSvc bit set)
-        #   - a raw UTF-8 decoded string (e.g. '\x00' for no partial, '@' for 0x40)
-        partial_svc_map: dict[str, bool] = {}
+        # DOCS-IF31-MIB defines this object as the INTEGER textual convention
+        # PartialServiceType: 1=other, 2=none, 3=DS-only, 4=US-only, 5=both.
+        # Preserve direction; collapsing 3/4/5 into one Boolean makes the GUI
+        # incorrectly report both OFDM and OFDMA as impaired.
+        partial_svc_map: dict[str, tuple[bool, bool, str]] = {}
         for item in raw.get(OID_PARTIAL_SVC, []):
             try:
                 idx = self._extract_index(item['oid'], OID_PARTIAL_SVC)
-                val = item['value']
-                if isinstance(val, int):
-                    # INTEGER encoding per DOCS-IF31-MIB PartialServiceType:
-                    # 1=other, 2=none, 3=partialSvcDsOnlyImpaired, 4=partialSvcUsOnlyImpaired, 5=partialSvcDsAndUsImpaired
-                    # Only 3,4,5 indicate actual partial service
-                    partial_svc_map[idx] = val >= 3
-                elif isinstance(val, str) and val:
-                    # BITS/INTEGER encoded as string — try decimal first, then hex
-                    try:
-                        int_val = int(val)  # decimal string e.g. "2" (none) or "3" (partial)
-                        partial_svc_map[idx] = int_val >= 3
-                    except ValueError:
-                        try:
-                            partial_svc_map[idx] = int(val, 16) != 0  # hex OctetString e.g. "80"
-                        except ValueError:
-                            # Raw bytes decoded as UTF-8 (e.g. '\x00', '@')
-                            partial_svc_map[idx] = any(ord(c) != 0 for c in val)
-                else:
-                    partial_svc_map[idx] = False
+                partial_svc_map[idx] = self._decode_partial_service(item['value'])
             except (ValueError, TypeError):
                 pass
 
@@ -742,12 +756,13 @@ class CMTSModemService:
             if mac in mac_to_firmware:
                 modem['firmware'] = mac_to_firmware[mac]
 
+            modem['docsis_version'] = 'Unknown'
             if d3_index is not None and d3_index in partial_svc_map:
-                modem['partial_service'] = partial_svc_map[d3_index]
-                # docsIf31CmtsCmRegStatusTable is D3.1-only → modem is DOCSIS 3.1
-                modem['docsis_version'] = 'DOCSIS 3.1'
-            else:
-                modem['docsis_version'] = 'Unknown'
+                partial_ds, partial_us, partial_state = partial_svc_map[d3_index]
+                modem['partial_service'] = partial_ds or partial_us
+                modem['partial_service_downstream'] = partial_ds
+                modem['partial_service_upstream'] = partial_us
+                modem['partial_service_state'] = partial_state
 
             # Upstream interface resolution. D3 metadata must use the docsIf3
             # index, which is not guaranteed to match the legacy table index.

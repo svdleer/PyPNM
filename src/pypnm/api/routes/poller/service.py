@@ -162,6 +162,9 @@ class PollerService:
                 ofdm_enabled BOOLEAN NULL,
                 ofdma_enabled BOOLEAN NULL,
                 partial_service BOOLEAN NULL,
+                partial_service_downstream BOOLEAN NULL,
+                partial_service_upstream BOOLEAN NULL,
+                partial_service_state VARCHAR(16) NULL,
                 software_version VARCHAR(128) NULL,
                 first_seen_at DATETIME NOT NULL,
                 last_seen_at DATETIME NOT NULL,
@@ -262,9 +265,44 @@ class PollerService:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
-        # Backward-compatible upgrades for already-existing tables.
+        # Backward-compatible upgrades for already-existing inventory tables.
+        # Add all missing columns in one ALTER so a large table is rebuilt at
+        # most once on MySQL versions that cannot apply ADD COLUMN instantly.
+        inventory_columns = {
+            "software_version": "VARCHAR(128) NULL",
+            "partial_service_downstream": "BOOLEAN NULL",
+            "partial_service_upstream": "BOOLEAN NULL",
+            "partial_service_state": "VARCHAR(16) NULL",
+        }
+        existing_inventory_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM modem_inventory_current")
+        }
+        missing_inventory_columns = [
+            name for name in inventory_columns if name not in existing_inventory_columns
+        ]
+        if missing_inventory_columns:
+            clauses = ", ".join(
+                f"ADD COLUMN `{name}` {inventory_columns[name]}"
+                for name in missing_inventory_columns
+            )
+            try:
+                self._execute(f"ALTER TABLE modem_inventory_current {clauses}")
+            except Exception as exc:
+                remaining = {
+                    str(row.get("Field"))
+                    for row in self._query("SHOW COLUMNS FROM modem_inventory_current")
+                }
+                still_missing = [
+                    name for name in missing_inventory_columns if name not in remaining
+                ]
+                if still_missing:
+                    raise RuntimeError(
+                        "Failed to add required modem inventory columns: "
+                        + ", ".join(still_missing)
+                    ) from exc
+
         for ddl in [
-            "ALTER TABLE modem_inventory_current ADD COLUMN software_version VARCHAR(128) NULL",
             "ALTER TABLE scheduler_decision_log ADD COLUMN poller_id BIGINT NULL",
             "ALTER TABLE scheduler_decision_log ADD COLUMN poller_name VARCHAR(64) NULL",
             "ALTER TABLE scheduler_decision_log ADD COLUMN reason VARCHAR(64) NULL",
@@ -839,6 +877,20 @@ class PollerService:
             except Exception:
                 return None
 
+        def _to_bool(value):
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            normalized = str(value).strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+            return None
+
         # Build all value tuples first (no lock needed)
         all_values = []
         for r in rows:
@@ -861,9 +913,12 @@ class PollerService:
                 _to_int(r.get("upstream_ifindex") or r.get("md_if_index")),
                 _to_int(r.get("ofdma_ifindex")),
                 _to_int(r.get("ofdma_rf_port_ifindex") or r.get("rf_port_ifindex")),
-                1 if r.get("ofdm_enabled") else 0,
-                1 if r.get("ofdma_enabled") else 0,
-                1 if r.get("partial_service") else 0,
+                _to_bool(r.get("ofdm_enabled")),
+                _to_bool(r.get("ofdma_enabled")),
+                _to_bool(r.get("partial_service")),
+                _to_bool(r.get("partial_service_downstream")),
+                _to_bool(r.get("partial_service_upstream")),
+                r.get("partial_service_state"),
                 r.get("software_version") or r.get("firmware") or None,
                 now,
                 now,
@@ -876,8 +931,9 @@ class PollerService:
             INSERT INTO modem_inventory_current
                 (mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model,
                  upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service,
+                 partial_service_downstream, partial_service_upstream, partial_service_state,
                  software_version, first_seen_at, last_seen_at, updated_at, source_poller, snapshot_id)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON DUPLICATE KEY UPDATE
               ip=VALUES(ip), cmts=VALUES(cmts), cmts_ip=VALUES(cmts_ip), fiber_node=VALUES(fiber_node),
               cable_mac=VALUES(cable_mac), mac_domain=VALUES(mac_domain), status=VALUES(status), docsis_version=VALUES(docsis_version),
@@ -885,7 +941,11 @@ class PollerService:
               upstream_ifindex=VALUES(upstream_ifindex), ofdma_ifindex=VALUES(ofdma_ifindex),
               ofdma_rf_port_ifindex=VALUES(ofdma_rf_port_ifindex),
               ofdm_enabled=VALUES(ofdm_enabled), ofdma_enabled=VALUES(ofdma_enabled),
-              partial_service=VALUES(partial_service), software_version=VALUES(software_version),
+              partial_service=COALESCE(VALUES(partial_service), partial_service),
+              partial_service_downstream=COALESCE(VALUES(partial_service_downstream), partial_service_downstream),
+              partial_service_upstream=COALESCE(VALUES(partial_service_upstream), partial_service_upstream),
+              partial_service_state=COALESCE(VALUES(partial_service_state), partial_service_state),
+              software_version=VALUES(software_version),
               last_seen_at=VALUES(last_seen_at),
               updated_at=VALUES(updated_at), source_poller=VALUES(source_poller),
               snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id)
@@ -1537,7 +1597,8 @@ class PollerService:
         marker = "%s"
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, software_version, updated_at "
+            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, "
+            "partial_service_downstream, partial_service_upstream, partial_service_state, software_version, updated_at "
             f"FROM modem_inventory_current{where_sql} ORDER BY cmts ASC, mac ASC LIMIT {marker}",
             tuple(params + [limit]),
         )
@@ -1548,7 +1609,8 @@ class PollerService:
         mac_norm = (mac_address or "").lower().replace(":", "").replace("-", "")
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, software_version, updated_at "
+            "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, "
+            "partial_service_downstream, partial_service_upstream, partial_service_state, software_version, updated_at "
             f"FROM modem_inventory_current WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = {marker} LIMIT 1",
             (mac_norm,),
         )
@@ -1574,7 +1636,8 @@ class PollerService:
             placeholders = ",".join(["%s"] * len(batch))
             rows = self._query(
                 "SELECT mac, ip, cmts, cmts_ip, fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-                "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, software_version, updated_at "
+                "upstream_interface, upstream_ifindex, ofdma_ifindex, ofdma_rf_port_ifindex, ofdm_enabled, ofdma_enabled, partial_service, "
+                "partial_service_downstream, partial_service_upstream, partial_service_state, software_version, updated_at "
                 f"FROM modem_inventory_current WHERE mac IN ({placeholders})",
                 tuple(batch),
             )
@@ -1649,6 +1712,9 @@ class PollerService:
             "ofdm_enabled": _to_bool(row.get("ofdm_enabled")),
             "ofdma_enabled": _to_bool(row.get("ofdma_enabled")),
             "partial_service": _to_bool(row.get("partial_service")),
+            "partial_service_downstream": _to_bool(row.get("partial_service_downstream")),
+            "partial_service_upstream": _to_bool(row.get("partial_service_upstream")),
+            "partial_service_state": row.get("partial_service_state"),
             "software_version": row.get("software_version"),
             "updated_at": row.get("updated_at"),
         }
@@ -1747,6 +1813,7 @@ class PollerService:
                                 "docsis_version", "upstream_interface", "upstream_ifindex",
                                 "ofdma_ifindex", "ofdma_rf_port_ifindex",
                                 "ofdm_enabled", "ofdma_enabled", "partial_service",
+                                "partial_service_downstream", "partial_service_upstream", "partial_service_state",
                                 "firmware", "software_version", "vendor", "model",
                             )},
                         }], source_poller="refresh-fallback")
