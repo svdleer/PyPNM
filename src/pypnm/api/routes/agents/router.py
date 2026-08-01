@@ -110,10 +110,12 @@ async def send_task(agent_id: str, command: str, params: dict, timeout: Optional
     
     try:
         task_id = await agent_manager.send_task(agent_id, command, params, timeout)
+        pending_task = agent_manager.pending_tasks.get(task_id)
+        effective_timeout = pending_task.timeout if pending_task is not None else timeout
         
         if wait:
-            # Wait for task result (async)
-            result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
+            # Honor the effective timeout selected by the manager.
+            result = await agent_manager.wait_for_task_async(task_id, timeout=effective_timeout)
             if result:
                 return {"task_id": task_id, "status": "completed", "success": True, "result": result}
             else:

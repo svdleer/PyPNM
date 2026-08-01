@@ -329,6 +329,13 @@ class AgentSnmpTransport:
             raise RuntimeError(f"No agent available with '{capability}' capability")
         return mgr, agent
 
+    @staticmethod
+    def _task_timeout_budget(timeout: float, retries: int, *, operations: int = 1,
+                             sleep_seconds: float = 0.0) -> float:
+        """Return an outer task deadline that covers the agent's SNMP retry budget."""
+        per_operation = max(float(timeout), 0.1) * (max(int(retries), 0) + 1)
+        return max(5.0, (per_operation * max(int(operations), 1)) + sleep_seconds + 5.0)
+
     async def _send_and_wait(self, capability: str, command: str,
                              params: dict, timeout: float) -> dict | None:
         """Send a command and async-wait for the response."""
@@ -343,12 +350,15 @@ class AgentSnmpTransport:
             timeout = actual_timeout.timeout
         result = await mgr.wait_for_task_async(task_id, timeout=timeout)
         if not result:
-            return None
+            raise TimeoutError(f"Agent task timed out after {timeout:g}s")
         if result.get('type') == 'response':
             return result.get('result', {})
+        error = str(result.get('error') or 'unknown agent error')
+        if 'timeout' in error.lower() or 'timed out' in error.lower():
+            raise TimeoutError(error)
         if result.get('type') == 'error':
-            err = result.get('error', 'unknown agent error')
-            self.logger.error(f"Agent error for {command}: {err}")
+            self.logger.error(f"Agent error for {command}: {error}")
+            raise RuntimeError(f"Agent task failed: {error}")
         return None
 
     # ------------------------------------------------------------------
@@ -369,6 +379,8 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
+        r = retries if retries is not None else self._retries
+        task_timeout = self._task_timeout_budget(t, r)
         
         start_time = time.time()
         print(f"DEBUG: AgentSnmpTransport.get() called with oid='{oid}' -> resolved='{resolved}'")
@@ -379,8 +391,10 @@ class AgentSnmpTransport:
                 'target_ip': self._host,
                 'oid': resolved,
                 'community': self._read_community,
+                'timeout': t,
+                'retries': r,
             },
-            timeout=t,
+            timeout=task_timeout,
         )
         
         elapsed = time.time() - start_time
@@ -486,6 +500,8 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
+        r = retries if retries is not None else self._retries
+        task_timeout = self._task_timeout_budget(t, r)
         
         start_time = time.time()
         print(f"DEBUG: AgentSnmpTransport.walk() called with oid='{oid}' -> resolved='{resolved}'")
@@ -496,8 +512,10 @@ class AgentSnmpTransport:
                 'target_ip': self._host,
                 'oid': resolved,
                 'community': self._read_community,
+                'timeout': t,
+                'retries': r,
             },
-            timeout=t,
+            timeout=task_timeout,
         )
         
         elapsed = time.time() - start_time
@@ -588,6 +606,8 @@ class AgentSnmpTransport:
         """
         resolved = _resolve_oid(oid)
         t = timeout if timeout is not None else self._timeout
+        r = self._retries
+        task_timeout = self._task_timeout_budget(t, r)
 
         # Convert pysnmp type classes to agent string codes
         type_str = value_type
@@ -631,8 +651,10 @@ class AgentSnmpTransport:
                 'value': value,
                 'type': type_str,
                 'community': self._write_community,
+                'timeout': t,
+                'retries': r,
             },
-            timeout=t,
+            timeout=task_timeout,
         )
         if not data:
             return None
@@ -666,6 +688,7 @@ class AgentSnmpTransport:
         Returns the agent result dict, or None on timeout/error.
         """
         t = timeout if timeout is not None else self._timeout
+        r = self._retries
 
         # Convert pysnmp type classes to string codes and normalise values
         type_map = {
@@ -698,6 +721,10 @@ class AgentSnmpTransport:
                 'sleep_after': item.get('sleep_after', 0),
             })
 
+        sleep_seconds = sum(max(float(item.get('sleep_after', 0) or 0), 0.0) for item in normalised)
+        task_timeout = self._task_timeout_budget(
+            t, r, operations=len(normalised), sleep_seconds=sleep_seconds,
+        )
         data = await self._send_and_wait(
             'snmp_set_sequence', 'snmp_set_sequence',
             {
@@ -705,8 +732,9 @@ class AgentSnmpTransport:
                 'community': self._write_community,
                 'sets': normalised,
                 'timeout': t,
+                'retries': r,
             },
-            timeout=t,
+            timeout=task_timeout,
         )
         return data
 
