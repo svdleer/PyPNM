@@ -1691,7 +1691,21 @@ class PollerService:
                 return True
             if text in {"0", "false", "no", "off", ""}:
                 return False
-            return bool(value)
+            return None
+
+        partial_downstream = _to_bool(row.get("partial_service_downstream"))
+        partial_upstream = _to_bool(row.get("partial_service_upstream"))
+        partial_state = str(row.get("partial_service_state") or "").strip().lower() or None
+        if partial_downstream is not None or partial_upstream is not None:
+            partial_service = bool(partial_downstream) or bool(partial_upstream)
+        elif partial_state in {"downstream", "upstream", "both"}:
+            partial_service = True
+        elif partial_state in {"none", "other"}:
+            partial_service = False
+        else:
+            # Aggregate-only rows predate directional decoding and may contain
+            # values produced by the former incorrect BITS/string parser.
+            partial_service = None
 
         return {
             "mac_address": row.get("mac"),
@@ -1711,10 +1725,10 @@ class PollerService:
             "ofdma_rf_port_ifindex": row.get("ofdma_rf_port_ifindex"),
             "ofdm_enabled": _to_bool(row.get("ofdm_enabled")),
             "ofdma_enabled": _to_bool(row.get("ofdma_enabled")),
-            "partial_service": _to_bool(row.get("partial_service")),
-            "partial_service_downstream": _to_bool(row.get("partial_service_downstream")),
-            "partial_service_upstream": _to_bool(row.get("partial_service_upstream")),
-            "partial_service_state": row.get("partial_service_state"),
+            "partial_service": partial_service,
+            "partial_service_downstream": partial_downstream,
+            "partial_service_upstream": partial_upstream,
+            "partial_service_state": partial_state,
             "software_version": row.get("software_version"),
             "updated_at": row.get("updated_at"),
         }
