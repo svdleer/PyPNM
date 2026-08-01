@@ -757,13 +757,20 @@ class CMTSModemService:
             if mac in mac_to_firmware:
                 modem['firmware'] = mac_to_firmware[mac]
 
+            # Positive DOCS-IF31 per-modem state proves DOCSIS 3.1 capability,
+            # including state=none (healthy, not partial service). Operational
+            # rows without 3.1 evidence fall back to the online DOCSIS 3.0
+            # bucket; an online modem must never leave discovery as Unknown.
             modem['docsis_version'] = 'Unknown'
             if d3_index is not None and d3_index in partial_svc_map:
                 partial_ds, partial_us, partial_state = partial_svc_map[d3_index]
+                modem['docsis_version'] = 'DOCSIS 3.1'
                 modem['partial_service'] = partial_ds or partial_us
                 modem['partial_service_downstream'] = partial_ds
                 modem['partial_service_upstream'] = partial_us
                 modem['partial_service_state'] = partial_state
+            elif modem.get('status') == 'operational':
+                modem['docsis_version'] = 'DOCSIS 3.0'
 
             # Upstream interface resolution. D3 metadata must use the docsIf3
             # index, which is not guaranteed to match the legacy table index.
@@ -1017,9 +1024,21 @@ class CMTSModemService:
                 ofdma_ifidx = ofdma_if_map[idx]
                 modem['ofdma_ifindex'] = ofdma_ifidx
                 modem['ofdma_enabled'] = True
-                # OFDMA upstream ⟹ DOCSIS 3.1 ⟹ OFDM downstream is present
-                modem['ofdm_enabled'] = True
-                if not modem.get('docsis_version') or modem.get('docsis_version') in ('Unknown', ''):
+                # OFDMA upstream is positive upstream and DOCSIS >=3.1
+                # evidence; it does not establish downstream OFDM support.
+                # Explicit positive enrichment upgrades every lower/unknown
+                # version, while preserving stronger DOCSIS 4.0 evidence.
+                current_docsis = str(modem.get('docsis_version') or '').lower()
+                current_rank = (
+                    40 if '4.0' in current_docsis else
+                    31 if '3.1' in current_docsis else
+                    30 if '3.0' in current_docsis else
+                    20 if '2.0' in current_docsis else
+                    11 if '1.1' in current_docsis else
+                    10 if '1.0' in current_docsis else
+                    0
+                )
+                if current_rank < 31:
                     modem['docsis_version'] = 'DOCSIS 3.1'
                 if ofdma_ifidx in ofdma_descr_map:
                     descr = ofdma_descr_map[ofdma_ifidx]
@@ -1030,15 +1049,14 @@ class CMTSModemService:
                         descr = f'cable-us-ofdma {descr}'
                     modem['upstream_interface'] = descr
             else:
-                modem['ofdma_enabled'] = False
-                # Collect SC-QAM US-CH ifIndexes for later resolution
+                # Absence from this positive OFDMA timing table is not an
+                # authoritative negative. Preserve tri-state capability so a
+                # missing vendor row cannot paint a healthy modem red or
+                # override stronger evidence from inventory/channel discovery.
                 us_ifidx = modem.get('upstream_ifindex')
                 if us_ifidx and us_ifidx in if_name_map:
                     modem['upstream_interface'] = if_name_map[us_ifidx]
                     us_ch_resolved += 1
-                # Non-OFDMA: derive ofdm_enabled from docsis_version (sysDescr enrichment)
-                docsis = modem.get('docsis_version', '')
-                modem['ofdm_enabled'] = '3.1' in docsis or '4.0' in docsis
 
         self.logger.info(f"Enriched {enriched_count} modems with cable-mac, {len(ofdma_if_map)} with OFDMA")
         
