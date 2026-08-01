@@ -1197,7 +1197,20 @@ class CMTSModemService:
                             if docsis_version:
                                 break
                 if docsis_version:
-                    modem['docsis_version'] = docsis_version
+                    # Never let a weaker fallback capability overwrite stronger
+                    # positive evidence already learned from OFDMA/OFDM or an
+                    # earlier capability probe.
+                    version_rank = {
+                        'DOCSIS 1.0': 10,
+                        'DOCSIS 1.1': 11,
+                        'DOCSIS 2.0': 20,
+                        'DOCSIS 3.0': 30,
+                        'DOCSIS 3.1': 31,
+                        'DOCSIS 4.0': 40,
+                    }
+                    current_version = modem.get('docsis_version')
+                    if version_rank.get(docsis_version, 0) >= version_rank.get(current_version, 0):
+                        modem['docsis_version'] = docsis_version
 
             except Exception as e:
                 if not _first_failure_logged:
