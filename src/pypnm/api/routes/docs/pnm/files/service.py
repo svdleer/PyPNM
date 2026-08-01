@@ -640,13 +640,17 @@ class PnmFileService:
         safe_name = self._safe_remote_basename(filename)
         result = await self._send_remote_file_task(
             agent_id,
-            "file_get",
-            {"filename": safe_name, "glob": False},
+            "pnm_file_get",
+            {"filename": safe_name},
             timeout=30,
             priority="long",
         )
         if not result.get("success"):
-            raise HTTPException(status_code=404, detail="Remote PNM file could not be retrieved")
+            error = str(result.get("error") or "unspecified agent error")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Remote PNM file could not be retrieved: {error}",
+            )
         returned_name = self._safe_remote_basename(str(result.get("filename") or safe_name))
         if returned_name != safe_name:
             raise HTTPException(status_code=409, detail="Remote file identity changed during retrieval")
@@ -900,6 +904,9 @@ class PnmFileService:
                 raise HTTPException(status_code=400, detail="Selected file is not impulse-response PNM data")
             selected = [(entry, content)]
         else:
+            # This catalog is intentionally fetched for every no-file-id request.
+            # Immediately retrieve the latest advertised file body; do not cache it
+            # and do not invoke any capture command.
             catalog = await self.get_remote_impulse_files(request.mac_address, request.direction)
             if not catalog.success:
                 return RemoteImpulseAnalysisResponse(
@@ -914,16 +921,30 @@ class PnmFileService:
             ):
                 latest = next((entry for entry in catalog.files if entry.direction == wanted_direction), None)
                 if latest is None:
-                    warnings.append(f"No existing {wanted_direction} PNN file found")
+                    warnings.append(f"No existing {wanted_direction} PNN file found in fresh catalog")
                 else:
                     selected_entries.append(latest)
             selected = []
-            for entry in selected_entries:
-                agent_id, filename = self._decode_remote_file_id(entry.file_id)
+            for catalog_entry in selected_entries:
+                agent_id, filename = self._decode_remote_file_id(catalog_entry.file_id)
                 try:
-                    selected.append((entry, await self._fetch_remote_file_bytes(agent_id, filename)))
+                    content = await self._fetch_remote_file_bytes(agent_id, filename)
+                    fresh_entry = self._remote_metadata_from_bytes(agent_id, filename, content)
+                    if fresh_entry is None:
+                        warnings.append(
+                            f"{catalog_entry.direction} file {catalog_entry.filename} changed or is no longer impulse-response PNM data"
+                        )
+                        continue
+                    if fresh_entry.direction != catalog_entry.direction:
+                        warnings.append(
+                            f"Skipped {catalog_entry.filename}: direction changed between fresh catalog and retrieval"
+                        )
+                        continue
+                    selected.append((fresh_entry, content))
                 except HTTPException as exc:
-                    warnings.append(f"{entry.direction} file unavailable: {exc.detail}")
+                    warnings.append(
+                        f"Fresh retrieval of {catalog_entry.direction} file {catalog_entry.filename} failed: {exc.detail}"
+                    )
 
         results: list[RemoteImpulseAnalysisResult] = []
         for entry, content in selected:
