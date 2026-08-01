@@ -32,6 +32,12 @@ class TopologyImportResponse(BaseModel):
     stats: dict[str, Any] = Field(default_factory=dict)
 
 
+class TopologyPathsByModemsRequest(BaseModel):
+    mac_addresses: list[str] = Field(default_factory=list)
+    date: str | None = None
+    max_hops: int = Field(default=32, ge=1, le=64)
+
+
 class TopologySummaryResponse(BaseModel):
     status: str = "success"
     files: dict[str, Any]

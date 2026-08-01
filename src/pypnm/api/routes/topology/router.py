@@ -7,6 +7,7 @@ from pypnm.api.routes.topology.schema import (
     ImportJobStatusResponse,
     TopologyDatasetsResponse,
     TopologyImportResponse,
+    TopologyPathsByModemsRequest,
     TopologySummaryResponse,
 )
 from pypnm.api.routes.topology.service import topology_service
@@ -161,6 +162,23 @@ def topology_modem_by_mac(
         payload = topology_service.get_modem_by_mac(
             selected_date=selected_date,
             mac_address=mm,
+        )
+        return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/paths/by-modems")
+def topology_paths_by_modems(body: TopologyPathsByModemsRequest) -> dict:
+    if not body.mac_addresses:
+        raise HTTPException(status_code=400, detail="mac_addresses must be a non-empty list")
+    if len(body.mac_addresses) > 100:
+        raise HTTPException(status_code=400, detail="at most 100 modem MAC addresses are allowed")
+    try:
+        payload = topology_service.get_paths_by_modems(
+            selected_date=body.date,
+            mac_addresses=body.mac_addresses,
+            max_hops=body.max_hops,
         )
         return {"status": "success", **payload}
     except Exception as exc:

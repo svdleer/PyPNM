@@ -522,6 +522,299 @@ class TopologyStorage:
             conn.close()
             return resolved_date, (dict(modem) if modem else None)
 
+    def get_paths_by_modems(
+        self,
+        snapshot_date: str | None,
+        mac_addresses: list[str],
+        max_hops: int = 32,
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Resolve bounded modem-to-fiber-node ancestor paths in one snapshot."""
+        max_hops = max(1, min(int(max_hops), 64))
+
+        def bare_mac(value: object) -> str:
+            return re.sub(r"[^0-9a-f]", "", str(value or "").lower())
+
+        requested: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for value in mac_addresses:
+            raw = str(value or "").strip()
+            bare = bare_mac(raw)
+            dedupe_key = bare if len(bare) == 12 else f"invalid:{raw.lower()}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            requested.append((raw, bare))
+
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                resolved_date = snapshot_date
+                if not resolved_date:
+                    cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
+                    latest = cur.fetchone() or {}
+                    resolved_date = str(latest.get("snapshot_date") or "") or None
+                if not resolved_date:
+                    return None, [
+                        {
+                            "mac": raw,
+                            "found": False,
+                            "modem": None,
+                            "nodes": [],
+                            "complete": False,
+                            "cycle_detected": False,
+                            "truncated": False,
+                            "warnings": ["No topology snapshot is available"],
+                        }
+                        for raw, _ in requested
+                    ]
+
+                cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
+                snapshot_row = cur.fetchone() or {}
+                snapshot_id = int(snapshot_row.get("id") or 0)
+                if snapshot_id <= 0:
+                    return resolved_date, [
+                        {
+                            "mac": raw,
+                            "found": False,
+                            "modem": None,
+                            "nodes": [],
+                            "complete": False,
+                            "cycle_detected": False,
+                            "truncated": False,
+                            "warnings": [f"Topology snapshot {resolved_date} was not found"],
+                        }
+                        for raw, _ in requested
+                    ]
+
+                valid_bares = [bare for _, bare in requested if len(bare) == 12]
+                candidate_to_bare: dict[str, str] = {}
+                for bare in valid_bares:
+                    pairs = [bare[i:i + 2] for i in range(0, 12, 2)]
+                    for candidate in {
+                        bare,
+                        ":".join(pairs),
+                        "-".join(pairs),
+                        f"{bare[:4]}.{bare[4:8]}.{bare[8:]}",
+                    }:
+                        candidate_to_bare[candidate] = bare
+
+                modems_by_bare: dict[str, dict[str, Any]] = {}
+                if candidate_to_bare:
+                    candidates = sorted(candidate_to_bare)
+                    placeholders = ",".join(["%s"] * len(candidates))
+                    cur.execute(
+                        "SELECT mac, fibernode, topology_link_id, lat, lon, address, "
+                        "linked_node_id, linked_node_type, link_match "
+                        "FROM topology_modems "
+                        f"WHERE snapshot_id=%s AND mac IN ({placeholders})",
+                        tuple([snapshot_id, *candidates]),
+                    )
+                    for row in cur.fetchall() or []:
+                        modem = dict(row)
+                        bare = bare_mac(modem.get("mac"))
+                        if len(bare) == 12 and bare not in modems_by_bare:
+                            modems_by_bare[bare] = modem
+
+                node_cache: dict[str, dict[str, Any]] = {}
+                queried: set[str] = set()
+                frontier = {
+                    str(modem.get("linked_node_id") or "").strip()
+                    for modem in modems_by_bare.values()
+                    if str(modem.get("linked_node_id") or "").strip()
+                }
+                for _ in range(max_hops):
+                    pending = sorted(frontier - queried)
+                    if not pending:
+                        break
+                    placeholders = ",".join(["%s"] * len(pending))
+                    cur.execute(
+                        "SELECT node_id, parent_id, fnid, node_type, lat, lon, description "
+                        "FROM topology_nodes "
+                        f"WHERE snapshot_id=%s AND node_id IN ({placeholders})",
+                        tuple([snapshot_id, *pending]),
+                    )
+                    queried.update(pending)
+                    rows = [dict(row) for row in (cur.fetchall() or [])]
+                    for row in rows:
+                        node_id = str(row.get("node_id") or "").strip()
+                        if node_id:
+                            node_cache[node_id] = row
+                    frontier = {
+                        str(row.get("parent_id") or "").strip()
+                        for row in rows
+                        if str(row.get("parent_id") or "").strip() not in queried
+                    }
+
+                def node_tokens(node_id: str) -> list[str]:
+                    return [token for token in re.split(r"[._]", node_id) if token]
+
+                def is_fiber_node(node: dict[str, Any], expected: str) -> bool:
+                    node_id = str(node.get("node_id") or "").strip()
+                    node_type = str(node.get("node_type") or "").strip().lower()
+                    expected_lower = expected.strip().lower()
+                    if expected_lower and node_id.lower() == expected_lower:
+                        return True
+                    return "fiber" in node_type and (
+                        not expected_lower
+                        or str(node.get("fnid") or "").strip().lower() == expected_lower
+                    )
+
+                paths: list[dict[str, Any]] = []
+                for raw, bare in requested:
+                    display_mac = ":".join(bare[i:i + 2] for i in range(0, 12, 2)) if len(bare) == 12 else raw
+                    if len(bare) != 12:
+                        paths.append({
+                            "mac": display_mac,
+                            "found": False,
+                            "modem": None,
+                            "nodes": [],
+                            "complete": False,
+                            "cycle_detected": False,
+                            "truncated": False,
+                            "warnings": ["Invalid MAC address"],
+                        })
+                        continue
+
+                    modem = modems_by_bare.get(bare)
+                    if not modem:
+                        paths.append({
+                            "mac": display_mac,
+                            "found": False,
+                            "modem": None,
+                            "nodes": [],
+                            "complete": False,
+                            "cycle_detected": False,
+                            "truncated": False,
+                            "warnings": ["Modem was not found in the selected topology snapshot"],
+                        })
+                        continue
+
+                    warnings: list[str] = []
+                    chain: list[dict[str, Any]] = []
+                    visited: set[str] = set()
+                    current_id = str(modem.get("linked_node_id") or "").strip()
+                    cycle_detected = False
+                    truncated = False
+                    reached_fiber = False
+                    expected_fiber = str(modem.get("fibernode") or "").strip()
+                    if not current_id:
+                        warnings.append("Modem has no linked topology node")
+
+                    for hop in range(max_hops):
+                        if not current_id:
+                            break
+                        if current_id in visited:
+                            cycle_detected = True
+                            warnings.append(f"Cycle detected at topology node {current_id}")
+                            break
+                        visited.add(current_id)
+                        row = node_cache.get(current_id)
+                        if not row:
+                            warnings.append(f"Topology node {current_id} was not found")
+                            break
+                        node = {
+                            "id": current_id,
+                            "parent_id": str(row.get("parent_id") or "").strip() or None,
+                            "fnid": str(row.get("fnid") or "").strip() or None,
+                            "node_type": str(row.get("node_type") or "").strip() or None,
+                            "lat": row.get("lat"),
+                            "lon": row.get("lon"),
+                            "description": str(row.get("description") or "").strip() or None,
+                            "hop": hop,
+                            "role": "path_node",
+                            "role_basis": None,
+                        }
+                        chain.append(node)
+                        if is_fiber_node(row, expected_fiber):
+                            reached_fiber = True
+                            break
+                        parent_id = str(row.get("parent_id") or "").strip()
+                        if not parent_id:
+                            break
+                        if hop == max_hops - 1:
+                            truncated = True
+                            warnings.append(f"Path exceeded the {max_hops}-hop limit")
+                            break
+                        current_id = parent_id
+
+                    end_index = next((
+                        index for index, node in enumerate(chain)
+                        if any(re.fullmatch(r"E\d+", token, flags=re.IGNORECASE) for token in node_tokens(node["id"]))
+                    ), None)
+                    group_index = next((
+                        index for index, node in enumerate(chain)
+                        if any(re.fullmatch(r"G\d+", token, flags=re.IGNORECASE) for token in node_tokens(node["id"]))
+                        and not any(re.fullmatch(r"E\d+", token, flags=re.IGNORECASE) for token in node_tokens(node["id"]))
+                    ), None)
+                    amp_indices = [
+                        index for index, node in enumerate(chain)
+                        if "amp" in str(node.get("node_type") or "").lower()
+                    ]
+                    if end_index is None and amp_indices:
+                        end_index = amp_indices[0]
+                        chain[end_index]["role_basis"] = "nearest-upstream-amp"
+                    if group_index is None:
+                        group_index = next((index for index in amp_indices if index != end_index), None)
+                        if group_index is not None:
+                            chain[group_index]["role_basis"] = "second-upstream-amp"
+                    if end_index is not None:
+                        chain[end_index]["role"] = "end_amp"
+                        chain[end_index]["role_basis"] = chain[end_index]["role_basis"] or "id-token"
+                    else:
+                        warnings.append("No end amplifier could be identified")
+                    if group_index is not None:
+                        chain[group_index]["role"] = "group_amp"
+                        chain[group_index]["role_basis"] = chain[group_index]["role_basis"] or "id-token"
+                    else:
+                        warnings.append("No group amplifier could be identified")
+
+                    fiber_index = next((
+                        index for index, node in enumerate(chain)
+                        if node["id"].lower() == expected_fiber.lower()
+                        or "fiber" in str(node.get("node_type") or "").lower()
+                    ), None)
+                    if fiber_index is not None:
+                        chain[fiber_index]["role"] = "fiber_node"
+                        chain[fiber_index]["role_basis"] = (
+                            "modem-fibernode-match"
+                            if expected_fiber and chain[fiber_index]["id"].lower() == expected_fiber.lower()
+                            else "node-type"
+                        )
+                    else:
+                        warnings.append("The matching Fiber Node was not reached")
+
+                    missing_coordinates = sum(
+                        1 for node in chain
+                        if node.get("role") in {"end_amp", "group_amp", "fiber_node"}
+                        and (node.get("lat") is None or node.get("lon") is None)
+                    )
+                    if missing_coordinates:
+                        warnings.append(f"{missing_coordinates} mapped path node(s) have no coordinates")
+
+                    paths.append({
+                        "mac": display_mac,
+                        "found": True,
+                        "modem": {
+                            "mac": display_mac,
+                            "lat": modem.get("lat"),
+                            "lon": modem.get("lon"),
+                            "linked_node_id": str(modem.get("linked_node_id") or "").strip() or None,
+                            "linked_node_type": str(modem.get("linked_node_type") or "").strip() or None,
+                            "fibernode": expected_fiber or None,
+                            "address": str(modem.get("address") or "").strip() or None,
+                        },
+                        "nodes": chain,
+                        "complete": bool(reached_fiber and not cycle_detected and not truncated),
+                        "cycle_detected": cycle_detected,
+                        "truncated": truncated,
+                        "warnings": warnings,
+                    })
+
+                return resolved_date, paths
+            finally:
+                conn.close()
+
     def suggest_values(
         self,
         snapshot_date: str | None,
@@ -1820,6 +2113,24 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "mac_address": mac_address,
             "modem": modem,
+        }
+
+    def get_paths_by_modems(
+        self,
+        selected_date: str | None,
+        mac_addresses: list[str],
+        max_hops: int = 32,
+    ) -> dict[str, Any]:
+        self.storage.init_db()
+        snapshot_date, paths = self.storage.get_paths_by_modems(
+            snapshot_date=selected_date,
+            mac_addresses=mac_addresses,
+            max_hops=max_hops,
+        )
+        return {
+            "snapshot_date": snapshot_date,
+            "count": len(paths),
+            "paths": paths,
         }
 
     def get_node_metadata(
