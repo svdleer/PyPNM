@@ -173,8 +173,10 @@ class Analysis:
         Wrapped transport of the measurement payload; must expose
         ``payload_to_dict()`` with a top-level ``"data"`` entry.
     cable_type : CableType, default CableType.RG6
-        Cable type used by echo-detection analysis to determine the
-        propagation velocity factor for distance calculations.
+        Cable type used by echo-detection analysis when no explicit velocity
+        factor is supplied.
+    velocity_factor : float or None, default None
+        Optional propagation velocity factor overriding the cable-type default.
 
     """
 
@@ -205,6 +207,7 @@ class Analysis:
         direction: str,
         channel_id: ChannelId,
         cable_type: str = "RG6",
+        velocity_factor: float | None = None,
     ) -> EchoDetectorReport:
         """Build the detector-windowed response from raw decoded complex coefficients."""
         n_fft = cls._docsis_impulse_fft_size(direction, int(subcarrier_spacing), len(values))
@@ -214,6 +217,7 @@ class Analysis:
             n_fft=n_fft,
             cable_type=cast(CableTypes, cable_type),
             channel_id=channel_id,
+            velocity_factor=velocity_factor,
         )
         adaptive_guard = int(np.ceil(2.0 * n_fft / max(1, len(values))))
         return detector.multi_echo(
@@ -235,12 +239,14 @@ class Analysis:
     def __init__(self, analysis_type: AnalysisType,
                  msg_response: MessageResponse,
                  cable_type: CableType = CableType.RG6,
-                 skip_automatic_process: bool = False) -> None:
+                 skip_automatic_process: bool = False,
+                 velocity_factor: float | None = None) -> None:
 
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
         self.analysis_type: AnalysisType        = analysis_type
         self.msg_response: MessageResponse      = msg_response
         self._cable_type: CableType             = cable_type
+        self._velocity_factor: float | None     = velocity_factor
         payload: dict[int | str, Any]           = msg_response.payload_to_dict() or {}
         _raw_data                               = payload.get("data", [])
 
@@ -357,7 +363,11 @@ class Analysis:
 
         if pnm_file_type == PnmFileType.OFDM_CHANNEL_ESTIMATE_COEFFICIENT.value:
             self.logger.debug("Processing: OFDM_CHANNEL_ESTIMATE_COEFFICIENT")
-            model = self.basic_analysis_ds_chan_est(measurement)
+            model = self.basic_analysis_ds_chan_est(
+                measurement,
+                cable_type=self._cable_type,
+                velocity_factor=self._velocity_factor,
+            )
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
             self.__add_pnmType(PnmFileType.OFDM_CHANNEL_ESTIMATE_COEFFICIENT)
@@ -388,14 +398,22 @@ class Analysis:
 
         elif pnm_file_type == PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS.value:
             self.logger.debug("Processing: UPSTREAM_PRE_EQUALIZER_COEFFICIENTS")
-            model = self.basic_analysis_us_ofdma_pre_equalization(measurement)
+            model = self.basic_analysis_us_ofdma_pre_equalization(
+                measurement,
+                cable_type=self._cable_type,
+                velocity_factor=self._velocity_factor,
+            )
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
             self.__add_pnmType(PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS)
 
         elif pnm_file_type == PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS_LAST_UPDATE.value:
             self.logger.debug("Processing: UPSTREAM_PRE_EQUALIZER_COEFFICIENTS_LAST_UPDATE")
-            model = self.basic_analysis_us_ofdma_pre_equalization(measurement)
+            model = self.basic_analysis_us_ofdma_pre_equalization(
+                measurement,
+                cable_type=self._cable_type,
+                velocity_factor=self._velocity_factor,
+            )
             self.__update_result_model(model)
             self.__update_result_dict(model.model_dump())
             self.__add_pnmType(PnmFileType.UPSTREAM_PRE_EQUALIZER_COEFFICIENTS_LAST_UPDATE)
@@ -520,6 +538,7 @@ class Analysis:
         model: BaseAnalysisModel,
         analysis_type: AnalysisType = AnalysisType.BASIC,
         cable_type: CableType = CableType.RG6,
+        velocity_factor: float | None = None,
     ) -> Analysis:
         """
         Construct an Analysis instance from an existing analysis model.
@@ -569,6 +588,7 @@ class Analysis:
         analysis.analysis_type           = analysis_type
         analysis.msg_response            = None
         analysis._cable_type             = cable_type
+        analysis._velocity_factor        = velocity_factor
         analysis._skip_automatic_process = True
         analysis._analysis_para          = AnalysisProcessParameters()
 
@@ -698,7 +718,12 @@ class Analysis:
         return out
 
     @classmethod
-    def basic_analysis_ds_chan_est(cls, measurement: dict[str, Any], cable_type: CableType = CableType.RG6) -> DsChannelEstAnalysisModel:
+    def basic_analysis_ds_chan_est(
+        cls,
+        measurement: dict[str, Any],
+        cable_type: CableType = CableType.RG6,
+        velocity_factor: float | None = None,
+    ) -> DsChannelEstAnalysisModel:
         """
         Perform downstream channel-estimation analysis.
 
@@ -796,6 +821,7 @@ class Analysis:
             direction="downstream",
             channel_id=channel_id,
             cable_type=cable_type.name,
+            velocity_factor=velocity_factor,
         )
 
         echo_rpt = EchoDatasetModel(type = EchoDetectorType.IFFT, report = echo_report)
@@ -987,7 +1013,12 @@ class Analysis:
         return out
 
     @classmethod
-    def basic_analysis_us_ofdma_pre_equalization(cls, measurement: dict[str, Any]) -> UsOfdmaUsPreEqAnalysisModel:
+    def basic_analysis_us_ofdma_pre_equalization(
+        cls,
+        measurement: dict[str, Any],
+        cable_type: CableType = CableType.RG6,
+        velocity_factor: float | None = None,
+    ) -> UsOfdmaUsPreEqAnalysisModel:
         """
         Perform Upstream OFDMA Pre-Equalization Analysis.
 
@@ -1081,13 +1112,13 @@ class Analysis:
             magnitude        = ComplexArrayOps.to_list(gd_results.group_delay_us),
         )
 
-        cable_type_name = "RG6"
         echo_report = cls._impulse_echo_report(
             values=values,
             subcarrier_spacing=subcarrier_spacing,
             direction="upstream",
             channel_id=channel_id,
-            cable_type=cable_type_name,
+            cable_type=cable_type.name,
+            velocity_factor=velocity_factor,
         )
 
         echo_rpt = EchoDatasetModel(

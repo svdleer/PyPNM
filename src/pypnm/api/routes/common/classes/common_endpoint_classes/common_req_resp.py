@@ -110,6 +110,19 @@ class CommonSingleCaptureAnalysisType(BaseModel):
     type: AnalysisType              = Field(default=AnalysisType.BASIC, description="Analysis type to perform")
     output: CommonOutput            = Field(description="Output format selection for single capture analysis")
     plot: CommonMatPlotConfigRequest = Field(description="Plot configuration for single capture analysis")
+    velocity_factor: float          = Field(
+        default=0.87,
+        ge=0.50,
+        le=1.00,
+        allow_inf_nan=False,
+        description="Velocity of propagation as a fraction of the speed of light",
+    )
+
+    @field_validator("velocity_factor", mode="before")
+    def _reject_boolean_velocity_factor(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("velocity_factor must be a number, not a boolean")
+        return value
 
 
 class CommonSingleCaptureAnalysisRequest(BaseModel):

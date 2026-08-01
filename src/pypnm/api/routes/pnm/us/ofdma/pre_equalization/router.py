@@ -98,7 +98,11 @@ class UsOfdmaPreEqualizationRouter:
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()
 
-            analysis = Analysis(AnalysisType.BASIC, msg_rsp)
+            analysis = Analysis(
+                AnalysisType.BASIC,
+                msg_rsp,
+                velocity_factor=request.analysis.velocity_factor,
+            )
 
             if request.analysis.output.type == OutputType.JSON:
                 payload: dict[str, Any] = cast(dict[str, Any], analysis.get_results())

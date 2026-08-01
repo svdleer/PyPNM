@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from math import ceil, log2
+from math import ceil, isfinite, log2
 from typing import Literal, TypeAlias
 
 import numpy as np
@@ -113,6 +113,7 @@ class EchoDetector:
         n_fft: int | None = None,
         cable_type: CableTypes = "RG6",
         channel_id: ChannelId | None = None,
+        velocity_factor: float | None = None,
     ) -> None:
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
         if subcarrier_spacing_hz <= 0.0:
@@ -132,6 +133,12 @@ class EchoDetector:
         if channel_id is None:
             channel_id = ChannelId(INVALID_CHANNEL_ID)
 
+        if isinstance(velocity_factor, bool):
+            raise ValueError("velocity_factor must be a number, not a boolean")
+        resolved_velocity_factor = CABLE_VF[cable_type] if velocity_factor is None else float(velocity_factor)
+        if not isfinite(resolved_velocity_factor) or not 0.50 <= resolved_velocity_factor <= 1.00:
+            raise ValueError("velocity_factor must be finite and between 0.50 and 1.00 inclusive")
+
         self._H_in: NDArrayC128 = H
         self._N: int = N
         self._snapshots: int = snapshots
@@ -139,7 +146,7 @@ class EchoDetector:
         self._df: float = float(subcarrier_spacing_hz)
         self._fs: float = float(n_fft) * float(subcarrier_spacing_hz)
         self._cable_type: CableTypes = cable_type
-        self._vf: float = float(CABLE_VF[cable_type])
+        self._vf: float = resolved_velocity_factor
         self._v: float = SPEED_OF_LIGHT * self._vf
         self._channel_id: int = int(channel_id)
 
