@@ -82,6 +82,28 @@ class TopologyStorage:
     def __init__(self) -> None:
         self._db_lock = threading.Lock()
 
+    @staticmethod
+    def _node_location_from_description(description: object) -> dict[str, str | None]:
+        """Extract only authoritative location fields supplied by the topology source."""
+        fields: dict[str, str] = {}
+        for part in str(description or "").split(";"):
+            key, separator, value = part.partition(":")
+            if separator and value.strip():
+                fields[key.strip().upper()] = value.strip()
+
+        postalcode = fields.get("POSTCODE", "")
+        house_number = fields.get("HNR", "")
+        extension = fields.get("EXT", "")
+        address = None
+        if postalcode and house_number:
+            house = f"{house_number} {extension}".strip()
+            address = f"{postalcode} {house}"
+
+        return {
+            "address": address,
+            "room": fields.get("ROOM") or None,
+        }
+
     def _connect(self):
         try:
             import pymysql
@@ -713,6 +735,7 @@ class TopologyStorage:
                         if not row:
                             warnings.append(f"Topology node {current_id} was not found")
                             break
+                        location = self._node_location_from_description(row.get("description"))
                         node = {
                             "id": current_id,
                             "parent_id": str(row.get("parent_id") or "").strip() or None,
@@ -721,6 +744,8 @@ class TopologyStorage:
                             "lat": row.get("lat"),
                             "lon": row.get("lon"),
                             "description": str(row.get("description") or "").strip() or None,
+                            "address": location["address"],
+                            "room": location["room"],
                             "hop": hop,
                             "role": "path_node",
                             "role_basis": None,
