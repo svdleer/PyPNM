@@ -97,6 +97,14 @@ class UsOfdmaPreEqualizationRouter:
 
             cps = CommonProcessService(msg_rsp)
             msg_rsp = cps.process()
+            if msg_rsp.status != ServiceStatusCode.SUCCESS or not msg_rsp.payload:
+                err = "No valid Upstream OFDMA Pre-Equalization files were captured."
+                self.logger.error(err)
+                return SnmpResponse(
+                    mac_address=mac,
+                    message=err,
+                    status=ServiceStatusCode.TEST_ERROR,
+                )
 
             analysis = Analysis(
                 AnalysisType.BASIC,
