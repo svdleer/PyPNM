@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+from inspect import signature
 
 from fastapi import APIRouter, HTTPException
 
@@ -75,15 +76,24 @@ async def get_cmts_modems(
             limit = 50000
 
     try:
-        result = await service.discover_modems(
-            cmts_ip=cmts_ip,
-            community=community,
-            limit=limit,
-            enrich=enrich,
-            refresh=refresh,
-            modem_community=modem_community,
-            cmts_hostname=cmts_hostname or "",
-        )
+        discovery_kwargs = {
+            'cmts_ip': cmts_ip,
+            'community': community,
+            'limit': limit,
+            'enrich': enrich,
+            'modem_community': modem_community,
+            'cmts_hostname': cmts_hostname or '',
+        }
+        if 'refresh' in signature(service.discover_modems).parameters:
+            discovery_kwargs['refresh'] = refresh
+        elif refresh:
+            return CMTSModemResponse(
+                success=False,
+                modems=[],
+                count=0,
+                error='This PyPNM service version does not support forced inventory refresh',
+            )
+        result = await service.discover_modems(**discovery_kwargs)
         
         if not result.get('success'):
             return CMTSModemResponse(
