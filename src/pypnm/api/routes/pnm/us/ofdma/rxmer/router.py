@@ -592,7 +592,7 @@ class UsOfdmaRxMerRouter:
             profile (dB relative to main tap) for every modem on the fiber node.
 
             - X-axis : tap offset from main tap (tap numbers); top twin axis in
-              estimated one-way cable distance (ft) when sample_period_us is available.
+              estimated one-way cable distance (m) when sample_period_us is available.
             - Y-axis : magnitude relative to main tap (dB).  Main tap = 0 dB.
             - One line per modem coloured by plant-assessment verdict:
                 green = clean, yellow = in-home, red = plant, grey = unknown.
@@ -609,7 +609,6 @@ class UsOfdmaRxMerRouter:
             import numpy as np
 
             _COAX_VEL = 0.85 * 299_792_458   # m/s  (VOP 0.85)
-            _M_TO_FT  = 3.28084
 
             VERDICT_COLOUR = {
                 "clean":   "#2ca02c",  # green
@@ -837,13 +836,13 @@ class UsOfdmaRxMerRouter:
                           fontsize=8, framealpha=0.85,
                           title="Line style = verdict", title_fontsize=7)
 
-                # Twin top x-axis in cable ft (when sample_period_us known)
+                # Twin top x-axis in cable meters (when sample_period_us known)
                 if fn_sp_us and fn_sp_us > 0:
                     ax2 = ax.twiny()
                     ax2.set_xlim(ax.get_xlim())
-                    def tap_to_ft(x):
+                    def tap_to_meters(x):
                         delay_s = abs(x) * fn_sp_us * 1e-6
-                        return delay_s * _COAX_VEL / 2.0 * _M_TO_FT
+                        return delay_s * _COAX_VEL / 2.0
                     tick_offs = sorted(set(
                         [o for o in fn_offsets if o != 0] or [1]
                     ), key=abs)
@@ -851,12 +850,12 @@ class UsOfdmaRxMerRouter:
                     shown = [0] + tick_offs[::step]
                     ax2.set_xticks(shown)
                     ax2.set_xticklabels(
-                        ["main" if t == 0 else f"{tap_to_ft(t):.0f} ft"
+                        ["main" if t == 0 else f"{tap_to_meters(t):.0f} m"
                          for t in shown],
                         fontsize=8,
                     )
                     ax2.set_xlabel(
-                        "Estimated one-way reflection distance (ft, VOP 0.85)",
+                        "Estimated one-way reflection distance (m, VOP 0.85)",
                         fontsize=9,
                     )
 
