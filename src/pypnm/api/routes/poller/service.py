@@ -1768,13 +1768,17 @@ class PollerService:
                         "SELECT status FROM poller_job WHERE id=%s",
                         (job_id,),
                     )
-                    current_status = str((status_rows[0] or {}).get("status") or "").lower() if status_rows else ""
-                    if current_status and current_status != "running":
-                        if current_status == "cancelled":
-                            error_text = "Killed by admin"
-                        else:
-                            error_text = f"Stopped (status={current_status})"
-                        break
+                    current_status = (
+                        str((status_rows[0] or {}).get("status") or "").lower()
+                        if status_rows else ""
+                    )
+                    if current_status != "running":
+                        self._execute(
+                            "UPDATE poller_setting SET last_target_offset=0, "
+                            "updated_at=%s WHERE id=%s",
+                            (self._now(), poller_id),
+                        )
+                        return
                     cmts_ip = t.get("ip")
                     cmts_name = t.get("name") or cmts_ip
                     if not cmts_ip:
@@ -1803,6 +1807,40 @@ class PollerService:
                                 modems_succeeded=modems_succeeded,
                                 modems_failed=modems_failed,
                             )
+                            status_rows = self._query(
+                                "SELECT status FROM poller_job WHERE id=%s",
+                                (job_id,),
+                            )
+                            if (
+                                not status_rows
+                                or str(status_rows[0].get("status") or "").lower()
+                                != "running"
+                            ):
+                                self._execute(
+                                    "UPDATE poller_setting SET last_target_offset=0, "
+                                    "updated_at=%s WHERE id=%s",
+                                    (self._now(), poller_id),
+                                )
+                                return
+
+                    # Cancellation is cooperative: discard an in-flight result
+                    # returned after the administrator stopped or cleared the job.
+                    status_rows = self._query(
+                        "SELECT status FROM poller_job WHERE id=%s",
+                        (job_id,),
+                    )
+                    if (
+                        not status_rows
+                        or str(status_rows[0].get("status") or "").lower()
+                        != "running"
+                    ):
+                        self._execute(
+                            "UPDATE poller_setting SET last_target_offset=0, "
+                            "updated_at=%s WHERE id=%s",
+                            (self._now(), poller_id),
+                        )
+                        return
+
                     if fetch_result is None:
                         self._execute(
                             "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
@@ -2090,9 +2128,7 @@ class PollerService:
 
     def kill_job(self, job_id: int) -> Dict[str, Any]:
         rows = self._query(
-            "SELECT j.id, j.status, j.poller_id, p.task_type "
-            "FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
-            "WHERE j.id=%s",
+            "SELECT id, status, poller_id FROM poller_job WHERE id=%s",
             (int(job_id),),
         )
         if not rows:
@@ -2107,12 +2143,11 @@ class PollerService:
             "WHERE id=%s AND status IN ('queued','running')",
             ("cancelled", self._now(), "Killed by admin", int(job_id)),
         )
-        if str(rows[0].get("task_type") or "") == _CPE_TASK_TYPE:
-            self._execute(
-                "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
-                "WHERE id=%s",
-                (self._now(), int(rows[0].get("poller_id") or 0)),
-            )
+        self._execute(
+            "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+            "WHERE id=%s",
+            (self._now(), int(rows[0].get("poller_id") or 0)),
+        )
         return {"killed": 1, "state": "cancelled"}
 
     def get_scheduler_status(self) -> Dict[str, Any]:
