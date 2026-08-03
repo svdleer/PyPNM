@@ -131,6 +131,7 @@ async def get_cmts_modems(
             raw_legacy_mac_count=result.get('raw_legacy_mac_count'),
             raw_d3_mac_count=result.get('raw_d3_mac_count'),
             cpe_addresses=result.get('cpe_addresses') or [],
+            skipped_cpe_rows=int(result.get('skipped_cpe_rows') or 0),
             cpe_complete=result.get('cpe_complete') is True,
             cpe_truncated=result.get('cpe_truncated') is True,
             cpe_oid_errors=result.get('cpe_oid_errors') or {},

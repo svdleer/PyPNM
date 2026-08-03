@@ -41,6 +41,7 @@ class CPECollectionResponse(BaseModel):
     success: bool
     cpe_addresses: List[Dict[str, Any]] = Field(default_factory=list)
     count: int = 0
+    skipped_cpe_rows: int = 0
     complete: bool = False
     truncated: bool = False
     requested_limit: Optional[int] = None
@@ -102,6 +103,7 @@ class CMTSModemResponse(BaseModel):
     raw_legacy_mac_count: Optional[int] = Field(default=None, description="Rows returned by the legacy registration MAC table")
     raw_d3_mac_count: Optional[int] = Field(default=None, description="Rows returned by the DOCSIS 3.x registration MAC table")
     cpe_addresses: List[Dict[str, Any]] = Field(default_factory=list, description="CPE addresses collected for scheduled persistence")
+    skipped_cpe_rows: int = Field(default=0, description="Individual incomplete or undecodable CPE rows omitted from this generation")
     cpe_complete: bool = Field(default=False, description="Whether all requested CPE address columns completed")
     cpe_truncated: bool = Field(default=False, description="Whether a CPE address column reached the walk limit")
     cpe_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from CPE address columns")

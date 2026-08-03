@@ -152,32 +152,62 @@ class CMTSModemService:
 
     @staticmethod
     def _extract_index(full_oid: str, base_oid: str) -> str:
-        """Return the OID suffix after *base_oid* (without leading dot)."""
-        if full_oid.startswith(base_oid + '.'):
-            return full_oid[len(base_oid) + 1:]
-        return full_oid.rsplit('.', 1)[-1]
+        """Return the complete OID suffix for a proper child of *base_oid*."""
+        full = str(full_oid or '').strip().lstrip('.')
+        base = str(base_oid or '').strip().lstrip('.').rstrip('.')
+        prefix = f'{base}.'
+        if base and full.startswith(prefix):
+            return full[len(prefix):]
+        return ''
 
     @staticmethod
-    def _parse_mac(raw: str) -> str | None:
-        """Normalise a MAC value (hex‑string / 0x‑prefixed / colon‑separated)
-        into ``aa:bb:cc:dd:ee:ff`` format.  Returns *None* on failure.
+    def _parse_mac(raw: Any) -> str | None:
+        """Normalise a six-octet SNMP value into canonical MAC notation."""
+        payload: bytes | None = None
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            candidate = bytes(raw)
+            if len(candidate) == 6:
+                payload = candidate
+        elif isinstance(raw, str):
+            # pysnmp OctetString values can arrive as six Latin-1 characters,
+            # including non-printable characters, rather than rendered hex.
+            if len(raw) == 6:
+                try:
+                    payload = raw.encode('latin-1')
+                except UnicodeEncodeError:
+                    return None
+            else:
+                text = raw.strip()
+                lowered = text.lower()
+                if lowered.startswith('hex-string:'):
+                    text = text.split(':', 1)[1].strip()
+                elif lowered.startswith('0x'):
+                    text = text[2:]
 
-        Handles short octets like ``0:7:11:14:3c:27`` (SNMP strips leading
-        zeros per octet) by zero-padding each octet before joining.
-        """
-        mac_hex = str(raw).strip()
-        if mac_hex.startswith('0x'):
-            mac_hex = mac_hex[2:]
-        # If colon/hyphen separated, zero-pad each octet then rejoin
-        sep = ':' if ':' in mac_hex else ('-' if '-' in mac_hex else None)
-        if sep:
-            parts = mac_hex.split(sep)
-            if len(parts) == 6:
-                mac_hex = ''.join(p.zfill(2) for p in parts)
-        mac_hex = mac_hex.replace(' ', '').replace(':', '').replace('-', '')
-        if len(mac_hex) >= 12:
-            return ':'.join(mac_hex[i:i + 2] for i in range(0, 12, 2)).lower()
-        return None
+                sep = ':' if ':' in text else ('-' if '-' in text else None)
+                if sep:
+                    parts = text.split(sep)
+                    if len(parts) == 6 and all(
+                        1 <= len(part) <= 2
+                        and all(ch in '0123456789abcdefABCDEF' for ch in part)
+                        for part in parts
+                    ):
+                        text = ''.join(part.zfill(2) for part in parts)
+
+                mac_hex = ''.join(
+                    ch for ch in text if ch not in ' \t\r\n:-'
+                )
+                if len(mac_hex) == 12 and all(
+                    ch in '0123456789abcdefABCDEF' for ch in mac_hex
+                ):
+                    try:
+                        payload = bytes.fromhex(mac_hex)
+                    except ValueError:
+                        return None
+
+        if payload is None or len(payload) != 6:
+            return None
+        return ':'.join(f'{octet:02x}' for octet in payload)
 
     @staticmethod
     def _enum_code(value: Any) -> int | None:
@@ -234,55 +264,78 @@ class CMTSModemService:
         self,
         raw: dict,
         modems: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], bool]:
-        """Join CPE rows to CMs and report whether every row was valid."""
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Join valid CPE rows to CMs and count skipped individual entries."""
         modem_by_index = {
             str(modem.get('docsif3_index')): str(modem.get('mac_address'))
             for modem in modems
             if modem.get('docsif3_index') is not None and modem.get('mac_address')
         }
 
-        def indexed_rows(oid: str, value_getter) -> tuple[Dict[str, Any], bool]:
+        def indexed_rows(
+            oid: str,
+            value_getter,
+        ) -> tuple[Dict[str, Any], set[str], int]:
             mapped: Dict[str, Any] = {}
-            rows_valid = True
-            for item in raw.get(oid, []):
+            duplicate_indexes: set[str] = set()
+            invalid_rows = 0
+            for item in raw.get(oid, []) or []:
+                if not isinstance(item, dict):
+                    invalid_rows += 1
+                    continue
                 row_index = self._extract_index(item.get('oid', ''), oid)
-                if not row_index or row_index in mapped:
-                    rows_valid = False
+                if not row_index:
+                    invalid_rows += 1
+                    continue
+                if row_index in mapped or row_index in duplicate_indexes:
+                    mapped.pop(row_index, None)
+                    duplicate_indexes.add(row_index)
                     continue
                 mapped[row_index] = value_getter(item)
-            return mapped, rows_valid
+            return mapped, duplicate_indexes, invalid_rows
 
-        type_by_index, type_rows_valid = indexed_rows(
+        type_by_index, type_duplicates, invalid_type_rows = indexed_rows(
             OID_CPE_ADDR_TYPE,
             lambda item: self._enum_code(item.get('value')),
         )
-        prefix_by_index, prefix_rows_valid = indexed_rows(
+        prefix_by_index, prefix_duplicates, invalid_prefix_rows = indexed_rows(
             OID_CPE_PREFIX,
             lambda item: self._enum_code(item.get('value')),
         )
-        address_rows, address_rows_valid = indexed_rows(
+        address_rows, address_duplicates, invalid_address_rows = indexed_rows(
             OID_CPE_ADDR,
             lambda item: item,
         )
-        valid = bool(
-            type_rows_valid
-            and prefix_rows_valid
-            and address_rows_valid
-            and set(address_rows) == set(type_by_index) == set(prefix_by_index)
-        )
+        duplicate_indexes = type_duplicates | prefix_duplicates | address_duplicates
+        all_indexes = list(dict.fromkeys([
+            *address_rows,
+            *type_by_index,
+            *prefix_by_index,
+            *duplicate_indexes,
+        ]))
+        skipped_count = invalid_type_rows + invalid_prefix_rows + invalid_address_rows
         entries: List[Dict[str, Any]] = []
-        for row_index, item in address_rows.items():
+        for row_index in all_indexes:
+            if (
+                row_index in duplicate_indexes
+                or row_index not in address_rows
+                or row_index not in type_by_index
+                or row_index not in prefix_by_index
+            ):
+                skipped_count += 1
+                continue
+
+            item = address_rows[row_index]
             parts = row_index.split('.')
             if len(parts) < 2:
-                valid = False
+                skipped_count += 1
                 continue
             docsif3_index = '.'.join(parts[:-1])
             modem_mac = modem_by_index.get(docsif3_index)
-            address_type = type_by_index.get(row_index)
+            address_type = type_by_index[row_index]
             address = self._decode_inet_address(item.get('value'), address_type or 0)
             maximum = 32 if address_type == 1 else 128 if address_type == 2 else -1
-            prefix_length = prefix_by_index.get(row_index)
+            prefix_length = prefix_by_index[row_index]
             if (
                 not modem_mac
                 or not address
@@ -290,7 +343,7 @@ class CMTSModemService:
                 or prefix_length is None
                 or not 0 <= prefix_length <= maximum
             ):
-                valid = False
+                skipped_count += 1
                 continue
             entries.append({
                 'docsif3_index': docsif3_index,
@@ -300,7 +353,7 @@ class CMTSModemService:
                 'ip_address': address,
                 'prefix_length': prefix_length,
             })
-        return entries, valid
+        return entries, skipped_count
 
     @staticmethod
     def _decode_partial_service(value: Any) -> tuple[bool, bool, str]:
@@ -544,20 +597,21 @@ class CMTSModemService:
         )
 
         modem_by_index: Dict[str, str] = {}
-        d3_rows_valid = True
-        for item in raw.get(OID_D3_MAC, []):
+        ambiguous_d3_indexes: set[str] = set()
+        for item in raw.get(OID_D3_MAC, []) or []:
+            if not isinstance(item, dict):
+                continue
             docsif3_index = self._extract_index(item.get('oid', ''), OID_D3_MAC)
             modem_mac = self._parse_mac(item.get('value'))
-            if not docsif3_index or not modem_mac:
-                d3_rows_valid = False
+            if not docsif3_index or not modem_mac or docsif3_index in ambiguous_d3_indexes:
                 continue
-            previous = modem_by_index.get(docsif3_index)
-            if previous and previous != modem_mac:
-                d3_rows_valid = False
+            if docsif3_index in modem_by_index:
+                modem_by_index.pop(docsif3_index, None)
+                ambiguous_d3_indexes.add(docsif3_index)
                 continue
             modem_by_index[docsif3_index] = modem_mac
 
-        cpe_addresses, cpe_rows_valid = self._correlate_cpe_data(
+        cpe_addresses, skipped_cpe_rows = self._correlate_cpe_data(
             raw,
             [
                 {'docsif3_index': index, 'mac_address': mac}
@@ -570,8 +624,6 @@ class CMTSModemService:
             and not relevant_errors
             and not missing_completions
             and not truncated
-            and d3_rows_valid
-            and cpe_rows_valid
         )
         validation_reasons = []
         if not has_completion_metadata:
@@ -582,19 +634,16 @@ class CMTSModemService:
             validation_reasons.append('one or more required OID walks did not complete')
         if truncated:
             validation_reasons.append('one or more required OID walks were truncated')
-        if not d3_rows_valid:
-            validation_reasons.append('invalid or conflicting DOCSIS registration rows')
-        if not cpe_rows_valid:
-            validation_reasons.append('CPE table indexes or modem correlations were inconsistent')
 
         self.logger.info(
-            'Collected %s CPE addresses from CMTS %s (complete=%s)',
-            len(cpe_addresses), cmts_ip, complete,
+            'Collected %s CPE addresses from CMTS %s (skipped=%s, complete=%s)',
+            len(cpe_addresses), cmts_ip, skipped_cpe_rows, complete,
         )
         return {
             'success': True,
             'cpe_addresses': cpe_addresses,
             'count': len(cpe_addresses),
+            'skipped_cpe_rows': skipped_cpe_rows,
             'complete': complete,
             'truncated': truncated,
             'requested_limit': requested_limit,
@@ -960,10 +1009,10 @@ class CMTSModemService:
             # ── Step 2: Parse raw results into lookup maps ───────────────
             modems = self._correlate_modem_data(raw, limit)
             if collect_cpe:
-                cpe_addresses, cpe_rows_valid = self._correlate_cpe_data(raw, modems)
-                cpe_complete = cpe_complete and cpe_rows_valid
+                cpe_addresses, skipped_cpe_rows = self._correlate_cpe_data(raw, modems)
                 inventory_meta.update({
                     'cpe_addresses': cpe_addresses,
+                    'skipped_cpe_rows': skipped_cpe_rows,
                     'cpe_complete': cpe_complete,
                     'cpe_truncated': cpe_truncated,
                     'cpe_oid_errors': cpe_oid_errors,

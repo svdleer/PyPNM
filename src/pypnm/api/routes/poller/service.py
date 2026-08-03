@@ -1059,6 +1059,7 @@ class PollerService:
             rows = []
         return {
             "cpe_addresses": rows,
+            "skipped_cpe_rows": int(result.get("skipped_cpe_rows") or 0),
             "complete": result.get("complete") is True,
             "truncated": result.get("truncated") is True,
             "requested_limit": result.get("requested_limit"),
@@ -1630,6 +1631,7 @@ class PollerService:
                 "cmts_ip": cmts_ip,
                 "row_count": written,
                 "cpe_row_count": written,
+                "skipped_cpe_rows": int(fetch_result.get("skipped_cpe_rows") or 0),
                 "cpe_complete": complete,
                 "cpe_truncated": truncated,
                 "cpe_oid_errors": fetch_result.get("oid_errors") or {},
