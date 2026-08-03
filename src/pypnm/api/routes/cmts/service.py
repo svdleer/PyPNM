@@ -588,12 +588,39 @@ class CMTSModemService:
         completed_oids = set(walk_result.get('completed_oids') or [])
         truncated_oids = set(walk_result.get('truncated_oids') or [])
         has_completion_metadata = 'completed_oids' in walk_result
+        walk_warnings_raw = walk_result.get('warnings')
+        walk_warnings = (
+            [str(warning) for warning in walk_warnings_raw]
+            if isinstance(walk_warnings_raw, list)
+            else []
+        )
+        walk_durations = walk_result.get('walk_durations') or {}
         relevant_errors = {
             oid: str(walk_errors[oid]) for oid in walk_oids if oid in walk_errors
         }
         truncated = bool(
             any(oid in truncated_oids for oid in walk_oids)
             or any(len(raw.get(oid, [])) >= requested_limit for oid in walk_oids)
+        )
+        metadata_completion_confirmed = bool(
+            has_completion_metadata
+            and all(oid in completed_oids for oid in walk_oids)
+        )
+        response_completion_confirmed = bool(
+            not has_completion_metadata
+            and isinstance(walk_result.get('results'), dict)
+            and all(oid in raw and isinstance(raw.get(oid), list) for oid in walk_oids)
+            and isinstance(walk_warnings_raw, list)
+            and not walk_warnings
+            and isinstance(walk_durations, dict)
+            and all(oid in walk_durations for oid in walk_oids)
+        )
+        completion_source = (
+            'completed_oids'
+            if metadata_completion_confirmed
+            else 'response_evidence'
+            if response_completion_confirmed
+            else 'unconfirmed'
         )
 
         modem_by_index: Dict[str, str] = {}
@@ -620,24 +647,28 @@ class CMTSModemService:
         )
         missing_completions = [oid for oid in walk_oids if oid not in completed_oids]
         complete = bool(
-            has_completion_metadata
+            (metadata_completion_confirmed or response_completion_confirmed)
             and not relevant_errors
-            and not missing_completions
             and not truncated
         )
         validation_reasons = []
-        if not has_completion_metadata:
-            validation_reasons.append('agent omitted per-OID completion metadata')
+        if not has_completion_metadata and not response_completion_confirmed:
+            validation_reasons.append(
+                'agent omitted per-OID completion metadata and response evidence was insufficient'
+            )
+        if has_completion_metadata and missing_completions:
+            validation_reasons.append('one or more required OID walks did not complete')
         if relevant_errors:
             validation_reasons.append('one or more required OID walks failed')
-        if missing_completions:
-            validation_reasons.append('one or more required OID walks did not complete')
+        if walk_warnings and not has_completion_metadata:
+            validation_reasons.append('one or more required OID walks returned warnings')
         if truncated:
             validation_reasons.append('one or more required OID walks were truncated')
 
         self.logger.info(
-            'Collected %s CPE addresses from CMTS %s (skipped=%s, complete=%s)',
-            len(cpe_addresses), cmts_ip, skipped_cpe_rows, complete,
+            'Collected %s CPE addresses from CMTS %s '
+            '(skipped=%s, complete=%s, completion_source=%s)',
+            len(cpe_addresses), cmts_ip, skipped_cpe_rows, complete, completion_source,
         )
         return {
             'success': True,
@@ -645,6 +676,7 @@ class CMTSModemService:
             'count': len(cpe_addresses),
             'skipped_cpe_rows': skipped_cpe_rows,
             'complete': complete,
+            'completion_source': completion_source,
             'truncated': truncated,
             'requested_limit': requested_limit,
             'collected_at': datetime.now(timezone.utc).isoformat(),

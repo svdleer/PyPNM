@@ -43,6 +43,7 @@ class CPECollectionResponse(BaseModel):
     count: int = 0
     skipped_cpe_rows: int = 0
     complete: bool = False
+    completion_source: Optional[str] = None
     truncated: bool = False
     requested_limit: Optional[int] = None
     collected_at: Optional[str] = None
