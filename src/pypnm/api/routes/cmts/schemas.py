@@ -29,6 +29,31 @@ class CMTSModemRequest(BaseModel):
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
 
 
+class CPECollectionRequest(BaseModel):
+    """Request model for the dedicated scheduled CPE collection."""
+    cmts_ip: str = Field(..., description="CMTS IP address")
+    community: str = Field(default="public", description="SNMP community for CMTS")
+    limit: Optional[int] = Field(default=None, ge=1, le=500000)
+
+
+class CPECollectionResponse(BaseModel):
+    """One validated CPE-address generation from a CMTS."""
+    success: bool
+    cpe_addresses: List[Dict[str, Any]] = Field(default_factory=list)
+    count: int = 0
+    complete: bool = False
+    truncated: bool = False
+    requested_limit: Optional[int] = None
+    collected_at: Optional[str] = None
+    oid_errors: Dict[str, str] = Field(default_factory=dict)
+    validation_error: Optional[str] = None
+    raw_d3_mac_count: Optional[int] = None
+    raw_cpe_type_count: Optional[int] = None
+    raw_cpe_address_count: Optional[int] = None
+    raw_cpe_prefix_count: Optional[int] = None
+    error: Optional[str] = None
+
+
 class ModemInfo(BaseModel):
     """Modem information from CMTS discovery."""
     mac_address: str = Field(..., description="Modem MAC address")

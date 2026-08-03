@@ -9,7 +9,8 @@ import logging
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time as datetime_time, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import pymysql
@@ -17,6 +18,11 @@ import pymysql.cursors
 import requests
 
 logger = logging.getLogger(__name__)
+
+_CPE_TASK_TYPE = "cpe_address_refresh"
+_CPE_TASK_SYSTEM_KEY = "cpe-address-refresh"
+_CPE_TASK_NAME = "CPE address refresh"
+_CPE_TASK_SCHEDULE = (datetime_time(hour=0), datetime_time(hour=12))
 
 
 class PollerService:
@@ -205,6 +211,8 @@ class PollerService:
             CREATE TABLE IF NOT EXISTS poller_setting (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 name VARCHAR(64) NOT NULL,
+                task_type VARCHAR(32) NOT NULL DEFAULT 'inventory',
+                system_key VARCHAR(64) NULL,
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 scope_type VARCHAR(16) NOT NULL DEFAULT 'all_cmts',
                 scope_json JSON NULL,
@@ -223,9 +231,11 @@ class PollerService:
                 heavy_delay_ms INT NOT NULL DEFAULT 0,
                 max_runtime_sec INT NOT NULL DEFAULT 3600,
                 last_target_offset INT NOT NULL DEFAULT 0,
+                last_scheduled_slot_utc DATETIME NULL,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
-                UNIQUE KEY uk_poller_setting_name (name)
+                UNIQUE KEY uk_poller_setting_name (name),
+                UNIQUE KEY uk_poller_setting_system_key (system_key)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -246,8 +256,10 @@ class PollerService:
                 finished_at DATETIME NULL,
                 error_text TEXT NULL,
                 cmts_breakdown JSON NULL,
+                scheduled_slot_utc DATETIME NULL,
                 created_at DATETIME NOT NULL,
-                INDEX idx_job_status_created (status, created_at)
+                INDEX idx_job_status_created (status, created_at),
+                UNIQUE KEY uk_job_scheduled_slot (poller_id, scheduled_slot_utc)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -348,6 +360,112 @@ class PollerService:
                 self._execute(ddl)
             except Exception:
                 pass
+
+        setting_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM poller_setting")
+        }
+        missing_setting_columns = []
+        if "task_type" not in setting_columns:
+            missing_setting_columns.append(
+                "ADD COLUMN `task_type` VARCHAR(32) NOT NULL DEFAULT 'inventory'"
+            )
+        if "system_key" not in setting_columns:
+            missing_setting_columns.append("ADD COLUMN `system_key` VARCHAR(64) NULL")
+        if "last_scheduled_slot_utc" not in setting_columns:
+            missing_setting_columns.append(
+                "ADD COLUMN `last_scheduled_slot_utc` DATETIME NULL"
+            )
+        if missing_setting_columns:
+            self._execute(
+                "ALTER TABLE poller_setting " + ", ".join(missing_setting_columns)
+            )
+
+        job_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM poller_job")
+        }
+        if "scheduled_slot_utc" not in job_columns:
+            self._execute(
+                "ALTER TABLE poller_job "
+                "ADD COLUMN `scheduled_slot_utc` DATETIME NULL"
+            )
+
+        required_indexes = {
+            "poller_setting": (
+                "uk_poller_setting_system_key",
+                "CREATE UNIQUE INDEX uk_poller_setting_system_key "
+                "ON poller_setting (system_key)",
+            ),
+            "poller_job": (
+                "uk_job_scheduled_slot",
+                "CREATE UNIQUE INDEX uk_job_scheduled_slot "
+                "ON poller_job (poller_id, scheduled_slot_utc)",
+            ),
+        }
+        for table, (index_name, ddl) in required_indexes.items():
+            indexes = {
+                str(row.get("Key_name"))
+                for row in self._query(f"SHOW INDEX FROM {table}")
+            }
+            if index_name not in indexes:
+                self._execute(ddl)
+        for table, (index_name, _) in required_indexes.items():
+            indexes = {
+                str(row.get("Key_name"))
+                for row in self._query(f"SHOW INDEX FROM {table}")
+            }
+            if index_name not in indexes:
+                raise RuntimeError(
+                    f"Required database index {table}.{index_name} is missing"
+                )
+
+        cpe_by_key = self._query(
+            "SELECT id FROM poller_setting WHERE system_key=%s LIMIT 1",
+            (_CPE_TASK_SYSTEM_KEY,),
+        )
+        cpe_by_name = self._query(
+            "SELECT id FROM poller_setting WHERE name=%s LIMIT 1",
+            (_CPE_TASK_NAME,),
+        )
+        if (
+            cpe_by_key
+            and cpe_by_name
+            and int(cpe_by_key[0]["id"]) != int(cpe_by_name[0]["id"])
+        ):
+            raise RuntimeError(
+                "Conflicting CPE system task rows exist; refusing unsafe adoption"
+            )
+        existing_cpe_task = cpe_by_key or cpe_by_name
+        if existing_cpe_task:
+            self._execute(
+                "UPDATE poller_setting SET task_type=%s, system_key=%s, name=%s, "
+                "scope_type='all_cmts', scope_json=NULL, collect_identity=FALSE, "
+                "collect_scqam=FALSE, collect_rxmer=FALSE, interval_minutes=720, "
+                "max_runtime_sec=43200, updated_at=%s WHERE id=%s",
+                (
+                    _CPE_TASK_TYPE,
+                    _CPE_TASK_SYSTEM_KEY,
+                    _CPE_TASK_NAME,
+                    self._now(),
+                    int(existing_cpe_task[0]["id"]),
+                ),
+            )
+        else:
+            now = self._now()
+            self._execute(
+                """
+                INSERT INTO poller_setting
+                    (name, task_type, system_key, enabled, scope_type, scope_json,
+                     collect_identity, collect_scqam, collect_rxmer,
+                     interval_minutes, max_concurrency, max_agent_queue_depth,
+                     retention_days, heavy_max_modems, heavy_delay_ms,
+                     max_runtime_sec, last_target_offset, created_at, updated_at)
+                VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,FALSE,FALSE,FALSE,
+                        720,1,20,30,300,0,43200,0,%s,%s)
+                """,
+                (_CPE_TASK_NAME, _CPE_TASK_TYPE, _CPE_TASK_SYSTEM_KEY, now, now),
+            )
 
         snapshot_columns = {
             "revision_at": "DATETIME NULL",
@@ -889,7 +1007,7 @@ class PollerService:
             "limit": requested_limit,
             "enrich": False,
             "refresh": True,
-            "collect_cpe": True,
+            "collect_cpe": False,
         }
         request_timeout = max(330, int(timeout_sec or 300) + 30)
         r = requests.post(
@@ -915,12 +1033,43 @@ class PollerService:
                 "critical_oid_errors": response_payload.get("critical_oid_errors") or {},
                 "raw_legacy_mac_count": response_payload.get("raw_legacy_mac_count"),
                 "raw_d3_mac_count": response_payload.get("raw_d3_mac_count"),
-                "cpe_addresses": response_payload.get("cpe_addresses") or [],
-                "cpe_complete": response_payload.get("cpe_complete") is True,
-                "cpe_truncated": response_payload.get("cpe_truncated") is True,
-                "cpe_oid_errors": response_payload.get("cpe_oid_errors") or {},
             }
         raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {response_payload}")
+
+    def _fetch_cmts_cpe(self, cmts_ip: str, timeout_sec: int = 300) -> Dict[str, Any]:
+        """Fetch one fresh CPE-only generation from a CMTS."""
+        base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
+        payload = {
+            "cmts_ip": cmts_ip,
+            "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
+        }
+        request_timeout = max(330, int(timeout_sec or 300) + 30)
+        response = requests.post(
+            f"{base}/cmts/cpe/query",
+            json=payload,
+            timeout=request_timeout,
+            verify=False,
+        )
+        response.raise_for_status()
+        result = response.json() if response.content else {}
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise RuntimeError(f"CPE fetch failed for {cmts_ip}: {result}")
+        rows = result.get("cpe_addresses") or []
+        if not isinstance(rows, list):
+            rows = []
+        return {
+            "cpe_addresses": rows,
+            "complete": result.get("complete") is True,
+            "truncated": result.get("truncated") is True,
+            "requested_limit": result.get("requested_limit"),
+            "collected_at": result.get("collected_at") or self._now(),
+            "oid_errors": result.get("oid_errors") or {},
+            "validation_error": result.get("validation_error"),
+            "raw_d3_mac_count": result.get("raw_d3_mac_count"),
+            "raw_cpe_type_count": result.get("raw_cpe_type_count"),
+            "raw_cpe_address_count": result.get("raw_cpe_address_count"),
+            "raw_cpe_prefix_count": result.get("raw_cpe_prefix_count"),
+        }
 
     def _upsert_inventory_rows(
         self,
@@ -1079,25 +1228,27 @@ class PollerService:
             return 0
         now = self._now()
         values = []
-        for row in rows or []:
+        for position, row in enumerate(rows or []):
             if not isinstance(row, dict):
-                continue
+                raise ValueError(f"Invalid CPE row at position {position}")
             try:
                 address = ipaddress.ip_address(str(row.get('ip_address') or ''))
                 prefix_length = int(row.get('prefix_length'))
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid CPE address or prefix at position {position}"
+                ) from exc
             family = f'ipv{address.version}'
             if row.get('address_family') != family:
-                continue
+                raise ValueError(f"CPE address family mismatch at position {position}")
             maximum = 32 if address.version == 4 else 128
             if not 0 <= prefix_length <= maximum:
-                continue
+                raise ValueError(f"Invalid CPE prefix length at position {position}")
             docsif3_index = str(row.get('docsif3_index') or '').strip()
             cpe_id = str(row.get('cpe_id') or '').strip()
             modem_mac = self._normalize_mac(str(row.get('modem_mac') or ''))
-            if not docsif3_index or not cpe_id or not modem_mac:
-                continue
+            if not docsif3_index or not cpe_id or len(modem_mac) != 17:
+                raise ValueError(f"Invalid CPE correlation at position {position}")
             values.append((
                 str(cmts_ip), docsif3_index, cpe_id, modem_mac, family,
                 address.compressed, prefix_length, snapshot_id, now, now, now,
@@ -1349,6 +1500,197 @@ class PollerService:
         count_after = int((after[0] or {}).get("c") or 0) if after else 0
         return max(0, count_before - count_after)
 
+    def _process_cpe_job(
+        self,
+        job_id: int,
+        poller: Dict[str, Any],
+        targets: List[Dict[str, str]],
+    ) -> None:
+        """Run the protected CPE refresh task across its configured CMTS scope."""
+        rows_collected = 0
+        targets_attempted = 0
+        targets_succeeded = 0
+        targets_failed = 0
+        breakdown: List[Dict[str, Any]] = []
+        fatal_error = None
+        incomplete_targets = 0
+        poller_id = int(poller.get("id") or 0)
+        start_offset = max(0, int(poller.get("last_target_offset") or 0))
+        subtask_timeout_sec = max(
+            30, int(os.environ.get("DATA_STORE_SUBTASK_TIMEOUT_SEC", "300"))
+        )
+        subtask_retries = max(
+            0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
+        )
+        total_targets = len(targets)
+        if total_targets == 0:
+            fatal_error = "No CMTS targets resolved (check scope/appdb config)"
+
+        for idx, target in enumerate(targets, start=1):
+            if fatal_error or idx <= start_offset:
+                continue
+            status_rows = self._query(
+                "SELECT status FROM poller_job WHERE id=%s", (job_id,)
+            )
+            current_status = (
+                str((status_rows[0] or {}).get("status") or "").lower()
+                if status_rows else ""
+            )
+            if current_status != "running":
+                self._execute(
+                    "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+                    "WHERE id=%s",
+                    (self._now(), poller_id),
+                )
+                return
+
+            cmts_ip = target.get("ip")
+            cmts_name = target.get("name") or cmts_ip
+            if not cmts_ip:
+                continue
+            self._update_running_job_progress(
+                job_id,
+                f"CPE {idx}/{total_targets}: walking {cmts_name}",
+                rows_collected=rows_collected,
+                modems_attempted=targets_attempted,
+                modems_succeeded=targets_succeeded,
+                modems_failed=targets_failed,
+            )
+
+            fetch_result = None
+            last_target_error = None
+            for attempt in range(subtask_retries + 1):
+                try:
+                    fetch_result = self._fetch_cmts_cpe(
+                        cmts_ip, timeout_sec=subtask_timeout_sec
+                    )
+                    break
+                except Exception as exc:
+                    last_target_error = exc
+                    self._update_running_job_progress(
+                        job_id,
+                        f"CPE {idx}/{total_targets}: {cmts_name} attempt "
+                        f"{attempt + 1}/{subtask_retries + 1} failed ({exc})",
+                        rows_collected=rows_collected,
+                        modems_attempted=targets_attempted,
+                        modems_succeeded=targets_succeeded,
+                        modems_failed=targets_failed,
+                    )
+            if fetch_result is None:
+                self._execute(
+                    "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
+                    "WHERE id=%s",
+                    (idx - 1, self._now(), poller_id),
+                )
+                fatal_error = (
+                    f"Subtask timeout/failure at CMTS {idx}/{total_targets} "
+                    f"({cmts_name}): {last_target_error}"
+                )
+                targets_failed += 1
+                break
+
+            # Kill is cooperative. Never persist a generation returned after the
+            # administrator cancelled the job while its SNMP request was in flight.
+            status_rows = self._query(
+                "SELECT status FROM poller_job WHERE id=%s", (job_id,)
+            )
+            if not status_rows or str(status_rows[0].get("status") or "") != "running":
+                self._execute(
+                    "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+                    "WHERE id=%s",
+                    (self._now(), poller_id),
+                )
+                return
+
+            targets_attempted += 1
+            cpe_rows = fetch_result.get("cpe_addresses") or []
+            complete = fetch_result.get("complete") is True
+            truncated = fetch_result.get("truncated") is True
+            validation_error = fetch_result.get("validation_error")
+            written = 0
+            if complete and not truncated:
+                try:
+                    written = self._persist_cpe_generation(
+                        cpe_rows,
+                        cmts_ip=cmts_ip,
+                        snapshot_id=str(uuid.uuid4()),
+                        complete=True,
+                        truncated=False,
+                    )
+                    targets_succeeded += 1
+                except Exception as exc:
+                    complete = False
+                    validation_error = str(exc)
+            if not complete or truncated:
+                targets_failed += 1
+                incomplete_targets += 1
+
+            breakdown.append({
+                "cmts": cmts_name,
+                "cmts_ip": cmts_ip,
+                "row_count": written,
+                "cpe_row_count": written,
+                "cpe_complete": complete,
+                "cpe_truncated": truncated,
+                "cpe_oid_errors": fetch_result.get("oid_errors") or {},
+                "validation_error": validation_error,
+                "requested_limit": fetch_result.get("requested_limit"),
+                "collected_at": fetch_result.get("collected_at"),
+                "raw_d3_mac_count": fetch_result.get("raw_d3_mac_count"),
+                "raw_cpe_type_count": fetch_result.get("raw_cpe_type_count"),
+                "raw_cpe_address_count": fetch_result.get("raw_cpe_address_count"),
+                "raw_cpe_prefix_count": fetch_result.get("raw_cpe_prefix_count"),
+            })
+            self._execute(
+                "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                (json.dumps(breakdown), job_id),
+            )
+            rows_collected += written
+            self._execute(
+                "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
+                "WHERE id=%s",
+                (idx, self._now(), poller_id),
+            )
+            self._update_running_job_progress(
+                job_id,
+                f"CPE {idx}/{total_targets}: {cmts_name} done "
+                f"({written} addresses, complete={complete})",
+                rows_collected=rows_collected,
+                modems_attempted=targets_attempted,
+                modems_succeeded=targets_succeeded,
+                modems_failed=targets_failed,
+            )
+
+        if not fatal_error:
+            self._execute(
+                "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+                "WHERE id=%s",
+                (self._now(), poller_id),
+            )
+        result_error = fatal_error
+        if not result_error and incomplete_targets:
+            result_error = (
+                f"CPE refresh completed with {incomplete_targets} incomplete "
+                "CMTS generation(s); previous stored rows were preserved"
+            )
+        self._execute(
+            "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, "
+            "modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, "
+            "error_text=%s WHERE id=%s AND status='running'",
+            (
+                "done" if not result_error else "failed",
+                self._now(),
+                rows_collected,
+                targets_attempted,
+                targets_succeeded,
+                targets_failed,
+                result_error,
+                job_id,
+            ),
+        )
+        if fatal_error and "Subtask timeout/failure" in fatal_error:
+            self.enqueue_run(poller_id, source="resume")
+
     def _process_one_job(self) -> None:
         queued = self._query("SELECT id, poller_id FROM poller_job WHERE status='queued' ORDER BY id ASC LIMIT 1")
         if not queued:
@@ -1401,6 +1743,9 @@ class PollerService:
                     modems_failed=0,
                 )
                 targets = self._cmts_targets_for_poller(poller)
+                if str(poller.get("task_type") or "inventory") == _CPE_TASK_TYPE:
+                    self._process_cpe_job(job_id, poller, targets)
+                    return
                 total_targets = len(targets)
                 start_offset = max(0, int(poller.get("last_target_offset") or 0))
                 subtask_timeout_sec = max(30, int(os.environ.get("DATA_STORE_SUBTASK_TIMEOUT_SEC", "300")))
@@ -1482,13 +1827,6 @@ class PollerService:
                         source_poller=poller.get("name"),
                         snapshot_id=snapshot_id,
                     )
-                    cpe_written = self._persist_cpe_generation(
-                        fetch_result.get('cpe_addresses') or [],
-                        cmts_ip=cmts_ip,
-                        snapshot_id=snapshot_id,
-                        complete=fetch_result.get('cpe_complete') is True,
-                        truncated=fetch_result.get('cpe_truncated') is True,
-                    )
                     self._record_inventory_snapshot(
                         cmts=cmts_name,
                         cmts_ip=cmts_ip,
@@ -1507,9 +1845,6 @@ class PollerService:
                         "requested_limit": fetch_result.get("requested_limit"),
                         "collected_at": fetch_result.get("collected_at"),
                         "critical_oid_errors": fetch_result.get("critical_oid_errors") or {},
-                        "cpe_row_count": cpe_written,
-                        "cpe_complete": fetch_result.get("cpe_complete") is True,
-                        "cpe_truncated": fetch_result.get("cpe_truncated") is True,
                     }
                     cmts_breakdown.append(breakdown_entry)
                     self._execute(
@@ -1576,6 +1911,19 @@ class PollerService:
         now = self._now()
         poller_id = payload.get("id")
 
+        if poller_id is not None:
+            protected = self._query(
+                "SELECT system_key FROM poller_setting WHERE id=%s",
+                (int(poller_id),),
+            )
+            if protected and protected[0].get("system_key"):
+                if "enabled" in payload:
+                    self._execute(
+                        "UPDATE poller_setting SET enabled=%s, updated_at=%s WHERE id=%s",
+                        (bool(payload.get("enabled")), now, int(poller_id)),
+                    )
+                return int(poller_id)
+
         if poller_id is None:
             cols = [k for k in payload.keys() if k != "id"]
             vals = [payload[k] for k in cols]
@@ -1596,12 +1944,29 @@ class PollerService:
         self._execute(sql, tuple(params))
         return poller_id
 
+    def set_poller_enabled(self, poller_id: int, enabled: bool) -> Dict[str, Any]:
+        pid = int(poller_id)
+        exists = self._query(
+            "SELECT id, enabled FROM poller_setting WHERE id=%s", (pid,)
+        )
+        if not exists:
+            return {"updated": 0, "state": "not_found"}
+        self._execute(
+            "UPDATE poller_setting SET enabled=%s, updated_at=%s WHERE id=%s",
+            (bool(enabled), self._now(), pid),
+        )
+        return {"updated": 1, "state": "enabled" if enabled else "disabled"}
+
     def delete_poller(self, poller_id: int) -> Dict[str, Any]:
         pid = int(poller_id)
 
-        exists = self._query("SELECT id FROM poller_setting WHERE id=%s", (pid,))
+        exists = self._query(
+            "SELECT id, system_key FROM poller_setting WHERE id=%s", (pid,)
+        )
         if not exists:
             return {"deleted": 0, "state": "not_found"}
+        if exists[0].get("system_key"):
+            return {"deleted": 0, "state": "protected"}
 
         active = self._query(
             "SELECT COUNT(*) AS c FROM poller_job WHERE poller_id=%s AND status IN ('queued','running')",
@@ -1620,27 +1985,93 @@ class PollerService:
         self._execute("DELETE FROM poller_setting WHERE id=%s", (pid,))
         return {"deleted": 1, "state": "deleted", "deleted_jobs": jobs_count}
 
-    def enqueue_run(self, poller_id: int, source: Optional[str] = None) -> int:
+    def request_run(
+        self,
+        poller_id: int,
+        source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate and queue an explicit run request."""
+        pid = int(poller_id)
+        pollers = self._query(
+            "SELECT id, enabled FROM poller_setting WHERE id=%s",
+            (pid,),
+        )
+        if not pollers:
+            return {"state": "not_found", "job_id": 0}
+        if int(pollers[0].get("enabled") or 0) != 1:
+            return {"state": "disabled", "job_id": 0}
+
         active = self._query(
-            "SELECT id FROM poller_job WHERE poller_id=%s AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
-            (int(poller_id),),
+            "SELECT id FROM poller_job WHERE poller_id=%s "
+            "AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
+            (pid,),
+        )
+        if active:
+            return {
+                "state": "already_active",
+                "job_id": int(active[0].get("id") or 0),
+            }
+
+        job_id = self.enqueue_run(pid, source=source)
+        return {"state": "queued" if job_id else "rejected", "job_id": job_id}
+
+    def enqueue_run(
+        self,
+        poller_id: int,
+        source: Optional[str] = None,
+        scheduled_slot_utc: Optional[str] = None,
+    ) -> int:
+        pid = int(poller_id)
+        active = self._query(
+            "SELECT id FROM poller_job WHERE poller_id=%s "
+            "AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
+            (pid,),
         )
         if active:
             return int((active[0] or {}).get("id") or 0)
 
         now = self._now()
-        sql = (
-            "INSERT INTO poller_job (poller_id, trigger_type, status, requested_by, request_payload, created_at) VALUES (%s,%s,%s,%s,%s,%s)"
-        )
         trigger = "scheduler" if (source or "api") == "scheduler" else "manual"
-        payload = '{"source":"' + (source or "api") + '"}'
-        return int(self._execute(sql, (int(poller_id), trigger, "queued", source or "api", payload, now)) or 0)
+        payload = json.dumps({"source": source or "api"})
+        sql = (
+            "INSERT IGNORE INTO poller_job "
+            "(poller_id, trigger_type, status, requested_by, request_payload, "
+            "scheduled_slot_utc, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)"
+        )
+        job_id = int(self._execute(
+            sql,
+            (
+                pid,
+                trigger,
+                "queued",
+                source or "api",
+                payload,
+                scheduled_slot_utc,
+                now,
+            ),
+        ) or 0)
+        if job_id or not scheduled_slot_utc:
+            return job_id
+        existing = self._query(
+            "SELECT id FROM poller_job WHERE poller_id=%s "
+            "AND scheduled_slot_utc=%s LIMIT 1",
+            (pid, scheduled_slot_utc),
+        )
+        return int((existing[0] or {}).get("id") or 0) if existing else 0
 
     def list_jobs(self, limit: int = 30) -> List[Dict[str, Any]]:
         lim = max(1, int(limit))
         ph = "%s"
         rows = self._query(
-            f"SELECT id, poller_id, status, rows_collected, modems_attempted, modems_succeeded, modems_failed, error_text, started_at, finished_at, created_at FROM poller_job ORDER BY id DESC LIMIT {ph}",
+            f"SELECT j.id, j.poller_id, p.name AS poller_name, "
+            f"p.task_type, j.trigger_type, j.status, j.rows_collected, "
+            f"j.modems_attempted, j.modems_succeeded, j.modems_failed, "
+            f"j.error_text, j.cmts_breakdown, j.scheduled_slot_utc, "
+            f"j.started_at, j.finished_at, j.created_at, "
+            f"TIMESTAMPDIFF(SECOND, j.started_at, "
+            f"COALESCE(j.finished_at, UTC_TIMESTAMP())) AS duration_seconds "
+            f"FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
+            f"ORDER BY j.id DESC LIMIT {ph}",
             (lim,),
         )
         return rows
@@ -1659,7 +2090,9 @@ class PollerService:
 
     def kill_job(self, job_id: int) -> Dict[str, Any]:
         rows = self._query(
-            "SELECT id, status FROM poller_job WHERE id=%s",
+            "SELECT j.id, j.status, j.poller_id, p.task_type "
+            "FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
+            "WHERE j.id=%s",
             (int(job_id),),
         )
         if not rows:
@@ -1670,9 +2103,16 @@ class PollerService:
             return {"killed": 0, "state": state}
 
         self._execute(
-            "UPDATE poller_job SET status=%s, finished_at=%s, error_text=%s WHERE id=%s AND status IN ('queued','running')",
+            "UPDATE poller_job SET status=%s, finished_at=%s, error_text=%s "
+            "WHERE id=%s AND status IN ('queued','running')",
             ("cancelled", self._now(), "Killed by admin", int(job_id)),
         )
+        if str(rows[0].get("task_type") or "") == _CPE_TASK_TYPE:
+            self._execute(
+                "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+                "WHERE id=%s",
+                (self._now(), int(rows[0].get("poller_id") or 0)),
+            )
         return {"killed": 1, "state": "cancelled"}
 
     def get_scheduler_status(self) -> Dict[str, Any]:
@@ -1689,6 +2129,24 @@ class PollerService:
         self._scheduler["poll_sec"] = max(5, int(poll_sec))
         self._scheduler["last_tick"] = datetime.now(timezone.utc).isoformat()
         return dict(self._scheduler)
+
+    @staticmethod
+    def _schedule_zone() -> ZoneInfo:
+        return ZoneInfo("Europe/Amsterdam")
+
+    def _latest_cpe_slot_utc(self, now_utc: datetime | None = None) -> str:
+        current_utc = now_utc or datetime.now(timezone.utc)
+        local_now = current_utc.astimezone(self._schedule_zone())
+        slot = _CPE_TASK_SCHEDULE[1] if local_now.hour >= 12 else _CPE_TASK_SCHEDULE[0]
+        local_slot = local_now.replace(
+            hour=slot.hour,
+            minute=slot.minute,
+            second=0,
+            microsecond=0,
+        )
+        return local_slot.astimezone(timezone.utc).replace(tzinfo=None).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     def run_scheduler_once(self) -> int:
         if self._scheduler.get("running"):
@@ -1707,7 +2165,10 @@ class PollerService:
             )
             global_active = int((global_active_rows[0] or {}).get("c") or 0) if global_active_rows else 0
 
-            pollers = self._query("SELECT id, name, enabled, interval_minutes FROM poller_setting ORDER BY id ASC")
+            pollers = self._query(
+                "SELECT id, name, enabled, interval_minutes, task_type, "
+                "last_scheduled_slot_utc FROM poller_setting ORDER BY id ASC"
+            )
             for p in pollers:
                 pid = int(p.get("id") or 0)
                 if pid <= 0:
@@ -1728,6 +2189,68 @@ class PollerService:
                 )
                 if active:
                     decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "active_job_exists"})
+                    continue
+
+                if str(p.get("task_type") or "inventory") == _CPE_TASK_TYPE:
+                    scheduled_slot = self._latest_cpe_slot_utc()
+                    recorded_slot = p.get("last_scheduled_slot_utc")
+                    if isinstance(recorded_slot, datetime):
+                        recorded_slot = recorded_slot.strftime("%Y-%m-%d %H:%M:%S")
+                    elif recorded_slot is not None:
+                        recorded_slot = str(recorded_slot)
+                    if recorded_slot == scheduled_slot:
+                        decisions.append({
+                            "poller_id": pid,
+                            "poller_name": pname,
+                            "decision": "skip",
+                            "reason": "scheduled_slot_already_recorded",
+                        })
+                        continue
+
+                    existing_slot = self._query(
+                        "SELECT id FROM poller_job WHERE poller_id=%s "
+                        "AND scheduled_slot_utc=%s LIMIT 1",
+                        (pid, scheduled_slot),
+                    )
+                    if existing_slot:
+                        self._execute(
+                            "UPDATE poller_setting SET last_scheduled_slot_utc=%s, "
+                            "updated_at=%s WHERE id=%s",
+                            (scheduled_slot, self._now(), pid),
+                        )
+                        decisions.append({
+                            "poller_id": pid,
+                            "poller_name": pname,
+                            "decision": "skip",
+                            "reason": "scheduled_slot_already_exists",
+                        })
+                        continue
+                    new_id = self.enqueue_run(
+                        pid,
+                        source="scheduler",
+                        scheduled_slot_utc=scheduled_slot,
+                    )
+                    if new_id:
+                        self._execute(
+                            "UPDATE poller_setting SET last_scheduled_slot_utc=%s, "
+                            "updated_at=%s WHERE id=%s",
+                            (scheduled_slot, self._now(), pid),
+                        )
+                        queued += 1
+                        global_active += 1
+                        decisions.append({
+                            "poller_id": pid,
+                            "poller_name": pname,
+                            "decision": "queued",
+                            "reason": "fixed_schedule_due",
+                        })
+                    else:
+                        decisions.append({
+                            "poller_id": pid,
+                            "poller_name": pname,
+                            "decision": "skip",
+                            "reason": "enqueue_rejected",
+                        })
                     continue
 
                 minutes = max(1, int(p.get("interval_minutes") or 360))

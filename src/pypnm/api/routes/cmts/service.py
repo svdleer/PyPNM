@@ -241,21 +241,36 @@ class CMTSModemService:
             for modem in modems
             if modem.get('docsif3_index') is not None and modem.get('mac_address')
         }
-        type_by_index = {
-            self._extract_index(item.get('oid', ''), OID_CPE_ADDR_TYPE):
-                self._enum_code(item.get('value'))
-            for item in raw.get(OID_CPE_ADDR_TYPE, [])
-        }
-        prefix_by_index = {
-            self._extract_index(item.get('oid', ''), OID_CPE_PREFIX):
-                self._enum_code(item.get('value'))
-            for item in raw.get(OID_CPE_PREFIX, [])
-        }
-        address_rows = {
-            self._extract_index(item.get('oid', ''), OID_CPE_ADDR): item
-            for item in raw.get(OID_CPE_ADDR, [])
-        }
-        valid = set(address_rows) == set(type_by_index) == set(prefix_by_index)
+
+        def indexed_rows(oid: str, value_getter) -> tuple[Dict[str, Any], bool]:
+            mapped: Dict[str, Any] = {}
+            rows_valid = True
+            for item in raw.get(oid, []):
+                row_index = self._extract_index(item.get('oid', ''), oid)
+                if not row_index or row_index in mapped:
+                    rows_valid = False
+                    continue
+                mapped[row_index] = value_getter(item)
+            return mapped, rows_valid
+
+        type_by_index, type_rows_valid = indexed_rows(
+            OID_CPE_ADDR_TYPE,
+            lambda item: self._enum_code(item.get('value')),
+        )
+        prefix_by_index, prefix_rows_valid = indexed_rows(
+            OID_CPE_PREFIX,
+            lambda item: self._enum_code(item.get('value')),
+        )
+        address_rows, address_rows_valid = indexed_rows(
+            OID_CPE_ADDR,
+            lambda item: item,
+        )
+        valid = bool(
+            type_rows_valid
+            and prefix_rows_valid
+            and address_rows_valid
+            and set(address_rows) == set(type_by_index) == set(prefix_by_index)
+        )
         entries: List[Dict[str, Any]] = []
         for row_index, item in address_rows.items():
             parts = row_index.split('.')
@@ -467,6 +482,130 @@ class CMTSModemService:
                     response[key] = entry[key]
         response['capability_enriched'] = entry.get('capability_enriched') is True
         return response
+
+    # ── dedicated CPE collection ────────────────────────────────────────────
+
+    async def collect_cpe_addresses(
+        self,
+        cmts_ip: str,
+        community: str = "public",
+        limit: int | None = None,
+    ) -> Dict[str, Any]:
+        """Collect one authoritative CPE generation without full inventory."""
+        self.cmts_ip = cmts_ip
+        self.community = community
+        requested_limit = limit or _int_env(
+            'CM_CPE_IP_LIMIT',
+            max(10000, _int_env('CM_MODEM_LIMIT', 50000, maximum=50000) * 8),
+            maximum=500000,
+        )
+        requested_limit = max(1, min(int(requested_limit), 500000))
+        walk_oids = (OID_D3_MAC, OID_CPE_ADDR_TYPE, OID_CPE_ADDR, OID_CPE_PREFIX)
+
+        live_lock = await _get_live_walk_lock(cmts_ip)
+        await live_lock.acquire()
+        try:
+            walk_result = await self._send_agent_command(
+                'snmp_parallel_walk',
+                {
+                    'ip': cmts_ip,
+                    'oids': list(walk_oids),
+                    'community': community,
+                    'timeout': 5,
+                    'limit': requested_limit,
+                    'overall_timeout': 270,
+                },
+                timeout=300,
+            )
+        finally:
+            live_lock.release()
+
+        if not walk_result.get('success'):
+            return {
+                'success': False,
+                'error': f"CPE SNMP walks failed: {walk_result.get('error', 'unknown')}",
+                'cpe_addresses': [],
+                'count': 0,
+                'complete': False,
+                'truncated': False,
+            }
+
+        raw = walk_result.get('results') or {}
+        walk_errors = walk_result.get('errors') or {}
+        completed_oids = set(walk_result.get('completed_oids') or [])
+        truncated_oids = set(walk_result.get('truncated_oids') or [])
+        has_completion_metadata = 'completed_oids' in walk_result
+        relevant_errors = {
+            oid: str(walk_errors[oid]) for oid in walk_oids if oid in walk_errors
+        }
+        truncated = bool(
+            any(oid in truncated_oids for oid in walk_oids)
+            or any(len(raw.get(oid, [])) >= requested_limit for oid in walk_oids)
+        )
+
+        modem_by_index: Dict[str, str] = {}
+        d3_rows_valid = True
+        for item in raw.get(OID_D3_MAC, []):
+            docsif3_index = self._extract_index(item.get('oid', ''), OID_D3_MAC)
+            modem_mac = self._parse_mac(item.get('value'))
+            if not docsif3_index or not modem_mac:
+                d3_rows_valid = False
+                continue
+            previous = modem_by_index.get(docsif3_index)
+            if previous and previous != modem_mac:
+                d3_rows_valid = False
+                continue
+            modem_by_index[docsif3_index] = modem_mac
+
+        cpe_addresses, cpe_rows_valid = self._correlate_cpe_data(
+            raw,
+            [
+                {'docsif3_index': index, 'mac_address': mac}
+                for index, mac in modem_by_index.items()
+            ],
+        )
+        missing_completions = [oid for oid in walk_oids if oid not in completed_oids]
+        complete = bool(
+            has_completion_metadata
+            and not relevant_errors
+            and not missing_completions
+            and not truncated
+            and d3_rows_valid
+            and cpe_rows_valid
+        )
+        validation_reasons = []
+        if not has_completion_metadata:
+            validation_reasons.append('agent omitted per-OID completion metadata')
+        if relevant_errors:
+            validation_reasons.append('one or more required OID walks failed')
+        if missing_completions:
+            validation_reasons.append('one or more required OID walks did not complete')
+        if truncated:
+            validation_reasons.append('one or more required OID walks were truncated')
+        if not d3_rows_valid:
+            validation_reasons.append('invalid or conflicting DOCSIS registration rows')
+        if not cpe_rows_valid:
+            validation_reasons.append('CPE table indexes or modem correlations were inconsistent')
+
+        self.logger.info(
+            'Collected %s CPE addresses from CMTS %s (complete=%s)',
+            len(cpe_addresses), cmts_ip, complete,
+        )
+        return {
+            'success': True,
+            'cpe_addresses': cpe_addresses,
+            'count': len(cpe_addresses),
+            'complete': complete,
+            'truncated': truncated,
+            'requested_limit': requested_limit,
+            'collected_at': datetime.now(timezone.utc).isoformat(),
+            'oid_errors': relevant_errors,
+            'validation_error': '; '.join(validation_reasons) or None,
+            'raw_d3_mac_count': len(raw.get(OID_D3_MAC, [])),
+            'raw_cpe_type_count': len(raw.get(OID_CPE_ADDR_TYPE, [])),
+            'raw_cpe_address_count': len(raw.get(OID_CPE_ADDR, [])),
+            'raw_cpe_prefix_count': len(raw.get(OID_CPE_PREFIX, [])),
+        }
 
     # ── core discovery ──────────────────────────────────────────────────────
 

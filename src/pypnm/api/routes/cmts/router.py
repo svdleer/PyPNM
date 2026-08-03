@@ -10,7 +10,12 @@ from inspect import signature
 from fastapi import APIRouter, HTTPException
 
 from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
-from pypnm.api.routes.cmts.schemas import CMTSModemRequest, CMTSModemResponse
+from pypnm.api.routes.cmts.schemas import (
+    CPECollectionRequest,
+    CPECollectionResponse,
+    CMTSModemRequest,
+    CMTSModemResponse,
+)
 from pypnm.api.routes.cmts.service import CMTSModemService, cancel_enrichment
 
 logger = logging.getLogger(__name__)
@@ -155,6 +160,29 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         modem_community=payload.modem_community,
         cmts_hostname=payload.cmts_hostname,
     )
+
+
+@router.post("/cpe/query", response_model=CPECollectionResponse)
+async def query_cpe_addresses(payload: CPECollectionRequest) -> CPECollectionResponse:
+    """Collect a fresh, validated CPE-address generation from one CMTS."""
+    agent_manager = get_agent_manager()
+    if not agent_manager or not agent_manager.get_available_agents():
+        raise HTTPException(status_code=503, detail="No agents available")
+    try:
+        result = await CMTSModemService().collect_cpe_addresses(
+            cmts_ip=payload.cmts_ip,
+            community=payload.community,
+            limit=payload.limit,
+        )
+        return CPECollectionResponse(**result)
+    except Exception as exc:
+        logger.exception("CPE collection failed for %s: %s", payload.cmts_ip, exc)
+        return CPECollectionResponse(
+            success=False,
+            cpe_addresses=[],
+            count=0,
+            error=str(exc),
+        )
 
 
 @router.post("/enrich/cancel")

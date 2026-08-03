@@ -35,19 +35,42 @@ def upsert_poller_setting(payload: PollerSettingUpsertRequest) -> dict:
     return {"status": "success", "poller_id": poller_id}
 
 
+@router.post("/poller-settings/{poller_id}/enabled")
+def set_poller_setting_enabled(
+    poller_id: int,
+    payload: PollerSchedulerToggleRequest,
+) -> dict:
+    out = poller_service.set_poller_enabled(poller_id, payload.enabled)
+    if out.get("state") == "not_found":
+        raise HTTPException(status_code=404, detail="Poller not found")
+    return {"status": "success", **out}
+
+
 @router.post("/poller-settings/{poller_id}/run")
 def run_poller_setting(poller_id: int, payload: PollerRunRequest) -> dict:
-    job_id = poller_service.enqueue_run(poller_id=poller_id, source=payload.source)
-    return {"status": "success", "job_id": job_id}
+    out = poller_service.request_run(poller_id=poller_id, source=payload.source)
+    state = out.get("state")
+    if state == "not_found":
+        raise HTTPException(status_code=404, detail="Poller not found")
+    if state == "disabled":
+        raise HTTPException(status_code=409, detail="Poller is disabled")
+    if state == "rejected":
+        raise HTTPException(status_code=409, detail="Poller run could not be queued")
+    return {"status": "success", **out}
 
 
 @router.delete("/poller-settings/{poller_id}")
 def delete_poller_setting(poller_id: int) -> dict:
     out = poller_service.delete_poller(poller_id=poller_id)
     if out.get("state") == "not_found":
-        return {"status": "error", "message": "Poller not found", **out}
+        raise HTTPException(status_code=404, detail="Poller not found")
     if out.get("state") == "active_jobs":
-        return {"status": "error", "message": "Poller has active jobs", **out}
+        raise HTTPException(status_code=409, detail="Poller has active jobs")
+    if out.get("state") == "protected":
+        raise HTTPException(
+            status_code=409,
+            detail="System task can be disabled but not deleted",
+        )
     return {"status": "success", **out}
 
 
