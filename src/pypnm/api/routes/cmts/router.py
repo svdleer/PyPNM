@@ -29,6 +29,7 @@ async def get_cmts_modems(
     limit: int | None = None,
     enrich: bool = False,
     refresh: bool = False,
+    collect_cpe: bool = False,
     modem_community: str = "private",
     cmts_hostname: str = "",
 ) -> CMTSModemResponse:
@@ -81,6 +82,7 @@ async def get_cmts_modems(
             'community': community,
             'limit': limit,
             'enrich': enrich,
+            'collect_cpe': collect_cpe,
             'modem_community': modem_community,
             'cmts_hostname': cmts_hostname or '',
         }
@@ -123,6 +125,10 @@ async def get_cmts_modems(
             critical_oid_errors=result.get('critical_oid_errors') or {},
             raw_legacy_mac_count=result.get('raw_legacy_mac_count'),
             raw_d3_mac_count=result.get('raw_d3_mac_count'),
+            cpe_addresses=result.get('cpe_addresses') or [],
+            cpe_complete=result.get('cpe_complete') is True,
+            cpe_truncated=result.get('cpe_truncated') is True,
+            cpe_oid_errors=result.get('cpe_oid_errors') or {},
             enrichment_progress=result.get('enrich_progress'),
         )
         
@@ -145,6 +151,7 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         limit=payload.limit,
         enrich=payload.enrich,
         refresh=payload.refresh,
+        collect_cpe=payload.collect_cpe,
         modem_community=payload.modem_community,
         cmts_hostname=payload.cmts_hostname,
     )

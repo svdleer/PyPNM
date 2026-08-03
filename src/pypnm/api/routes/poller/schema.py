@@ -16,7 +16,7 @@ class PollerSettingUpsertRequest(BaseModel):
     collect_identity: bool = Field(default=True)
     collect_scqam: bool = Field(default=True)
     collect_rxmer: bool = Field(default=True)
-    interval_minutes: int = Field(default=1440)
+    interval_minutes: int = Field(default=360)
     run_window_start: Optional[str] = Field(default=None)
     run_window_end: Optional[str] = Field(default=None)
     max_concurrency: int = Field(default=1)

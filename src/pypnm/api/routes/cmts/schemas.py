@@ -24,6 +24,7 @@ class CMTSModemRequest(BaseModel):
     limit: int = Field(default_factory=_cm_modem_limit_default, description="Maximum number of modems to return")
     enrich: bool = Field(default=False, description="Whether to enrich modems with firmware/model from sysDescr")
     refresh: bool = Field(default=False, description="Bypass cached inventory and perform a live CMTS walk")
+    collect_cpe: bool = Field(default=False, description="Collect DOCS-SUBMGT3 CPE addresses for scheduled inventory")
     modem_community: str = Field(default="private", description="SNMP community for modem enrichment")
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
 
@@ -75,6 +76,10 @@ class CMTSModemResponse(BaseModel):
     critical_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from critical modem MAC tables")
     raw_legacy_mac_count: Optional[int] = Field(default=None, description="Rows returned by the legacy registration MAC table")
     raw_d3_mac_count: Optional[int] = Field(default=None, description="Rows returned by the DOCSIS 3.x registration MAC table")
+    cpe_addresses: List[Dict[str, Any]] = Field(default_factory=list, description="CPE addresses collected for scheduled persistence")
+    cpe_complete: bool = Field(default=False, description="Whether all requested CPE address columns completed")
+    cpe_truncated: bool = Field(default=False, description="Whether a CPE address column reached the walk limit")
+    cpe_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from CPE address columns")
     enrichment_progress: Optional[Dict[str, int]] = Field(default=None, description="Live enrichment progress: {completed, total}")
 
 

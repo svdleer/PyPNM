@@ -94,6 +94,8 @@ def list_inventory_modems(
             interface_filter=interface,
             limit=limit,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error(f"inventory/modems DB error: {exc}")
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
@@ -131,6 +133,34 @@ def list_current_inventory_snapshots() -> dict:
         logger.error("inventory/snapshots/current DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "snapshots": snapshots}
+
+
+@router.get("/inventory/cpe/index")
+def list_cpe_index(limit: int = Query(default=500000, ge=1, le=500000)) -> dict:
+    """Return a complete CPE address index for GUI Redis warming."""
+    try:
+        result = poller_service.list_cpe_index(limit=limit)
+    except Exception as exc:
+        logger.error("inventory/cpe/index DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    if result.get('truncated') is True:
+        raise HTTPException(status_code=409, detail="CPE index exceeds transfer limit")
+    return {"status": "success", **result}
+
+
+@router.get("/inventory/cpe/suggestions")
+def suggest_cpe_addresses(
+    q: str = Query(min_length=1, max_length=45),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> dict:
+    try:
+        suggestions = poller_service.suggest_cpe_addresses(q, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/cpe/suggestions DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "suggestions": suggestions}
 
 
 @router.get("/inventory/modems/{mac_address}")

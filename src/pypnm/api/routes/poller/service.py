@@ -182,6 +182,26 @@ class PollerService:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS modem_cpe_ip_current (
+                cmts_ip VARCHAR(45) NOT NULL,
+                docsif3_index VARCHAR(128) NOT NULL,
+                cpe_id VARCHAR(32) NOT NULL,
+                modem_mac VARCHAR(17) NOT NULL,
+                address_family VARCHAR(4) NOT NULL,
+                ip_address VARCHAR(45) NOT NULL,
+                prefix_length SMALLINT UNSIGNED NOT NULL,
+                snapshot_id CHAR(36) NULL,
+                first_seen_at DATETIME NOT NULL,
+                last_seen_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (cmts_ip, docsif3_index, cpe_id),
+                INDEX idx_cpe_address (address_family, ip_address, modem_mac),
+                INDEX idx_cpe_modem (modem_mac, address_family, ip_address)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS poller_setting (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 name VARCHAR(64) NOT NULL,
@@ -191,7 +211,7 @@ class PollerService:
                 collect_identity BOOLEAN NOT NULL DEFAULT TRUE,
                 collect_scqam BOOLEAN NOT NULL DEFAULT FALSE,
                 collect_rxmer BOOLEAN NOT NULL DEFAULT FALSE,
-                interval_minutes INT NOT NULL DEFAULT 1440,
+                interval_minutes INT NOT NULL DEFAULT 360,
                 run_window_start TIME NULL,
                 run_window_end TIME NULL,
                 max_concurrency INT NOT NULL DEFAULT 1,
@@ -869,6 +889,7 @@ class PollerService:
             "limit": requested_limit,
             "enrich": False,
             "refresh": True,
+            "collect_cpe": True,
         }
         request_timeout = max(330, int(timeout_sec or 300) + 30)
         r = requests.post(
@@ -894,6 +915,10 @@ class PollerService:
                 "critical_oid_errors": response_payload.get("critical_oid_errors") or {},
                 "raw_legacy_mac_count": response_payload.get("raw_legacy_mac_count"),
                 "raw_d3_mac_count": response_payload.get("raw_d3_mac_count"),
+                "cpe_addresses": response_payload.get("cpe_addresses") or [],
+                "cpe_complete": response_payload.get("cpe_complete") is True,
+                "cpe_truncated": response_payload.get("cpe_truncated") is True,
+                "cpe_oid_errors": response_payload.get("cpe_oid_errors") or {},
             }
         raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {response_payload}")
 
@@ -1040,6 +1065,76 @@ class PollerService:
 
         return inserted
 
+    def _persist_cpe_generation(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        cmts_ip: str,
+        snapshot_id: str,
+        complete: bool,
+        truncated: bool,
+    ) -> int:
+        """Replace one CMTS CPE generation only after a complete walk."""
+        if not complete or truncated:
+            return 0
+        now = self._now()
+        values = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                address = ipaddress.ip_address(str(row.get('ip_address') or ''))
+                prefix_length = int(row.get('prefix_length'))
+            except (TypeError, ValueError):
+                continue
+            family = f'ipv{address.version}'
+            if row.get('address_family') != family:
+                continue
+            maximum = 32 if address.version == 4 else 128
+            if not 0 <= prefix_length <= maximum:
+                continue
+            docsif3_index = str(row.get('docsif3_index') or '').strip()
+            cpe_id = str(row.get('cpe_id') or '').strip()
+            modem_mac = self._normalize_mac(str(row.get('modem_mac') or ''))
+            if not docsif3_index or not cpe_id or not modem_mac:
+                continue
+            values.append((
+                str(cmts_ip), docsif3_index, cpe_id, modem_mac, family,
+                address.compressed, prefix_length, snapshot_id, now, now, now,
+            ))
+
+        sql = """
+            INSERT INTO modem_cpe_ip_current
+                (cmts_ip, docsif3_index, cpe_id, modem_mac, address_family,
+                 ip_address, prefix_length, snapshot_id, first_seen_at,
+                 last_seen_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+                modem_mac=VALUES(modem_mac), address_family=VALUES(address_family),
+                ip_address=VALUES(ip_address), prefix_length=VALUES(prefix_length),
+                snapshot_id=VALUES(snapshot_id), last_seen_at=VALUES(last_seen_at),
+                updated_at=VALUES(updated_at)
+        """
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                for offset in range(0, len(values), 1000):
+                    cur.executemany(sql, values[offset:offset + 1000])
+                cur.execute(
+                    "DELETE FROM modem_cpe_ip_current "
+                    "WHERE cmts_ip=%s AND (snapshot_id IS NULL OR snapshot_id<>%s)",
+                    (str(cmts_ip), snapshot_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return len(values)
+
     def persist_inventory_generation(
         self,
         rows: List[Dict[str, Any]],
@@ -1070,6 +1165,13 @@ class PollerService:
             source_poller=source_poller,
             snapshot_id=snapshot_id,
         )
+        cpe_written = self._persist_cpe_generation(
+            metadata.get('cpe_addresses') or [],
+            cmts_ip=cmts_address,
+            snapshot_id=snapshot_id,
+            complete=metadata.get('cpe_complete') is True,
+            truncated=metadata.get('cpe_truncated') is True,
+        )
         self._record_inventory_snapshot(
             cmts=cmts_name,
             cmts_ip=cmts_address,
@@ -1078,7 +1180,11 @@ class PollerService:
             row_count=written,
             source_poller=source_poller,
         )
-        return {"snapshot_id": snapshot_id, "row_count": written}
+        return {
+            "snapshot_id": snapshot_id,
+            "row_count": written,
+            "cpe_row_count": cpe_written,
+        }
 
     def _record_inventory_snapshot(
         self,
@@ -1231,6 +1337,14 @@ class PollerService:
             "DELETE FROM modem_inventory_current WHERE last_seen_at < (UTC_TIMESTAMP() - INTERVAL %s DAY)",
             (days,),
         )
+        self._execute(
+            "DELETE FROM modem_cpe_ip_current "
+            "WHERE last_seen_at < (UTC_TIMESTAMP() - INTERVAL %s DAY) "
+            "OR NOT EXISTS (SELECT 1 FROM modem_inventory_current m "
+            "WHERE m.mac=modem_cpe_ip_current.modem_mac "
+            "AND m.cmts_ip=modem_cpe_ip_current.cmts_ip)",
+            (days,),
+        )
         after = self._query("SELECT COUNT(*) AS c FROM modem_inventory_current")
         count_after = int((after[0] or {}).get("c") or 0) if after else 0
         return max(0, count_before - count_after)
@@ -1368,6 +1482,13 @@ class PollerService:
                         source_poller=poller.get("name"),
                         snapshot_id=snapshot_id,
                     )
+                    cpe_written = self._persist_cpe_generation(
+                        fetch_result.get('cpe_addresses') or [],
+                        cmts_ip=cmts_ip,
+                        snapshot_id=snapshot_id,
+                        complete=fetch_result.get('cpe_complete') is True,
+                        truncated=fetch_result.get('cpe_truncated') is True,
+                    )
                     self._record_inventory_snapshot(
                         cmts=cmts_name,
                         cmts_ip=cmts_ip,
@@ -1386,6 +1507,9 @@ class PollerService:
                         "requested_limit": fetch_result.get("requested_limit"),
                         "collected_at": fetch_result.get("collected_at"),
                         "critical_oid_errors": fetch_result.get("critical_oid_errors") or {},
+                        "cpe_row_count": cpe_written,
+                        "cpe_complete": fetch_result.get("cpe_complete") is True,
+                        "cpe_truncated": fetch_result.get("cpe_truncated") is True,
                     }
                     cmts_breakdown.append(breakdown_entry)
                     self._execute(
@@ -1606,7 +1730,7 @@ class PollerService:
                     decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "active_job_exists"})
                     continue
 
-                minutes = max(1, int(p.get("interval_minutes") or 1440))
+                minutes = max(1, int(p.get("interval_minutes") or 360))
                 due = self._query(
                     """
                     SELECT id FROM poller_job
@@ -1687,6 +1811,41 @@ class PollerService:
             "daily_series": daily_series,
         }
 
+    @staticmethod
+    def normalize_cpe_search(value: str) -> Dict[str, Any]:
+        query = str(value or '').strip()
+        if not query:
+            raise ValueError('CPE address is required')
+        if ':' in query:
+            try:
+                address = ipaddress.ip_address(query)
+            except ValueError as exc:
+                raise ValueError('Enter a complete valid IPv6 address') from exc
+            if address.version != 6:
+                raise ValueError('Enter a complete valid IPv6 address')
+            return {'family': 'ipv6', 'value': address.compressed, 'prefix': False}
+
+        trailing_dot = query.endswith('.')
+        parts = query[:-1].split('.') if trailing_dot else query.split('.')
+        if not 1 <= len(parts) <= 4 or any(not part.isdigit() for part in parts):
+            raise ValueError('Enter a valid dotted IPv4 address prefix')
+        octets = [int(part) for part in parts]
+        if any(not 0 <= octet <= 255 for octet in octets):
+            raise ValueError('IPv4 prefix octets must be between 0 and 255')
+        if len(octets) == 4 and not trailing_dot:
+            return {
+                'family': 'ipv4',
+                'value': ipaddress.ip_address('.'.join(str(o) for o in octets)).compressed,
+                'prefix': False,
+            }
+        if len(octets) == 4:
+            raise ValueError('A complete IPv4 address cannot end with a dot')
+        return {
+            'family': 'ipv4',
+            'value': '.'.join(str(o) for o in octets) + '.',
+            'prefix': True,
+        }
+
     def list_inventory_modems(
         self,
         cmts: Optional[str] = None,
@@ -1717,7 +1876,23 @@ class PollerService:
         if search_value:
             sv = f"%{str(search_value).lower()}%"
             marker = "%s"
-            if search_type == "ip":
+            if search_type == "cpe_ip":
+                cpe_query = self.normalize_cpe_search(str(search_value))
+                comparator = (
+                    f"c.ip_address LIKE {marker}"
+                    if cpe_query['prefix'] else f"c.ip_address = {marker}"
+                )
+                where.append(
+                    "EXISTS (SELECT 1 FROM modem_cpe_ip_current c "
+                    f"WHERE c.modem_mac=modem_inventory_current.mac "
+                    f"AND c.cmts_ip=modem_inventory_current.cmts_ip "
+                    f"AND c.address_family={marker} AND {comparator})"
+                )
+                params.extend([
+                    cpe_query['family'],
+                    cpe_query['value'] + '%' if cpe_query['prefix'] else cpe_query['value'],
+                ])
+            elif search_type == "ip":
                 where.append(f"LOWER(COALESCE(ip,'')) LIKE {marker}")
                 params.append(sv)
             elif search_type == "mac":
@@ -1782,7 +1957,53 @@ class PollerService:
             f"FROM modem_inventory_current WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = {marker} LIMIT 1",
             (mac_norm,),
         )
-        return self._map_inventory_row(rows[0]) if rows else None
+        if not rows:
+            return None
+        modem = self._map_inventory_row(rows[0])
+        cpe_rows = self._query(
+            "SELECT address_family, ip_address, prefix_length "
+            "FROM modem_cpe_ip_current WHERE modem_mac=%s AND cmts_ip=%s "
+            "ORDER BY address_family, ip_address, prefix_length",
+            (
+                str(rows[0].get('mac') or '').lower(),
+                str(rows[0].get('cmts_ip') or ''),
+            ),
+        )
+        modem['cpe_ipv4'] = [
+            {'address': row.get('ip_address'), 'prefix_length': row.get('prefix_length')}
+            for row in cpe_rows if row.get('address_family') == 'ipv4'
+        ]
+        modem['cpe_ipv6'] = [
+            {'address': row.get('ip_address'), 'prefix_length': row.get('prefix_length')}
+            for row in cpe_rows if row.get('address_family') == 'ipv6'
+        ]
+        return modem
+
+    def list_cpe_index(self, limit: int = 500000) -> Dict[str, Any]:
+        capped = max(1, min(int(limit or 500000), 500000))
+        rows = self._query(
+            "SELECT ip_address, address_family, modem_mac "
+            "FROM modem_cpe_ip_current LIMIT %s",
+            (capped + 1,),
+        )
+        return {
+            'rows': rows[:capped],
+            'row_count': len(rows[:capped]),
+            'truncated': len(rows) > capped,
+        }
+
+    def suggest_cpe_addresses(self, query: str, limit: int = 10) -> List[str]:
+        normalized = self.normalize_cpe_search(query)
+        capped = max(1, min(int(limit or 10), 50))
+        comparator = 'LIKE %s' if normalized['prefix'] else '= %s'
+        value = normalized['value'] + '%' if normalized['prefix'] else normalized['value']
+        rows = self._query(
+            "SELECT DISTINCT ip_address FROM modem_cpe_ip_current "
+            f"WHERE address_family=%s AND ip_address {comparator} "
+            "ORDER BY ip_address LIMIT %s",
+            (normalized['family'], value, capped),
+        )
+        return [str(row.get('ip_address')) for row in rows if row.get('ip_address')]
 
     def get_inventory_modems_bulk(self, mac_addresses: list[str]) -> list[Dict[str, Any]]:
         """Look up multiple modems by MAC address using a single indexed query."""
@@ -1839,6 +2060,23 @@ class PollerService:
         )
         before_count = int((before_rows[0] or {}).get("c") or 0) if before_rows else 0
         if before_count > 0:
+            cpe_where: list[str] = []
+            cpe_params: list[Any] = []
+            if cmts_name:
+                cpe_where.append(
+                    "EXISTS (SELECT 1 FROM modem_inventory_current m "
+                    "WHERE m.mac=modem_cpe_ip_current.modem_mac "
+                    "AND LOWER(m.cmts)=LOWER(%s))"
+                )
+                cpe_params.append(cmts_name)
+            if cmts_addr:
+                cpe_where.append("cmts_ip=%s")
+                cpe_params.append(cmts_addr)
+            if cpe_where:
+                self._execute(
+                    f"DELETE FROM modem_cpe_ip_current WHERE {' OR '.join(cpe_where)}",
+                    tuple(cpe_params),
+                )
             self._execute(
                 f"DELETE FROM modem_inventory_current WHERE {where_sql}",
                 tuple(params),

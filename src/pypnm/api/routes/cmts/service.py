@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import time
@@ -57,6 +58,10 @@ def cancel_enrichment(cmts_ip: str) -> bool:
 # ── CMTS SNMP OIDs ──────────────────────────────────────────────────────────
 # DOCSIS 3.1 registration table
 OID_D3_MAC       = '1.3.6.1.4.1.4491.2.1.20.1.3.1.2'   # docsIf3CmtsCmRegStatusMacAddr
+# DOCS-SUBMGT3 CPE address table, indexed by docsIf3 registration ID + CPE ID.
+OID_CPE_ADDR_TYPE = '1.3.6.1.4.1.4491.2.1.10.1.3.1.2'
+OID_CPE_ADDR      = '1.3.6.1.4.1.4491.2.1.10.1.3.1.3'
+OID_CPE_PREFIX    = '1.3.6.1.4.1.4491.2.1.10.1.3.1.4'
 # Old (DOCSIS 3.0) CM status table
 OID_OLD_MAC      = '1.3.6.1.2.1.10.127.1.3.3.1.2'       # docsIfCmtsCmStatusMacAddress
 OID_OLD_IP       = '1.3.6.1.2.1.10.127.1.3.3.1.3'       # docsIfCmtsCmStatusIpAddress
@@ -173,6 +178,114 @@ class CMTSModemService:
         if len(mac_hex) >= 12:
             return ':'.join(mac_hex[i:i + 2] for i in range(0, 12, 2)).lower()
         return None
+
+    @staticmethod
+    def _enum_code(value: Any) -> int | None:
+        text = str(value or '').strip()
+        if '(' in text and text.endswith(')'):
+            text = text.rsplit('(', 1)[-1][:-1].strip()
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return {'ipv4': 1, 'ipv6': 2}.get(str(value or '').strip().lower())
+
+    @staticmethod
+    def _decode_inet_address(value: Any, address_type: int) -> str | None:
+        expected_length = 4 if address_type == 1 else 16 if address_type == 2 else 0
+        if not expected_length:
+            return None
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            payload = bytes(value)
+        else:
+            text = str(value or '').strip()
+            if not text:
+                return None
+            try:
+                parsed = ipaddress.ip_address(text)
+                return parsed.compressed if parsed.version == address_type else None
+            except ValueError:
+                pass
+            lowered = text.lower()
+            if lowered.startswith('hex-string:'):
+                text = text.split(':', 1)[1]
+            elif lowered.startswith('0x'):
+                text = text[2:]
+            hex_text = ''.join(ch for ch in text if ch not in ' \t\r\n:-')
+            if len(hex_text) == expected_length * 2 and all(
+                ch in '0123456789abcdefABCDEF' for ch in hex_text
+            ):
+                try:
+                    payload = bytes.fromhex(hex_text)
+                except ValueError:
+                    return None
+            else:
+                try:
+                    payload = value.encode('latin-1') if isinstance(value, str) else b''
+                except UnicodeEncodeError:
+                    return None
+        if len(payload) != expected_length:
+            return None
+        try:
+            return ipaddress.ip_address(payload).compressed
+        except ValueError:
+            return None
+
+    def _correlate_cpe_data(
+        self,
+        raw: dict,
+        modems: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """Join CPE rows to CMs and report whether every row was valid."""
+        modem_by_index = {
+            str(modem.get('docsif3_index')): str(modem.get('mac_address'))
+            for modem in modems
+            if modem.get('docsif3_index') is not None and modem.get('mac_address')
+        }
+        type_by_index = {
+            self._extract_index(item.get('oid', ''), OID_CPE_ADDR_TYPE):
+                self._enum_code(item.get('value'))
+            for item in raw.get(OID_CPE_ADDR_TYPE, [])
+        }
+        prefix_by_index = {
+            self._extract_index(item.get('oid', ''), OID_CPE_PREFIX):
+                self._enum_code(item.get('value'))
+            for item in raw.get(OID_CPE_PREFIX, [])
+        }
+        address_rows = {
+            self._extract_index(item.get('oid', ''), OID_CPE_ADDR): item
+            for item in raw.get(OID_CPE_ADDR, [])
+        }
+        valid = set(address_rows) == set(type_by_index) == set(prefix_by_index)
+        entries: List[Dict[str, Any]] = []
+        for row_index, item in address_rows.items():
+            parts = row_index.split('.')
+            if len(parts) < 2:
+                valid = False
+                continue
+            docsif3_index = '.'.join(parts[:-1])
+            modem_mac = modem_by_index.get(docsif3_index)
+            address_type = type_by_index.get(row_index)
+            address = self._decode_inet_address(item.get('value'), address_type or 0)
+            maximum = 32 if address_type == 1 else 128 if address_type == 2 else -1
+            prefix_length = prefix_by_index.get(row_index)
+            if (
+                not modem_mac
+                or not address
+                or maximum < 0
+                or prefix_length is None
+                or not 0 <= prefix_length <= maximum
+            ):
+                valid = False
+                continue
+            entries.append({
+                'docsif3_index': docsif3_index,
+                'cpe_id': parts[-1],
+                'modem_mac': modem_mac,
+                'address_family': 'ipv4' if address_type == 1 else 'ipv6',
+                'ip_address': address,
+                'prefix_length': prefix_length,
+            })
+        return entries, valid
 
     @staticmethod
     def _decode_partial_service(value: Any) -> tuple[bool, bool, str]:
@@ -327,6 +440,7 @@ class CMTSModemService:
         *,
         enrich: bool,
         limit: int,
+        collect_cpe: bool = False,
     ) -> Dict[str, Any]:
         modems = entry.get('modems') or []
         returned_modems = modems[:int(limit)] if limit else modems
@@ -347,6 +461,10 @@ class CMTSModemService:
         ):
             if key in entry:
                 response[key] = entry[key]
+        if collect_cpe:
+            for key in ('cpe_addresses', 'cpe_complete', 'cpe_truncated', 'cpe_oid_errors'):
+                if key in entry:
+                    response[key] = entry[key]
         response['capability_enriched'] = entry.get('capability_enriched') is True
         return response
 
@@ -359,6 +477,7 @@ class CMTSModemService:
         limit: int = 10000,
         enrich: bool = False,
         refresh: bool = False,
+        collect_cpe: bool = False,
         modem_community: str = "private",
         cmts_hostname: str = "",
     ) -> Dict[str, Any]:
@@ -397,13 +516,19 @@ class CMTSModemService:
                 or cached.get('enriched') is True
                 or cached.get('enriching') is True
             )
-            if age < _LIVE_CACHE_TTL_SECONDS and cache_sufficient and cache_usable:
+            if (
+                age < _LIVE_CACHE_TTL_SECONDS
+                and cache_sufficient
+                and cache_usable
+                and (not collect_cpe or 'cpe_addresses' in cached)
+            ):
                 self.logger.info(
                     "Returning cached generation for %s (age=%.0fs, enrich=%s)",
                     cmts_ip, age, enrich,
                 )
                 return self._cache_response(
                     cmts_ip, cached, enrich=enrich, limit=limit,
+                    collect_cpe=collect_cpe,
                 )
 
         # ── Tier 2: MySQL inventory (survives restarts) ──────────────
@@ -484,7 +609,7 @@ class CMTSModemService:
                         "falling through to SNMP"
                     )
 
-                if is_fresh and inventory_covers_request and not enrich:
+                if is_fresh and inventory_covers_request and not enrich and not collect_cpe:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, complete={snapshot_complete})"
@@ -500,7 +625,7 @@ class CMTSModemService:
                         **inventory_meta,
                     }
 
-                if is_fresh and inventory_covers_request and enrich and is_enriched:
+                if is_fresh and inventory_covers_request and enrich and is_enriched and not collect_cpe:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, enriched)"
@@ -539,7 +664,11 @@ class CMTSModemService:
             # one whose capability tables completed with errors, starts a short
             # refresh cooldown so queued force-refresh requests do not walk again.
             cached = _enrichment_cache.get(cmts_ip)
-            if cached and self._cache_sufficient(cached, limit):
+            if (
+                cached
+                and self._cache_sufficient(cached, limit)
+                and (not collect_cpe or 'cpe_addresses' in cached)
+            ):
                 age = time.time() - cached.get('timestamp', 0)
                 cache_usable = (
                     not enrich
@@ -558,6 +687,7 @@ class CMTSModemService:
                     )
                     return self._cache_response(
                         cmts_ip, cached, enrich=enrich, limit=limit,
+                        collect_cpe=collect_cpe,
                     )
 
             # ── Step 1: Parallel SNMP walks via agent ────────────────────
@@ -567,10 +697,20 @@ class CMTSModemService:
                 OID_US_CH_ID, OID_IF_NAME,
                 OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
             ]
+            walk_limit = int(limit or 0)
+            if collect_cpe:
+                walk_oids.extend((OID_CPE_ADDR_TYPE, OID_CPE_ADDR, OID_CPE_PREFIX))
+                try:
+                    cpe_limit = int(os.environ.get(
+                        'CM_CPE_IP_LIMIT', max(10000, walk_limit * 8),
+                    ))
+                except (TypeError, ValueError):
+                    cpe_limit = max(10000, walk_limit * 8)
+                walk_limit = max(walk_limit, min(cpe_limit, 500000))
             walk_result = await self._send_agent_command(
                 'snmp_parallel_walk',
                 {'ip': cmts_ip, 'oids': walk_oids,
-                 'community': community, 'timeout': 5, 'limit': limit,
+                 'community': community, 'timeout': 5, 'limit': walk_limit,
                  'overall_timeout': 270},
                 timeout=300,
             )
@@ -657,9 +797,44 @@ class CMTSModemService:
                     list(critical_oid_errors),
                 )
 
+            cpe_addresses: List[Dict[str, Any]] = []
+            cpe_complete = False
+            cpe_truncated = False
+            cpe_oid_errors: Dict[str, str] = {}
+            if collect_cpe:
+                cpe_oids = (OID_CPE_ADDR_TYPE, OID_CPE_ADDR, OID_CPE_PREFIX)
+                cpe_oid_errors = {
+                    oid: str(walk_errors[oid]) for oid in cpe_oids if oid in walk_errors
+                }
+                cpe_truncated = bool(
+                    any(oid in truncated_oids for oid in cpe_oids)
+                    or any(len(raw.get(oid, [])) >= walk_limit for oid in cpe_oids)
+                    or inventory_truncated
+                )
+                cpe_complete = bool(
+                    critical_walks_complete
+                    and not cpe_oid_errors
+                    and not cpe_truncated
+                    and all(oid in completed_oids for oid in cpe_oids)
+                )
+
             # ── Step 2: Parse raw results into lookup maps ───────────────
             modems = self._correlate_modem_data(raw, limit)
-            self.logger.info(f"Discovered {len(modems)} modems from CMTS {cmts_ip}")
+            if collect_cpe:
+                cpe_addresses, cpe_rows_valid = self._correlate_cpe_data(raw, modems)
+                cpe_complete = cpe_complete and cpe_rows_valid
+                inventory_meta.update({
+                    'cpe_addresses': cpe_addresses,
+                    'cpe_complete': cpe_complete,
+                    'cpe_truncated': cpe_truncated,
+                    'cpe_oid_errors': cpe_oid_errors,
+                })
+            self.logger.info(
+                "Discovered %s modems%s from CMTS %s",
+                len(modems),
+                f" and {len(cpe_addresses)} CPE addresses" if collect_cpe else "",
+                cmts_ip,
+            )
 
             # Cache every live base generation, including non-enrichment and
             # unsuccessful capability attempts. Completeness metadata prevents
