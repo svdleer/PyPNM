@@ -98,7 +98,16 @@ class CmtsUsOfdmaRxMer(PnmHeader):
             mac_bytes = unpacked[5]
             self._cm_mac_address = MacAddress(mac_bytes).to_mac_format(MacAddressFormat.COLON)
             self._num_averages = unpacked[6]
-            self._preeq_enabled = bool(unpacked[7])
+            raw_preeq = unpacked[7]
+            # PNN105 producers use either a Boolean byte (0/1) or the
+            # SNMP TruthValue representation (1=true, 2=false). Generic
+            # bool(value) is incorrect for TruthValue false(2).
+            if raw_preeq == 1:
+                self._preeq_enabled = True
+            elif raw_preeq in (0, 2):
+                self._preeq_enabled = False
+            else:
+                raise ValueError(f"Unsupported RxMER PreEq flag value: {raw_preeq}")
             self._subcarrier_zero_frequency = unpacked[8]
             self._first_active_subcarrier = unpacked[9]
             # Spacing is 1 byte in kHz
