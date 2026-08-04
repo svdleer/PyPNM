@@ -811,9 +811,19 @@ class CmtsUsOfdmaRxMerService:
             # 3. Set filename
             await self._snmp_set(f"{self.OID_US_RXMER_FILENAME}{idx}", filename, 's')
 
-            # 4. Set pre-equalization (1=true, 2=false)
+            # 4. Set pre-equalization (SNMP TruthValue: 1=true, 2=false).
+            # Do not trigger a capture when the CMTS rejects this setting (for
+            # example, inconsistentValue while a previous capture is busy).
             pre_eq_val = 1 if pre_eq else 2
-            await self._snmp_set(f"{self.OID_US_RXMER_PRE_EQ}{idx}", pre_eq_val, 'i')
+            pre_eq_result = await self._snmp_set(
+                f"{self.OID_US_RXMER_PRE_EQ}{idx}", pre_eq_val, 'i'
+            )
+            if not pre_eq_result.get('success'):
+                state = 'enabled' if pre_eq else 'disabled'
+                error = pre_eq_result.get('error') or 'SNMP set failed'
+                raise RuntimeError(
+                    f"Failed to set RxMER pre-equalization {state}: {error}"
+                )
 
             # 5. Set number of averages (Gauge32)
             await self._snmp_set(f"{self.OID_US_RXMER_NUM_AVGS}{idx}", num_averages, 'g')
