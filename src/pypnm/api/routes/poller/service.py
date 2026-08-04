@@ -1578,18 +1578,81 @@ class PollerService:
                         modems_succeeded=targets_succeeded,
                         modems_failed=targets_failed,
                     )
+                    status_rows = self._query(
+                        "SELECT status FROM poller_job WHERE id=%s", (job_id,)
+                    )
+                    current_status = (
+                        str((status_rows[0] or {}).get("status") or "").lower()
+                        if status_rows else ""
+                    )
+                    if current_status != "running":
+                        self._execute(
+                            "UPDATE poller_setting SET last_target_offset=0, "
+                            "updated_at=%s WHERE id=%s",
+                            (self._now(), poller_id),
+                        )
+                        return
             if fetch_result is None:
+                # A non-responsive CMTS is a per-target failure. Preserve its
+                # previous CPE rows, record the failure, and continue the run.
+                status_rows = self._query(
+                    "SELECT status FROM poller_job WHERE id=%s", (job_id,)
+                )
+                if (
+                    not status_rows
+                    or str(status_rows[0].get("status") or "") != "running"
+                ):
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+                        "WHERE id=%s",
+                        (self._now(), poller_id),
+                    )
+                    return
+
+                targets_attempted += 1
+                targets_failed += 1
+                incomplete_targets += 1
+                validation_error = (
+                    f"CPE fetch failed after {subtask_retries + 1} attempt(s): "
+                    f"{last_target_error}"
+                )
+                breakdown.append({
+                    "cmts": cmts_name,
+                    "cmts_ip": cmts_ip,
+                    "row_count": 0,
+                    "cpe_row_count": 0,
+                    "skipped_cpe_rows": 0,
+                    "cpe_complete": False,
+                    "completion_source": None,
+                    "cpe_truncated": False,
+                    "cpe_oid_errors": {},
+                    "validation_error": validation_error,
+                    "requested_limit": None,
+                    "collected_at": None,
+                    "raw_d3_mac_count": None,
+                    "raw_cpe_type_count": None,
+                    "raw_cpe_address_count": None,
+                    "raw_cpe_prefix_count": None,
+                })
+                self._execute(
+                    "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                    (json.dumps(breakdown), job_id),
+                )
                 self._execute(
                     "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
                     "WHERE id=%s",
-                    (idx - 1, self._now(), poller_id),
+                    (idx, self._now(), poller_id),
                 )
-                fatal_error = (
-                    f"Subtask timeout/failure at CMTS {idx}/{total_targets} "
-                    f"({cmts_name}): {last_target_error}"
+                self._update_running_job_progress(
+                    job_id,
+                    f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                    f"after {subtask_retries + 1} failed attempt(s)",
+                    rows_collected=rows_collected,
+                    modems_attempted=targets_attempted,
+                    modems_succeeded=targets_succeeded,
+                    modems_failed=targets_failed,
                 )
-                targets_failed += 1
-                break
+                continue
 
             # Kill is cooperative. Never persist a generation returned after the
             # administrator cancelled the job while its SNMP request was in flight.
@@ -1655,45 +1718,61 @@ class PollerService:
                 "WHERE id=%s",
                 (idx, self._now(), poller_id),
             )
+            progress_message = (
+                f"CPE {idx}/{total_targets}: {cmts_name} done "
+                f"({written} addresses, complete=True)"
+                if complete and not truncated
+                else f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                "(incomplete generation; previous rows preserved)"
+            )
             self._update_running_job_progress(
                 job_id,
-                f"CPE {idx}/{total_targets}: {cmts_name} done "
-                f"({written} addresses, complete={complete})",
+                progress_message,
                 rows_collected=rows_collected,
                 modems_attempted=targets_attempted,
                 modems_succeeded=targets_succeeded,
                 modems_failed=targets_failed,
             )
 
-        if not fatal_error:
-            self._execute(
-                "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
-                "WHERE id=%s",
-                (self._now(), poller_id),
+        self._execute(
+            "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+            "WHERE id=%s",
+            (self._now(), poller_id),
+        )
+        result_status = "done"
+        result_message = fatal_error
+        if result_message:
+            result_status = "failed"
+        elif targets_attempted == 0:
+            result_status = "failed"
+            result_message = "No valid CMTS targets were attempted"
+        elif targets_succeeded == 0:
+            result_status = "failed"
+            result_message = (
+                f"CPE refresh failed for all {targets_attempted} attempted CMTS "
+                "target(s); previous stored rows were preserved"
             )
-        result_error = fatal_error
-        if not result_error and incomplete_targets:
-            result_error = (
-                f"CPE refresh completed with {incomplete_targets} incomplete "
-                "CMTS generation(s); previous stored rows were preserved"
+        elif incomplete_targets:
+            result_message = (
+                f"CPE refresh completed with {targets_succeeded} successful and "
+                f"{incomplete_targets} skipped/incomplete CMTS target(s); "
+                "previous stored rows were preserved for failed targets"
             )
         self._execute(
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, "
             "modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, "
             "error_text=%s WHERE id=%s AND status='running'",
             (
-                "done" if not result_error else "failed",
+                result_status,
                 self._now(),
                 rows_collected,
                 targets_attempted,
                 targets_succeeded,
                 targets_failed,
-                result_error,
+                result_message,
                 job_id,
             ),
         )
-        if fatal_error and "Subtask timeout/failure" in fatal_error:
-            self.enqueue_run(poller_id, source="resume")
 
     def _process_one_job(self) -> None:
         queued = self._query("SELECT id, poller_id FROM poller_job WHERE status='queued' ORDER BY id ASC LIMIT 1")
