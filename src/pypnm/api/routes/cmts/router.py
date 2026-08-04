@@ -178,6 +178,7 @@ async def query_modem_interface(
             cmts_ip=payload.cmts_ip,
             docsif3_index=payload.docsif3_index,
             community=payload.community,
+            modem_ip=payload.modem_ip,
         )
         return CMTSModemInterfaceResponse(**result)
     except Exception as exc:

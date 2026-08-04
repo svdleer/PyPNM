@@ -30,18 +30,20 @@ class CMTSModemRequest(BaseModel):
 
 
 class CMTSModemInterfaceRequest(BaseModel):
-    """Request targeted CMTS-side interface enrichment for one modem."""
+    """Request targeted CMTS-side enrichment for one modem."""
     cmts_ip: str = Field(..., description="CMTS IP address")
     docsif3_index: int = Field(..., ge=1, description="DOCS-IF3 modem registration index")
     community: str = Field(default="public", description="SNMP community for CMTS")
+    modem_ip: Optional[str] = Field(default=None, description="Optional modem IP for direct capability fallback")
 
 
 class CMTSModemInterfaceResponse(BaseModel):
-    """CMTS-side cable interface and Fiber Node values for one modem."""
+    """CMTS-side interface, Fiber Node, and DOCSIS version for one modem."""
     success: bool
     md_if_index: Optional[int] = None
     cable_mac: Optional[str] = None
     fiber_node: Optional[str] = None
+    docsis_version: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -80,7 +82,7 @@ class ModemInfo(BaseModel):
     ip_address: Optional[str] = Field(default=None, description="Modem IP address")
     status: Optional[str] = Field(default=None, description="Registration status (operational, ranging, etc)")
     status_code: Optional[int] = Field(default=None, description="Raw status code from CMTS")
-    docsis_version: Optional[str] = Field(default=None, description="DOCSIS version (1.0, 1.1, 2.0, 3.0, 3.1)")
+    docsis_version: Optional[str] = Field(default=None, description="DOCSIS version (1.0, 1.1, 2.0, 3.0, 3.1, 4.0)")
     partial_service: Optional[bool] = Field(default=None, description="Whether modem is in partial service in either direction")
     partial_service_downstream: Optional[bool] = Field(default=None, description="Whether downstream is in partial service")
     partial_service_upstream: Optional[bool] = Field(default=None, description="Whether upstream is in partial service")

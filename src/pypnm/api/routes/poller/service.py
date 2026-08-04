@@ -2946,12 +2946,19 @@ class PollerService:
         modem: Dict[str, Any] | None,
         base: str,
     ) -> Dict[str, str | None]:
-        """Resolve one modem's cable interface and Fiber Node through PyPNM."""
+        """Resolve one modem's CMTS interface, Fiber Node, and DOCSIS version."""
         existing = {
             "cable_mac": (modem or {}).get("cable_mac"),
             "fiber_node": (modem or {}).get("fiber_node"),
+            "docsis_version": (modem or {}).get("docsis_version"),
         }
-        if not modem or all(existing.values()):
+        if not modem:
+            return existing
+        if (
+            existing["cable_mac"]
+            and existing["fiber_node"]
+            and "4.0" in str(existing["docsis_version"] or "")
+        ):
             return existing
 
         cmts_ip = str(modem.get("cmts_ip") or "").strip()
@@ -2972,8 +2979,9 @@ class PollerService:
                 "cmts_ip": cmts_ip,
                 "docsif3_index": docsif3_index_value,
                 "community": community,
+                "modem_ip": modem.get("ip_address") or modem.get("ip"),
             },
-            timeout=140,
+            timeout=180,
         )
         response.raise_for_status()
         payload = response.json() if response.content else {}
@@ -2983,9 +2991,26 @@ class PollerService:
                 modem.get("mac_address") or modem.get("mac") or docsif3_index,
                 payload.get("error"),
             )
+
+        version_rank = {
+            "DOCSIS 1.0": 10,
+            "DOCSIS 1.1": 11,
+            "DOCSIS 2.0": 20,
+            "DOCSIS 3.0": 30,
+            "DOCSIS 3.1": 31,
+            "DOCSIS 4.0": 40,
+        }
+        discovered_version = payload.get("docsis_version")
+        docsis_version = (
+            discovered_version
+            if version_rank.get(discovered_version, 0)
+            >= version_rank.get(existing["docsis_version"], 0)
+            else existing["docsis_version"]
+        )
         return {
             "cable_mac": payload.get("cable_mac") or existing["cable_mac"],
             "fiber_node": payload.get("fiber_node") or existing["fiber_node"],
+            "docsis_version": docsis_version,
         }
 
     def _process_refresh_queue(self) -> None:
@@ -3100,6 +3125,7 @@ class PollerService:
             interface_values = {
                 "cable_mac": cable_source.get("cable_mac"),
                 "fiber_node": cable_source.get("fiber_node"),
+                "docsis_version": cable_source.get("docsis_version"),
             }
             try:
                 interface_values = self._resolve_cmts_interface_from_cmts(cable_source, base)
@@ -3107,8 +3133,9 @@ class PollerService:
                 logger.warning("Targeted CMTS interface lookup for %s failed: %s", mac, exc)
             cable_mac = interface_values.get("cable_mac")
             fiber_node = interface_values.get("fiber_node")
+            docsis_version = interface_values.get("docsis_version")
 
-            if vendor or model_name or software_ver or cable_mac or fiber_node:
+            if vendor or model_name or software_ver or cable_mac or fiber_node or docsis_version:
                 self._execute(
                     "UPDATE modem_inventory_current SET "
                     "vendor=COALESCE(NULLIF(%s,''), vendor), "
@@ -3116,8 +3143,18 @@ class PollerService:
                     "software_version=COALESCE(NULLIF(%s,''), software_version), "
                     "cable_mac=COALESCE(NULLIF(%s,''), cable_mac), "
                     "fiber_node=COALESCE(NULLIF(%s,''), fiber_node), "
+                    "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                     "updated_at=%s WHERE mac=%s",
-                    (vendor, model_name, software_ver, cable_mac, fiber_node, self._now(), mac),
+                    (
+                        vendor,
+                        model_name,
+                        software_ver,
+                        cable_mac,
+                        fiber_node,
+                        docsis_version,
+                        self._now(),
+                        mac,
+                    ),
                 )
             # A completed single-modem refresh changes data outside the full
             # snapshot generation. Advance its CMTS revision so every GUI

@@ -78,6 +78,10 @@ OID_IF_NAME      = '1.3.6.1.2.1.31.1.1.1.1'              # IF-MIB::ifName
 OID_DS_PROFILE_LIST = '1.3.6.1.4.1.4491.2.1.28.1.3.1.2'  # docsIf31CmtsCmRegStatusDsProfileIdList
 OID_US_PROFILE_LIST = '1.3.6.1.4.1.4491.2.1.28.1.3.1.3'  # docsIf31CmtsCmRegStatusUsProfileIucList
 OID_PARTIAL_SVC  = '1.3.6.1.4.1.4491.2.1.28.1.3.1.9'    # docsIf31CmtsCmRegStatusPartialSvcState
+OID_D4_ADV_CAP   = '1.3.6.1.4.1.4491.2.1.38.1.1.1.1.1'  # docsIf40CmtsCmRegStatusAdvBandPlanCapability
+# Direct cable-modem capability scalars
+OID_CM_DOCSIS_CAP = '1.3.6.1.4.1.4491.2.1.28.1.1.0'     # docsIf31DocsisBaseCapability.0
+OID_CM_DOCSIS_CAP_LEGACY = '1.3.6.1.2.1.10.127.1.1.5.0' # docsIfDocsisBaseCapability.0
 
 # Status code mapping (docsIfCmtsCmStatusValue)
 # 6 = registrationComplete → mapped to 'operational' since modem is fully online
@@ -180,8 +184,66 @@ class CMTSModemService:
         cmts_ip: str,
         docsif3_index: int,
         community: str = 'public',
+        modem_ip: str | None = None,
     ) -> dict:
-        """Resolve one modem's cable interface and Fiber Node from DOCS-IF3."""
+        """Resolve one modem's CMTS interface, Fiber Node, and DOCSIS version."""
+        docsis_version = None
+
+        # The DOCS-IF40 augmentation is authoritative per registration index.
+        try:
+            d4_result = await self._send_agent_command(
+                'snmp_get',
+                {
+                    'target_ip': cmts_ip,
+                    'oid': f'{OID_D4_ADV_CAP}.{docsif3_index}',
+                    'community': community,
+                    'timeout': 5,
+                    'raw_octets': True,
+                },
+                timeout=15,
+            )
+            if self._has_docsis40_capability(self._agent_scalar_value(d4_result)):
+                docsis_version = 'DOCSIS 4.0'
+        except Exception as exc:
+            self.logger.debug(
+                "DOCS-IF40 lookup unavailable for %s index %s: %s",
+                cmts_ip,
+                docsif3_index,
+                exc,
+            )
+
+        # If the CMTS does not expose DOCS-IF40, ask this modem's capability
+        # scalar directly. The CM agent owns its SNMP community configuration.
+        if modem_ip and docsis_version != 'DOCSIS 4.0':
+            try:
+                cap_result = await self._send_cm_agent_command(
+                    'snmp_bulk_get',
+                    {
+                        'target_ip': modem_ip,
+                        'oids': [OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY],
+                        'timeout': 3,
+                        'retries': 0,
+                        'max_concurrent': 1,
+                    },
+                    timeout=20,
+                )
+                oid_results = cap_result.get('results') or {}
+                for oid in (OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY):
+                    result = oid_results.get(oid) or {}
+                    output = str(result.get('output') or '')
+                    if result.get('success') and output and 'No Such' not in output:
+                        raw_capability = output.split('=')[-1].strip() if '=' in output else output
+                        parsed_version = self._parse_docsis_cap(raw_capability)
+                        if parsed_version:
+                            docsis_version = parsed_version
+                            break
+            except Exception as exc:
+                self.logger.debug(
+                    "Direct DOCSIS capability lookup unavailable for %s: %s",
+                    modem_ip,
+                    exc,
+                )
+
         md_if_result = await self._send_agent_command(
             'snmp_get',
             {
@@ -198,11 +260,13 @@ class CMTSModemService:
         except (TypeError, ValueError):
             return {
                 'success': False,
+                'docsis_version': docsis_version,
                 'error': f'No DOCS-IF3 MAC-domain index for registration index {docsif3_index}',
             }
         if md_if_index <= 0:
             return {
                 'success': False,
+                'docsis_version': docsis_version,
                 'error': f'Invalid DOCS-IF3 MAC-domain index for registration index {docsif3_index}',
             }
 
@@ -251,6 +315,7 @@ class CMTSModemService:
             'md_if_index': md_if_index,
             'cable_mac': cable_mac,
             'fiber_node': fiber_node,
+            'docsis_version': docsis_version,
             'error': error,
         }
 
@@ -587,6 +652,40 @@ class CMTSModemService:
             assignments.append((ifindex, profiles))
             offset = end
         return assignments
+
+    @staticmethod
+    def _has_docsis40_capability(value: Any) -> bool:
+        """Return True only when a DOCS-IF40 advanced-band-plan bit is set."""
+        if value is None:
+            return False
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return any(bytes(value))
+        if isinstance(value, (int, float)):
+            return int(value) > 0
+
+        text = str(value).strip()
+        if not text or 'no such' in text.lower():
+            return False
+        lowered = text.lower()
+        if any(name in lowered for name in ('supportsfdxl', 'supportsfdx', 'supportsfdd')):
+            return True
+        for prefix in ('hex-string:', 'bits:'):
+            if lowered.startswith(prefix):
+                text = text.split(':', 1)[1].strip()
+                lowered = text.lower()
+                break
+        if lowered.startswith('0x'):
+            text = text[2:]
+        compact_hex = ''.join(ch for ch in text if ch not in ' \t\r\n:-')
+        if compact_hex and all(ch in '0123456789abcdefABCDEF' for ch in compact_hex):
+            try:
+                return any(bytes.fromhex(compact_hex.zfill(len(compact_hex) + len(compact_hex) % 2)))
+            except ValueError:
+                return False
+        try:
+            return int(text, 10) > 0
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def _upgrade_docsis31(modem: dict[str, Any]) -> None:
@@ -1022,6 +1121,7 @@ class CMTSModemService:
                 OID_OLD_US_CH_IF, OID_SW_REV,
                 OID_US_CH_ID, OID_IF_NAME,
                 OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
+                OID_D4_ADV_CAP,
             ]
             walk_limit = int(limit or 0)
             if collect_cpe:
@@ -1037,7 +1137,8 @@ class CMTSModemService:
                 'snmp_parallel_walk',
                 {'ip': cmts_ip, 'oids': walk_oids,
                  'community': community, 'timeout': 5, 'limit': walk_limit,
-                 'overall_timeout': 270},
+                 'overall_timeout': 270,
+                 'raw_octet_oids': [OID_D4_ADV_CAP]},
                 timeout=300,
             )
             if not walk_result.get('success'):
@@ -1411,6 +1512,21 @@ class CMTSModemService:
             except (ValueError, TypeError):
                 pass
 
+        # ---- authoritative DOCSIS 4.0 registration capability ----
+        # DOCS-IF40 augments docsIf3CmtsCmRegStatusEntry with the same index.
+        # At least one FDX-L/FDX/FDD bit must be set; an empty/zero row is neutral.
+        docsis40_indexes: set[str] = set()
+        for item in raw.get(OID_D4_ADV_CAP, []):
+            if self._has_docsis40_capability(item.get('value')):
+                idx = self._extract_index(item.get('oid', ''), OID_D4_ADV_CAP)
+                if idx:
+                    docsis40_indexes.add(idx)
+        if docsis40_indexes:
+            self.logger.info(
+                "Resolved %s DOCSIS 4.0 registrations from DOCS-IF40",
+                len(docsis40_indexes),
+            )
+
         # ---- authoritative per-modem OFDM/OFDMA profile assignments ----
         # These DOCS-IF31 augmentation rows use the docsIf3 registration index.
         # Only fully valid, non-empty assignment lists become positive evidence.
@@ -1530,6 +1646,9 @@ class CMTSModemService:
                 modem['partial_service_state'] = partial_state
             elif modem.get('status') == 'operational':
                 modem['docsis_version'] = 'DOCSIS 3.0'
+
+            if d3_index is not None and d3_index in docsis40_indexes:
+                modem['docsis_version'] = 'DOCSIS 4.0'
 
             if d3_index is not None:
                 ds_assignments = ds_profile_map.get(d3_index) or []
@@ -1845,9 +1964,7 @@ class CMTSModemService:
         import asyncio
 
         OID_SYS_DESCR = '1.3.6.1.2.1.1.1.0'
-        OID_DOCSIS_CAP_31 = '1.3.6.1.4.1.4491.2.1.28.1.1.5'
-        OID_DOCSIS_CAP_30 = '1.3.6.1.2.1.10.127.1.1.5.0'
-        ALL_OIDS = [OID_SYS_DESCR, OID_DOCSIS_CAP_31, OID_DOCSIS_CAP_30]
+        ALL_OIDS = [OID_SYS_DESCR, OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY]
 
         online_statuses = {'operational', 'registrationComplete', 'ipComplete', 'online'}
         skip_prefixes = ('10.160.', '10.254.', '10.255.')
@@ -1973,9 +2090,9 @@ class CMTSModemService:
                             _first_success_logged = True
                             self.logger.info(f"Enrichment sample: {ip} → model={modem['model']} vendor={modem.get('vendor')} sw={modem.get('software_version')}")
 
-                # ── DOCSIS capability (try 3.1 first, fallback 3.0) ──
+                # ── DOCSIS capability (modern scalar first, legacy fallback) ──
                 docsis_version = None
-                for oid in (OID_DOCSIS_CAP_31, OID_DOCSIS_CAP_30):
+                for oid in (OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY):
                     dr = oid_results.get(oid, {})
                     if dr.get('success') and dr.get('output'):
                         raw = dr['output']
