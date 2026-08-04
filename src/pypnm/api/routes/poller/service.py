@@ -549,21 +549,37 @@ class PollerService:
     def _start_worker(self) -> None:
         if self._worker_started:
             return
-        t = threading.Thread(target=self._worker_loop, name="pypnm-poller-worker", daemon=True)
-        t.start()
+        poller_thread = threading.Thread(
+            target=self._worker_loop,
+            name="pypnm-poller-worker",
+            daemon=True,
+        )
+        refresh_thread = threading.Thread(
+            target=self._refresh_worker_loop,
+            name="pypnm-refresh-worker",
+            daemon=True,
+        )
+        poller_thread.start()
+        refresh_thread.start()
         self._worker_started = True
 
-    def _try_acquire_worker_lock(self):
-        """Return a dedicated connection holding the singleton worker lock."""
+    def _try_acquire_worker_lock(self, worker_kind: str = "poller"):
+        """Return a dedicated connection holding one singleton worker lock."""
+        if worker_kind not in {"poller", "refresh"}:
+            raise ValueError(f"Unsupported worker kind: {worker_kind}")
         conn = self._connect()
-        lock_name = f"pypnm-poller-worker:{self._db_name()}"[:64]
+        lock_name = f"pypnm-{worker_kind}-worker:{self._db_name()}"[:64]
         try:
             cur = conn.cursor()
             cur.execute("SELECT GET_LOCK(%s, 0) AS acquired", (lock_name,))
             row = cur.fetchone() or {}
             cur.close()
             if int(row.get("acquired") or 0) == 1:
-                logger.info("Acquired poller worker lock for database %s", self._db_name())
+                logger.info(
+                    "Acquired %s worker lock for database %s",
+                    worker_kind,
+                    self._db_name(),
+                )
                 return conn
         except Exception:
             conn.close()
@@ -571,8 +587,8 @@ class PollerService:
         conn.close()
         return None
 
-    def _recover_interrupted_work(self) -> None:
-        """Requeue work orphaned when the previous lock owner stopped."""
+    def _recover_interrupted_poller_work(self) -> None:
+        """Requeue poller work orphaned when the poller lock owner stopped."""
         self._execute(
             """
             UPDATE poller_job
@@ -581,11 +597,14 @@ class PollerService:
             WHERE status='running'
             """
         )
+
+    def _recover_interrupted_refresh_work(self) -> None:
+        """Requeue refresh work orphaned when the refresh lock owner stopped."""
         self._execute(
             """
             UPDATE modem_refresh_request
             SET status='queued', started_at=NULL, finished_at=NULL,
-                error_text='Recovered after poller worker restart'
+                error_text='Recovered after refresh worker restart'
             WHERE status='running'
             """
         )
@@ -595,9 +614,9 @@ class PollerService:
         while True:
             if lock_conn is None:
                 try:
-                    lock_conn = self._try_acquire_worker_lock()
+                    lock_conn = self._try_acquire_worker_lock("poller")
                     if lock_conn is not None:
-                        self._recover_interrupted_work()
+                        self._recover_interrupted_poller_work()
                 except Exception as exc:
                     logger.warning("Poller worker lock/recovery failed: %s", exc)
                     if lock_conn is not None:
@@ -628,25 +647,60 @@ class PollerService:
                 logger.warning("Poller timeout sweep failed: %s", exc)
 
             try:
-                self._timeout_stale_refresh_requests()
-            except Exception as exc:
-                logger.warning("Refresh timeout sweep failed: %s", exc)
-
-            try:
                 self._process_one_job()
             except Exception as exc:
                 logger.warning("Poller queue worker failed: %s", exc)
-
-            try:
-                self._process_refresh_queue()
-            except Exception as exc:
-                logger.warning("Refresh queue worker failed: %s", exc)
 
             try:
                 if self._scheduler.get("enabled") and self._scheduler_due():
                     self.run_scheduler_once()
             except Exception as exc:
                 logger.warning("Poller scheduler tick failed: %s", exc)
+
+            time.sleep(2)
+
+    def _refresh_worker_loop(self) -> None:
+        """Process targeted modem enrichment independently of long poller jobs."""
+        lock_conn = None
+        while True:
+            if lock_conn is None:
+                try:
+                    lock_conn = self._try_acquire_worker_lock("refresh")
+                    if lock_conn is not None:
+                        self._recover_interrupted_refresh_work()
+                except Exception as exc:
+                    logger.warning("Refresh worker lock/recovery failed: %s", exc)
+                    if lock_conn is not None:
+                        try:
+                            lock_conn.close()
+                        except Exception:
+                            pass
+                        lock_conn = None
+                if lock_conn is None:
+                    time.sleep(2)
+                    continue
+
+            try:
+                # Keep the advisory-lock connection distinct from thread-local
+                # query connections, and never reconnect it implicitly.
+                lock_conn.ping(reconnect=False)
+            except Exception:
+                try:
+                    lock_conn.close()
+                except Exception:
+                    pass
+                lock_conn = None
+                continue
+
+            try:
+                self._timeout_stale_refresh_requests()
+            except Exception as exc:
+                logger.warning("Refresh timeout sweep failed: %s", exc)
+
+            try:
+                self._process_refresh_queue()
+            except Exception as exc:
+                logger.warning("Refresh queue worker failed: %s", exc)
 
             time.sleep(2)
 
@@ -2959,12 +3013,16 @@ class PollerService:
         mac = req["mac"]
         cmts = req.get("cmts")
 
-        # Claim only if still queued; if not, another worker/admin changed state.
+        # Claim only if still queued; never resurrect a request cancelled
+        # between the SELECT and UPDATE.
         self._execute(
-            "UPDATE modem_refresh_request SET status=%s, started_at=%s WHERE id=%s",
+            "UPDATE modem_refresh_request SET status=%s, started_at=%s "
+            "WHERE id=%s AND status='queued'",
             ("running", self._now(), req_id),
         )
-        claimed = self._query("SELECT status FROM modem_refresh_request WHERE id=%s", (req_id,))
+        claimed = self._query(
+            "SELECT status FROM modem_refresh_request WHERE id=%s", (req_id,)
+        )
         if not claimed or str((claimed[0] or {}).get("status") or "") != "running":
             return
         try:
