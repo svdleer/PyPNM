@@ -29,6 +29,22 @@ class CMTSModemRequest(BaseModel):
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
 
 
+class CMTSModemInterfaceRequest(BaseModel):
+    """Request targeted CMTS-side interface enrichment for one modem."""
+    cmts_ip: str = Field(..., description="CMTS IP address")
+    docsif3_index: int = Field(..., ge=1, description="DOCS-IF3 modem registration index")
+    community: str = Field(default="public", description="SNMP community for CMTS")
+
+
+class CMTSModemInterfaceResponse(BaseModel):
+    """CMTS-side cable interface and Fiber Node values for one modem."""
+    success: bool
+    md_if_index: Optional[int] = None
+    cable_mac: Optional[str] = None
+    fiber_node: Optional[str] = None
+    error: Optional[str] = None
+
+
 class CPECollectionRequest(BaseModel):
     """Request model for the dedicated scheduled CPE collection."""
     cmts_ip: str = Field(..., description="CMTS IP address")

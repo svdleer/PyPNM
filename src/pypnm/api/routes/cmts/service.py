@@ -12,6 +12,10 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any
 
 from pypnm.api.agent.manager import get_agent_manager
+from pypnm.api.routes.common.service.fiber_node_utils import (
+    OID_MD_NODE_STATUS_MD_DS_SG_ID,
+    parse_fn_name_from_oid,
+)
 
 
 # ── In-memory enrichment cache ──────────────────────────────────────────────
@@ -147,6 +151,108 @@ class CMTSModemService:
         if result and not result.get('success'):
             return result
         return {'success': False, 'error': 'No result from agent'}
+
+    @staticmethod
+    def _agent_scalar_value(result: dict) -> str | None:
+        """Extract a scalar value from a normalized agent SNMP response."""
+        payload = result or {}
+        nested = payload.get('result')
+        if isinstance(nested, dict):
+            payload = nested
+        if payload.get('success') is not True:
+            return None
+        value = payload.get('value')
+        if value is None:
+            value = payload.get('output')
+        text = str(value or '').strip()
+        if ' = ' in text:
+            text = text.split(' = ', 1)[1].strip()
+        if not text or 'No Such' in text:
+            return None
+        for prefix in ('STRING:', 'INTEGER:', 'Gauge32:'):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+        return text.strip('"') or None
+
+    async def resolve_modem_interface(
+        self,
+        cmts_ip: str,
+        docsif3_index: int,
+        community: str = 'public',
+    ) -> dict:
+        """Resolve one modem's cable interface and Fiber Node from DOCS-IF3."""
+        md_if_result = await self._send_agent_command(
+            'snmp_get',
+            {
+                'target_ip': cmts_ip,
+                'oid': f'1.3.6.1.4.1.4491.2.1.20.1.3.1.7.{docsif3_index}',
+                'community': community,
+                'timeout': 5,
+            },
+            timeout=15,
+        )
+        md_if_value = self._agent_scalar_value(md_if_result)
+        try:
+            md_if_index = int(str(md_if_value).split()[-1])
+        except (TypeError, ValueError):
+            return {
+                'success': False,
+                'error': f'No DOCS-IF3 MAC-domain index for registration index {docsif3_index}',
+            }
+        if md_if_index <= 0:
+            return {
+                'success': False,
+                'error': f'Invalid DOCS-IF3 MAC-domain index for registration index {docsif3_index}',
+            }
+
+        if_name_result = await self._send_agent_command(
+            'snmp_get',
+            {
+                'target_ip': cmts_ip,
+                'oid': f'1.3.6.1.2.1.31.1.1.1.1.{md_if_index}',
+                'community': community,
+                'timeout': 5,
+            },
+            timeout=15,
+        )
+        cable_mac = self._agent_scalar_value(if_name_result)
+
+        fn_result = await self._send_agent_command(
+            'snmp_parallel_walk',
+            {
+                'ip': cmts_ip,
+                'oids': [OID_MD_NODE_STATUS_MD_DS_SG_ID],
+                'community': community,
+                'timeout': 5,
+                'max_repetitions': 500,
+            },
+            timeout=120,
+        )
+        fiber_node = None
+        raw_results = fn_result.get('results') or {}
+        fn_entries = (
+            raw_results.get(OID_MD_NODE_STATUS_MD_DS_SG_ID, [])
+            if isinstance(raw_results, dict)
+            else raw_results if isinstance(raw_results, list) else []
+        )
+        for entry in fn_entries:
+            oid = entry.get('oid', '') if isinstance(entry, dict) else ''
+            parsed = parse_fn_name_from_oid(oid, OID_MD_NODE_STATUS_MD_DS_SG_ID)
+            if parsed and parsed[1] == md_if_index:
+                fiber_node = parsed[0]
+                break
+
+        error = None
+        if fn_result.get('success') is not True:
+            error = str(fn_result.get('error') or 'Fiber Node table walk failed')
+        return {
+            'success': True,
+            'md_if_index': md_if_index,
+            'cable_mac': cable_mac,
+            'fiber_node': fiber_node,
+            'error': error,
+        }
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

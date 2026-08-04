@@ -2941,65 +2941,52 @@ class PollerService:
         modem = self._resolve_modem_from_cmts(mac, cmts_name, base)
         return (modem or {}).get("ip_address")
 
-    @staticmethod
-    def _agent_snmp_get_value(base: str, target_ip: str, oid: str) -> str | None:
-        """Run one read-only CMTS SNMP GET through the configured agent."""
-        community = os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public"
-        agent_id = os.environ.get("CMTS_AGENT_ID") or "cmts-agent"
-        response = requests.post(
-            f"{base}/api/agents/{agent_id}/task",
-            params={"command": "snmp_get", "timeout": 30, "wait": "true"},
-            json={
-                "target_ip": target_ip,
-                "oid": oid,
-                "community": community,
-                "timeout": 10,
-            },
-            timeout=40,
-        )
-        response.raise_for_status()
-        payload = response.json() if response.content else {}
-        result = payload.get("result") or {}
-        if result.get("type") == "response":
-            result = result.get("result") or {}
-        if result.get("success") is not True:
-            return None
-        output = str(result.get("output") or "").strip()
-        value = output.split(" = ", 1)[1].strip() if " = " in output else output
-        if not value or "No Such" in value:
-            return None
-        for prefix in ("STRING:", "INTEGER:", "Gauge32:"):
-            if value.startswith(prefix):
-                value = value[len(prefix):].strip()
-                break
-        return value.strip('"') or None
+    def _resolve_cmts_interface_from_cmts(
+        self,
+        modem: Dict[str, Any] | None,
+        base: str,
+    ) -> Dict[str, str | None]:
+        """Resolve one modem's cable interface and Fiber Node through PyPNM."""
+        existing = {
+            "cable_mac": (modem or {}).get("cable_mac"),
+            "fiber_node": (modem or {}).get("fiber_node"),
+        }
+        if not modem or all(existing.values()):
+            return existing
 
-    def _resolve_cable_mac_from_cmts(self, modem: Dict[str, Any] | None, base: str) -> str | None:
-        """Resolve one modem's MAC-domain ifName using two scalar GETs."""
-        if not modem or modem.get("cable_mac"):
-            return (modem or {}).get("cable_mac")
         cmts_ip = str(modem.get("cmts_ip") or "").strip()
         docsif3_index = str(modem.get("docsif3_index") or "").strip()
         if not cmts_ip or not docsif3_index:
-            return None
-
-        md_if_value = self._agent_snmp_get_value(
-            base,
-            cmts_ip,
-            f"1.3.6.1.4.1.4491.2.1.20.1.3.1.7.{docsif3_index}",
-        )
+            return existing
         try:
-            md_if_index = int(str(md_if_value).split()[-1])
+            docsif3_index_value = int(docsif3_index)
         except (TypeError, ValueError):
-            return None
-        if md_if_index <= 0:
-            return None
+            return existing
+        if docsif3_index_value <= 0:
+            return existing
 
-        return self._agent_snmp_get_value(
-            base,
-            cmts_ip,
-            f"1.3.6.1.2.1.31.1.1.1.1.{md_if_index}",
+        community = os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public"
+        response = requests.post(
+            f"{base}/cmts/modem-interface/query",
+            json={
+                "cmts_ip": cmts_ip,
+                "docsif3_index": docsif3_index_value,
+                "community": community,
+            },
+            timeout=140,
         )
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+        if payload.get("error"):
+            logger.warning(
+                "Targeted CMTS interface lookup for %s returned: %s",
+                modem.get("mac_address") or modem.get("mac") or docsif3_index,
+                payload.get("error"),
+            )
+        return {
+            "cable_mac": payload.get("cable_mac") or existing["cable_mac"],
+            "fiber_node": payload.get("fiber_node") or existing["fiber_node"],
+        }
 
     def _process_refresh_queue(self) -> None:
         """Process one queued modem refresh request."""
@@ -3110,21 +3097,27 @@ class PollerService:
                 for key, value in cmts_fallback_modem.items():
                     if value is not None and not cable_source.get(key):
                         cable_source[key] = value
-            cable_mac = None
+            interface_values = {
+                "cable_mac": cable_source.get("cable_mac"),
+                "fiber_node": cable_source.get("fiber_node"),
+            }
             try:
-                cable_mac = self._resolve_cable_mac_from_cmts(cable_source, base)
+                interface_values = self._resolve_cmts_interface_from_cmts(cable_source, base)
             except Exception as exc:
-                logger.warning("Targeted cable-MAC lookup for %s failed: %s", mac, exc)
+                logger.warning("Targeted CMTS interface lookup for %s failed: %s", mac, exc)
+            cable_mac = interface_values.get("cable_mac")
+            fiber_node = interface_values.get("fiber_node")
 
-            if vendor or model_name or software_ver or cable_mac:
+            if vendor or model_name or software_ver or cable_mac or fiber_node:
                 self._execute(
                     "UPDATE modem_inventory_current SET "
                     "vendor=COALESCE(NULLIF(%s,''), vendor), "
                     "model=COALESCE(NULLIF(%s,''), model), "
                     "software_version=COALESCE(NULLIF(%s,''), software_version), "
                     "cable_mac=COALESCE(NULLIF(%s,''), cable_mac), "
+                    "fiber_node=COALESCE(NULLIF(%s,''), fiber_node), "
                     "updated_at=%s WHERE mac=%s",
-                    (vendor, model_name, software_ver, cable_mac, self._now(), mac),
+                    (vendor, model_name, software_ver, cable_mac, fiber_node, self._now(), mac),
                 )
             # A completed single-modem refresh changes data outside the full
             # snapshot generation. Advance its CMTS revision so every GUI

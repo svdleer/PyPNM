@@ -13,6 +13,8 @@ from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
 from pypnm.api.routes.cmts.schemas import (
     CPECollectionRequest,
     CPECollectionResponse,
+    CMTSModemInterfaceRequest,
+    CMTSModemInterfaceResponse,
     CMTSModemRequest,
     CMTSModemResponse,
 )
@@ -161,6 +163,31 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         modem_community=payload.modem_community,
         cmts_hostname=payload.cmts_hostname,
     )
+
+
+@router.post("/modem-interface/query", response_model=CMTSModemInterfaceResponse)
+async def query_modem_interface(
+    payload: CMTSModemInterfaceRequest,
+) -> CMTSModemInterfaceResponse:
+    """Resolve cable-interface and Fiber Node values for one inventory modem."""
+    agent_manager = get_agent_manager()
+    if not agent_manager or not agent_manager.get_available_agents():
+        raise HTTPException(status_code=503, detail="No agents available")
+    try:
+        result = await CMTSModemService().resolve_modem_interface(
+            cmts_ip=payload.cmts_ip,
+            docsif3_index=payload.docsif3_index,
+            community=payload.community,
+        )
+        return CMTSModemInterfaceResponse(**result)
+    except Exception as exc:
+        logger.exception(
+            "Targeted CMTS interface lookup failed for %s index %s: %s",
+            payload.cmts_ip,
+            payload.docsif3_index,
+            exc,
+        )
+        return CMTSModemInterfaceResponse(success=False, error=str(exc))
 
 
 @router.post("/cpe/query", response_model=CPECollectionResponse)
