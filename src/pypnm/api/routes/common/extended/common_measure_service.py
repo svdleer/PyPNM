@@ -1343,7 +1343,7 @@ class CommonMeasureService(CommonMessagingService):
                 - Maximum seconds to wait for the CM to complete the measurement
             • first_segment_center_freq      (int, default=300_000_000)
                 - Starting center frequency in Hz
-            • last_segment_center_freq       (int, default=900_000_000)
+            • last_segment_center_freq       (int, default=1_850_000_000)
                 - Ending center frequency in Hz
             • segment_freq_span              (int, default=7_500_000)
                 - Frequency span per segment in Hz
@@ -1388,7 +1388,7 @@ class CommonMeasureService(CommonMessagingService):
             capture_parameter = SpecAnCapturePara (
                 inactivity_timeout          = self.extra_options.get("inactivity_timeout", 100),
                 first_segment_center_freq   = self.extra_options.get("first_segment_center_freq", 300_000_000),
-                last_segment_center_freq    = self.extra_options.get("last_segment_center_freq", 993_000_000),
+                last_segment_center_freq    = self.extra_options.get("last_segment_center_freq", 1_850_000_000),
                 segment_freq_span           = self.extra_options.get("segment_freq_span", 1_000_000),  # Will be adjusted for vendor
                 num_bins_per_segment        = self.extra_options.get("num_bins_per_segment", 256),
                 noise_bw                    = self.extra_options.get("noise_bw", 110),

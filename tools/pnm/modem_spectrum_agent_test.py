@@ -55,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated inactivity timeout(s), e.g. 60 or 60,300",
     )
     p.add_argument("--first-segment-center-freq", type=int, default=108000000)
-    p.add_argument("--last-segment-center-freq", type=int, default=993000000)
+    p.add_argument("--last-segment-center-freq", type=int, default=1850000000)
     p.add_argument("--segment-freq-span", type=int, default=1000000)
     p.add_argument("--num-bins-per-segment", type=int, default=256)
     p.add_argument("--moving-average-points", type=int, default=10)

@@ -37,7 +37,7 @@ async def main() -> None:
     parser.add_argument("--tftp-ipv4", "-t4", required=True, help="IPv4 TFTP server")
 
     parser.add_argument("--first-segment-center-freq", "-fscf", default="300000000", help="First Segment Center Frequency (Hz)")
-    parser.add_argument("--last-segment-center-freq", "-lscf", default="900000000", help="Last Segment Center Frequency (Hz)")
+    parser.add_argument("--last-segment-center-freq", "-lscf", default="1850000000", help="Last Segment Center Frequency (Hz)")
     parser.add_argument("--segment-freq-span", "-sfs", default="1000000", help="Segment Frequency Span (Hz)")
     parser.add_argument("--number-bin-per-segment", "-nbps", default="256", help="Number of bins per segment")
     parser.add_argument("--equivalent-noise-bandwidth", "-enb", default="150", help="Equivalent Noise Bandwidth (kHz)")

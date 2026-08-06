@@ -616,7 +616,7 @@ class PNMDiagnosticsService:
             
             # Spectrum analyzer parameters
             first_seg_freq = 108_000_000  # 108 MHz
-            last_seg_freq = 993_000_000   # 993 MHz
+            last_seg_freq = 1_850_000_000  # 1850 MHz
             segment_span = 1_000_000      # 1 MHz (2 MHz for Ubee)
             num_bins = 256
             noise_bw = 110

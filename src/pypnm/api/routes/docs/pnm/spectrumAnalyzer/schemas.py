@@ -34,7 +34,7 @@ class SpecAnMovingAvgParameters(BaseModel):
 class SpecAnCapturePara(BaseModel):
     inactivity_timeout       : int                      = Field(default=60, description="Timeout in seconds for inactivity during spectrum analysis.")
     first_segment_center_freq: FrequencyHz              = Field(default=FrequencyHz(300_000_000), description="First segment center frequency in Hz.")
-    last_segment_center_freq : FrequencyHz              = Field(default=FrequencyHz(900_000_000), description="Last segment center frequency in Hz.")
+    last_segment_center_freq : FrequencyHz              = Field(default=FrequencyHz(1_850_000_000), description="Last segment center frequency in Hz.")
     segment_freq_span        : FrequencyHz              = Field(default=FrequencyHz(1_000_000), description="Frequency span of each segment in Hz.")
     num_bins_per_segment     : int                      = Field(default=256, description="Number of FFT bins per segment.")
     noise_bw                 : int                      = Field(default=150, description="Equivalent noise bandwidth in kHz.")
