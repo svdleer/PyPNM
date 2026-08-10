@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import Any
 
 from pypnm.api.routes.rxmer_analytics.service import rxmer_analytics_service
+from pypnm.config.pnm_config_manager import PnmConfigManager
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_modem_community() -> str:
+    """Resolve the modem community supplied by the deployment environment."""
+    community = (
+        os.environ.get("MODEM_COMMUNITY")
+        or os.environ.get("CM_SNMP_COMMUNITY")
+        or PnmConfigManager.get_write_community()
+    )
+    if not community:
+        raise RuntimeError("Cable-modem SNMP community is not configured")
+    return str(community)
 
 
 class RxMerCollectionWorker:
@@ -143,6 +157,7 @@ class RxMerCollectionWorker:
             modem = CableModem(
                 mac_address=MacAddress(str(target["mac"])),
                 inet=Inet(str(target["modem_ip"])),
+                write_community=_configured_modem_community(),
             )
             cm_agent_id = getattr(getattr(modem, "_snmp", None), "_agent_id", None)
             channels = await modem.getDocsIf31CmDsOfdmChannelIdIndexStack()
