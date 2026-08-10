@@ -149,7 +149,7 @@ class UtscStartRequest(BaseModel):
     """Request to start UTSC test."""
     cmts: CmtsSnmpConfig
     rf_port_ifindex: int = Field(..., description="RF Port ifIndex")
-    cfg_index: int = Field(default=1, description="Config table index (default 1; values <=0 are normalized to 1 by callers)")
+    cfg_index: int = Field(default=1, description="Config table index; use 0 to auto-probe by TriggerMode")
     trigger_mode: int = Field(default=2, description="TriggerMode to match during auto-probe (default 2=freeRunning)")
 
 

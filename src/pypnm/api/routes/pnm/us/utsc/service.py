@@ -1304,6 +1304,25 @@ class CmtsUtscService:
         import asyncio
         requested_cfg_index = cfg_index
 
+        # cfg_index=0 means auto-probe. Detect EVO locally in start() so the
+        # preferred row and fallback order do not depend on configure() locals.
+        is_evo = False
+        if cfg_index <= 0:
+            sys_descr_result = await self._snmp_get("1.3.6.1.2.1.1.1.0")
+            sys_descr_value = self._parse_get_value(sys_descr_result) or ""
+            if sys_descr_value.upper().startswith("0X"):
+                try:
+                    sys_descr_value = bytes.fromhex(sys_descr_value[2:]).decode(
+                        "utf-8", errors="replace"
+                    )
+                except (ValueError, TypeError):
+                    pass
+            is_evo = "DCTS VCCAP" in sys_descr_value.upper()
+            self.logger.info(
+                "UTSC start auto-probe vendor=%s",
+                "evo" if is_evo else "non-evo-or-unknown",
+            )
+
         # Probe for the row by TriggerMode — same logic as configure().
         # Casa pre-provisions rows 1-3 with fixed TriggerModes; RowStatus is
         # always createAndWait so probing by RowStatus=active never finds anything.
