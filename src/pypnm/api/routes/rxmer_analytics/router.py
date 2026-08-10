@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 
 from pypnm.api.routes.rxmer_analytics.schema import (
     RxMerAggregateResponse,
     RxMerDeleteResponse,
+    RxMerFilterOptionsResponse,
     RxMerJob,
     RxMerJobActionResponse,
     RxMerJobListResponse,
@@ -29,6 +31,19 @@ router = APIRouter(prefix="/api/admin/rxmer-analytics", tags=["RxMER analytics"]
 @router.get("/capabilities")
 def get_capabilities() -> dict:
     return {"status": "success", **rxmer_analytics_service.capabilities()}
+
+
+@router.get("/options/cmts", response_model=RxMerFilterOptionsResponse)
+def list_cmts_options(
+    q: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> RxMerFilterOptionsResponse:
+    try:
+        cmts = rxmer_analytics_service.list_cmts_options(query=q, limit=limit)
+    except Exception as exc:
+        logger.error("RxMER CMTS option lookup failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RxMER CMTS options unavailable") from exc
+    return RxMerFilterOptionsResponse(status="success", cmts=cmts)
 
 
 @router.post("/jobs/plan", response_model=RxMerPlanResponse, status_code=status.HTTP_201_CREATED)
@@ -66,14 +81,34 @@ def get_job(public_id: str) -> RxMerPlanResponse:
     return RxMerPlanResponse(status="success", job=RxMerJob(**job), reused=False)
 
 
+@router.get("/jobs/{public_id}/options", response_model=RxMerFilterOptionsResponse)
+def get_job_filter_options(public_id: str) -> RxMerFilterOptionsResponse:
+    try:
+        payload = rxmer_analytics_service.get_job_filter_options(public_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc
+    except Exception as exc:
+        logger.error("RxMER job filter option lookup failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RxMER job options unavailable") from exc
+    return RxMerFilterOptionsResponse(status="success", **payload)
+
+
 @router.get("/jobs/{public_id}/modems", response_model=RxMerTargetListResponse)
 def list_job_modems(
     public_id: str,
     cursor: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
+    cmts: str | None = Query(default=None, max_length=128),
+    fiber_node: str | None = Query(default=None, max_length=128),
 ) -> RxMerTargetListResponse:
     try:
-        page = rxmer_analytics_service.list_targets(public_id, cursor=cursor, limit=limit)
+        page = rxmer_analytics_service.list_targets(
+            public_id,
+            cursor=cursor,
+            limit=limit,
+            cmts=cmts,
+            fiber_node=fiber_node,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc
     except Exception as exc:
@@ -104,6 +139,36 @@ def get_job_aggregates(
         logger.error("RxMER aggregate lookup failed: %s", exc)
         raise HTTPException(status_code=503, detail="RxMER analytics database unavailable") from exc
     return RxMerAggregateResponse(status="success", **payload)
+
+
+@router.get("/jobs/{public_id}/report")
+def download_job_report(
+    public_id: str,
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    cmts: str | None = Query(default=None, max_length=128),
+    fiber_node: str | None = Query(default=None, max_length=128),
+) -> StreamingResponse:
+    try:
+        stream = rxmer_analytics_service.stream_report(
+            public_id,
+            report_format=format,
+            cmts=cmts,
+            fiber_node=fiber_node,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("RxMER report creation failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RxMER report unavailable") from exc
+    media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
+    filename = f"network-rxmer-{public_id}.{format}"
+    return StreamingResponse(
+        stream,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/jobs/{public_id}/spectrum", response_model=RxMerSpectrumResponse)

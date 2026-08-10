@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import math
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import pymysql
 import pymysql.cursors
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SPECTRUM_GRID_HZ = 25_000
 _SPECTRUM_MAX_GRID_POINTS = 100_000
 _MAX_COLLECTION_CONCURRENCY = 20
@@ -205,6 +207,13 @@ class RxMerAnalyticsService:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
+            CREATE TABLE IF NOT EXISTS rxmer_job_topology_snapshot (
+                job_id BIGINT PRIMARY KEY,
+                snapshot_date CHAR(8) NOT NULL,
+                created_at DATETIME NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
             CREATE TABLE IF NOT EXISTS rxmer_target_channel (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 target_id BIGINT NOT NULL,
@@ -301,6 +310,32 @@ class RxMerAnalyticsService:
                 INDEX idx_rxmer_aggregate_job_best (job_id, best_qdb),
                 INDEX idx_rxmer_aggregate_cmts_avg (job_id, cmts, avg_db),
                 INDEX idx_rxmer_aggregate_fiber_avg (job_id, fiber_node, avg_db)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rxmer_channel_extreme (
+                capture_attempt_id BIGINT PRIMARY KEY,
+                job_id BIGINT NOT NULL,
+                target_id BIGINT NOT NULL,
+                worst_qdb TINYINT UNSIGNED NOT NULL,
+                worst_subcarrier_index INT NOT NULL,
+                worst_frequency_hz BIGINT NOT NULL,
+                created_at DATETIME NOT NULL,
+                INDEX idx_rxmer_channel_extreme_job (job_id, worst_qdb),
+                INDEX idx_rxmer_channel_extreme_target (target_id, worst_qdb)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rxmer_modem_extreme (
+                job_id BIGINT NOT NULL,
+                target_id BIGINT NOT NULL,
+                worst_qdb TINYINT UNSIGNED NOT NULL,
+                worst_channel_id SMALLINT UNSIGNED NOT NULL,
+                worst_subcarrier_index INT NOT NULL,
+                worst_frequency_hz BIGINT NOT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (job_id, target_id),
+                INDEX idx_rxmer_modem_extreme_job (job_id, worst_qdb)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -408,6 +443,24 @@ class RxMerAnalyticsService:
         public_id = str(uuid.uuid4())
         now = self._now()
 
+        if idempotency_key:
+            existing_rows = self._query(
+                "SELECT public_id FROM rxmer_job WHERE requested_by=%s "
+                "AND idempotency_key=%s LIMIT 1",
+                (requested_by, idempotency_key),
+            )
+            if existing_rows:
+                job = self.get_job(str(existing_rows[0]["public_id"]))
+                if not job:
+                    raise RuntimeError("idempotent RxMER plan disappeared")
+                return job, True
+
+        from pypnm.api.routes.topology.service import topology_service
+
+        topology_snapshot_date, topology_fiber_nodes = (
+            topology_service.storage.latest_fiber_nodes_by_mac()
+        )
+
         connection = self._connect(autocommit=False)
         try:
             with connection.cursor() as cursor:
@@ -475,23 +528,57 @@ class RxMerAnalyticsService:
 
                 cursor.execute(
                     f"""
-                    INSERT INTO rxmer_job_target
-                    (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
-                     inventory_snapshot_id, state, expected_channels,
-                     created_at, updated_at)
-                    SELECT %s, mac, ip, cmts, cmts_ip, fiber_node,
-                           snapshot_id, 'planned', COALESCE(ofdm_channel_count, 0),
-                           %s, %s
+                    SELECT mac, ip, cmts, cmts_ip, fiber_node, snapshot_id,
+                           COALESCE(ofdm_channel_count, 0) AS expected_channels
                     FROM modem_inventory_current
                     WHERE {where_sql}
                     ORDER BY cmts, mac
                     LIMIT 50000
                     """,
-                    (job_id, now, now, *where_params),
+                    tuple(where_params),
                 )
-                target_count = int(cursor.rowcount or 0)
+                inventory_rows = list(cursor.fetchall())
+                target_rows = []
+                for row in inventory_rows:
+                    bare_mac = "".join(
+                        char for char in str(row.get("mac") or "").lower()
+                        if char in "0123456789abcdef"
+                    )
+                    topology_fiber_node = topology_fiber_nodes.get(bare_mac)
+                    target_rows.append(
+                        (
+                            job_id,
+                            row["mac"],
+                            row["ip"],
+                            row["cmts"],
+                            row.get("cmts_ip"),
+                            (topology_fiber_node or row.get("fiber_node") or "")[:128] or None,
+                            row.get("snapshot_id"),
+                            int(row.get("expected_channels") or 0),
+                            now,
+                            now,
+                        )
+                    )
+                if target_rows:
+                    cursor.executemany(
+                        """
+                        INSERT INTO rxmer_job_target
+                        (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
+                         inventory_snapshot_id, state, expected_channels,
+                         created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'planned', %s, %s, %s)
+                        """,
+                        target_rows,
+                    )
+                target_count = len(target_rows)
                 if target_count <= 0:
                     raise ValueError("no eligible operational OFDM modems found in the selected inventory scope")
+                if topology_snapshot_date:
+                    cursor.execute(
+                        "INSERT INTO rxmer_job_topology_snapshot "
+                        "(job_id, snapshot_date, created_at) VALUES (%s, %s, %s)",
+                        (job_id, topology_snapshot_date, now),
+                    )
                 cursor.execute(
                     "UPDATE rxmer_job SET targets_total=%s, updated_at=%s WHERE id=%s",
                     (target_count, now, job_id),
@@ -541,15 +628,71 @@ class RxMerAnalyticsService:
         )
         return [self._job_row(row) for row in rows]
 
-    def list_targets(self, public_id: str, *, cursor: int = 0, limit: int = 200) -> dict[str, Any]:
+    def list_cmts_options(self, *, query: str | None = None, limit: int = 500) -> list[str]:
+        """Return persisted inventory CMTS names; never performs discovery."""
+        self.ensure_schema()
+        safe_limit = max(1, min(int(limit), 5000))
+        query_value = str(query or "").strip()
+        params: list[Any] = []
+        where = "TRIM(cmts)<>''"
+        if query_value:
+            where += " AND cmts LIKE %s"
+            params.append(f"%{query_value}%")
+        rows = self._query(
+            f"SELECT DISTINCT cmts FROM modem_inventory_current WHERE {where} "
+            "ORDER BY cmts LIMIT %s",
+            (*params, safe_limit),
+        )
+        return [str(row["cmts"]) for row in rows]
+
+    def get_job_filter_options(self, public_id: str) -> dict[str, Any]:
+        self.ensure_schema()
+        jobs = self._query("SELECT id FROM rxmer_job WHERE public_id=%s LIMIT 1", (public_id,))
+        if not jobs:
+            raise KeyError(public_id)
+        job_id = int(jobs[0]["id"])
+        cmts_rows = self._query(
+            "SELECT DISTINCT cmts FROM rxmer_job_target WHERE job_id=%s "
+            "AND TRIM(cmts)<>'' ORDER BY cmts",
+            (job_id,),
+        )
+        fiber_rows = self._query(
+            "SELECT DISTINCT fiber_node FROM rxmer_job_target WHERE job_id=%s "
+            "AND fiber_node IS NOT NULL AND TRIM(fiber_node)<>'' ORDER BY fiber_node",
+            (job_id,),
+        )
+        return {
+            "job_public_id": public_id,
+            "cmts": [str(row["cmts"]) for row in cmts_rows],
+            "fiber_nodes": [str(row["fiber_node"]) for row in fiber_rows],
+        }
+
+    def list_targets(
+        self,
+        public_id: str,
+        *,
+        cursor: int = 0,
+        limit: int = 200,
+        cmts: str | None = None,
+        fiber_node: str | None = None,
+    ) -> dict[str, Any]:
         self.ensure_schema()
         job_rows = self._query("SELECT id FROM rxmer_job WHERE public_id=%s LIMIT 1", (public_id,))
         if not job_rows:
             raise KeyError(public_id)
         job_id = int(job_rows[0]["id"])
         safe_limit = max(1, min(int(limit), 1000))
+        filters = ["t.job_id=%s", "t.id>%s"]
+        params: list[Any] = [job_id, max(0, int(cursor))]
+        if cmts:
+            filters.append("t.cmts=%s")
+            params.append(str(cmts).strip())
+        if fiber_node:
+            filters.append("t.fiber_node=%s")
+            params.append(str(fiber_node).strip())
+        where_sql = " AND ".join(filters)
         rows = self._query(
-            """
+            f"""
             SELECT t.id, t.mac, t.modem_ip, t.cmts, t.cmts_ip, t.fiber_node,
                    t.inventory_snapshot_id, t.state, t.expected_channels,
                    t.completed_channels, t.failed_channels, t.attempt_count,
@@ -557,13 +700,17 @@ class RxMerAnalyticsService:
                    a.completeness, a.valid_channel_count, a.sample_count,
                    a.avg_db, (a.best_qdb / 4.0) AS best_db,
                    a.best_channel_id, a.best_subcarrier_index,
-                   a.best_frequency_hz
+                   a.best_frequency_hz, (e.worst_qdb / 4.0) AS worst_db,
+                   e.worst_channel_id, e.worst_subcarrier_index,
+                   e.worst_frequency_hz
             FROM rxmer_job_target t
             LEFT JOIN rxmer_modem_aggregate a
               ON a.job_id=t.job_id AND a.target_id=t.id
-            WHERE t.job_id=%s AND t.id>%s ORDER BY t.id ASC LIMIT %s
+            LEFT JOIN rxmer_modem_extreme e
+              ON e.job_id=t.job_id AND e.target_id=t.id
+            WHERE {where_sql} ORDER BY t.id ASC LIMIT %s
             """,
-            (job_id, max(0, int(cursor)), safe_limit + 1),
+            (*params, safe_limit + 1),
         )
         has_more = len(rows) > safe_limit
         page = rows[:safe_limit]
@@ -710,6 +857,23 @@ class RxMerAnalyticsService:
                     ),
                 )
                 cursor.execute(
+                    """
+                    INSERT INTO rxmer_channel_extreme
+                    (capture_attempt_id, job_id, target_id, worst_qdb,
+                     worst_subcarrier_index, worst_frequency_hz, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        attempt_id,
+                        job_id,
+                        target_id,
+                        metrics.worst_qdb,
+                        metrics.worst_subcarrier_index,
+                        metrics.worst_frequency_hz,
+                        now,
+                    ),
+                )
+                cursor.execute(
                     "UPDATE rxmer_target_channel SET state='succeeded', "
                     "successful_attempt_id=%s, updated_at=%s WHERE id=%s",
                     (attempt_id, now, channel_target_id),
@@ -745,6 +909,22 @@ class RxMerAnalyticsService:
                     (target_id,),
                 )
                 best = cursor.fetchone() or {}
+                cursor.execute(
+                    """
+                    SELECT e.worst_qdb, r.channel_id,
+                           e.worst_subcarrier_index, e.worst_frequency_hz
+                    FROM rxmer_target_channel c
+                    JOIN rxmer_channel_result r
+                      ON r.capture_attempt_id=c.successful_attempt_id
+                    JOIN rxmer_channel_extreme e
+                      ON e.capture_attempt_id=r.capture_attempt_id
+                    WHERE c.target_id=%s
+                    ORDER BY e.worst_qdb ASC, e.worst_frequency_hz ASC,
+                             r.channel_id ASC LIMIT 1
+                    """,
+                    (target_id,),
+                )
+                worst = cursor.fetchone() or {}
                 expected_channels = int(target.get("expected_channels") or 0)
                 completeness = (
                     "complete"
@@ -789,6 +969,28 @@ class RxMerAnalyticsService:
                     ),
                 )
                 cursor.execute(
+                    """
+                    INSERT INTO rxmer_modem_extreme
+                    (job_id, target_id, worst_qdb, worst_channel_id,
+                     worst_subcarrier_index, worst_frequency_hz, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE worst_qdb=VALUES(worst_qdb),
+                        worst_channel_id=VALUES(worst_channel_id),
+                        worst_subcarrier_index=VALUES(worst_subcarrier_index),
+                        worst_frequency_hz=VALUES(worst_frequency_hz),
+                        updated_at=VALUES(updated_at)
+                    """,
+                    (
+                        job_id,
+                        target_id,
+                        int(worst["worst_qdb"]),
+                        int(worst["channel_id"]),
+                        int(worst["worst_subcarrier_index"]),
+                        int(worst["worst_frequency_hz"]),
+                        now,
+                    ),
+                )
+                cursor.execute(
                     "UPDATE rxmer_job_target SET state=%s, completed_channels=%s, "
                     "updated_at=%s WHERE id=%s",
                     (completeness, valid_channels, now, target_id),
@@ -812,6 +1014,8 @@ class RxMerAnalyticsService:
             "avg_db": metrics.avg_db,
             "best_db": metrics.best_qdb / 4.0,
             "best_frequency_hz": metrics.best_frequency_hz,
+            "worst_db": metrics.worst_qdb / 4.0,
+            "worst_frequency_hz": metrics.worst_frequency_hz,
             "sample_count": metrics.sample_count,
         }
 
@@ -1285,7 +1489,9 @@ class RxMerAnalyticsService:
     def _delete_result_rows(cursor, job_id: int) -> None:
         cursor.execute("DELETE FROM rxmer_spectrum_bin WHERE job_id=%s", (job_id,))
         cursor.execute("DELETE FROM rxmer_spectrum_build WHERE job_id=%s", (job_id,))
+        cursor.execute("DELETE FROM rxmer_modem_extreme WHERE job_id=%s", (job_id,))
         cursor.execute("DELETE FROM rxmer_modem_aggregate WHERE job_id=%s", (job_id,))
+        cursor.execute("DELETE FROM rxmer_channel_extreme WHERE job_id=%s", (job_id,))
         cursor.execute(
             """
             UPDATE rxmer_target_channel c
@@ -1397,6 +1603,7 @@ class RxMerAnalyticsService:
                 if child_count:
                     raise RuntimeError("RxMER job has child jobs and cannot be deleted")
                 self._delete_result_rows(cursor, job_id)
+                cursor.execute("DELETE FROM rxmer_job_topology_snapshot WHERE job_id=%s", (job_id,))
                 cursor.execute("DELETE FROM rxmer_job_target WHERE job_id=%s", (job_id,))
                 cursor.execute(
                     """
@@ -1417,6 +1624,121 @@ class RxMerAnalyticsService:
             raise
         finally:
             connection.close()
+
+    def stream_report(
+        self,
+        public_id: str,
+        *,
+        report_format: str,
+        cmts: str | None = None,
+        fiber_node: str | None = None,
+    ) -> Iterator[str]:
+        """Stream a bounded-memory report over frozen targets and persisted results."""
+        self.ensure_schema()
+        jobs = self._query("SELECT id FROM rxmer_job WHERE public_id=%s LIMIT 1", (public_id,))
+        if not jobs:
+            raise KeyError(public_id)
+        job_id = int(jobs[0]["id"])
+        normalized_format = str(report_format or "").lower()
+        if normalized_format not in {"json", "csv"}:
+            raise ValueError("report format must be json or csv")
+
+        filters = ["t.job_id=%s"]
+        params: list[Any] = [job_id]
+        clean_cmts = str(cmts or "").strip() or None
+        clean_fiber_node = str(fiber_node or "").strip() or None
+        if clean_cmts:
+            filters.append("t.cmts=%s")
+            params.append(clean_cmts)
+        if clean_fiber_node:
+            filters.append("t.fiber_node=%s")
+            params.append(clean_fiber_node)
+        where_sql = " AND ".join(filters)
+        sql = f"""
+            SELECT t.id AS target_id, t.mac, t.modem_ip, t.cmts, t.cmts_ip,
+                   t.fiber_node, p.snapshot_date AS topology_snapshot_date,
+                   t.state, t.expected_channels,
+                   t.completed_channels, t.failed_channels, t.attempt_count,
+                   t.error_class, t.error_text, t.created_at, t.updated_at,
+                   a.completeness, a.valid_channel_count, a.sample_count,
+                   a.avg_db, (a.best_qdb / 4.0) AS best_db,
+                   a.best_channel_id, a.best_subcarrier_index,
+                   a.best_frequency_hz, (e.worst_qdb / 4.0) AS worst_db,
+                   e.worst_channel_id, e.worst_subcarrier_index,
+                   e.worst_frequency_hz
+            FROM rxmer_job_target t
+            LEFT JOIN rxmer_job_topology_snapshot p
+              ON p.job_id=t.job_id
+            LEFT JOIN rxmer_modem_aggregate a
+              ON a.job_id=t.job_id AND a.target_id=t.id
+            LEFT JOIN rxmer_modem_extreme e
+              ON e.job_id=t.job_id AND e.target_id=t.id
+            WHERE {where_sql}
+            ORDER BY t.id ASC
+        """
+        field_names = [
+            "target_id", "mac", "modem_ip", "cmts", "cmts_ip", "fiber_node",
+            "topology_snapshot_date", "state", "expected_channels", "completed_channels", "failed_channels",
+            "attempt_count", "error_class", "error_text", "created_at", "updated_at",
+            "completeness", "valid_channel_count", "sample_count", "avg_db", "best_db",
+            "best_channel_id", "best_subcarrier_index", "best_frequency_hz", "worst_db",
+            "worst_channel_id", "worst_subcarrier_index", "worst_frequency_hz",
+        ]
+
+        def serialize_row(source: dict[str, Any]) -> dict[str, Any]:
+            row: dict[str, Any] = {}
+            for field in field_names:
+                value = source.get(field)
+                if isinstance(value, datetime):
+                    value = value.replace(tzinfo=timezone.utc).isoformat()
+                elif hasattr(value, "as_integer_ratio") and not isinstance(value, (int, float)):
+                    value = float(value)
+                row[field] = value
+            return row
+
+        def generate() -> Iterator[str]:
+            connection = self._connect(autocommit=True)
+            try:
+                with connection.cursor(pymysql.cursors.SSDictCursor) as cursor:
+                    cursor.execute(sql, tuple(params))
+                    if normalized_format == "json":
+                        yield json.dumps(
+                            {
+                                "job_public_id": public_id,
+                                "filters": {
+                                    "cmts": clean_cmts,
+                                    "fiber_node": clean_fiber_node,
+                                },
+                            },
+                            separators=(",", ":"),
+                        )[:-1] + ',"results":['
+                        first = True
+                        for source in cursor:
+                            if not first:
+                                yield ","
+                            first = False
+                            yield json.dumps(
+                                serialize_row(dict(source)),
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                            )
+                        yield "]}"
+                    else:
+                        buffer = io.StringIO()
+                        writer = csv.DictWriter(buffer, fieldnames=field_names)
+                        writer.writeheader()
+                        yield buffer.getvalue()
+                        buffer.seek(0)
+                        buffer.truncate(0)
+                        for source in cursor:
+                            writer.writerow(serialize_row(dict(source)))
+                            yield buffer.getvalue()
+                            buffer.seek(0)
+                            buffer.truncate(0)
+            finally:
+                connection.close()
+
+        return generate()
 
     def request_spectrum_build(self, public_id: str) -> dict[str, Any]:
         """Acquire a DB lease for post-processing persisted RxMER vectors."""
@@ -1447,13 +1769,29 @@ class RxMerAnalyticsService:
                 current_revision = int(existing.get("source_revision") or -1)
                 existing_state = str(existing.get("state") or "")
                 if current_revision == revision and existing_state == "ready":
-                    connection.commit()
-                    return {
-                        "job_public_id": public_id,
-                        "state": "ready",
-                        "queued": False,
-                        "message": "Spectrum profile is already current",
-                    }
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS missing_extremes
+                        FROM rxmer_channel_result r
+                        JOIN rxmer_target_channel c
+                          ON c.successful_attempt_id=r.capture_attempt_id
+                        LEFT JOIN rxmer_channel_extreme e
+                          ON e.capture_attempt_id=r.capture_attempt_id
+                        WHERE r.job_id=%s AND e.capture_attempt_id IS NULL
+                        """,
+                        (job_id,),
+                    )
+                    missing_extremes = int(
+                        (cursor.fetchone() or {}).get("missing_extremes") or 0
+                    )
+                    if missing_extremes == 0:
+                        connection.commit()
+                        return {
+                            "job_public_id": public_id,
+                            "state": "ready",
+                            "queued": False,
+                            "message": "Spectrum profile is already current",
+                        }
                 if (
                     current_revision == revision
                     and existing_state == "building"
@@ -1559,8 +1897,9 @@ class RxMerAnalyticsService:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT r.capture_attempt_id, r.zero_frequency_hz,
-                               r.first_active_index, r.spacing_hz, r.sample_count,
+                        SELECT r.capture_attempt_id, r.target_id, r.channel_id,
+                               r.zero_frequency_hz, r.first_active_index,
+                               r.spacing_hz, r.sample_count,
                                r.vector_sha256, v.codec, v.uncompressed_bytes,
                                v.payload
                         FROM rxmer_channel_result r
@@ -1576,6 +1915,7 @@ class RxMerAnalyticsService:
                     rows = list(cursor.fetchall())
                 if not rows:
                     break
+                extreme_rows: list[tuple[Any, ...]] = []
                 for row in rows:
                     if str(row.get("codec") or "") != CODEC:
                         raise ValueError("unsupported persisted RxMER vector codec")
@@ -1602,6 +1942,21 @@ class RxMerAnalyticsService:
                         raise ValueError("RxMER vector exceeds the calculated spectrum grid")
                     positions = slice(start_index, stop_index, stride)
                     values = np.frombuffer(vector, dtype=np.uint8)
+                    worst_qdb = min(vector)
+                    worst_offset = vector.index(worst_qdb)
+                    worst_subcarrier_index = int(row["first_active_index"]) + worst_offset
+                    extreme_rows.append(
+                        (
+                            int(row["capture_attempt_id"]),
+                            job_id,
+                            int(row["target_id"]),
+                            worst_qdb,
+                            worst_subcarrier_index,
+                            int(row["zero_frequency_hz"])
+                            + worst_subcarrier_index * spacing_hz,
+                            self._now(),
+                        )
+                    )
                     count_view = counts[positions]
                     sum_view = sums[positions]
                     worst_view = worst[positions]
@@ -1613,14 +1968,34 @@ class RxMerAnalyticsService:
                     last_attempt_id = int(row["capture_attempt_id"])
                     processed_channels += 1
                 with connection.cursor() as cursor:
+                    cursor.executemany(
+                        """
+                        INSERT INTO rxmer_channel_extreme
+                        (capture_attempt_id, job_id, target_id, worst_qdb,
+                         worst_subcarrier_index, worst_frequency_hz, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE worst_qdb=VALUES(worst_qdb),
+                            worst_subcarrier_index=VALUES(worst_subcarrier_index),
+                            worst_frequency_hz=VALUES(worst_frequency_hz)
+                        """,
+                        extreme_rows,
+                    )
                     cursor.execute(
                         "UPDATE rxmer_spectrum_build SET lease_until="
                         "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE), updated_at=%s "
-                        "WHERE job_id=%s AND source_revision=%s AND lease_owner=%s",
+                        "WHERE job_id=%s AND source_revision=%s AND lease_owner=%s "
+                        "AND state='building'",
                         (self._now(), job_id, source_revision, lease_owner),
                     )
-                    if cursor.rowcount != 1:
-                        raise RuntimeError("RxMER spectrum build lease was lost")
+                    if cursor.rowcount == 0:
+                        cursor.execute(
+                            "SELECT 1 FROM rxmer_spectrum_build WHERE job_id=%s "
+                            "AND source_revision=%s AND lease_owner=%s "
+                            "AND state='building' LIMIT 1",
+                            (job_id, source_revision, lease_owner),
+                        )
+                        if not cursor.fetchone():
+                            raise RuntimeError("RxMER spectrum build lease was lost")
 
             if processed_channels != source_channels:
                 raise ValueError("one or more successful RxMER vectors are missing")
@@ -1653,6 +2028,39 @@ class RxMerAnalyticsService:
                     )
                     for offset in range(0, len(rows_to_insert), 1000):
                         cursor.executemany(insert_sql, rows_to_insert[offset:offset + 1000])
+                    cursor.execute(
+                        """
+                        INSERT INTO rxmer_modem_extreme
+                        (job_id, target_id, worst_qdb, worst_channel_id,
+                         worst_subcarrier_index, worst_frequency_hz, updated_at)
+                        SELECT job_id, target_id, worst_qdb, channel_id,
+                               worst_subcarrier_index, worst_frequency_hz, %s
+                        FROM (
+                            SELECT e.job_id, e.target_id, e.worst_qdb,
+                                   r.channel_id, e.worst_subcarrier_index,
+                                   e.worst_frequency_hz,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY e.target_id
+                                       ORDER BY e.worst_qdb ASC,
+                                                e.worst_frequency_hz ASC,
+                                                r.channel_id ASC
+                                   ) AS extreme_rank
+                            FROM rxmer_channel_extreme e
+                            JOIN rxmer_channel_result r
+                              ON r.capture_attempt_id=e.capture_attempt_id
+                            JOIN rxmer_target_channel c
+                              ON c.successful_attempt_id=e.capture_attempt_id
+                            WHERE e.job_id=%s
+                        ) ranked
+                        WHERE extreme_rank=1
+                        ON DUPLICATE KEY UPDATE worst_qdb=VALUES(worst_qdb),
+                            worst_channel_id=VALUES(worst_channel_id),
+                            worst_subcarrier_index=VALUES(worst_subcarrier_index),
+                            worst_frequency_hz=VALUES(worst_frequency_hz),
+                            updated_at=VALUES(updated_at)
+                        """,
+                        (self._now(), job_id),
+                    )
                     cursor.execute(
                         """
                         UPDATE rxmer_spectrum_build
@@ -1754,6 +2162,8 @@ class RxMerAnalyticsService:
             "frequency_end_hz": None,
             "bin_width_hz": None,
             "points": [],
+            "best_subcarriers": [],
+            "worst_subcarriers": [],
             "channel_spans": [],
             "span_groups_omitted": 0,
         }
@@ -1792,6 +2202,36 @@ class RxMerAnalyticsService:
         if int(build.get("point_count") or 0) == 0:
             base["message"] = "No successful channel vectors are available"
             return base
+
+        ranking_select = """
+            SELECT frequency_hz, sample_count, sum_qdb, worst_qdb, max_qdb
+            FROM rxmer_spectrum_bin
+            WHERE job_id=%s AND source_revision=%s
+            ORDER BY (sum_qdb / sample_count) {direction}, frequency_hz ASC
+            LIMIT 10
+        """
+        best_rows = self._query(
+            ranking_select.format(direction="DESC"),
+            (job_id, source_revision),
+        )
+        worst_rows = self._query(
+            ranking_select.format(direction="ASC"),
+            (job_id, source_revision),
+        )
+
+        def ranking_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "frequency_hz": int(row["frequency_hz"]),
+                    "average_db": round(
+                        int(row["sum_qdb"]) / (4.0 * int(row["sample_count"])), 3
+                    ),
+                    "max_db": round(int(row["max_qdb"]) / 4.0, 3),
+                    "worst_db": round(int(row["worst_qdb"]) / 4.0, 3),
+                    "sample_count": int(row["sample_count"]),
+                }
+                for row in rows
+            ]
 
         safe_max_points = max(200, min(int(max_points), 4000))
         start_hz = int(build["frequency_start_hz"])
@@ -1887,6 +2327,8 @@ class RxMerAnalyticsService:
             {
                 "bin_width_hz": bin_width_hz,
                 "points": points,
+                "best_subcarriers": ranking_rows(best_rows),
+                "worst_subcarriers": ranking_rows(worst_rows),
                 "channel_spans": [
                     {
                         "channel_id": int(row["channel_id"]),

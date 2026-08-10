@@ -96,6 +96,10 @@ class RxMerTarget(BaseModel):
     best_channel_id: int | None = None
     best_subcarrier_index: int | None = None
     best_frequency_hz: int | None = None
+    worst_db: float | None = None
+    worst_channel_id: int | None = None
+    worst_subcarrier_index: int | None = None
+    worst_frequency_hz: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -105,6 +109,13 @@ class RxMerTargetListResponse(BaseModel):
     targets: list[RxMerTarget] = Field(default_factory=list)
     next_cursor: int | None = None
     has_more: bool = False
+
+
+class RxMerFilterOptionsResponse(BaseModel):
+    status: str = "success"
+    job_public_id: str | None = None
+    cmts: list[str] = Field(default_factory=list, max_length=5000)
+    fiber_nodes: list[str] = Field(default_factory=list, max_length=50000)
 
 
 class RxMerAggregateBin(BaseModel):
@@ -130,6 +141,14 @@ class RxMerSpectrumPoint(BaseModel):
     sample_count: int
 
 
+class RxMerSpectrumRanking(BaseModel):
+    frequency_hz: int
+    average_db: float
+    max_db: float
+    worst_db: float
+    sample_count: int
+
+
 class RxMerChannelSpan(BaseModel):
     channel_id: int
     start_frequency_hz: int
@@ -151,6 +170,8 @@ class RxMerSpectrumResponse(BaseModel):
     frequency_end_hz: int | None = None
     bin_width_hz: int | None = None
     points: list[RxMerSpectrumPoint] = Field(default_factory=list, max_length=4000)
+    best_subcarriers: list[RxMerSpectrumRanking] = Field(default_factory=list, max_length=10)
+    worst_subcarriers: list[RxMerSpectrumRanking] = Field(default_factory=list, max_length=10)
     channel_spans: list[RxMerChannelSpan] = Field(default_factory=list, max_length=64)
     span_groups_omitted: int = 0
 

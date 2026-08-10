@@ -1377,6 +1377,38 @@ class TopologyStorage:
                 },
             }
 
+    def latest_fiber_nodes_by_mac(self) -> tuple[str | None, dict[str, str]]:
+        """Return frozen MAC-to-fiber-node data from the latest persisted snapshot."""
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, snapshot_date FROM topology_snapshots "
+                    "ORDER BY snapshot_date DESC LIMIT 1"
+                )
+                snapshot = cur.fetchone() or {}
+                snapshot_id = int(snapshot.get("id") or 0)
+                snapshot_date = str(snapshot.get("snapshot_date") or "") or None
+                if snapshot_id <= 0:
+                    return snapshot_date, {}
+                cur.execute(
+                    "SELECT LOWER(REPLACE(REPLACE(REPLACE(mac, ':', ''), '-', ''), '.', '')) "
+                    "AS bare_mac, MIN(NULLIF(TRIM(fibernode), '')) AS fibernode "
+                    "FROM topology_modems WHERE snapshot_id=%s "
+                    "GROUP BY bare_mac",
+                    (snapshot_id,),
+                )
+                mapping: dict[str, str] = {}
+                for row in cur.fetchall() or []:
+                    bare_mac = str(row.get("bare_mac") or "")
+                    fiber_node = str(row.get("fibernode") or "").strip()
+                    if len(bare_mac) == 12 and fiber_node:
+                        mapping[bare_mac] = fiber_node
+                return snapshot_date, mapping
+            finally:
+                conn.close()
+
 
 class TopologyService:
     DATE_PATTERN = re.compile(r"_(\d{8})(?:\D.*)?$")

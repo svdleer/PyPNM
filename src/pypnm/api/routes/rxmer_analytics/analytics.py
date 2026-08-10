@@ -23,6 +23,9 @@ class ChannelMetrics:
     best_qdb: int
     best_subcarrier_index: int
     best_frequency_hz: int
+    worst_qdb: int
+    worst_subcarrier_index: int
+    worst_frequency_hz: int
     vector_sha256: bytes
     normalized_vector: bytes
     compressed_vector: bytes
@@ -51,6 +54,9 @@ def analyze_channel(
     best_qdb = max(normalized)
     best_offset = normalized.index(best_qdb)
     best_index = first_active_index + best_offset
+    worst_qdb = min(normalized)
+    worst_offset = normalized.index(worst_qdb)
+    worst_index = first_active_index + worst_offset
     digest = hashlib.sha256(normalized).digest()
 
     return ChannelMetrics(
@@ -65,6 +71,9 @@ def analyze_channel(
         best_qdb=best_qdb,
         best_subcarrier_index=best_index,
         best_frequency_hz=int(zero_frequency_hz) + best_index * int(spacing_hz),
+        worst_qdb=worst_qdb,
+        worst_subcarrier_index=worst_index,
+        worst_frequency_hz=int(zero_frequency_hz) + worst_index * int(spacing_hz),
         vector_sha256=digest,
         normalized_vector=normalized,
         compressed_vector=zlib.compress(normalized, level=3),
