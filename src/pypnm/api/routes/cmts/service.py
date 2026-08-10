@@ -1100,13 +1100,102 @@ class CMTSModemService:
                 except (TypeError, ValueError):
                     cpe_limit = max(10000, walk_limit * 8)
                 walk_limit = max(walk_limit, min(cpe_limit, 500000))
-            walk_result = await self._send_agent_command(
-                'snmp_parallel_walk',
-                {'ip': cmts_ip, 'oids': walk_oids,
-                 'community': community, 'timeout': 5, 'limit': walk_limit,
-                 'overall_timeout': 270,
-                 'raw_octet_oids': [OID_D4_ADV_CAP]},
-                timeout=300,
+            # Regular persisted-inventory refreshes are the only caller allowed
+            # to overlap CMTS table walks. Two balanced tasks reduce wall time
+            # without changing the OID set, row cap, or completeness gates.
+            # Interactive and CPE collections retain the serial behavior.
+            regular_inventory_refresh = bool(
+                refresh and not enrich and not collect_cpe
+                and not str(cmts_hostname or '').strip()
+            )
+            walk_group_count = 2 if regular_inventory_refresh else 1
+            walk_params = {
+                'ip': cmts_ip,
+                'community': community,
+                'timeout': 5,
+                'limit': walk_limit,
+                'overall_timeout': 270,
+                'raw_octet_oids': [OID_D4_ADV_CAP],
+            }
+            walk_started = time.perf_counter()
+            if walk_group_count == 1:
+                walk_result = await self._send_agent_command(
+                    'snmp_parallel_walk',
+                    {**walk_params, 'oids': walk_oids},
+                    timeout=300,
+                )
+            else:
+                walk_groups = [
+                    walk_oids[offset::walk_group_count]
+                    for offset in range(walk_group_count)
+                ]
+                self.logger.info(
+                    "Regular inventory: collecting %s OID trees in %s bounded agent tasks",
+                    len(walk_oids),
+                    walk_group_count,
+                )
+                group_results = await asyncio.gather(
+                    *(
+                        self._send_agent_command(
+                            'snmp_parallel_walk',
+                            {**walk_params, 'oids': group},
+                            timeout=300,
+                        )
+                        for group in walk_groups
+                    ),
+                    return_exceptions=True,
+                )
+                merged_results: Dict[str, Any] = {}
+                merged_errors: Dict[str, str] = {}
+                merged_completed: set[str] = set()
+                merged_truncated: set[str] = set()
+                merged_durations: Dict[str, Any] = {}
+                merged_warnings: List[str] = []
+                completion_metadata_present = True
+                successful_groups = 0
+                for group, group_result in zip(walk_groups, group_results):
+                    for oid in group:
+                        merged_results.setdefault(oid, [])
+                    if isinstance(group_result, Exception):
+                        group_error = str(group_result)
+                        merged_errors.update({oid: group_error for oid in group})
+                        completion_metadata_present = False
+                        continue
+                    if not isinstance(group_result, dict) or not group_result.get('success'):
+                        group_error = str(
+                            (group_result or {}).get('error')
+                            if isinstance(group_result, dict)
+                            else 'invalid agent response'
+                        )
+                        merged_errors.update({oid: group_error for oid in group})
+                        completion_metadata_present = False
+                        continue
+                    successful_groups += 1
+                    merged_results.update(group_result.get('results') or {})
+                    merged_errors.update(group_result.get('errors') or {})
+                    merged_truncated.update(group_result.get('truncated_oids') or [])
+                    merged_durations.update(group_result.get('walk_durations') or {})
+                    merged_warnings.extend(group_result.get('warnings') or [])
+                    if 'completed_oids' in group_result:
+                        merged_completed.update(group_result.get('completed_oids') or [])
+                    else:
+                        completion_metadata_present = False
+                walk_result = {
+                    'success': successful_groups > 0,
+                    'results': merged_results,
+                    'errors': merged_errors,
+                    'truncated_oids': sorted(merged_truncated),
+                    'walk_durations': merged_durations,
+                    'warnings': merged_warnings,
+                }
+                if completion_metadata_present:
+                    walk_result['completed_oids'] = sorted(merged_completed)
+                if successful_groups == 0:
+                    walk_result['error'] = 'All bounded CMTS inventory walk tasks failed'
+            self.logger.info(
+                "CMTS inventory walk phase finished in %.2fs using %s task(s)",
+                time.perf_counter() - walk_started,
+                walk_group_count,
             )
             if not walk_result.get('success'):
                 return {'success': False,
