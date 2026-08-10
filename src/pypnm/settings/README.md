@@ -1,12 +1,12 @@
-# Config Symlink
+# Configuration Sources
 
-`system.json` in this directory is a symlink to `deploy/docker/config/system.json`.
-The running container mounts `/app/config/system.json` from that deploy path,
-so keeping them linked ensures:
+`system.json` in this directory is a source-development symlink to
+`deploy/docker/config/system.json`.
 
-- The baked-in default and the deploy config stay in sync.
-- Edits made via config-menu or direct file edits hit the same file the
-  container reads.
+Containers do not rewrite this directory. They select
+`/app/config/system.json` through `PYPNM_CONFIG_PATH`; that runtime file belongs
+on a persistent volume or deployment-owned bind mount. On first start, the
+entrypoint seeds an empty runtime config from the packaged deploy config or
+its template.
 
-If you need to regenerate or relocate the config, update `deploy/docker/config/system.json`
-and recreate the symlink here. Do not commit secrets to version control.
+Do not commit secrets to version control.

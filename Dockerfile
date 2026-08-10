@@ -63,8 +63,9 @@ RUN mkdir -p /app/deploy/config \
     fi \
  && ls -l /app/deploy/config
 
-# Set config path explicitly
-ENV PYPNM_CONFIG=/app/deploy/config/system.json
+# Select the writable runtime configuration. The entrypoint seeds this path
+# from the packaged defaults on first start when the config volume is empty.
+ENV PYPNM_CONFIG=/app/config/system.json
 
 # Create non-root user
 RUN useradd -m -u 10001 -s /usr/sbin/nologin pypnm \

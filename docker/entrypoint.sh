@@ -13,7 +13,12 @@ DEMO_CONFIG="/app/demo/settings/system.json"
 DEMO_CONFIG_TEMPLATE="/app/demo/settings/system.json.template"
 DEPLOY_CONFIG="/app/deploy/config/system.json"
 DEPLOY_CONFIG_TEMPLATE="/app/deploy/config/system.json.template"
-PKG_SETTINGS_DIR=""
+
+# Normalize legacy and canonical configuration selectors without overriding
+# an explicit operator-provided path. Runtime configuration belongs under
+# /app/config and must never require rewriting installed or bind-mounted code.
+PYPNM_CONFIG_PATH="${PYPNM_CONFIG_PATH:-${PYPNM_CONFIG:-${CONFIG_FILE}}}"
+export PYPNM_CONFIG_PATH
 
 LOG_DIR="/app/logs"
 LOG_FILE="${LOG_DIR}/pypnm.log"
@@ -24,14 +29,6 @@ VOLUME_DATA_DIR="/app/data"
 VOLUME_CACHE_DIR="/app/data/pnm_cache"
 
 mkdir -p "${CONFIG_DIR}" "${LOG_DIR}" "${DATA_DIR}" "${OUTPUT_DIR}" "${VOLUME_DATA_DIR}" "${VOLUME_CACHE_DIR}"
-
-# Resolve installed package settings path for system.json
-PKG_SETTINGS_DIR="$(python3.12 - <<'PY'
-import pathlib, pypnm
-print((pathlib.Path(pypnm.__file__).parent / "settings").as_posix())
-PY
-)"
-PKG_CONFIG="${PKG_SETTINGS_DIR}/system.json"
 
 if [ ! -f "${CONFIG_FILE}" ]; then
   # Pick the first available source config
@@ -46,16 +43,6 @@ fi
 if [ ! -f "${CONFIG_FILE}" ]; then
   echo "Error: no config source found (checked ${DEFAULT_CONFIG}, ${DEPLOY_CONFIG}, templates)."
   exit 1
-fi
-
-# Point the installed package settings directory to the writable volume-backed config dir
-if [ -n "${PKG_SETTINGS_DIR}" ]; then
-  if [ -d "${PKG_SETTINGS_DIR}" ] && [ ! -L "${PKG_SETTINGS_DIR}" ]; then
-    rm -rf "${PKG_SETTINGS_DIR}"
-  fi
-  if [ ! -L "${PKG_SETTINGS_DIR}" ]; then
-    ln -s "${CONFIG_DIR}" "${PKG_SETTINGS_DIR}"
-  fi
 fi
 
 if [ ! -f "${LOG_FILE}" ]; then
