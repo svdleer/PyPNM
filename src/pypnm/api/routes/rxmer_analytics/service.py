@@ -195,9 +195,7 @@ class RxMerAnalyticsService:
                 UNIQUE KEY uk_rxmer_target_job_mac (job_id, mac),
                 INDEX idx_rxmer_target_claim (job_id, state, next_attempt_at, id),
                 INDEX idx_rxmer_target_cmts (job_id, cmts, state),
-                INDEX idx_rxmer_target_mac_job (mac, job_id),
-                CONSTRAINT fk_rxmer_target_job FOREIGN KEY (job_id)
-                    REFERENCES rxmer_job(id) ON DELETE CASCADE
+                INDEX idx_rxmer_target_mac_job (mac, job_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -215,9 +213,7 @@ class RxMerAnalyticsService:
                 updated_at DATETIME NOT NULL,
                 UNIQUE KEY uk_rxmer_channel_target_ifindex (target_id, ifindex),
                 INDEX idx_rxmer_channel_claim (target_id, state),
-                INDEX idx_rxmer_channel_id_state (channel_id, state),
-                CONSTRAINT fk_rxmer_channel_target FOREIGN KEY (target_id)
-                    REFERENCES rxmer_job_target(id) ON DELETE CASCADE
+                INDEX idx_rxmer_channel_id_state (channel_id, state)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -241,9 +237,7 @@ class RxMerAnalyticsService:
                 UNIQUE KEY uk_rxmer_attempt_number (channel_target_id, attempt_no),
                 UNIQUE KEY uk_rxmer_attempt_capture_key (capture_key),
                 INDEX idx_rxmer_attempt_state_started (state, started_at),
-                INDEX idx_rxmer_attempt_filename (filename),
-                CONSTRAINT fk_rxmer_attempt_channel FOREIGN KEY (channel_target_id)
-                    REFERENCES rxmer_target_channel(id) ON DELETE CASCADE
+                INDEX idx_rxmer_attempt_filename (filename)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -266,11 +260,7 @@ class RxMerAnalyticsService:
                 created_at DATETIME NOT NULL,
                 INDEX idx_rxmer_result_job_avg (job_id, avg_db),
                 INDEX idx_rxmer_result_job_best (job_id, best_qdb),
-                INDEX idx_rxmer_result_job_channel (job_id, channel_id, avg_db),
-                CONSTRAINT fk_rxmer_result_attempt FOREIGN KEY (capture_attempt_id)
-                    REFERENCES rxmer_capture_attempt(id) ON DELETE CASCADE,
-                CONSTRAINT fk_rxmer_result_target FOREIGN KEY (target_id)
-                    REFERENCES rxmer_job_target(id) ON DELETE CASCADE
+                INDEX idx_rxmer_result_job_channel (job_id, channel_id, avg_db)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -280,9 +270,7 @@ class RxMerAnalyticsService:
                 uncompressed_bytes INT NOT NULL,
                 compressed_bytes INT NOT NULL,
                 payload MEDIUMBLOB NOT NULL,
-                created_at DATETIME NOT NULL,
-                CONSTRAINT fk_rxmer_vector_attempt FOREIGN KEY (capture_attempt_id)
-                    REFERENCES rxmer_capture_attempt(id) ON DELETE CASCADE
+                created_at DATETIME NOT NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -306,11 +294,7 @@ class RxMerAnalyticsService:
                 INDEX idx_rxmer_aggregate_job_avg (job_id, avg_db),
                 INDEX idx_rxmer_aggregate_job_best (job_id, best_qdb),
                 INDEX idx_rxmer_aggregate_cmts_avg (job_id, cmts, avg_db),
-                INDEX idx_rxmer_aggregate_fiber_avg (job_id, fiber_node, avg_db),
-                CONSTRAINT fk_rxmer_aggregate_job FOREIGN KEY (job_id)
-                    REFERENCES rxmer_job(id) ON DELETE CASCADE,
-                CONSTRAINT fk_rxmer_aggregate_target FOREIGN KEY (target_id)
-                    REFERENCES rxmer_job_target(id) ON DELETE CASCADE
+                INDEX idx_rxmer_aggregate_fiber_avg (job_id, fiber_node, avg_db)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
         )
