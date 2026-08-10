@@ -7,6 +7,7 @@ import os
 import re
 import time
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1376,6 +1377,67 @@ class TopologyStorage:
                     "node_type_counts": node_type_counts,
                 },
             }
+
+    @contextmanager
+    def stream_latest_fiber_nodes(
+        self, batch_size: int = 5000
+    ) -> Iterator[tuple[str | None, Iterator[list[tuple[str, str]]]]]:
+        """Stream one consistent topology snapshot in bounded mapping batches."""
+        import pymysql
+
+        safe_batch_size = max(100, min(int(batch_size), 20000))
+        with self._db_lock:
+            conn = self._connect()
+            conn.autocommit(False)
+            stream_cursor = None
+            try:
+                conn.begin()
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT id, snapshot_date FROM topology_snapshots "
+                        "ORDER BY snapshot_date DESC LIMIT 1"
+                    )
+                    snapshot = cursor.fetchone() or {}
+                snapshot_id = int(snapshot.get("id") or 0)
+                snapshot_date = str(snapshot.get("snapshot_date") or "") or None
+                if snapshot_id <= 0:
+                    yield snapshot_date, iter(())
+                    return
+
+                stream_cursor = conn.cursor(pymysql.cursors.SSDictCursor)
+                stream_cursor.execute(
+                    "SELECT LOWER(REPLACE(REPLACE(REPLACE(mac, ':', ''), '-', ''), '.', '')) "
+                    "AS bare_mac, LEFT(MIN(NULLIF(TRIM(fibernode), '')), 128) AS fibernode "
+                    "FROM topology_modems WHERE snapshot_id=%s "
+                    "GROUP BY bare_mac HAVING CHAR_LENGTH(bare_mac)=12 "
+                    "AND fibernode IS NOT NULL",
+                    (snapshot_id,),
+                )
+
+                def batches() -> Iterator[list[tuple[str, str]]]:
+                    while True:
+                        rows = stream_cursor.fetchmany(safe_batch_size)
+                        if not rows:
+                            return
+                        batch = [
+                            (
+                                str(row.get("bare_mac") or ""),
+                                str(row.get("fibernode") or "").strip()[:128],
+                            )
+                            for row in rows
+                            if row.get("bare_mac") and row.get("fibernode")
+                        ]
+                        if batch:
+                            yield batch
+
+                yield snapshot_date, batches()
+            finally:
+                if stream_cursor is not None:
+                    stream_cursor.close()
+                try:
+                    conn.rollback()
+                finally:
+                    conn.close()
 
     def latest_fiber_nodes_by_mac(self) -> tuple[str | None, dict[str, str]]:
         """Return frozen MAC-to-fiber-node data from the latest persisted snapshot."""

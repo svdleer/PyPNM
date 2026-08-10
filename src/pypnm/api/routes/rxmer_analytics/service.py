@@ -450,7 +450,7 @@ class RxMerAnalyticsService:
             "cmts": cmts_names,
             "online_only": online_only,
             "channel_mode": "all",
-            "topology_source": "persisted_inventory",
+            "topology_source": "latest_topology_with_inventory_fallback",
         }
         scope_json = json.dumps(scope_document, sort_keys=True, separators=(",", ":"))
         scope_hash = self._scope_hash(scope_document, online_only)
@@ -468,6 +468,8 @@ class RxMerAnalyticsService:
                 if not job:
                     raise RuntimeError("idempotent RxMER plan disappeared")
                 return job, True
+
+        from pypnm.api.routes.topology.service import topology_service
 
         connection = self._connect(autocommit=False)
         try:
@@ -487,25 +489,25 @@ class RxMerAnalyticsService:
                         return job, True
 
                 where_parts = [
-                    "ip IS NOT NULL",
-                    "TRIM(ip) NOT IN ('', 'N/A', '0.0.0.0', '::')",
-                    "(ofdm_enabled=TRUE OR COALESCE(ofdm_channel_count, 0)>0 "
-                    "OR COALESCE(ofdm_ifindex, 0)>0)",
+                    "i.ip IS NOT NULL",
+                    "TRIM(i.ip) NOT IN ('', 'N/A', '0.0.0.0', '::')",
+                    "(i.ofdm_enabled=TRUE OR COALESCE(i.ofdm_channel_count, 0)>0 "
+                    "OR COALESCE(i.ofdm_ifindex, 0)>0)",
                 ]
                 where_params: list[Any] = []
                 if online_only:
                     placeholders = ",".join(["%s"] * len(_ONLINE_STATUSES))
-                    where_parts.append(f"status IN ({placeholders})")
+                    where_parts.append(f"i.status IN ({placeholders})")
                     where_params.extend(_ONLINE_STATUSES)
                 if scope_type == "cmts":
                     placeholders = ",".join(["%s"] * len(cmts_names))
-                    where_parts.append(f"cmts IN ({placeholders})")
+                    where_parts.append(f"i.cmts IN ({placeholders})")
                     where_params.extend(cmts_names)
                 where_sql = " AND ".join(where_parts)
 
                 cursor.execute(
-                    f"SELECT DATE_FORMAT(MAX(updated_at), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS revision "
-                    f"FROM modem_inventory_current WHERE {where_sql}",
+                    f"SELECT DATE_FORMAT(MAX(i.updated_at), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS revision "
+                    f"FROM modem_inventory_current AS i WHERE {where_sql}",
                     tuple(where_params),
                 )
                 revision_row = cursor.fetchone() or {}
@@ -534,23 +536,53 @@ class RxMerAnalyticsService:
                 )
                 job_id = int(cursor.lastrowid)
 
-                # Materialize the immutable plan entirely inside MySQL. Fetching
-                # eligible inventory (and the whole topology snapshot) into Python
-                # made planning memory-bound and silently capped network jobs at
-                # 50,000 targets. The persisted inventory fiber-node value is part
-                # of the same source snapshot and keeps this operation bounded by
-                # database work rather than API-process memory.
+                # Stage the latest topology mapping in bounded batches. The
+                # connection-local table works even when topology and inventory
+                # use different database servers, without rebuilding a multi-
+                # million-entry Python dictionary.
+                cursor.execute(
+                    """
+                    CREATE TEMPORARY TABLE rxmer_plan_topology (
+                        bare_mac CHAR(12) NOT NULL PRIMARY KEY,
+                        fiber_node VARCHAR(128) NOT NULL
+                    ) ENGINE=InnoDB
+                    """
+                )
+                with topology_service.storage.stream_latest_fiber_nodes() as (
+                    topology_snapshot_date,
+                    topology_batches,
+                ):
+                    for topology_batch in topology_batches:
+                        cursor.executemany(
+                            """
+                            INSERT INTO rxmer_plan_topology (bare_mac, fiber_node)
+                            VALUES (%s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                fiber_node=LEAST(fiber_node, VALUES(fiber_node))
+                            """,
+                            topology_batch,
+                        )
+
+                # Materialize the immutable target set inside MySQL. Latest
+                # topology takes precedence; persisted inventory remains the
+                # fallback for MACs absent from that topology snapshot.
                 cursor.execute(
                     f"""
                     INSERT INTO rxmer_job_target
                     (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
                      inventory_snapshot_id, state, expected_channels,
                      created_at, updated_at)
-                    SELECT %s, mac, ip, cmts, cmts_ip,
-                           NULLIF(LEFT(TRIM(COALESCE(fiber_node, '')), 128), ''),
-                           snapshot_id, 'planned',
-                           COALESCE(ofdm_channel_count, 0), %s, %s
-                    FROM modem_inventory_current
+                    SELECT %s, i.mac, i.ip, i.cmts, i.cmts_ip,
+                           COALESCE(
+                               t.fiber_node,
+                               NULLIF(LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), '')
+                           ),
+                           i.snapshot_id, 'planned',
+                           COALESCE(i.ofdm_channel_count, 0), %s, %s
+                    FROM modem_inventory_current AS i
+                    LEFT JOIN rxmer_plan_topology AS t
+                      ON t.bare_mac=LOWER(REPLACE(REPLACE(REPLACE(
+                          i.mac, ':', ''), '-', ''), '.', ''))
                     WHERE {where_sql}
                     """,
                     (job_id, now, now, *where_params),
@@ -558,6 +590,12 @@ class RxMerAnalyticsService:
                 target_count = max(0, int(cursor.rowcount or 0))
                 if target_count <= 0:
                     raise ValueError("no eligible operational OFDM modems found in the selected inventory scope")
+                if topology_snapshot_date:
+                    cursor.execute(
+                        "INSERT INTO rxmer_job_topology_snapshot "
+                        "(job_id, snapshot_date, created_at) VALUES (%s, %s, %s)",
+                        (job_id, topology_snapshot_date, now),
+                    )
                 cursor.execute(
                     "UPDATE rxmer_job SET targets_total=%s, updated_at=%s WHERE id=%s",
                     (target_count, now, job_id),
