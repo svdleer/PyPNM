@@ -124,6 +124,10 @@ class CmDsOfdmRxMer(PnmHeader):
         self.logger.debug(f"Decoded {len(self._rx_mer_float_data)} RxMER float values.")
         return self._rx_mer_float_data
 
+    def get_raw_rxmer_qdb(self) -> bytes:
+        """Return an immutable copy of the native quarter-dB RxMER vector."""
+        return bytes(self._rxmer_data)
+
     def get_frequencies(self) -> FrequencySeriesHz:
         spacing = int(self._subcarrier_spacing)
         f_zero = int(self._subcarrier_zero_frequency)
