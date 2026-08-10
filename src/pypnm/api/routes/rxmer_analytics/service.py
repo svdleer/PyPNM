@@ -37,6 +37,14 @@ class RxMerAnalyticsService:
     def _db_name() -> str:
         return os.environ.get("DATA_DB_NAME") or os.environ.get("AUTH_DB_NAME") or "pypnm_auth"
 
+    @staticmethod
+    def _db_timeout_seconds(name: str, fallback_name: str, default: int) -> int:
+        raw = os.environ.get(name) or os.environ.get(fallback_name) or str(default)
+        try:
+            return max(30, min(int(raw), 3600))
+        except (TypeError, ValueError):
+            return default
+
     def _connect(self, *, autocommit: bool = True):
         return pymysql.connect(
             host=os.environ.get("DATA_DB_HOST") or os.environ.get("AUTH_DB_HOST", "127.0.0.1"),
@@ -47,8 +55,12 @@ class RxMerAnalyticsService:
             autocommit=autocommit,
             cursorclass=pymysql.cursors.DictCursor,
             connect_timeout=10,
-            read_timeout=30,
-            write_timeout=30,
+            read_timeout=self._db_timeout_seconds(
+                "RXMER_DB_READ_TIMEOUT_SEC", "DATA_DB_READ_TIMEOUT_SEC", 600
+            ),
+            write_timeout=self._db_timeout_seconds(
+                "RXMER_DB_WRITE_TIMEOUT_SEC", "DATA_DB_WRITE_TIMEOUT_SEC", 120
+            ),
         )
 
     def _get_conn(self):
@@ -382,7 +394,8 @@ class RxMerAnalyticsService:
             "scheduler_enabled": False,
             "max_concurrency": _MAX_COLLECTION_CONCURRENCY,
             "default_concurrency": _DEFAULT_COLLECTION_CONCURRENCY,
-            "max_inventory_modems": 50000,
+            "max_inventory_modems": None,
+            "planning_source": "persisted_inventory",
             "spectrum_enabled": True,
             "spectrum_max_points": 4000,
             "scope_types": ["all_network", "cmts"],
@@ -437,6 +450,7 @@ class RxMerAnalyticsService:
             "cmts": cmts_names,
             "online_only": online_only,
             "channel_mode": "all",
+            "topology_source": "persisted_inventory",
         }
         scope_json = json.dumps(scope_document, sort_keys=True, separators=(",", ":"))
         scope_hash = self._scope_hash(scope_document, online_only)
@@ -454,12 +468,6 @@ class RxMerAnalyticsService:
                 if not job:
                     raise RuntimeError("idempotent RxMER plan disappeared")
                 return job, True
-
-        from pypnm.api.routes.topology.service import topology_service
-
-        topology_snapshot_date, topology_fiber_nodes = (
-            topology_service.storage.latest_fiber_nodes_by_mac()
-        )
 
         connection = self._connect(autocommit=False)
         try:
@@ -526,59 +534,30 @@ class RxMerAnalyticsService:
                 )
                 job_id = int(cursor.lastrowid)
 
+                # Materialize the immutable plan entirely inside MySQL. Fetching
+                # eligible inventory (and the whole topology snapshot) into Python
+                # made planning memory-bound and silently capped network jobs at
+                # 50,000 targets. The persisted inventory fiber-node value is part
+                # of the same source snapshot and keeps this operation bounded by
+                # database work rather than API-process memory.
                 cursor.execute(
                     f"""
-                    SELECT mac, ip, cmts, cmts_ip, fiber_node, snapshot_id,
-                           COALESCE(ofdm_channel_count, 0) AS expected_channels
+                    INSERT INTO rxmer_job_target
+                    (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
+                     inventory_snapshot_id, state, expected_channels,
+                     created_at, updated_at)
+                    SELECT %s, mac, ip, cmts, cmts_ip,
+                           NULLIF(LEFT(TRIM(COALESCE(fiber_node, '')), 128), ''),
+                           snapshot_id, 'planned',
+                           COALESCE(ofdm_channel_count, 0), %s, %s
                     FROM modem_inventory_current
                     WHERE {where_sql}
-                    ORDER BY cmts, mac
-                    LIMIT 50000
                     """,
-                    tuple(where_params),
+                    (job_id, now, now, *where_params),
                 )
-                inventory_rows = list(cursor.fetchall())
-                target_rows = []
-                for row in inventory_rows:
-                    bare_mac = "".join(
-                        char for char in str(row.get("mac") or "").lower()
-                        if char in "0123456789abcdef"
-                    )
-                    topology_fiber_node = topology_fiber_nodes.get(bare_mac)
-                    target_rows.append(
-                        (
-                            job_id,
-                            row["mac"],
-                            row["ip"],
-                            row["cmts"],
-                            row.get("cmts_ip"),
-                            (topology_fiber_node or row.get("fiber_node") or "")[:128] or None,
-                            row.get("snapshot_id"),
-                            int(row.get("expected_channels") or 0),
-                            now,
-                            now,
-                        )
-                    )
-                if target_rows:
-                    cursor.executemany(
-                        """
-                        INSERT INTO rxmer_job_target
-                        (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
-                         inventory_snapshot_id, state, expected_channels,
-                         created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'planned', %s, %s, %s)
-                        """,
-                        target_rows,
-                    )
-                target_count = len(target_rows)
+                target_count = max(0, int(cursor.rowcount or 0))
                 if target_count <= 0:
                     raise ValueError("no eligible operational OFDM modems found in the selected inventory scope")
-                if topology_snapshot_date:
-                    cursor.execute(
-                        "INSERT INTO rxmer_job_topology_snapshot "
-                        "(job_id, snapshot_date, created_at) VALUES (%s, %s, %s)",
-                        (job_id, topology_snapshot_date, now),
-                    )
                 cursor.execute(
                     "UPDATE rxmer_job SET targets_total=%s, updated_at=%s WHERE id=%s",
                     (target_count, now, job_id),
