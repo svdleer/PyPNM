@@ -49,6 +49,11 @@ def _int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None =
     return max(minimum, value)
 
 
+def _inventory_freshness_seconds() -> int:
+    """Age threshold for informational stale metadata; rows remain usable."""
+    return _int_env('INVENTORY_FRESHNESS_SECONDS', 172800)
+
+
 def cancel_enrichment(cmts_ip: str) -> bool:
     """Signal a running background enrichment to stop. Returns True if one was running."""
     entry = _enrichment_cache.get(cmts_ip)
@@ -739,6 +744,10 @@ class CMTSModemService:
                 if key in entry:
                     response[key] = entry[key]
         response['capability_enriched'] = entry.get('capability_enriched') is True
+        response['inventory_stale'] = entry.get('inventory_stale') is True
+        response['inventory_complete'] = entry.get(
+            'inventory_complete', entry.get('complete')
+        ) is True
         return response
 
     # ── dedicated CPE collection ────────────────────────────────────────────
@@ -899,7 +908,7 @@ class CMTSModemService:
         self, 
         cmts_ip: str, 
         community: str = "public", 
-        limit: int = 10000,
+        limit: int = 50000,
         enrich: bool = False,
         refresh: bool = False,
         collect_cpe: bool = False,
@@ -920,31 +929,16 @@ class CMTSModemService:
         global _enrichment_cache
         self.cmts_ip = cmts_ip
         self.community = community
-        
-        agent_manager = get_agent_manager()
-        if not agent_manager:
-            return {'success': False, 'error': 'Agent manager not available',
-                    'modems': [], 'count': 0}
-        
-        agents = agent_manager.get_available_agents()
-        if not agents:
-            return {'success': False, 'error': 'No agents available',
-                    'modems': [], 'count': 0}
+        limit = max(1, min(int(limit or 1), 50000))
 
         # ── Tier 1: In-memory cache (Redis-like speed) ─────────────────
         if not refresh and cmts_ip in _enrichment_cache:
             cached = _enrichment_cache[cmts_ip]
             age = time.time() - cached.get('timestamp', 0)
             cache_sufficient = self._cache_sufficient(cached, limit)
-            cache_usable = (
-                not enrich
-                or cached.get('enriched') is True
-                or cached.get('enriching') is True
-            )
             if (
                 age < _LIVE_CACHE_TTL_SECONDS
                 and cache_sufficient
-                and cache_usable
                 and (not collect_cpe or 'cpe_addresses' in cached)
             ):
                 self.logger.info(
@@ -995,20 +989,16 @@ class CMTSModemService:
                     if timestamps:
                         age_s = (datetime.now(timezone.utc) - min(timestamps)).total_seconds()
 
-                is_fresh = age_s < 7200
-                requested_limit = int(limit or 0)
+                is_fresh = age_s < _inventory_freshness_seconds()
                 snapshot_complete = bool(
                     snapshot
                     and snapshot.get('complete') is True
                     and snapshot.get('truncated') is not True
                 )
-                inventory_covers_request = (
-                    snapshot_complete
-                    or requested_limit <= 200
-                    or len(inv_modems) >= requested_limit
-                )
                 inventory_meta = {
                     'source': 'mysql-inventory',
+                    'inventory_stale': not is_fresh,
+                    'inventory_complete': snapshot_complete,
                     'capability_enriched': (snapshot or {}).get('capability_enriched') is True,
                     'complete': snapshot_complete,
                     'truncated': (snapshot or {}).get('truncated') is True,
@@ -1027,37 +1017,15 @@ class CMTSModemService:
                 )
                 is_enriched = (enriched_count / max(len(sample), 1)) >= 0.40
 
-                if is_fresh and not inventory_covers_request:
-                    self.logger.info(
-                        f"MySQL inventory for {cmts_ip} has {len(inv_modems)} rows "
-                        f"without a complete snapshot below requested limit {requested_limit}; "
-                        "falling through to SNMP"
-                    )
-
-                if is_fresh and inventory_covers_request and not enrich and not collect_cpe:
+                if not collect_cpe:
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
-                        f"from MySQL inventory (age={age_s:.0f}s, complete={snapshot_complete})"
-                    )
-                    return {
-                        'success': True,
-                        'modems': inv_modems,
-                        'count': len(inv_modems),
-                        'cmts_ip': cmts_ip,
-                        'enriched': False,
-                        'enriching': False,
-                        'cached': True,
-                        **inventory_meta,
-                    }
-
-                if is_fresh and inventory_covers_request and enrich and is_enriched and not collect_cpe:
-                    self.logger.info(
-                        f"Returning {len(inv_modems)} modems for {cmts_ip} "
-                        f"from MySQL inventory (age={age_s:.0f}s, enriched)"
+                        f"from MySQL inventory (age={age_s:.0f}s, "
+                        f"complete={snapshot_complete}, enriched={is_enriched})"
                     )
                     _enrichment_cache[cmts_ip] = {
                         'modems': inv_modems,
-                        'enriched': True,
+                        'enriched': is_enriched,
                         'enriching': False,
                         'timestamp': time.time(),
                         **inventory_meta,
@@ -1067,19 +1035,23 @@ class CMTSModemService:
                         'modems': inv_modems,
                         'count': len(inv_modems),
                         'cmts_ip': cmts_ip,
-                        'enriched': True,
+                        'enriched': bool(enrich and is_enriched),
                         'enriching': False,
                         'cached': True,
                         **inventory_meta,
                     }
-
-                if is_fresh and inventory_covers_request and enrich and not is_enriched:
-                    self.logger.info(
-                        f"MySQL inventory for {cmts_ip} is fresh but not enriched "
-                        f"({enriched_count}/{len(sample)}) — falling through to SNMP"
-                    )
         except Exception as exc:
             self.logger.warning(f"MySQL inventory lookup skipped for {cmts_ip}: {exc}")
+
+        # An agent is required only for Tier 3 live collection.
+        agent_manager = get_agent_manager()
+        if not agent_manager:
+            return {'success': False, 'error': 'Agent manager not available',
+                    'modems': [], 'count': 0}
+        agents = agent_manager.get_available_agents()
+        if not agents:
+            return {'success': False, 'error': 'No agents available',
+                    'modems': [], 'count': 0}
 
         # ── Tier 3: Live SNMP walk (slow, last resort) ───────────────
         live_lock = await _get_live_walk_lock(cmts_ip)
@@ -1095,16 +1067,11 @@ class CMTSModemService:
                 and (not collect_cpe or 'cpe_addresses' in cached)
             ):
                 age = time.time() - cached.get('timestamp', 0)
-                cache_usable = (
-                    not enrich
-                    or cached.get('enriched') is True
-                    or cached.get('enriching') is True
-                )
                 max_age = (
                     _LIVE_REFRESH_COOLDOWN_SECONDS
                     if refresh else _LIVE_CACHE_TTL_SECONDS
                 )
-                if age < max_age and cache_usable:
+                if age < max_age:
                     self.logger.info(
                         "Reusing single-flight generation for %s "
                         "(age=%.0fs, refresh=%s)",
@@ -1201,12 +1168,15 @@ class CMTSModemService:
                     and (legacy_mac_rows >= int(limit) or d3_mac_rows >= int(limit))
                 )
             )
+            inventory_complete = critical_walks_complete and not inventory_truncated
             inventory_meta = {
                 'source': 'snmp-live',
+                'inventory_stale': False,
+                'inventory_complete': inventory_complete,
                 # Empty/unsupported tables count when both walks completed
                 # cleanly; errors or absent completion metadata do not.
                 'capability_enriched': capability_enriched,
-                'complete': critical_walks_complete and not inventory_truncated,
+                'complete': inventory_complete,
                 'truncated': inventory_truncated,
                 'requested_limit': int(limit or 0),
                 'collected_at': datetime.now(timezone.utc).isoformat(),
@@ -1430,17 +1400,15 @@ class CMTSModemService:
                 _enrichment_cache[cmts_ip] = {
                     **existing_cache,
                     'modems': existing_cache.get('modems', modems),
-                    'enriched': True,
+                    'enriched': False,
                     'enriching': False,
+                    'enrichment_failed': True,
                     'timestamp': time.time(),
-                    'partial': True,    # flag so callers can tell data is incomplete
-                    'complete': False,
-                    'truncated': True,
                 }
 
     # ── correlation logic (moved from agent._async_cmts_get_modems) ─────
 
-    def _correlate_modem_data(self, raw: dict, limit: int = 10000) -> List[Dict[str, Any]]:
+    def _correlate_modem_data(self, raw: dict, limit: int = 50000) -> List[Dict[str, Any]]:
         """Build the modem list from raw parallel-walk results.
 
         ``raw`` is ``{oid_base: [{'oid': full, 'value': parsed, 'type': t}, …]}``.

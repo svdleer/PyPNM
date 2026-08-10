@@ -7,7 +7,7 @@ import logging
 import os
 from inspect import signature
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
 from pypnm.api.routes.cmts.schemas import (
@@ -33,7 +33,7 @@ init_agent_manager(_auth_token)
 async def get_cmts_modems(
     cmts_ip: str,
     community: str = "public",
-    limit: int | None = None,
+    limit: int | None = Query(default=None, ge=1, le=50000),
     enrich: bool = False,
     refresh: bool = False,
     collect_cpe: bool = False,
@@ -64,14 +64,6 @@ async def get_cmts_modems(
     - Base discovery: ~3 seconds for 1000+ modems
     - With enrichment: ~30-60 seconds (queries each modem)
     """
-    agent_manager = get_agent_manager()
-    if not agent_manager:
-        raise HTTPException(status_code=503, detail="Agent manager not available")
-
-    agents = agent_manager.get_available_agents()
-    if not agents:
-        raise HTTPException(status_code=503, detail="No agents available")
-
     logger.info(f"CMTS modem discovery request: {cmts_ip} (enrich={enrich})")
 
     service = CMTSModemService()
@@ -125,6 +117,10 @@ async def get_cmts_modems(
             enriching=result.get('enriching', False),
             complete=result.get('complete', False),
             truncated=result.get('truncated', False),
+            inventory_stale=result.get('inventory_stale') is True,
+            inventory_complete=result.get(
+                'inventory_complete', result.get('complete')
+            ) is True,
             source=result.get('source'),
             requested_limit=result.get('requested_limit'),
             collected_at=result.get('collected_at'),

@@ -21,7 +21,12 @@ class CMTSModemRequest(BaseModel):
     """Request model for CMTS modem discovery."""
     cmts_ip: str = Field(..., description="CMTS IP address")
     community: str = Field(default="public", description="SNMP community for CMTS")
-    limit: int = Field(default_factory=_cm_modem_limit_default, description="Maximum number of modems to return")
+    limit: int = Field(
+        default_factory=_cm_modem_limit_default,
+        ge=1,
+        le=50000,
+        description="Maximum number of modems to return",
+    )
     enrich: bool = Field(default=False, description="Whether to enrich modems with firmware/model from sysDescr")
     refresh: bool = Field(default=False, description="Bypass cached inventory and perform a live CMTS walk")
     collect_cpe: bool = Field(default=False, description="Collect DOCS-SUBMGT3 CPE addresses for scheduled inventory")
@@ -114,6 +119,8 @@ class CMTSModemResponse(BaseModel):
     enriching: bool = Field(default=False, description="Whether enrichment is in progress")
     complete: bool = Field(default=False, description="Whether the inventory walk reached the end of both MAC tables")
     truncated: bool = Field(default=False, description="Whether a MAC table reached the requested walk limit")
+    inventory_stale: bool = Field(default=False, description="Whether persisted inventory is older than the freshness threshold")
+    inventory_complete: bool = Field(default=False, description="Whether the base inventory generation is complete and not truncated")
     source: Optional[str] = Field(default=None, description="Inventory source")
     requested_limit: Optional[int] = Field(default=None, description="Safety limit used for the inventory walk")
     collected_at: Optional[str] = Field(default=None, description="Inventory collection timestamp")
