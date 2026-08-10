@@ -23,6 +23,10 @@ class RxMerScope(BaseModel):
         normalized = sorted({value.strip() for value in self.cmts if value.strip()})
         if self.type == RxMerScopeType.CMTS and not normalized:
             raise ValueError("cmts scope requires at least one CMTS")
+        if self.type == RxMerScopeType.CMTS and any(
+            "ccap" not in value.casefold() for value in normalized
+        ):
+            raise ValueError("cmts scope accepts only hostnames containing CCAP")
         if self.type == RxMerScopeType.ALL_NETWORK and normalized:
             raise ValueError("all_network scope cannot include CMTS selections")
         self.cmts = normalized

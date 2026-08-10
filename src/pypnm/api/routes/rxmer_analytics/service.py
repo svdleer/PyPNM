@@ -629,12 +629,12 @@ class RxMerAnalyticsService:
         return [self._job_row(row) for row in rows]
 
     def list_cmts_options(self, *, query: str | None = None, limit: int = 500) -> list[str]:
-        """Return persisted inventory CMTS names; never performs discovery."""
+        """Return persisted CCAP hostnames; never performs discovery."""
         self.ensure_schema()
         safe_limit = max(1, min(int(limit), 5000))
         query_value = str(query or "").strip()
-        params: list[Any] = []
-        where = "TRIM(cmts)<>''"
+        params: list[Any] = ["%ccap%"]
+        where = "TRIM(cmts)<>'' AND LOWER(TRIM(cmts)) LIKE %s"
         if query_value:
             where += " AND cmts LIKE %s"
             params.append(f"%{query_value}%")
@@ -653,8 +653,8 @@ class RxMerAnalyticsService:
         job_id = int(jobs[0]["id"])
         cmts_rows = self._query(
             "SELECT DISTINCT cmts FROM rxmer_job_target WHERE job_id=%s "
-            "AND TRIM(cmts)<>'' ORDER BY cmts",
-            (job_id,),
+            "AND TRIM(cmts)<>'' AND LOWER(TRIM(cmts)) LIKE %s ORDER BY cmts",
+            (job_id, "%ccap%"),
         )
         fiber_rows = self._query(
             "SELECT DISTINCT fiber_node FROM rxmer_job_target WHERE job_id=%s "
