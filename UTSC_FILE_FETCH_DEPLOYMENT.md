@@ -8,12 +8,17 @@ Added agent-based AND direct FTP file retrieval for UTSC (Upstream Triggered Spe
 - **Cisco cBR-8:** TFTP via agent (`PNMCcapUsSpecAn_*` format)
 - **Casa E6000/C100G:** FTP or TFTP via agent
 - **CommScope E6000:** FTP or TFTP via agent
-- `src/pypnm/api/routes/pnm/us/utsc/schemas.py` — Added request/response schemas for file operations
-- `src/pypnm/api/routes/pnm/us/utsc/router.py` — Added 2 new FastAPI endpoints + agent prefetch helper
+- `src/pypnm/api/routes/pnm/us/utsc/schemas.py` — Request/response schemas for file operations
+- `src/pypnm/api/routes/pnm/us/utsc/router.py` — Source-owned listing, retrieval, normalized samples, exact deletion, and housekeeping
 
-### New Endpoints
-1. **POST `/pnm/us/utsc/files/list`** — List UTSC files on TFTP server
-2. **POST `/pnm/us/utsc/files/retrieve`** — Fetch a UTSC file from agent to local cache
+### File Endpoints
+1. **POST `/pnm/us/utsc/files/list`** — List UTSC files on the authoritative source
+2. **POST `/pnm/us/utsc/files/retrieve`** — Fetch one UTSC file into PyPNM's cache
+3. **POST `/pnm/us/utsc/files/sample`** — Return normalized UTSC bins
+4. **POST `/pnm/us/utsc/files/delete`** — Delete exact approved basenames
+5. **POST `/pnm/us/utsc/files/housekeeping`** — Dry-run or remove aged approved captures
+
+Agent-mode deletion and housekeeping are never broadcast. PyPNM selects one capable file agent, and the agent requires an explicit writable root plus independent, default-disabled operation opt-ins.
 
 ## Deployment Steps
 
@@ -42,25 +47,29 @@ python3 -m py_compile \
 
 ### 3. Commit & Deploy
 
+Only commit or deploy with explicit authorization. Stage the reviewed migration files individually; never use `git add -A`, blind `git pull`, reset, clean, stash, or manual source copying.
+
 ```bash
-cd /Users/silvester/PythonDev/Git/PyPNM
+# In the source repository
+git add src/pypnm/api/agent/manager.py
+git add src/pypnm/api/routes/pnm/us/ofdma/rxmer/router.py
+git add src/pypnm/api/routes/pnm/us/ofdma/rxmer/schemas.py
+git add src/pypnm/api/routes/pnm/us/ofdma/rxmer/service.py
+git add src/pypnm/api/routes/pnm/us/spectrumAnalyzer/router.py
+git add src/pypnm/api/routes/pnm/us/utsc/router.py
+git add src/pypnm/api/routes/pnm/us/utsc/schemas.py
+git add src/pypnm/lib/pnm_file_source.py
+git add src/pypnm/pnm/parser/utsc_file.py
+git add UTSC_FILE_FETCH_DEPLOYMENT.md
+git commit -m "Complete PyPNM-owned PNM file handling"
+git push origin <reviewed-branch>
 
-# Commit changes
-git add -A
-git commit -m "feat: Add agent-based UTSC file fetching endpoints
-
-- Add /pnm/us/utsc/files/list endpoint to list UTSC files on TFTP
-- Add /pnm/us/utsc/files/retrieve endpoint to fetch files from agent
-- Implement vendor-aware filename pattern matching (Cisco/CommScope)
-- Parallel agent lookup with fallback; first-success strategy
-
-Fixes spectrum analyzer data retrieval for UTSC captures."
-
-# Push to origin
-git push origin main
-
-# SSH to server and deploy
-ssh mndlab 'cd /Users/silvester/PythonDev/Git/PyPNM && git pull && docker-compose restart pypnm'
+# On an explicitly authorized deployment target, first verify the worktree,
+# preserve unrelated tracked/untracked files, then fast-forward only:
+git status --short
+git fetch origin
+git merge --ff-only origin/<reviewed-branch>
+# Restart through the target's approved deployment procedure.
 ```
 
 ## Configuration
@@ -76,8 +85,15 @@ CMTS_TFTP_UTSC=agent         # UTSC-specific setting (optional)
 # Or use global setting
 CMTS_TFTP=agent              # Applies to both RxMER and UTSC
 
-# Agent must be connected with file_list and pnm_file_get capabilities
+# Agent must be connected with file_list and pnm_file_get capabilities.
+# Destructive operations additionally require these settings on the designated
+# file agent; leave both operation flags false unless explicitly authorized:
+PYPNM_PNM_WRITE_ROOT=/srv/tftp
+PYPNM_PNM_FILE_DELETE_ENABLED=false
+PYPNM_PNM_FILE_HOUSEKEEPING_ENABLED=false
 ```
+
+`PYPNM_PNM_WRITE_ROOT` has no discovery fallback and must name the exact writable capture root. Delete accepts exact `utsc_` or `PNMCcapUsSpecAn_` basenames only. Housekeeping defaults to dry-run, applies the same prefixes, and is bounded by the agent scan/action limits.
 
 #### Direct FTP Mode
 ```bash
@@ -355,12 +371,17 @@ CMTS (RF port)
 
 ## Rollback
 
-If issues occur:
+Create and push a new revert commit only with explicit authorization. On the authorized target, verify the worktree before fetching and fast-forwarding; preserve unrelated tracked changes and untracked runtime files.
 
 ```bash
-git revert HEAD --no-edit
-git push origin main
-ssh mndlab 'cd /Users/silvester/PythonDev/Git/PyPNM && git pull && docker-compose restart pypnm'
+git revert <migration-commit>
+git push origin <reviewed-branch>
+
+# Authorized deployment target:
+git status --short
+git fetch origin
+git merge --ff-only origin/<reviewed-branch>
+# Restart through the target's approved deployment procedure.
 ```
 
 ## Related Documentation

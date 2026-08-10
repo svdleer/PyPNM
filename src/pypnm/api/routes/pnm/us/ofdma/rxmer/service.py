@@ -727,7 +727,7 @@ class CmtsUsOfdmaRxMerService:
         num_averages: int = 1,
         destination_index: int = 0,
         tftp_server: Optional[str] = None,
-        dest_path: str = "./"
+        dest_path: Optional[str] = None
     ) -> dict[str, Any]:
         """
         Start Upstream OFDMA RxMER measurement.
@@ -761,6 +761,9 @@ class CmtsUsOfdmaRxMerService:
             # 0. Detect vendor for BDT routing
             vendor = await self.detect_vendor()
             self.logger.info(f"Detected vendor: {vendor}")
+            from pypnm.lib.pnm_file_source import get_tftp_dest_path, get_tftp_server
+            tftp_server = tftp_server or get_tftp_server(vendor)
+            dest_path = dest_path or get_tftp_dest_path(vendor)
 
             # 1. Set up bulk destination — vendor-specific
             if vendor == 'casa':

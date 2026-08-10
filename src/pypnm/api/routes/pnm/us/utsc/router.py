@@ -7,21 +7,26 @@ Router for CMTS Upstream Triggered Spectrum Capture (UTSC) operations.
 This module provides FastAPI endpoints for CMTS-side UTSC measurements.
 
 Endpoints:
-- GET  /ports:             List available RF ports for UTSC
-- GET  /config:            Get current UTSC configuration
-- POST /configure:         Configure UTSC test parameters
-- POST /start:             Start UTSC test
-- POST /stop:              Stop UTSC test
-- POST /clear:             Clear/reset UTSC configuration
-- GET  /status:            Get UTSC test status
-- POST /files/list:        List UTSC files on agent TFTP
-- POST /files/retrieve:    Fetch and parse UTSC file from agent
+- GET  /ports:                 List available RF ports for UTSC
+- GET  /config:                Get current UTSC configuration
+- POST /configure:             Configure UTSC test parameters
+- POST /start:                 Start UTSC test
+- POST /stop:                  Stop UTSC test
+- POST /clear:                 Clear/reset UTSC configuration
+- GET  /status:                Get UTSC test status
+- POST /files/list:            List captures from the authoritative source
+- POST /files/retrieve:        Retrieve one raw capture into PyPNM
+- POST /files/sample:          Return normalized spectrum samples
+- POST /files/delete:          Delete named captures
+- POST /files/housekeeping:    Delete aged captures safely
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import stat
+import fnmatch
 import asyncio
 from typing import Any, Optional
 from pathlib import Path
@@ -30,10 +35,15 @@ from fastapi import APIRouter
 from pypnm.api.agent.manager import get_agent_manager
 
 from pypnm.lib.pnm_file_source import (
-    fetch_pnm_files as _fetch_pnm_files,
+    delete_pnm_files as _delete_pnm_files,
     get_cache_dir as _get_cache_dir,
-    is_ftp_mode as _is_ftp_mode,
+    get_ftp_config as _get_ftp_config,
+    get_tftp_dest_path as _get_tftp_dest_path,
+    get_tftp_server as _get_tftp_server,
+    housekeeping_pnm_files as _housekeeping_pnm_files,
+    list_pnm_files as _list_pnm_files,
     local_pnm_dir as _local_pnm_dir,
+    resolve_file_mode as _resolve_file_mode,
 )
 
 from pypnm.api.routes.pnm.us.utsc.schemas import (
@@ -53,6 +63,12 @@ from pypnm.api.routes.pnm.us.utsc.schemas import (
     UtscFileListResponse,
     UtscFileRetrieveRequest,
     UtscFileRetrieveResponse,
+    UtscSampleRequest,
+    UtscSampleResponse,
+    UtscFileDeleteRequest,
+    UtscFileDeleteResponse,
+    UtscHousekeepingRequest,
+    UtscHousekeepingResponse,
 )
 from pypnm.api.routes.pnm.us.utsc.service import CmtsUtscService
 from pypnm.api.utils.cmts_vendor import (
@@ -61,6 +77,14 @@ from pypnm.api.utils.cmts_vendor import (
 )
 
 
+def _select_file_agent(agent_manager: Any, capability: str, requested: str | None = None) -> str | None:
+    """Select one capable file agent; destructive operations are never fanned out."""
+    capable = agent_manager.get_all_agent_ids_for_capability(capability)
+    if requested:
+        return requested if requested in capable else None
+    preferred = [agent_id for agent_id in capable if agent_id.startswith('file-agent')]
+    candidates = preferred or capable
+    return candidates[0] if candidates else None
 
 
 class UtscRouter:
@@ -78,26 +102,7 @@ class UtscRouter:
     def __routes(self) -> None:
 
         def _resolve_utsc_file_mode(vendor: Optional[str] = None) -> str:
-            vendor_lc = (vendor or '').strip().lower()
-            vendor_keys: list[str] = []
-            if 'cisco' in vendor_lc or 'cbr' in vendor_lc:
-                vendor_keys = ['CISCO_TFTP', 'CMTS_TFTP_CISCO', 'PNM_FILE_SOURCE_CMTS_CISCO']
-            elif 'commscope' in vendor_lc or 'arris' in vendor_lc or 'e6000' in vendor_lc:
-                vendor_keys = ['COMMSCOPE_TFTP', 'CMTS_TFTP_COMMSCOPE', 'PNM_FILE_SOURCE_CMTS_COMMSCOPE']
-            elif 'casa' in vendor_lc or 'evo' in vendor_lc or 'vccap' in vendor_lc:
-                vendor_keys = ['CASA_TFTP', 'CMTS_TFTP_CASA', 'PNM_FILE_SOURCE_CMTS_CASA']
-
-            for key in vendor_keys:
-                mode = (os.environ.get(key, '') or '').strip().lower()
-                if mode in ('ftp', 'agent', 'local'):
-                    return mode
-
-            fallback = (
-                os.environ.get('CMTS_TFTP', '')
-                or os.environ.get('PNM_FILE_SOURCE_CMTS', '')
-                or os.environ.get('PNM_FILE_SOURCE', 'local')
-            ).strip().lower()
-            return fallback if fallback in ('ftp', 'agent', 'local') else 'local'
+            return _resolve_file_mode(vendor)
         
         @self.router.get(
             "/ports",
@@ -198,22 +203,24 @@ class UtscRouter:
             )
 
             try:
-                # Configure bulk data destination (TFTP upload target) if provided
-                if request.tftp_server and request.destination_index > 0:
+                # PyPNM owns vendor detection and upload destination policy.
+                if request.destination_index > 0:
+                    vendor = await service.detect_vendor()
+                    tftp_server = request.tftp_server or _get_tftp_server(vendor)
+                    dest_path = request.dest_path or _get_tftp_dest_path(vendor)
                     bulk_result = await service.configure_bulk_data_control(
-                        dest_ip=request.tftp_server,
-                        dest_path=request.dest_path or "./",
+                        dest_ip=tftp_server,
+                        dest_path=dest_path,
                         index=request.destination_index,
                         pnm_types=['utsc'],
                     )
                     if not bulk_result.get('success'):
                         self.logger.warning(
-                            f"Bulk dest config failed (continuing): {bulk_result.get('error')}"
+                            "Bulk dest config failed (continuing): %s",
+                            bulk_result.get('error'),
                         )
                     else:
-                        self.logger.info(
-                            f"Bulk dest configured: {request.tftp_server}:{request.dest_path or './'}"
-                        )
+                        self.logger.info("UTSC bulk destination configured for vendor=%s", vendor)
 
                 result = await service.configure(
                     rf_port_ifindex=request.rf_port_ifindex,
@@ -382,85 +389,6 @@ class UtscRouter:
             finally:
                 service.close()
         
-        async def _prefetch_via_agent_if_enabled(filename: str) -> bool:
-            """Attempt agent-based file prefetch when enabled via environment.
-
-            Enables runtime control from .env:
-              - CMTS_TFTP=agent
-              - or CMTS_TFTP_UTSC=agent
-            """
-            mode_cmts = (os.environ.get('CMTS_TFTP', '') or os.environ.get('PNM_FILE_SOURCE_CMTS', '')).strip().lower()
-            mode_utsc = (os.environ.get('CMTS_TFTP_UTSC', '') or os.environ.get('PNM_FILE_SOURCE_UTSC', '')).strip().lower()
-            if mode_cmts != 'agent' and mode_utsc != 'agent':
-                return False
-
-            agent_manager = get_agent_manager()
-            if not agent_manager:
-                self.logger.warning("Agent prefetch enabled but agent manager is not available")
-                return False
-
-            candidate_ids = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
-            if not candidate_ids:
-                self.logger.warning("Agent prefetch enabled but no agent with pnm_file_get capability is connected")
-                return False
-
-            # Only file-agents have TFTP root access.
-            file_agent_ids = [a for a in candidate_ids if a.startswith('file-agent')]
-            if file_agent_ids:
-                candidate_ids = file_agent_ids
-
-            async def _try_agent(aid: str) -> tuple[str, dict | None]:
-                try:
-                    tid = await agent_manager.send_task(
-                        agent_id=aid,
-                        command='file_get',
-                        params={'filename': filename, 'glob': True},
-                    )
-                    res = await agent_manager.wait_for_task_async(
-                        tid,
-                        timeout=agent_manager.LONG_TASK_TIMEOUT,
-                    )
-                    return aid, res
-                except Exception as exc:
-                    self.logger.debug(f"Agent '{aid}' file_get error for '{filename}': {exc}")
-                    return aid, None
-
-            pending = {asyncio.ensure_future(_try_agent(aid)): aid for aid in candidate_ids}
-            winner: dict | None = None
-            winner_agent: str | None = None
-            try:
-                while pending:
-                    done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
-                    for fut in done:
-                        aid, result = fut.result()
-                        pending.pop(fut, None)
-                        result_inner = (result or {}).get('result') or result or {}
-                        if result_inner and result_inner.get('success'):
-                            winner = result_inner
-                            winner_agent = aid
-                            break
-                    if winner:
-                        break
-            finally:
-                for fut in pending:
-                    fut.cancel()
-
-            if not winner:
-                return False
-
-            try:
-                import base64
-                cache_dir = Path(_get_cache_dir())
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                out_name = winner.get('filename', Path(filename).name)
-                out_path = cache_dir / Path(out_name).name
-                out_path.write_bytes(base64.b64decode(winner['content_base64']))
-                self.logger.info(f"Agent prefetch succeeded via '{winner_agent}' -> {out_path.name}")
-                return True
-            except Exception as exc:
-                self.logger.warning(f"Agent prefetch decode/write failed for '{filename}': {exc}")
-                return False
-        
         @self.router.post(
             "/files/list",
             summary="List UTSC files (agent TFTP or direct FTP)",
@@ -507,41 +435,28 @@ class UtscRouter:
 
             self.logger.debug(f"Listing UTSC files with prefix: {prefix}")
 
-            # FTP mode: scan directly on FTP server
-            if mode == 'ftp':
-                import ftplib
+            # PyPNM owns direct FTP and local source listing.
+            if mode in ('ftp', 'local'):
                 try:
-                    from pypnm.lib.pnm_file_source import get_ftp_config
-                    ftp_cfg = get_ftp_config()
-                    
-                    ftp = ftplib.FTP()
-                    ftp.connect(ftp_cfg['host'], ftp_cfg['port'], timeout=15)
-                    ftp.login(ftp_cfg['user'], ftp_cfg['password'])
-                    ftp.cwd(ftp_cfg['ftp_dir'])
-                    
-                    # Parse prefix into glob pattern (e.g., "PNMCcapUsSpecAn_*_100" → "PNMCcapUsSpecAn_")
-                    # Simple pattern: match files starting with prefix up to first wildcard
-                    prefix_base = prefix.split('*')[0] if '*' in prefix else prefix
-                    
-                    all_files = ftp.nlst()
-                    matching = [f for f in all_files if f.startswith(prefix_base)]
-                    ftp.quit()
-                    
-                    self.logger.info(f"FTP list found {len(matching)} files matching {prefix}")
+                    matching = _list_pnm_files(
+                        prefix,
+                        vendor=request.vendor,
+                        exclude=request.exclude,
+                    )
                     return UtscFileListResponse(
                         success=True,
-                        files=sorted(matching),
+                        files=matching,
                         count=len(matching),
-                        prefix_used=prefix
+                        prefix_used=prefix,
                     )
                 except Exception as exc:
-                    self.logger.error(f"FTP list error: {exc}")
+                    self.logger.error("UTSC %s list error: %s", mode, exc)
                     return UtscFileListResponse(
                         success=False,
-                        error=f"FTP listing failed: {exc}"
+                        error=f"{mode.upper()} listing failed: {exc}",
                     )
 
-            # Agent/Local mode: use agent file_list command
+            # Agent mode: use agent file_list command
             agent_manager = get_agent_manager()
             if not agent_manager:
                 return UtscFileListResponse(
@@ -564,13 +479,27 @@ class UtscRouter:
                 f"UTSC file_list using agent mode via {len(candidate_ids)} candidate(s) for prefix={prefix}"
             )
 
+            # Agent file_list accepts a literal prefix, not an unsafe glob. Ask
+            # for the stable portion and apply the original pattern in PyPNM.
+            agent_pattern = Path(prefix).name
+            if (
+                agent_pattern != prefix
+                or '\x00' in agent_pattern
+                or any(char in agent_pattern for char in ('?', '[', ']'))
+            ):
+                return UtscFileListResponse(
+                    success=False,
+                    error="Agent listing accepts basename patterns with '*' only",
+                )
+            agent_prefix = agent_pattern.split('*', 1)[0]
+
             # Try agents in parallel, take first result
             async def _try_agent(aid: str) -> tuple[str, dict | None]:
                 try:
                     tid = await agent_manager.send_task(
                         agent_id=aid,
                         command='file_list',
-                        params={'prefix': prefix},
+                        params={'prefix': agent_prefix},
                         priority='interactive',
                     )
                     res = await agent_manager.wait_for_task_async(
@@ -608,7 +537,11 @@ class UtscRouter:
                     error="No agent returned file_list results"
                 )
 
-            raw_files: list[str] = winner.get('files', []) or []
+            raw_files: list[str] = [
+                Path(name).name
+                for name in (winner.get('files', []) or [])
+                if fnmatch.fnmatch(Path(name).name, agent_pattern)
+            ]
             # Filter out basenames the caller already has so they don't re-fetch them.
             exclude_set: set[str] = {
                 os.path.basename(f) for f in (request.exclude or [])
@@ -619,7 +552,8 @@ class UtscRouter:
                 success=True,
                 files=raw_files,
                 count=len(raw_files),
-                prefix_used=prefix
+                prefix_used=prefix,
+                agent_id=winner_agent,
             )
         
         @self.router.post(
@@ -667,64 +601,86 @@ class UtscRouter:
                         content_base64=_b64.b64encode(content_bytes).decode(),
                     )
 
-            # FTP mode: download directly from FTP server
+            # FTP mode: download directly into PyPNM's cache.
             if mode == 'ftp':
+                import base64
+                import ftplib
+                import fnmatch
+
+                ftp = None
                 try:
-                    from pypnm.lib.pnm_file_source import get_ftp_config
-                    import ftplib
-                    import base64
-                    ftp_cfg = get_ftp_config()
-                    
+                    ftp_cfg = _get_ftp_config(request.vendor)
                     ftp = ftplib.FTP()
                     ftp.connect(ftp_cfg['host'], ftp_cfg['port'], timeout=15)
                     ftp.login(ftp_cfg['user'], ftp_cfg['password'])
                     ftp.cwd(ftp_cfg['ftp_dir'])
-                    
-                    # If glob=True, find newest file matching pattern
+                    actual_filename = request.filename
                     if request.glob:
-                        prefix_base = request.filename.split('*')[0] if '*' in request.filename else request.filename
-                        all_files = ftp.nlst()
-                        matching = sorted([f for f in all_files if f.startswith(prefix_base)], reverse=True)
+                        matching = [
+                            name for name in ftp.nlst()
+                            if fnmatch.fnmatch(Path(name).name, Path(request.filename).name)
+                        ]
                         if not matching:
-                            ftp.quit()
                             return UtscFileRetrieveResponse(
                                 success=False,
-                                error=f"No FTP files matching pattern: {request.filename}"
+                                error=f"No FTP files matching pattern: {request.filename}",
                             )
-                        actual_filename = matching[0]
-                    else:
-                        actual_filename = request.filename
-                    
-                    # Download file to cache
-                    cache_dir = Path(_get_cache_dir())
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-                    cache_path = cache_dir / Path(actual_filename).name
-                    
-                    with open(cache_path, 'wb') as f:
-                        ftp.retrbinary(f'RETR {actual_filename}', f.write)
-                    ftp.quit()
+                        actual_filename = sorted(matching, reverse=True)[0]
 
+                    cache_path = Path(_get_cache_dir()) / Path(actual_filename).name
+                    temp_path = cache_path.with_suffix(cache_path.suffix + '.part')
+                    try:
+                        with temp_path.open('wb') as handle:
+                            ftp.retrbinary(f'RETR {actual_filename}', handle.write)
+                        temp_path.replace(cache_path)
+                    finally:
+                        temp_path.unlink(missing_ok=True)
                     content_bytes = cache_path.read_bytes()
-                    
-                    file_size = cache_path.stat().st_size
-                    self.logger.info(f"Retrieved UTSC file via FTP: {actual_filename} ({file_size} bytes) -> {cache_path}")
-                    
                     return UtscFileRetrieveResponse(
                         success=True,
-                        filename=actual_filename,
+                        filename=cache_path.name,
                         cache_path=str(cache_path),
-                        file_size=file_size,
-                        agent_id="ftp",
+                        file_size=len(content_bytes),
+                        agent_id='ftp',
                         content_base64=base64.b64encode(content_bytes).decode(),
                     )
                 except Exception as exc:
-                    self.logger.error(f"FTP retrieval error: {exc}")
+                    self.logger.error("FTP retrieval error: %s", exc)
+                    return UtscFileRetrieveResponse(success=False, error=f"FTP download failed: {exc}")
+                finally:
+                    if ftp is not None:
+                        try:
+                            ftp.quit()
+                        except Exception:
+                            pass
+
+            if mode == 'local':
+                import base64
+                import fnmatch
+
+                pattern = Path(request.filename).name
+                candidates = [
+                    path for path in _local_pnm_dir(request.vendor).rglob('*')
+                    if path.is_file() and (
+                        fnmatch.fnmatch(path.name, pattern) if request.glob else path.name == pattern
+                    )
+                ]
+                if not candidates:
                     return UtscFileRetrieveResponse(
                         success=False,
-                        error=f"FTP download failed: {exc}"
+                        error=f"No local files matching: {request.filename}",
                     )
+                selected = max(candidates, key=lambda path: path.stat().st_mtime)
+                content_bytes = selected.read_bytes()
+                return UtscFileRetrieveResponse(
+                    success=True,
+                    filename=selected.name,
+                    file_size=len(content_bytes),
+                    agent_id='local',
+                    content_base64=base64.b64encode(content_bytes).decode(),
+                )
 
-            # Agent/Local mode: use agent pnm_file_get command
+            # Agent mode: use agent pnm_file_get command
             agent_manager = get_agent_manager()
             if not agent_manager:
                 return UtscFileRetrieveResponse(
@@ -732,11 +688,30 @@ class UtscRouter:
                     error="Agent manager not available"
                 )
 
+            # Resolve agent-mode glob requests through the safe list contract,
+            # then retrieve one exact basename. pnm_file_get never accepts globs.
+            agent_filename = request.filename
+            source_agent: str | None = None
+            if request.glob:
+                listed = await list_utsc_files(UtscFileListRequest(
+                    prefix=request.filename,
+                    vendor=request.vendor,
+                ))
+                if not listed.success or not listed.files:
+                    return UtscFileRetrieveResponse(
+                        success=False,
+                        error=listed.error or f"No agent files matching: {request.filename}",
+                    )
+                agent_filename = sorted(listed.files, reverse=True)[0]
+                source_agent = listed.agent_id
+
             # Only file-agents have TFTP root access; cmts/cm agents do not.
             all_capable = agent_manager.get_all_agent_ids_for_capability('pnm_file_get')
             candidate_ids = [a for a in all_capable if a.startswith('file-agent')]
             if not candidate_ids:
                 candidate_ids = all_capable  # fallback if no file-agent connected
+            if source_agent in candidate_ids:
+                candidate_ids = [source_agent]
             if not candidate_ids:
                 return UtscFileRetrieveResponse(
                     success=False,
@@ -744,18 +719,19 @@ class UtscRouter:
                 )
 
             self.logger.info(
-                f"UTSC file_retrieve using agent mode via {len(candidate_ids)} candidate(s) for filename={request.filename}"
+                f"UTSC file_retrieve using agent mode via {len(candidate_ids)} candidate(s) for filename={agent_filename}"
             )
 
-            self.logger.info(f"Retrieving UTSC file: {request.filename} (glob={request.glob})")
+            self.logger.info(f"Retrieving exact UTSC file: {agent_filename}")
 
-            # Try agents in parallel, take first result
+            # Read-only retrieval may try equivalent file agents in parallel,
+            # except when a prior list response established source affinity.
             async def _try_agent(aid: str) -> tuple[str, dict | None]:
                 try:
                     tid = await agent_manager.send_task(
                         agent_id=aid,
                         command='pnm_file_get',
-                        params={'filename': request.filename, 'glob': request.glob},
+                        params={'filename': agent_filename},
                         priority='long'
                     )
                     res = await agent_manager.wait_for_task_async(
@@ -798,7 +774,7 @@ class UtscRouter:
                 cache_dir = Path(_get_cache_dir())
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 
-                filename = winner.get('filename', request.filename)
+                filename = winner.get('filename', agent_filename)
                 content_b64 = winner.get('content_base64')
                 
                 if not content_b64:
@@ -809,7 +785,12 @@ class UtscRouter:
                 
                 out_path = cache_dir / Path(filename).name
                 content_bytes = base64.b64decode(content_b64)
-                out_path.write_bytes(content_bytes)
+                temp_path = out_path.with_suffix(out_path.suffix + '.part')
+                try:
+                    temp_path.write_bytes(content_bytes)
+                    temp_path.replace(out_path)
+                finally:
+                    temp_path.unlink(missing_ok=True)
                 
                 self.logger.info(
                     f"Retrieved UTSC file: {filename} ({len(content_bytes)} bytes) "
@@ -829,6 +810,216 @@ class UtscRouter:
                 return UtscFileRetrieveResponse(
                     success=False,
                     error=f"Decode/write error: {exc}"
+                )
+
+        @self.router.post(
+            "/files/sample",
+            summary="Retrieve and normalize a UTSC spectrum sample",
+            response_model=UtscSampleResponse,
+        )
+        async def get_utsc_sample(request: UtscSampleRequest) -> UtscSampleResponse:
+            import base64
+            import time
+            from pypnm.pnm.parser.utsc_file import parse_utsc_file
+
+            retrieved = await retrieve_utsc_file(UtscFileRetrieveRequest(
+                filename=request.filename,
+                glob=request.glob,
+                vendor=request.vendor,
+            ))
+            if not retrieved.success or not retrieved.content_base64:
+                return UtscSampleResponse(
+                    success=False,
+                    error=retrieved.error or "UTSC file retrieval returned no content",
+                )
+            try:
+                content = base64.b64decode(retrieved.content_base64)
+                sample = parse_utsc_file(
+                    content,
+                    filename=retrieved.filename or Path(request.filename).name,
+                    vendor=request.vendor,
+                    center_freq_hz=request.center_freq_hz,
+                    span_hz=request.span_hz,
+                    max_bins=request.max_bins,
+                )
+                return UtscSampleResponse(
+                    success=True,
+                    collected_at=time.time(),
+                    source=retrieved.agent_id,
+                    **sample,
+                )
+            except Exception as exc:
+                self.logger.warning("UTSC sample parse failed for %s: %s", request.filename, exc)
+                return UtscSampleResponse(success=False, error=str(exc))
+
+        @self.router.post(
+            "/files/delete",
+            summary="Delete named UTSC capture files",
+            response_model=UtscFileDeleteResponse,
+        )
+        async def delete_utsc_files(
+            request: UtscFileDeleteRequest,
+        ) -> UtscFileDeleteResponse:
+            mode = _resolve_file_mode(request.vendor)
+            try:
+                if mode != 'agent':
+                    deleted = 0
+                    for filename in request.filenames:
+                        deleted += _delete_pnm_files(
+                            filename,
+                            vendor=request.vendor,
+                            include_local_source=True,
+                        )
+                    return UtscFileDeleteResponse(success=True, deleted_count=deleted)
+
+                agent_manager = get_agent_manager()
+                if not agent_manager:
+                    return UtscFileDeleteResponse(
+                        success=False,
+                        error="Agent manager not available",
+                    )
+                agent_id = _select_file_agent(
+                    agent_manager,
+                    'pnm_file_delete',
+                    request.agent_id,
+                )
+                if not agent_id:
+                    detail = (
+                        "Requested agent does not advertise pnm_file_delete"
+                        if request.agent_id
+                        else "No agent with pnm_file_delete capability is connected"
+                    )
+                    return UtscFileDeleteResponse(success=False, error=detail)
+
+                task_id = await agent_manager.send_task(
+                    agent_id=agent_id,
+                    command='pnm_file_delete',
+                    params={'filenames': request.filenames},
+                    timeout=agent_manager.LONG_TASK_TIMEOUT,
+                    priority='long',
+                )
+                result = await agent_manager.wait_for_task_async(
+                    task_id,
+                    timeout=agent_manager.LONG_TASK_TIMEOUT,
+                )
+                inner = (result or {}).get('result') or result or {}
+                deleted_names = [
+                    filename
+                    for filename in (inner.get('files') or [])
+                    if filename in request.filenames
+                ]
+                if inner.get('success') and not deleted_names:
+                    # An idempotent remote delete may report zero because the
+                    # authoritative file was already absent; its cache is stale.
+                    deleted_names = request.filenames
+                if deleted_names:
+                    # The agent is authoritative; remove only corresponding local
+                    # cache entries without treating cache cleanup as another delete.
+                    for filename in deleted_names:
+                        cache_path = Path(_get_cache_dir()) / filename
+                        try:
+                            cache_stat = os.lstat(cache_path)
+                            if stat.S_ISREG(cache_stat.st_mode) and not stat.S_ISLNK(cache_stat.st_mode):
+                                cache_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as exc:
+                            self.logger.warning("UTSC cache cleanup refused for %s: %s", filename, exc)
+                return UtscFileDeleteResponse(
+                    success=bool(inner.get('success')),
+                    deleted_count=int(inner.get('deleted_count') or 0),
+                    files=inner.get('files') or [],
+                    errors=inner.get('errors') or [],
+                    truncated=bool(inner.get('truncated', False)),
+                    agent_id=agent_id,
+                    error=inner.get('error'),
+                )
+            except Exception as exc:
+                self.logger.error("UTSC file deletion failed: %s", exc)
+                return UtscFileDeleteResponse(success=False, error=str(exc))
+
+        @self.router.post(
+            "/files/housekeeping",
+            summary="Delete aged UTSC capture files from the authoritative source",
+            response_model=UtscHousekeepingResponse,
+        )
+        async def housekeeping_utsc_files(
+            request: UtscHousekeepingRequest,
+        ) -> UtscHousekeepingResponse:
+            mode = _resolve_file_mode(request.vendor)
+            try:
+                if mode != 'agent':
+                    return UtscHousekeepingResponse(**_housekeeping_pnm_files(
+                        max_age_seconds=request.max_age_seconds,
+                        dry_run=request.dry_run,
+                        vendor=request.vendor,
+                    ))
+
+                agent_manager = get_agent_manager()
+                if not agent_manager:
+                    return UtscHousekeepingResponse(
+                        success=False,
+                        dry_run=request.dry_run,
+                        error="Agent manager not available",
+                    )
+                agent_id = _select_file_agent(
+                    agent_manager,
+                    'pnm_file_housekeeping',
+                    request.agent_id,
+                )
+                if not agent_id:
+                    detail = (
+                        "Requested agent does not advertise pnm_file_housekeeping"
+                        if request.agent_id
+                        else "No agent with pnm_file_housekeeping capability is connected"
+                    )
+                    return UtscHousekeepingResponse(
+                        success=False,
+                        dry_run=request.dry_run,
+                        error=detail,
+                    )
+
+                task_id = await agent_manager.send_task(
+                    agent_id=agent_id,
+                    command='pnm_file_housekeeping',
+                    params={
+                        'max_age_seconds': request.max_age_seconds,
+                        'dry_run': request.dry_run,
+                    },
+                    timeout=agent_manager.LONG_TASK_TIMEOUT,
+                    priority='long',
+                )
+                result = await agent_manager.wait_for_task_async(
+                    task_id,
+                    timeout=agent_manager.LONG_TASK_TIMEOUT,
+                )
+                inner = (result or {}).get('result') or result or {}
+                if inner.get('success') and not request.dry_run:
+                    # In agent mode the local helper is cache-only. Do not scan
+                    # or delete any local TFTP source directory.
+                    _housekeeping_pnm_files(
+                        max_age_seconds=request.max_age_seconds,
+                        dry_run=False,
+                        vendor=request.vendor,
+                    )
+                return UtscHousekeepingResponse(
+                    success=bool(inner.get('success')),
+                    dry_run=request.dry_run,
+                    candidate_count=int(inner.get('candidate_count') or 0),
+                    deleted_count=int(inner.get('deleted_count') or 0),
+                    total_size_bytes=int(inner.get('total_size_bytes') or 0),
+                    files=inner.get('files') or [],
+                    errors=inner.get('errors') or [],
+                    truncated=bool(inner.get('truncated', False)),
+                    agent_id=agent_id,
+                    error=inner.get('error'),
+                )
+            except Exception as exc:
+                self.logger.error("UTSC housekeeping failed: %s", exc)
+                return UtscHousekeepingResponse(
+                    success=False,
+                    dry_run=request.dry_run,
+                    error=str(exc),
                 )
 
 

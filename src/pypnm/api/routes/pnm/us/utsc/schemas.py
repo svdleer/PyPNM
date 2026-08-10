@@ -12,8 +12,9 @@ docsPnmCmtsUtscStatusTable).
 from __future__ import annotations
 
 from enum import IntEnum
+from pathlib import Path
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class TriggerMode(IntEnum):
@@ -305,6 +306,7 @@ class UtscFileListResponse(BaseModel):
     files: List[str] = Field(default_factory=list, description="Matching filenames (basenames only)")
     count: int = Field(default=0, description="Number of files found")
     prefix_used: Optional[str] = Field(None, description="Actual prefix used for glob")
+    agent_id: Optional[str] = Field(None, description="Agent that listed the authoritative source")
     error: Optional[str] = None
 
 
@@ -327,8 +329,100 @@ class UtscFileRetrieveResponse(BaseModel):
     """Response from file retrieval."""
     success: bool
     filename: Optional[str] = Field(None, description="Actual filename retrieved")
-    cache_path: Optional[str] = Field(None, description="Local cache path where file was written")
+    cache_path: Optional[str] = Field(None, description="Internal PyPNM cache path")
     file_size: Optional[int] = Field(None, description="Size of retrieved file in bytes")
     agent_id: Optional[str] = Field(None, description="Agent ID that served the file")
-    content_base64: Optional[str] = Field(None, description="File content as base64 (only if return_content=True)")
+    content_base64: Optional[str] = Field(None, description="File content as base64")
+    error: Optional[str] = None
+
+
+class UtscSampleRequest(BaseModel):
+    """Retrieve and normalize one UTSC spectrum capture."""
+    filename: str = Field(..., description="Bare filename or glob pattern")
+    glob: bool = Field(default=True)
+    vendor: Optional[str] = None
+    center_freq_hz: int = Field(default=50000000, gt=0)
+    span_hz: int = Field(default=80000000, gt=0)
+    max_bins: int = Field(default=1600, ge=1, le=16384)
+
+
+class UtscSampleResponse(BaseModel):
+    """Normalized UTSC spectrum data; no filesystem path or binary payload."""
+    success: bool
+    filename: Optional[str] = None
+    file_size: Optional[int] = None
+    collected_at: Optional[float] = None
+    vendor: Optional[str] = None
+    num_bins: int = 0
+    center_freq_hz: Optional[int] = None
+    span_hz: Optional[int] = None
+    freq_start_hz: Optional[float] = None
+    freq_step_hz: Optional[float] = None
+    bins: List[float] = Field(default_factory=list)
+    units: str = "dBmV"
+    source: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscFileDeleteRequest(BaseModel):
+    """Delete exact named UTSC captures from authoritative storage."""
+    filenames: List[str] = Field(..., min_length=1, max_length=100)
+    vendor: Optional[str] = None
+    agent_id: Optional[str] = Field(
+        default=None,
+        description="Optional source-agent affinity from a prior list/retrieve response",
+    )
+
+    @field_validator('filenames')
+    @classmethod
+    def validate_filenames(cls, filenames: List[str]) -> List[str]:
+        approved_prefixes = ('utsc_', 'PNMCcapUsSpecAn_')
+        validated: List[str] = []
+        for value in filenames:
+            filename = str(value or '')
+            if (
+                not filename
+                or filename in {'.', '..'}
+                or Path(filename).name != filename
+                or '\x00' in filename
+                or any(char in filename for char in ('*', '?', '[', ']'))
+                or not filename.startswith(approved_prefixes)
+            ):
+                raise ValueError('filenames must be exact approved UTSC capture basenames')
+            if filename not in validated:
+                validated.append(filename)
+        return validated
+
+
+class UtscFileDeleteResponse(BaseModel):
+    success: bool
+    deleted_count: int = 0
+    files: List[str] = Field(default_factory=list)
+    errors: List[dict] = Field(default_factory=list)
+    truncated: bool = False
+    agent_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UtscHousekeepingRequest(BaseModel):
+    """Safely remove aged UTSC capture files only."""
+    max_age_seconds: int = Field(default=60, ge=1)
+    dry_run: bool = True
+    vendor: Optional[str] = None
+    agent_id: Optional[str] = Field(
+        default=None,
+        description="Optional source-agent affinity from a prior list/retrieve response",
+    )
+
+
+class UtscHousekeepingResponse(BaseModel):
+    success: bool
+    dry_run: bool
+    candidate_count: int = 0
+    deleted_count: int = 0
+    total_size_bytes: int = 0
+    files: List[dict] = Field(default_factory=list)
+    errors: List[dict] = Field(default_factory=list)
+    truncated: bool = False
+    agent_id: Optional[str] = None
     error: Optional[str] = None

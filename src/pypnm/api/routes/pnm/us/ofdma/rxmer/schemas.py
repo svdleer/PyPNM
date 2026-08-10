@@ -53,11 +53,11 @@ class UsOfdmaRxMerStartRequest(BaseModel):
     )
     tftp_server: Optional[str] = Field(
         default=None,
-        description="TFTP server IP for bulk upload. Required on Cisco cBR-8 to trigger measurement."
+        description="Optional override; PyPNM resolves the vendor TFTP destination when omitted."
     )
-    dest_path: str = Field(
-        default="./",
-        description="Upload path on TFTP server (e.g. 'access/pnmupload/'). Empty/'./' = TFTP root."
+    dest_path: Optional[str] = Field(
+        default=None,
+        description="Optional upload-path override; PyPNM resolves vendor policy when omitted."
     )
 
 

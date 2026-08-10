@@ -39,7 +39,6 @@ from pypnm.lib.pnm_file_source import (
     delete_pnm_files as _delete_pnm_files,
     local_pnm_dir as _local_pnm_dir,
     get_cache_dir as _get_cache_dir,
-    is_ftp_mode as _is_ftp_mode,
 )
 
 from pypnm.api.routes.pnm.us.ofdma.rxmer.schemas import (
@@ -1053,10 +1052,9 @@ class UsOfdmaRxMerRouter:
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
             import glob
             
-            # Build file path - CMTS adds timestamp, so use glob to find latest.
-            # In hybrid deployments (PNM_FILE_SOURCE=agent/local + FTP configured),
-            # still include cache dir lookup for API-side FTP retrieval.
-            tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
+            # PyPNM owns source resolution; caller paths are retained only for
+            # request compatibility and are not used as a cross-container contract.
+            tftp_dir = _local_pnm_dir()
             cache_dir = Path(_get_cache_dir())
 
             # Strip leading '/' — Cisco/E6000 SNMP returns e.g. /pnm/mer/usrxmer_xxx
@@ -1208,7 +1206,7 @@ class UsOfdmaRxMerRouter:
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
             import glob
 
-            tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
+            tftp_dir = _local_pnm_dir()
             cache_dir = Path(_get_cache_dir())
             filename = request.filename.lstrip('/')
             basename = Path(filename).name
@@ -1306,8 +1304,8 @@ class UsOfdmaRxMerRouter:
 
             from pypnm.pnm.parser.CmtsUsOfdmaRxMer import CmtsUsOfdmaRxMer
 
-            # ── file resolution (same logic as getCapture) ──
-            tftp_dir = _local_pnm_dir() if _is_ftp_mode() else Path(request.tftp_path)
+            # ── file resolution is owned by PyPNM ──
+            tftp_dir = _local_pnm_dir()
             cache_dir = Path(_get_cache_dir())
             filename = request.filename.lstrip('/')
             basename = Path(filename).name
@@ -1446,7 +1444,7 @@ class UsOfdmaRxMerRouter:
                         return Path(matches[0])
                 return None
 
-            tftp_dir = Path(tftp_path)
+            tftp_dir = _local_pnm_dir()
             fn = filename.lstrip('/')
             fp = _find_capture(tftp_dir, fn)
 

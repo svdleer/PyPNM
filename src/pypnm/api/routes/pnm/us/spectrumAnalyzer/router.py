@@ -8,7 +8,6 @@ import logging
 import json
 import glob
 import os
-import struct
 from ftplib import FTP
 from pathlib import Path
 
@@ -644,19 +643,25 @@ async def _stream_spectrum_data(
                         with open(filepath, 'rb') as f:
                             binary_data = f.read()
                         
-                        if len(binary_data) >= 328:
-                            amp_data = binary_data[328:]
-                            n_samples = len(amp_data) // 2
-                            
-                            if n_samples > 0:
-                                amplitudes = struct.unpack(f'>{n_samples}h', amp_data[:n_samples * 2])
-                                bins_data = [a / 10.0 for a in amplitudes][:actual_num_bins or 1600]
-                                file_buffer.append({
-                                    'filepath': filepath,
-                                    'bins': bins_data,
-                                    'collected_at': current_time
-                                })
-                                logger.debug(f"Buffered {len(bins_data)} bins from {os.path.basename(filepath)} — Buffer: {len(file_buffer)}")
+                        from pypnm.pnm.parser.utsc_file import parse_utsc_file
+
+                        sample = parse_utsc_file(
+                            binary_data,
+                            filename=os.path.basename(filepath),
+                            vendor='cisco' if 'PNMCcap' in os.path.basename(filepath) else 'commscope',
+                            center_freq_hz=actual_center_freq,
+                            span_hz=actual_span,
+                            max_bins=actual_num_bins or 1600,
+                        )
+                        file_buffer.append({
+                            'filepath': filepath,
+                            'bins': sample['bins'],
+                            'collected_at': current_time,
+                        })
+                        logger.debug(
+                            "Buffered %s bins from %s — Buffer: %s",
+                            len(sample['bins']), os.path.basename(filepath), len(file_buffer),
+                        )
                     except Exception as e:
                         logger.error(f"Error parsing {filepath}: {e}")
                 

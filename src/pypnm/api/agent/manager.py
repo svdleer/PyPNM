@@ -39,7 +39,8 @@ class AgentManager:
         # These get a higher default timeout and are routed to the agent's
         # dedicated long-running thread pool so they never starve SNMP workers.
         self.LONG_COMMANDS: frozenset[str] = frozenset({
-            'file_get', 'pnm_file_get', 'snmp_set_sequence',
+            'file_get', 'pnm_file_get', 'pnm_file_delete',
+            'pnm_file_housekeeping', 'snmp_set_sequence',
         })
         self.LONG_TASK_TIMEOUT: float = 90.0   # default timeout for long commands
         # Per-agent log ring buffers — populated by agents streaming type=log messages
@@ -275,6 +276,11 @@ class AgentManager:
             
             if request_id in self._task_queues:
                 self._task_queues[request_id].put(data)
+            if request_id in self._async_task_queues:
+                try:
+                    self._async_task_queues[request_id].put_nowait(data)
+                except asyncio.QueueFull:
+                    self.logger.error(f"Async queue full for errored task: {request_id}")
 
     def _handle_log(self, data: dict) -> None:
         """Store a streamed log entry from an agent in its ring buffer."""
