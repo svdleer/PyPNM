@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pymysql
 import pymysql.cursors
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_SPECTRUM_GRID_HZ = 25_000
+_SPECTRUM_MAX_GRID_POINTS = 100_000
+_MAX_COLLECTION_CONCURRENCY = 20
+_DEFAULT_COLLECTION_CONCURRENCY = 10
 _ONLINE_STATUSES = ("operational", "registrationComplete", "ipComplete", "online")
 
 
@@ -297,6 +303,39 @@ class RxMerAnalyticsService:
                 INDEX idx_rxmer_aggregate_fiber_avg (job_id, fiber_node, avg_db)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
+            """
+            CREATE TABLE IF NOT EXISTS rxmer_spectrum_build (
+                job_id BIGINT PRIMARY KEY,
+                source_revision BIGINT NOT NULL,
+                state VARCHAR(16) NOT NULL,
+                lease_owner VARCHAR(128) NULL,
+                lease_until DATETIME NULL,
+                source_channels INT NOT NULL DEFAULT 0,
+                source_modems INT NOT NULL DEFAULT 0,
+                source_samples BIGINT NOT NULL DEFAULT 0,
+                frequency_start_hz BIGINT NULL,
+                frequency_end_hz BIGINT NULL,
+                point_count INT NOT NULL DEFAULT 0,
+                error_text TEXT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                INDEX idx_rxmer_spectrum_build_state (state, lease_until)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rxmer_spectrum_bin (
+                job_id BIGINT NOT NULL,
+                source_revision BIGINT NOT NULL,
+                frequency_hz BIGINT NOT NULL,
+                sample_count BIGINT NOT NULL,
+                sum_qdb BIGINT NOT NULL,
+                worst_qdb TINYINT UNSIGNED NOT NULL,
+                max_qdb TINYINT UNSIGNED NOT NULL,
+                PRIMARY KEY (job_id, source_revision, frequency_hz),
+                INDEX idx_rxmer_spectrum_frequency
+                    (job_id, source_revision, frequency_hz)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
         )
 
     def capabilities(self) -> dict[str, Any]:
@@ -306,8 +345,11 @@ class RxMerAnalyticsService:
             "planning_enabled": True,
             "dispatch_enabled": True,
             "scheduler_enabled": False,
-            "max_concurrency": 2,
+            "max_concurrency": _MAX_COLLECTION_CONCURRENCY,
+            "default_concurrency": _DEFAULT_COLLECTION_CONCURRENCY,
             "max_inventory_modems": 50000,
+            "spectrum_enabled": True,
+            "spectrum_max_points": 4000,
             "scope_types": ["all_network", "cmts"],
         }
 
@@ -960,7 +1002,7 @@ class RxMerAnalyticsService:
                     "SELECT id, mac, modem_ip, cmts, cmts_ip, fiber_node, expected_channels "
                     "FROM rxmer_job_target WHERE job_id=%s AND state='planned' "
                     "ORDER BY id ASC LIMIT %s FOR UPDATE SKIP LOCKED",
-                    (job_id, max(1, min(int(limit), 2))),
+                    (job_id, max(1, min(int(limit), _MAX_COLLECTION_CONCURRENCY))),
                 )
                 targets = list(cursor.fetchall())
                 if targets:
@@ -1195,6 +1237,671 @@ class RxMerAnalyticsService:
             "AND active_job_id=%s AND lease_owner=%s",
             (self._now(), job_id, lease_owner),
         )
+
+    def _lock_job_for_cleanup(self, cursor, public_id: str) -> dict[str, Any]:
+        cursor.execute(
+            "SELECT id, status, lease_owner, "
+            "(lease_until > UTC_TIMESTAMP()) AS lease_active "
+            "FROM rxmer_job WHERE public_id=%s FOR UPDATE",
+            (public_id,),
+        )
+        job = cursor.fetchone()
+        if not job:
+            raise KeyError(public_id)
+        job_id = int(job["id"])
+        if str(job.get("status") or "") in {"queued", "running", "cancelling"}:
+            raise RuntimeError("active RxMER jobs must be cancelled before deletion")
+        if bool(job.get("lease_active")):
+            raise RuntimeError("RxMER job still has an active worker lease")
+
+        cursor.execute(
+            "SELECT active_job_id, lease_owner, "
+            "(lease_until > UTC_TIMESTAMP()) AS lease_active "
+            "FROM rxmer_scope_lease WHERE scope_key='network-downstream-rxmer' "
+            "FOR UPDATE"
+        )
+        scope_lease = cursor.fetchone() or {}
+        if (
+            scope_lease.get("active_job_id") is not None
+            and int(scope_lease["active_job_id"]) == job_id
+            and bool(scope_lease.get("lease_active"))
+        ):
+            raise RuntimeError("RxMER job still owns the active network lease")
+
+        cursor.execute(
+            "SELECT state, (lease_until > UTC_TIMESTAMP()) AS lease_active "
+            "FROM rxmer_spectrum_build WHERE job_id=%s FOR UPDATE",
+            (job_id,),
+        )
+        spectrum_build = cursor.fetchone() or {}
+        if (
+            str(spectrum_build.get("state") or "") == "building"
+            and bool(spectrum_build.get("lease_active"))
+        ):
+            raise RuntimeError("spectrum materialization is still active")
+        return job
+
+    @staticmethod
+    def _delete_result_rows(cursor, job_id: int) -> None:
+        cursor.execute("DELETE FROM rxmer_spectrum_bin WHERE job_id=%s", (job_id,))
+        cursor.execute("DELETE FROM rxmer_spectrum_build WHERE job_id=%s", (job_id,))
+        cursor.execute("DELETE FROM rxmer_modem_aggregate WHERE job_id=%s", (job_id,))
+        cursor.execute(
+            """
+            UPDATE rxmer_target_channel c
+            JOIN rxmer_job_target t ON t.id=c.target_id
+            SET c.successful_attempt_id=NULL
+            WHERE t.job_id=%s
+            """,
+            (job_id,),
+        )
+        cursor.execute(
+            """
+            DELETE v FROM rxmer_vector v
+            JOIN rxmer_capture_attempt a ON a.id=v.capture_attempt_id
+            JOIN rxmer_target_channel c ON c.id=a.channel_target_id
+            JOIN rxmer_job_target t ON t.id=c.target_id
+            WHERE t.job_id=%s
+            """,
+            (job_id,),
+        )
+        cursor.execute("DELETE FROM rxmer_channel_result WHERE job_id=%s", (job_id,))
+        cursor.execute(
+            """
+            DELETE a FROM rxmer_capture_attempt a
+            JOIN rxmer_target_channel c ON c.id=a.channel_target_id
+            JOIN rxmer_job_target t ON t.id=c.target_id
+            WHERE t.job_id=%s
+            """,
+            (job_id,),
+        )
+        cursor.execute(
+            """
+            DELETE c FROM rxmer_target_channel c
+            JOIN rxmer_job_target t ON t.id=c.target_id
+            WHERE t.job_id=%s
+            """,
+            (job_id,),
+        )
+
+    def clear_job_results(self, public_id: str) -> dict[str, Any]:
+        """Delete collected data while retaining and resetting the inventory plan."""
+        self.ensure_schema()
+        now = self._now()
+        connection = self._connect(autocommit=False)
+        try:
+            with connection.cursor() as cursor:
+                job = self._lock_job_for_cleanup(cursor, public_id)
+                job_id = int(job["id"])
+                self._delete_result_rows(cursor, job_id)
+                cursor.execute(
+                    """
+                    UPDATE rxmer_job_target
+                    SET state='planned', completed_channels=0, failed_channels=0,
+                        attempt_count=0, next_attempt_at=NULL,
+                        last_cm_agent_id=NULL, error_class=NULL, error_text=NULL,
+                        started_at=NULL, finished_at=NULL, updated_at=%s
+                    WHERE job_id=%s
+                    """,
+                    (now, job_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE rxmer_job
+                    SET status='planned', aggregate_revision=aggregate_revision+1,
+                        targets_running=0, targets_succeeded=0, targets_partial=0,
+                        targets_failed=0, channels_succeeded=0, channels_failed=0,
+                        error_text=NULL, cancel_requested_at=NULL,
+                        lease_owner=NULL, lease_until=NULL,
+                        started_at=NULL, finished_at=NULL, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (now, job_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE rxmer_scope_lease
+                    SET active_job_id=NULL, lease_owner=NULL, lease_until=NULL,
+                        updated_at=%s
+                    WHERE scope_key='network-downstream-rxmer'
+                      AND active_job_id=%s
+                    """,
+                    (now, job_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        job = self.get_job(public_id)
+        if not job:
+            raise RuntimeError("reset RxMER job disappeared")
+        return job
+
+    def delete_job(self, public_id: str) -> None:
+        """Delete an inactive RxMER job and all analytics-owned rows."""
+        self.ensure_schema()
+        now = self._now()
+        connection = self._connect(autocommit=False)
+        try:
+            with connection.cursor() as cursor:
+                job = self._lock_job_for_cleanup(cursor, public_id)
+                job_id = int(job["id"])
+                cursor.execute(
+                    "SELECT COUNT(*) AS child_count FROM rxmer_job "
+                    "WHERE parent_job_id=%s",
+                    (job_id,),
+                )
+                child_count = int((cursor.fetchone() or {}).get("child_count") or 0)
+                if child_count:
+                    raise RuntimeError("RxMER job has child jobs and cannot be deleted")
+                self._delete_result_rows(cursor, job_id)
+                cursor.execute("DELETE FROM rxmer_job_target WHERE job_id=%s", (job_id,))
+                cursor.execute(
+                    """
+                    UPDATE rxmer_scope_lease
+                    SET active_job_id=NULL, lease_owner=NULL, lease_until=NULL,
+                        updated_at=%s
+                    WHERE scope_key='network-downstream-rxmer'
+                      AND active_job_id=%s
+                    """,
+                    (now, job_id),
+                )
+                cursor.execute("DELETE FROM rxmer_job WHERE id=%s", (job_id,))
+                if cursor.rowcount != 1:
+                    raise RuntimeError("RxMER job could not be deleted")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def request_spectrum_build(self, public_id: str) -> dict[str, Any]:
+        """Acquire a DB lease for post-processing persisted RxMER vectors."""
+        self.ensure_schema()
+        connection = self._connect(autocommit=False)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, status, aggregate_revision FROM rxmer_job "
+                    "WHERE public_id=%s FOR UPDATE",
+                    (public_id,),
+                )
+                job = cursor.fetchone()
+                if not job:
+                    raise KeyError(public_id)
+                job_status = str(job.get("status") or "")
+                if job_status in {"planned", "queued", "running", "cancelling"}:
+                    raise ValueError("spectrum materialization is available after collection stops")
+                job_id = int(job["id"])
+                revision = int(job.get("aggregate_revision") or 0)
+                cursor.execute(
+                    "SELECT source_revision, state, "
+                    "(lease_until > UTC_TIMESTAMP()) AS lease_active "
+                    "FROM rxmer_spectrum_build WHERE job_id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                existing = cursor.fetchone() or {}
+                current_revision = int(existing.get("source_revision") or -1)
+                existing_state = str(existing.get("state") or "")
+                if current_revision == revision and existing_state == "ready":
+                    connection.commit()
+                    return {
+                        "job_public_id": public_id,
+                        "state": "ready",
+                        "queued": False,
+                        "message": "Spectrum profile is already current",
+                    }
+                if (
+                    current_revision == revision
+                    and existing_state == "building"
+                    and bool(existing.get("lease_active"))
+                ):
+                    connection.commit()
+                    return {
+                        "job_public_id": public_id,
+                        "state": "building",
+                        "queued": False,
+                        "message": "Spectrum profile is already building",
+                    }
+
+                owner = f"rxmer-spectrum-{uuid.uuid4()}"
+                now = self._now()
+                cursor.execute(
+                    """
+                    INSERT INTO rxmer_spectrum_build
+                    (job_id, source_revision, state, lease_owner, lease_until,
+                     source_channels, source_modems, source_samples,
+                     frequency_start_hz, frequency_end_hz, point_count,
+                     error_text, created_at, updated_at)
+                    VALUES (%s, %s, 'building', %s,
+                            DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE),
+                            0, 0, 0, NULL, NULL, 0, NULL, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        source_revision=VALUES(source_revision), state='building',
+                        lease_owner=VALUES(lease_owner), lease_until=VALUES(lease_until),
+                        source_channels=0, source_modems=0, source_samples=0,
+                        frequency_start_hz=NULL, frequency_end_hz=NULL,
+                        point_count=0, error_text=NULL, updated_at=VALUES(updated_at)
+                    """,
+                    (job_id, revision, owner, now, now),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "job_public_id": public_id,
+            "state": "building",
+            "queued": True,
+            "message": "Spectrum post-processing queued",
+            "_job_id": job_id,
+            "_source_revision": revision,
+            "_lease_owner": owner,
+        }
+
+    def materialize_spectrum(self, job_id: int, source_revision: int, lease_owner: str) -> None:
+        """Build an exact 25 kHz rollup from stored vectors; never contacts modems."""
+        from pypnm.api.routes.rxmer_analytics.analytics import CODEC, decode_vector
+
+        connection = self._connect(autocommit=True)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS source_channels,
+                           COUNT(DISTINCT r.target_id) AS source_modems,
+                           COALESCE(SUM(r.sample_count), 0) AS source_samples,
+                           MIN(r.zero_frequency_hz +
+                               r.first_active_index * r.spacing_hz) AS start_hz,
+                           MAX(r.zero_frequency_hz +
+                               (r.first_active_index + r.sample_count - 1) *
+                               r.spacing_hz) AS end_hz
+                    FROM rxmer_channel_result r
+                    JOIN rxmer_target_channel c
+                      ON c.successful_attempt_id=r.capture_attempt_id
+                    WHERE r.job_id=%s
+                    """,
+                    (job_id,),
+                )
+                stats = cursor.fetchone() or {}
+            source_channels = int(stats.get("source_channels") or 0)
+            source_modems = int(stats.get("source_modems") or 0)
+            source_samples = int(stats.get("source_samples") or 0)
+            start_hz = int(stats.get("start_hz") or 0)
+            end_hz = int(stats.get("end_hz") or 0)
+
+            if source_channels == 0:
+                self._finish_empty_spectrum_build(
+                    job_id, source_revision, lease_owner,
+                )
+                return
+
+            grid_start_hz = (start_hz // _SPECTRUM_GRID_HZ) * _SPECTRUM_GRID_HZ
+            grid_end_hz = (
+                math.ceil(end_hz / _SPECTRUM_GRID_HZ) * _SPECTRUM_GRID_HZ
+            )
+            grid_points = ((grid_end_hz - grid_start_hz) // _SPECTRUM_GRID_HZ) + 1
+            if grid_points <= 0 or grid_points > _SPECTRUM_MAX_GRID_POINTS:
+                raise ValueError("RxMER spectrum frequency range exceeds the supported grid")
+
+            counts = np.zeros(grid_points, dtype=np.uint64)
+            sums = np.zeros(grid_points, dtype=np.uint64)
+            worst = np.full(grid_points, 255, dtype=np.uint16)
+            maximum = np.zeros(grid_points, dtype=np.uint8)
+            last_attempt_id = 0
+            processed_channels = 0
+            while True:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT r.capture_attempt_id, r.zero_frequency_hz,
+                               r.first_active_index, r.spacing_hz, r.sample_count,
+                               r.vector_sha256, v.codec, v.uncompressed_bytes,
+                               v.payload
+                        FROM rxmer_channel_result r
+                        JOIN rxmer_target_channel c
+                          ON c.successful_attempt_id=r.capture_attempt_id
+                        JOIN rxmer_vector v
+                          ON v.capture_attempt_id=r.capture_attempt_id
+                        WHERE r.job_id=%s AND r.capture_attempt_id>%s
+                        ORDER BY r.capture_attempt_id ASC LIMIT 250
+                        """,
+                        (job_id, last_attempt_id),
+                    )
+                    rows = list(cursor.fetchall())
+                if not rows:
+                    break
+                for row in rows:
+                    if str(row.get("codec") or "") != CODEC:
+                        raise ValueError("unsupported persisted RxMER vector codec")
+                    sample_count = int(row["sample_count"])
+                    vector = decode_vector(
+                        bytes(row["payload"]),
+                        expected_sha256=bytes(row["vector_sha256"]),
+                        expected_size=sample_count,
+                    )
+                    spacing_hz = int(row["spacing_hz"])
+                    first_frequency_hz = int(row["zero_frequency_hz"]) + (
+                        int(row["first_active_index"]) * spacing_hz
+                    )
+                    if (
+                        spacing_hz <= 0
+                        or spacing_hz % _SPECTRUM_GRID_HZ != 0
+                        or (first_frequency_hz - grid_start_hz) % _SPECTRUM_GRID_HZ != 0
+                    ):
+                        raise ValueError("RxMER vector is not aligned to the 25 kHz spectrum grid")
+                    start_index = (first_frequency_hz - grid_start_hz) // _SPECTRUM_GRID_HZ
+                    stride = spacing_hz // _SPECTRUM_GRID_HZ
+                    stop_index = start_index + stride * sample_count
+                    if start_index < 0 or stop_index > grid_points + stride - 1:
+                        raise ValueError("RxMER vector exceeds the calculated spectrum grid")
+                    positions = slice(start_index, stop_index, stride)
+                    values = np.frombuffer(vector, dtype=np.uint8)
+                    count_view = counts[positions]
+                    sum_view = sums[positions]
+                    worst_view = worst[positions]
+                    maximum_view = maximum[positions]
+                    count_view += 1
+                    sum_view += values.astype(np.uint64)
+                    np.minimum(worst_view, values, out=worst_view)
+                    np.maximum(maximum_view, values, out=maximum_view)
+                    last_attempt_id = int(row["capture_attempt_id"])
+                    processed_channels += 1
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE rxmer_spectrum_build SET lease_until="
+                        "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE), updated_at=%s "
+                        "WHERE job_id=%s AND source_revision=%s AND lease_owner=%s",
+                        (self._now(), job_id, source_revision, lease_owner),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("RxMER spectrum build lease was lost")
+
+            if processed_channels != source_channels:
+                raise ValueError("one or more successful RxMER vectors are missing")
+            occupied = np.flatnonzero(counts)
+            rows_to_insert = [
+                (
+                    job_id,
+                    source_revision,
+                    grid_start_hz + int(index) * _SPECTRUM_GRID_HZ,
+                    int(counts[index]),
+                    int(sums[index]),
+                    int(worst[index]),
+                    int(maximum[index]),
+                )
+                for index in occupied
+            ]
+            write_connection = self._connect(autocommit=False)
+            try:
+                with write_connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM rxmer_spectrum_bin WHERE job_id=%s "
+                        "AND source_revision=%s",
+                        (job_id, source_revision),
+                    )
+                    insert_sql = (
+                        "INSERT INTO rxmer_spectrum_bin "
+                        "(job_id, source_revision, frequency_hz, sample_count, "
+                        "sum_qdb, worst_qdb, max_qdb) VALUES "
+                        "(%s, %s, %s, %s, %s, %s, %s)"
+                    )
+                    for offset in range(0, len(rows_to_insert), 1000):
+                        cursor.executemany(insert_sql, rows_to_insert[offset:offset + 1000])
+                    cursor.execute(
+                        """
+                        UPDATE rxmer_spectrum_build
+                        SET state='ready', lease_owner=NULL, lease_until=NULL,
+                            source_channels=%s, source_modems=%s, source_samples=%s,
+                            frequency_start_hz=%s, frequency_end_hz=%s,
+                            point_count=%s, error_text=NULL, updated_at=%s
+                        WHERE job_id=%s AND source_revision=%s AND lease_owner=%s
+                        """,
+                        (
+                            source_channels,
+                            source_modems,
+                            source_samples,
+                            start_hz,
+                            end_hz,
+                            len(rows_to_insert),
+                            self._now(),
+                            job_id,
+                            source_revision,
+                            lease_owner,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("RxMER spectrum build lease was lost")
+                    cursor.execute(
+                        "DELETE FROM rxmer_spectrum_bin WHERE job_id=%s "
+                        "AND source_revision<>%s",
+                        (job_id, source_revision),
+                    )
+                write_connection.commit()
+            except Exception:
+                write_connection.rollback()
+                raise
+            finally:
+                write_connection.close()
+        except Exception as exc:
+            self._execute(
+                "UPDATE rxmer_spectrum_build SET state='failed', lease_owner=NULL, "
+                "lease_until=NULL, error_text=%s, updated_at=%s "
+                "WHERE job_id=%s AND source_revision=%s AND lease_owner=%s",
+                (str(exc)[:2000], self._now(), job_id, source_revision, lease_owner),
+            )
+        finally:
+            connection.close()
+
+    def _finish_empty_spectrum_build(
+        self, job_id: int, source_revision: int, lease_owner: str,
+    ) -> None:
+        connection = self._connect(autocommit=False)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM rxmer_spectrum_bin WHERE job_id=%s",
+                    (job_id,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE rxmer_spectrum_build
+                    SET state='ready', lease_owner=NULL, lease_until=NULL,
+                        source_channels=0, source_modems=0, source_samples=0,
+                        frequency_start_hz=NULL, frequency_end_hz=NULL,
+                        point_count=0, error_text=NULL, updated_at=%s
+                    WHERE job_id=%s AND source_revision=%s AND lease_owner=%s
+                    """,
+                    (self._now(), job_id, source_revision, lease_owner),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("RxMER spectrum build lease was lost")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_spectrum(self, public_id: str, *, max_points: int = 1600) -> dict[str, Any]:
+        """Return a bounded spectrum profile from a previously materialized rollup."""
+        self.ensure_schema()
+        jobs = self._query(
+            "SELECT id, aggregate_revision FROM rxmer_job WHERE public_id=%s LIMIT 1",
+            (public_id,),
+        )
+        if not jobs:
+            raise KeyError(public_id)
+        job_id = int(jobs[0]["id"])
+        source_revision = int(jobs[0].get("aggregate_revision") or 0)
+        builds = self._query(
+            "SELECT * FROM rxmer_spectrum_build WHERE job_id=%s LIMIT 1",
+            (job_id,),
+        )
+        base: dict[str, Any] = {
+            "job_public_id": public_id,
+            "state": "missing",
+            "source_revision": source_revision,
+            "source_channels": 0,
+            "source_modems": 0,
+            "source_samples": 0,
+            "frequency_start_hz": None,
+            "frequency_end_hz": None,
+            "bin_width_hz": None,
+            "points": [],
+            "channel_spans": [],
+            "span_groups_omitted": 0,
+        }
+        if not builds:
+            base["message"] = "Spectrum profile has not been materialized"
+            return base
+        build = builds[0]
+        build_revision = int(build.get("source_revision") or 0)
+        if build_revision != source_revision:
+            base["state"] = "stale"
+            base["message"] = "New channel results require spectrum rebuilding"
+            return base
+        state = str(build.get("state") or "missing")
+        base.update(
+            {
+                "state": state,
+                "source_channels": int(build.get("source_channels") or 0),
+                "source_modems": int(build.get("source_modems") or 0),
+                "source_samples": int(build.get("source_samples") or 0),
+                "frequency_start_hz": (
+                    int(build["frequency_start_hz"])
+                    if build.get("frequency_start_hz") is not None else None
+                ),
+                "frequency_end_hz": (
+                    int(build["frequency_end_hz"])
+                    if build.get("frequency_end_hz") is not None else None
+                ),
+            }
+        )
+        if state == "failed":
+            base["message"] = str(build.get("error_text") or "Spectrum build failed")
+            return base
+        if state != "ready":
+            base["message"] = "Spectrum profile is building"
+            return base
+        if int(build.get("point_count") or 0) == 0:
+            base["message"] = "No successful channel vectors are available"
+            return base
+
+        safe_max_points = max(200, min(int(max_points), 4000))
+        start_hz = int(build["frequency_start_hz"])
+        end_hz = int(build["frequency_end_hz"])
+        raw_width = max(1, math.ceil((end_hz - start_hz) / max(safe_max_points - 1, 1)))
+        bin_width_hz = max(
+            _SPECTRUM_GRID_HZ,
+            math.ceil(raw_width / _SPECTRUM_GRID_HZ) * _SPECTRUM_GRID_HZ,
+        )
+        grouped_rows = self._query(
+            """
+            SELECT (%s + FLOOR((frequency_hz - %s) / %s) * %s)
+                       AS bucket_frequency_hz,
+                   SUM(sample_count) AS sample_count,
+                   SUM(sum_qdb) AS sum_qdb,
+                   MIN(worst_qdb) AS worst_qdb,
+                   MAX(max_qdb) AS max_qdb
+            FROM rxmer_spectrum_bin
+            WHERE job_id=%s AND source_revision=%s
+            GROUP BY bucket_frequency_hz ORDER BY bucket_frequency_hz
+            """,
+            (start_hz, start_hz, bin_width_hz, bin_width_hz, job_id, source_revision),
+        )
+        grouped = {int(row["bucket_frequency_hz"]): row for row in grouped_rows}
+        lattice_end_hz = start_hz + ((end_hz - start_hz) // bin_width_hz) * bin_width_hz
+        points: list[dict[str, Any]] = []
+        for frequency_hz in range(start_hz, lattice_end_hz + 1, bin_width_hz):
+            row = grouped.get(frequency_hz)
+            if not row:
+                points.append(
+                    {
+                        "frequency_hz": frequency_hz,
+                        "average_db": None,
+                        "max_db": None,
+                        "worst_db": None,
+                        "sample_count": 0,
+                    }
+                )
+                continue
+            sample_count = int(row["sample_count"])
+            points.append(
+                {
+                    "frequency_hz": frequency_hz,
+                    "average_db": round(int(row["sum_qdb"]) / (4.0 * sample_count), 3),
+                    "max_db": round(int(row["max_qdb"]) / 4.0, 3),
+                    "worst_db": round(int(row["worst_qdb"]) / 4.0, 3),
+                    "sample_count": sample_count,
+                }
+            )
+
+        span_count_rows = self._query(
+            """
+            SELECT COUNT(*) AS span_count FROM (
+                SELECT r.channel_id,
+                       (r.zero_frequency_hz + r.first_active_index * r.spacing_hz),
+                       (r.zero_frequency_hz +
+                        (r.first_active_index + r.sample_count - 1) * r.spacing_hz),
+                       r.spacing_hz
+                FROM rxmer_channel_result r
+                JOIN rxmer_target_channel c
+                  ON c.successful_attempt_id=r.capture_attempt_id
+                WHERE r.job_id=%s
+                GROUP BY r.channel_id,
+                         (r.zero_frequency_hz + r.first_active_index * r.spacing_hz),
+                         (r.zero_frequency_hz +
+                          (r.first_active_index + r.sample_count - 1) * r.spacing_hz),
+                         r.spacing_hz
+            ) grouped_spans
+            """,
+            (job_id,),
+        )
+        total_span_groups = int(span_count_rows[0].get("span_count") or 0)
+        span_rows = self._query(
+            """
+            SELECT r.channel_id,
+                   (r.zero_frequency_hz + r.first_active_index * r.spacing_hz)
+                       AS start_frequency_hz,
+                   (r.zero_frequency_hz +
+                    (r.first_active_index + r.sample_count - 1) * r.spacing_hz)
+                       AS end_frequency_hz,
+                   r.spacing_hz, COUNT(DISTINCT r.target_id) AS modem_count
+            FROM rxmer_channel_result r
+            JOIN rxmer_target_channel c
+              ON c.successful_attempt_id=r.capture_attempt_id
+            WHERE r.job_id=%s
+            GROUP BY r.channel_id, start_frequency_hz, end_frequency_hz, r.spacing_hz
+            ORDER BY modem_count DESC, start_frequency_hz, r.channel_id
+            LIMIT 64
+            """,
+            (job_id,),
+        )
+        base.update(
+            {
+                "bin_width_hz": bin_width_hz,
+                "points": points,
+                "channel_spans": [
+                    {
+                        "channel_id": int(row["channel_id"]),
+                        "start_frequency_hz": int(row["start_frequency_hz"]),
+                        "end_frequency_hz": int(row["end_frequency_hz"]),
+                        "spacing_hz": int(row["spacing_hz"]),
+                        "modem_count": int(row["modem_count"]),
+                    }
+                    for row in span_rows
+                ],
+                "span_groups_omitted": max(0, total_span_groups - len(span_rows)),
+                "message": "Spectrum profile ready",
+            }
+        )
+        return base
 
 
 rxmer_analytics_service = RxMerAnalyticsService()

@@ -33,8 +33,8 @@ class RxMerCollectionWorker:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
 
-    async def start(self, public_id: str, max_concurrency: int = 2) -> dict[str, Any]:
-        concurrency = max(1, min(int(max_concurrency), 2))
+    async def start(self, public_id: str, max_concurrency: int = 10) -> dict[str, Any]:
+        concurrency = max(1, min(int(max_concurrency), 20))
         lease_owner = f"rxmer-worker-{uuid.uuid4()}"
         async with self._task_lock:
             current = self._tasks.get(public_id)
@@ -79,32 +79,50 @@ class RxMerCollectionWorker:
                 self._heartbeat(job_id, lease_owner),
                 name=f"rxmer-heartbeat-{public_id}",
             )
-            while not await asyncio.to_thread(
-                rxmer_analytics_service.job_cancel_requested,
-                job_id,
-            ):
+            active_targets: set[asyncio.Task[None]] = set()
+            while True:
                 if heartbeat.done():
                     heartbeat.result()
-                targets = await asyncio.to_thread(
-                    rxmer_analytics_service.claim_targets,
+                cancelling = await asyncio.to_thread(
+                    rxmer_analytics_service.job_cancel_requested,
                     job_id,
-                    max_concurrency,
                 )
-                if not targets:
+                while not cancelling and len(active_targets) < max_concurrency:
+                    targets = await asyncio.to_thread(
+                        rxmer_analytics_service.claim_targets,
+                        job_id,
+                        max_concurrency - len(active_targets),
+                    )
+                    if not targets:
+                        break
+                    for target in targets:
+                        target_id = int(target["id"])
+                        active_targets.add(
+                            asyncio.create_task(
+                                self._process_target(job_id, target),
+                                name=f"rxmer-target-{target_id}",
+                            )
+                        )
+                if not active_targets:
                     break
                 await asyncio.to_thread(
                     rxmer_analytics_service.refresh_job_progress,
                     job_id,
                 )
-                await asyncio.gather(
-                    *(self._process_target(job_id, target) for target in targets)
+                done, active_targets = await asyncio.wait(
+                    active_targets,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                if heartbeat.done():
-                    heartbeat.result()
+                for completed in done:
+                    completed.result()
                 await asyncio.to_thread(
                     rxmer_analytics_service.refresh_job_progress,
                     job_id,
                 )
+                if cancelling:
+                    await asyncio.gather(*active_targets)
+                    active_targets.clear()
+                    break
 
             await asyncio.to_thread(
                 rxmer_analytics_service.finish_job,

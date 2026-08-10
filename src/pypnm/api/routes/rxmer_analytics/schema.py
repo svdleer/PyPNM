@@ -122,11 +122,58 @@ class RxMerAggregateResponse(BaseModel):
     bucket_db: float
 
 
+class RxMerSpectrumPoint(BaseModel):
+    frequency_hz: int
+    average_db: float | None = None
+    max_db: float | None = None
+    worst_db: float | None = None
+    sample_count: int
+
+
+class RxMerChannelSpan(BaseModel):
+    channel_id: int
+    start_frequency_hz: int
+    end_frequency_hz: int
+    spacing_hz: int
+    modem_count: int
+
+
+class RxMerSpectrumResponse(BaseModel):
+    status: str = "success"
+    job_public_id: str
+    state: str
+    message: str | None = None
+    source_revision: int = 0
+    source_channels: int = 0
+    source_modems: int = 0
+    source_samples: int = 0
+    frequency_start_hz: int | None = None
+    frequency_end_hz: int | None = None
+    bin_width_hz: int | None = None
+    points: list[RxMerSpectrumPoint] = Field(default_factory=list, max_length=4000)
+    channel_spans: list[RxMerChannelSpan] = Field(default_factory=list, max_length=64)
+    span_groups_omitted: int = 0
+
+
+class RxMerSpectrumBuildResponse(BaseModel):
+    status: str = "success"
+    job_public_id: str
+    state: str
+    queued: bool = False
+    message: str | None = None
+
+
 class RxMerJobStartRequest(BaseModel):
-    max_concurrency: int = Field(default=2, ge=1, le=2)
+    max_concurrency: int = Field(default=10, ge=1, le=20)
 
 
 class RxMerJobActionResponse(BaseModel):
     status: str = "success"
     job: RxMerJob
     message: str | None = None
+
+
+class RxMerDeleteResponse(BaseModel):
+    status: str = "success"
+    job_public_id: str
+    message: str
