@@ -59,6 +59,13 @@ class PollerService:
         except (TypeError, ValueError):
             return 50000
 
+    @staticmethod
+    def _db_timeout_seconds(name: str, default: int) -> int:
+        try:
+            return max(10, min(int(os.environ.get(name, str(default))), 600))
+        except (TypeError, ValueError):
+            return default
+
     def _connect(self):
         return pymysql.connect(
             host=os.environ.get("DATA_DB_HOST") or os.environ.get("AUTH_DB_HOST", "127.0.0.1"),
@@ -69,8 +76,8 @@ class PollerService:
             autocommit=True,
             cursorclass=pymysql.cursors.DictCursor,
             connect_timeout=10,
-            read_timeout=30,
-            write_timeout=30,
+            read_timeout=self._db_timeout_seconds("DATA_DB_READ_TIMEOUT_SEC", 120),
+            write_timeout=self._db_timeout_seconds("DATA_DB_WRITE_TIMEOUT_SEC", 120),
         )
 
     def _get_conn(self):
