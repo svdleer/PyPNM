@@ -469,7 +469,7 @@ class RxMerAnalyticsService:
                     raise RuntimeError("idempotent RxMER plan disappeared")
                 return job, True
 
-        from pypnm.api.routes.topology.service import topology_service
+        from pypnm.api.routes.topology.service import normalize_bare_mac, topology_service
 
         connection = self._connect(autocommit=False)
         try:
@@ -504,28 +504,27 @@ class RxMerAnalyticsService:
                     where_parts.append(f"i.cmts IN ({placeholders})")
                     where_params.extend(cmts_names)
                 where_sql = " AND ".join(where_parts)
+                candidate_where_parts = list(where_parts)
+                candidate_where_params = list(where_params)
+                if scope_type == "cmts":
+                    candidate_where_parts = candidate_where_parts[:-1]
+                    candidate_where_params = candidate_where_params[:-len(cmts_names)]
+                candidate_where_sql = " AND ".join(candidate_where_parts)
 
-                cursor.execute(
-                    f"SELECT DATE_FORMAT(MAX(i.updated_at), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS revision "
-                    f"FROM modem_inventory_current AS i WHERE {where_sql}",
-                    tuple(where_params),
-                )
-                revision_row = cursor.fetchone() or {}
-                inventory_revision = revision_row.get("revision")
-
+                # Reserve the idempotency key before the potentially long
+                # snapshot preparation so duplicate requests cannot repeat it.
                 cursor.execute(
                     """
                     INSERT INTO rxmer_job
                     (public_id, trigger_type, status, scope_hash, scope_json,
                      inventory_revision, idempotency_key, requested_by,
                      raw_retention_days, aggregate_retention_days, created_at, updated_at)
-                    VALUES (%s, 'plan', 'planned', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, 'plan', 'planned', %s, %s, NULL, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         public_id,
                         scope_hash,
                         scope_json,
-                        inventory_revision,
                         idempotency_key,
                         requested_by,
                         int(payload.get("raw_retention_days") or 7),
@@ -536,10 +535,6 @@ class RxMerAnalyticsService:
                 )
                 job_id = int(cursor.lastrowid)
 
-                # Stage the latest topology mapping in bounded batches. The
-                # connection-local table works even when topology and inventory
-                # use different database servers, without rebuilding a multi-
-                # million-entry Python dictionary.
                 cursor.execute(
                     """
                     CREATE TEMPORARY TABLE rxmer_plan_topology (
@@ -548,20 +543,115 @@ class RxMerAnalyticsService:
                     ) ENGINE=InnoDB
                     """
                 )
-                with topology_service.storage.stream_latest_fiber_nodes() as (
-                    topology_snapshot_date,
-                    topology_batches,
+
+                # Prefer indexed point lookups against a completed normalized
+                # topology map. This keeps CMTS-scoped plans proportional to
+                # their eligible inventory instead of every topology modem.
+                inventory_revision: str | None = None
+                topology_snapshot_date: str | None = None
+                indexed_topology = False
+                with topology_service.storage.latest_fiber_node_map_lookup() as (
+                    map_snapshot_date,
+                    topology_lookup,
                 ):
-                    for topology_batch in topology_batches:
-                        cursor.executemany(
-                            """
-                            INSERT INTO rxmer_plan_topology (bare_mac, fiber_node)
-                            VALUES (%s, %s)
-                            ON DUPLICATE KEY UPDATE
-                                fiber_node=LEAST(fiber_node, VALUES(fiber_node))
-                            """,
-                            topology_batch,
+                    topology_snapshot_date = map_snapshot_date
+                    indexed_topology = topology_lookup is not None
+                    if topology_lookup is not None:
+                        try:
+                            lookup_batch_size = max(
+                                100,
+                                min(
+                                    int(os.environ.get("RXMER_PLAN_LOOKUP_BATCH_SIZE", "2000")),
+                                    5000,
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            lookup_batch_size = 2000
+                        latest_updated_at: datetime | None = None
+                        candidate_scopes: list[str | None] = (
+                            list(cmts_names) if scope_type == "cmts" else [None]
                         )
+                        for candidate_cmts in candidate_scopes:
+                            last_mac = ""
+                            while True:
+                                scoped_where_sql = candidate_where_sql
+                                scoped_params: list[Any] = list(candidate_where_params)
+                                if candidate_cmts is not None:
+                                    scoped_where_sql += " AND i.cmts=%s"
+                                    scoped_params.append(candidate_cmts)
+                                cursor.execute(
+                                    f"""
+                                    SELECT i.mac, i.updated_at
+                                    FROM modem_inventory_current AS i
+                                    WHERE {scoped_where_sql} AND i.mac>%s
+                                    ORDER BY i.mac ASC LIMIT %s
+                                    """,
+                                    (*scoped_params, last_mac, lookup_batch_size),
+                                )
+                                candidate_rows = list(cursor.fetchall())
+                                if not candidate_rows:
+                                    break
+                                last_mac = str(candidate_rows[-1]["mac"])
+                                bare_macs: list[str] = []
+                                for candidate in candidate_rows:
+                                    bare_mac = normalize_bare_mac(candidate.get("mac"))
+                                    if bare_mac:
+                                        bare_macs.append(bare_mac)
+                                    updated_at = candidate.get("updated_at")
+                                    if isinstance(updated_at, datetime) and (
+                                        latest_updated_at is None
+                                        or updated_at > latest_updated_at
+                                    ):
+                                        latest_updated_at = updated_at
+                                topology_rows = topology_lookup(bare_macs)
+                                if topology_rows:
+                                    cursor.executemany(
+                                        """
+                                        INSERT INTO rxmer_plan_topology
+                                            (bare_mac, fiber_node)
+                                        VALUES (%s, %s)
+                                        ON DUPLICATE KEY UPDATE
+                                            fiber_node=LEAST(
+                                                fiber_node, VALUES(fiber_node)
+                                            )
+                                        """,
+                                        topology_rows,
+                                    )
+                        if latest_updated_at is not None:
+                            inventory_revision = latest_updated_at.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            )
+
+                if not indexed_topology:
+                    # Compatibility path until the explicit existing-data map
+                    # backfill has completed. It preserves topology precedence
+                    # without making deployment run a blocking large migration.
+                    cursor.execute(
+                        f"SELECT DATE_FORMAT(MAX(i.updated_at), "
+                        f"'%%Y-%%m-%%dT%%H:%%i:%%sZ') AS revision "
+                        f"FROM modem_inventory_current AS i WHERE {where_sql}",
+                        tuple(where_params),
+                    )
+                    revision_row = cursor.fetchone() or {}
+                    inventory_revision = revision_row.get("revision")
+                    with topology_service.storage.stream_latest_fiber_nodes() as (
+                        fallback_snapshot_date,
+                        topology_batches,
+                    ):
+                        topology_snapshot_date = fallback_snapshot_date
+                        for topology_batch in topology_batches:
+                            cursor.executemany(
+                                """
+                                INSERT INTO rxmer_plan_topology
+                                    (bare_mac, fiber_node)
+                                VALUES (%s, %s)
+                                ON DUPLICATE KEY UPDATE
+                                    fiber_node=LEAST(
+                                        fiber_node, VALUES(fiber_node)
+                                    )
+                                """,
+                                topology_batch,
+                            )
 
                 # Materialize the immutable target set inside MySQL. Latest
                 # topology takes precedence; persisted inventory remains the
@@ -597,8 +687,9 @@ class RxMerAnalyticsService:
                         (job_id, topology_snapshot_date, now),
                     )
                 cursor.execute(
-                    "UPDATE rxmer_job SET targets_total=%s, updated_at=%s WHERE id=%s",
-                    (target_count, now, job_id),
+                    "UPDATE rxmer_job SET targets_total=%s, inventory_revision=%s, "
+                    "updated_at=%s WHERE id=%s",
+                    (target_count, inventory_revision, now, job_id),
                 )
             connection.commit()
         except Exception:

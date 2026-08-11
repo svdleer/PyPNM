@@ -16,6 +16,14 @@ from typing import Any, Iterator
 from pypnm.lib.mac_address import MacAddress, MacAddressFormat
 
 
+def normalize_bare_mac(value: object) -> str | None:
+    """Return a canonical 12-character lowercase hexadecimal MAC."""
+    bare = re.sub(r"[:.\-]", "", str(value or "").strip()).lower()
+    if len(bare) != 12 or re.fullmatch(r"[0-9a-f]{12}", bare) is None:
+        return None
+    return bare
+
+
 # ---------------------------------------------------------------------------
 # Background import job state
 # ---------------------------------------------------------------------------
@@ -214,6 +222,35 @@ class TopologyStorage:
                     KEY idx_modems_snapshot_postal_house (snapshot_id, postalcode, house_number),
                     KEY idx_modems_snapshot_match (snapshot_id, link_match),
                     CONSTRAINT fk_topology_modems_snapshot FOREIGN KEY (snapshot_id) REFERENCES topology_snapshots(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS topology_fiber_node_map (
+                    snapshot_id BIGINT NOT NULL,
+                    bare_mac CHAR(12) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    fiber_node VARCHAR(128) NOT NULL,
+                    PRIMARY KEY (snapshot_id, bare_mac),
+                    KEY idx_topology_fiber_map_mac (bare_mac, snapshot_id),
+                    CONSTRAINT fk_topology_fiber_map_snapshot
+                        FOREIGN KEY (snapshot_id) REFERENCES topology_snapshots(id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS topology_fiber_node_map_state (
+                    snapshot_id BIGINT PRIMARY KEY,
+                    state VARCHAR(16) NOT NULL,
+                    row_count BIGINT NOT NULL DEFAULT 0,
+                    updated_at DATETIME NOT NULL,
+                    CONSTRAINT fk_topology_fiber_map_state_snapshot
+                        FOREIGN KEY (snapshot_id) REFERENCES topology_snapshots(id)
+                        ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
@@ -1075,6 +1112,12 @@ class TopologyStorage:
             _upd("connecting to database", 2)
             conn = self._connect()
             cur = conn.cursor()
+            cur.execute(
+                "SELECT GET_LOCK('pypnm_topology_fiber_map_backfill', 0) AS acquired"
+            )
+            if int((cur.fetchone() or {}).get("acquired") or 0) != 1:
+                conn.close()
+                raise RuntimeError("topology import/backfill is already running")
 
             _upd("upserting snapshot record", 4)
             cur.execute(
@@ -1119,6 +1162,7 @@ class TopologyStorage:
             cur.execute("DELETE FROM topology_edges WHERE snapshot_id=%s", (snapshot_id,))
             cur.execute("DELETE FROM topology_modems WHERE snapshot_id=%s", (snapshot_id,))
             cur.execute("DELETE FROM topology_nodes WHERE snapshot_id=%s", (snapshot_id,))
+            self.begin_fiber_node_map(cur, snapshot_id, now)
 
             # --- nodes (batch 500, sleep between batches) ---
             nodes = payload.get("topology_nodes") or []
@@ -1185,6 +1229,16 @@ class TopologyStorage:
                 )
                 for m in modems
             ]
+            fiber_map_rows = [
+                (
+                    snapshot_id,
+                    bare_mac,
+                    str(m.get("fibernode") or "").strip()[:128],
+                )
+                for m in modems
+                if (bare_mac := normalize_bare_mac(m.get("mac")))
+                and str(m.get("fibernode") or "").strip()
+            ]
             total_modems = len(modem_rows)
             _batch = 1000
             for i in range(0, total_modems, _batch):
@@ -1192,6 +1246,8 @@ class TopologyStorage:
                 pct = 63 + int((i + _batch) / max(total_modems, 1) * 20)
                 _upd(f"inserting modems ({min(i + _batch, total_modems)}/{total_modems})", pct)
                 time.sleep(0.02)
+            for i in range(0, len(fiber_map_rows), _batch):
+                self.insert_fiber_node_map_rows(cur, fiber_map_rows[i : i + _batch])
 
             # --- hierarchy (batch 2000) ---
             hierarchy = payload.get("hierarchy_records") or []
@@ -1222,6 +1278,7 @@ class TopologyStorage:
                 time.sleep(0.02)
 
             _upd("finalising", 97)
+            self.publish_fiber_node_map(cur, snapshot_id, now)
             conn.close()
             return snapshot_id
 
@@ -1377,6 +1434,137 @@ class TopologyStorage:
                     "node_type_counts": node_type_counts,
                 },
             }
+
+    @staticmethod
+    def begin_fiber_node_map(cursor: Any, snapshot_id: int, now: str) -> None:
+        """Mark one snapshot map incomplete before replacing its rows."""
+        cursor.execute(
+            "DELETE FROM topology_fiber_node_map WHERE snapshot_id=%s",
+            (snapshot_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO topology_fiber_node_map_state
+                (snapshot_id, state, row_count, updated_at)
+            VALUES (%s, 'building', 0, %s)
+            ON DUPLICATE KEY UPDATE state='building', row_count=0,
+                updated_at=VALUES(updated_at)
+            """,
+            (snapshot_id, now),
+        )
+
+    @staticmethod
+    def insert_fiber_node_map_rows(cursor: Any, rows: list[tuple[int, str, str]]) -> None:
+        """Insert deterministic normalized topology mappings in bounded batches."""
+        if not rows:
+            return
+        cursor.executemany(
+            """
+            INSERT INTO topology_fiber_node_map
+                (snapshot_id, bare_mac, fiber_node)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                fiber_node=LEAST(fiber_node, VALUES(fiber_node))
+            """,
+            rows,
+        )
+
+    @staticmethod
+    def publish_fiber_node_map(cursor: Any, snapshot_id: int, now: str) -> None:
+        """Atomically expose a completely populated snapshot mapping."""
+        cursor.execute(
+            """
+            UPDATE topology_fiber_node_map_state
+            SET state='complete',
+                row_count=(SELECT COUNT(*) FROM topology_fiber_node_map
+                           WHERE snapshot_id=%s),
+                updated_at=%s
+            WHERE snapshot_id=%s
+            """,
+            (snapshot_id, now, snapshot_id),
+        )
+
+    @contextmanager
+    def latest_fiber_node_map_lookup(
+        self,
+    ) -> Iterator[tuple[str | None, Any]]:
+        """Pin the latest snapshot and expose indexed lookups when its map is complete."""
+        with self._db_lock:
+            conn = self._connect()
+            conn.autocommit(False)
+            try:
+                conn.begin()
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT id, snapshot_date FROM topology_snapshots "
+                        "ORDER BY snapshot_date DESC LIMIT 1"
+                    )
+                    latest_snapshot = cursor.fetchone() or {}
+                    latest_date = str(latest_snapshot.get("snapshot_date") or "") or None
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS table_count
+                        FROM information_schema.TABLES
+                        WHERE TABLE_SCHEMA=DATABASE()
+                          AND TABLE_NAME IN (
+                              'topology_fiber_node_map',
+                              'topology_fiber_node_map_state'
+                          )
+                        """
+                    )
+                    table_count = int((cursor.fetchone() or {}).get("table_count") or 0)
+                    if table_count != 2:
+                        yield latest_date, None
+                        return
+                    cursor.execute(
+                        """
+                        SELECT s.id, s.snapshot_date
+                        FROM topology_snapshots AS s
+                        JOIN topology_fiber_node_map_state AS m
+                          ON m.snapshot_id=s.id AND m.state='complete'
+                        ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
+                        """
+                    )
+                    snapshot = cursor.fetchone() or {}
+                    snapshot_id = int(snapshot.get("id") or 0)
+                    snapshot_date = str(snapshot.get("snapshot_date") or "") or None
+                    if snapshot_id <= 0:
+                        yield latest_date, None
+                        return
+
+                def lookup(bare_macs: list[str]) -> list[tuple[str, str]]:
+                    clean = sorted(
+                        {
+                            value
+                            for value in bare_macs
+                            if normalize_bare_mac(value) == value
+                        }
+                    )
+                    if not clean:
+                        return []
+                    placeholders = ",".join(["%s"] * len(clean))
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT bare_mac, fiber_node "
+                            "FROM topology_fiber_node_map "
+                            f"WHERE snapshot_id=%s AND bare_mac IN ({placeholders})",
+                            (snapshot_id, *clean),
+                        )
+                        return [
+                            (
+                                str(row.get("bare_mac") or ""),
+                                str(row.get("fiber_node") or "").strip()[:128],
+                            )
+                            for row in (cursor.fetchall() or [])
+                            if row.get("bare_mac") and row.get("fiber_node")
+                        ]
+
+                yield snapshot_date, lookup
+            finally:
+                try:
+                    conn.rollback()
+                finally:
+                    conn.close()
 
     @contextmanager
     def stream_latest_fiber_nodes(
@@ -1637,6 +1825,12 @@ class TopologyService:
         _upd("connecting database", 4)
         conn = self.storage._connect()
         cur = conn.cursor()
+        cur.execute(
+            "SELECT GET_LOCK('pypnm_topology_fiber_map_backfill', 0) AS acquired"
+        )
+        if int((cur.fetchone() or {}).get("acquired") or 0) != 1:
+            conn.close()
+            raise RuntimeError("topology import/backfill is already running")
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         cur.execute(
@@ -1676,6 +1870,7 @@ class TopologyService:
         cur.execute("DELETE FROM topology_edges WHERE snapshot_id=%s", (snapshot_id,))
         cur.execute("DELETE FROM topology_modems WHERE snapshot_id=%s", (snapshot_id,))
         cur.execute("DELETE FROM topology_nodes WHERE snapshot_id=%s", (snapshot_id,))
+        self.storage.begin_fiber_node_map(cur, snapshot_id, now)
 
         node_sql = (
             "INSERT IGNORE INTO topology_nodes "
@@ -1738,6 +1933,7 @@ class TopologyService:
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, 0)"
         )
         modems_buf: list[tuple[Any, ...]] = []
+        fiber_map_buf: list[tuple[int, str, str]] = []
         modem_rows = 0
         _upd("streaming modem rows", 58)
         for r in self._iter_csv_rows(modemlocation_file):
@@ -1745,6 +1941,9 @@ class TopologyService:
             address2_raw = r.get("ADDRESS2", "")
             locality = r.get("LOCALITY", "")
             postalcode = r.get("POSTALCODE", "")
+            normalized_mac = self._normalize_mac(r.get("MACADDRESS", ""))
+            bare_mac = normalize_bare_mac(normalized_mac)
+            fiber_node = str(r.get("FIBERNODE", "") or "").strip()
             address1, house_number, house_ext = self._parse_modem_address(address1_raw, address2_raw, locality)
             address = " ".join(
                 p for p in [address1_raw, address2_raw, postalcode, locality] if p
@@ -1752,8 +1951,8 @@ class TopologyService:
             modems_buf.append(
                 (
                     snapshot_id,
-                    self._normalize_mac(r.get("MACADDRESS", "")),
-                    r.get("FIBERNODE", ""),
+                    normalized_mac,
+                    fiber_node,
                     r.get("TOPOLOGYLINKID", ""),
                     self._to_float(r.get("LAT")),
                     self._to_float(r.get("LON")),
@@ -1767,15 +1966,20 @@ class TopologyService:
                     r.get("CUSTOMERID", ""),
                 )
             )
+            if bare_mac and fiber_node:
+                fiber_map_buf.append((snapshot_id, bare_mac, fiber_node[:128]))
             modem_rows += 1
             if len(modems_buf) >= batch_modems:
                 cur.executemany(modem_sql, modems_buf)
                 modems_buf.clear()
+                self.storage.insert_fiber_node_map_rows(cur, fiber_map_buf)
+                fiber_map_buf.clear()
                 if modem_rows % 3000 == 0:
                     _upd(f"streaming modem rows ({modem_rows})", min(80, 58 + modem_rows // 200000))
                 time.sleep(0.01)
         if modems_buf:
             cur.executemany(modem_sql, modems_buf)
+        self.storage.insert_fiber_node_map_rows(cur, fiber_map_buf)
 
         # Hierarchy (optional)
         hier_rows = 0
@@ -1828,6 +2032,7 @@ class TopologyService:
         )
 
         _upd("finalising", 97)
+        self.storage.publish_fiber_node_map(cur, snapshot_id, now)
         conn.close()
 
         stats_payload = self.storage.load_summary_payload(snapshot_date=snapshot_date, sample_limit=1) or {}
