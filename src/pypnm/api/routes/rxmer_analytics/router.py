@@ -46,6 +46,29 @@ def list_cmts_options(
     return RxMerFilterOptionsResponse(status="success", cmts=cmts)
 
 
+@router.get("/options/fiber-nodes", response_model=RxMerFilterOptionsResponse)
+def list_fiber_node_options(
+    cmts: list[str] = Query(default=[]),
+    q: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=5000, ge=1, le=50000),
+) -> RxMerFilterOptionsResponse:
+    try:
+        fiber_nodes = rxmer_analytics_service.list_fiber_node_options(
+            cmts=cmts,
+            query=q,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("RxMER fiber-node option lookup failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="RxMER fiber-node options unavailable",
+        ) from exc
+    return RxMerFilterOptionsResponse(status="success", fiber_nodes=fiber_nodes)
+
+
 @router.post("/jobs/plan", response_model=RxMerPlanResponse, status_code=status.HTTP_201_CREATED)
 def plan_job(payload: RxMerPlanRequest) -> RxMerPlanResponse:
     """Snapshot persisted inventory into a non-executing RxMER collection plan."""

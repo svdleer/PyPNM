@@ -17,25 +17,35 @@ class RxMerScopeType(str, Enum):
 class RxMerScope(BaseModel):
     type: RxMerScopeType = RxMerScopeType.ALL_NETWORK
     cmts: list[str] = Field(default_factory=list, max_length=256)
+    fiber_nodes: list[str] = Field(default_factory=list, max_length=512)
 
     @model_validator(mode="after")
     def validate_selection(self) -> "RxMerScope":
         normalized = sorted({value.strip() for value in self.cmts if value.strip()})
+        fiber_nodes = sorted(
+            {value.strip() for value in self.fiber_nodes if value.strip()}
+        )
         if self.type == RxMerScopeType.CMTS and not normalized:
             raise ValueError("cmts scope requires at least one CMTS")
         if self.type == RxMerScopeType.CMTS and any(
             "ccap" not in value.casefold() for value in normalized
         ):
             raise ValueError("cmts scope accepts only hostnames containing CCAP")
+        if any(len(value) > 128 for value in fiber_nodes):
+            raise ValueError("fiber-node names must not exceed 128 characters")
         if self.type == RxMerScopeType.ALL_NETWORK and normalized:
             raise ValueError("all_network scope cannot include CMTS selections")
+        if self.type == RxMerScopeType.ALL_NETWORK and fiber_nodes:
+            raise ValueError("fiber-node selection requires CMTS scope")
         self.cmts = normalized
+        self.fiber_nodes = fiber_nodes
         return self
 
 
 class RxMerPlanRequest(BaseModel):
     scope: RxMerScope = Field(default_factory=RxMerScope)
     online_only: bool = True
+    modem_count: int | None = Field(default=None, ge=1, le=100000)
     requested_by: str = Field(default="api", min_length=1, max_length=64)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
     raw_retention_days: int = Field(default=7, ge=1, le=365)

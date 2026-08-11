@@ -432,26 +432,49 @@ class RxMerAnalyticsService:
         self.ensure_schema()
         scope = dict(payload.get("scope") or {})
         scope_type = str(scope.get("type") or "all_network")
-        cmts_names = sorted({str(value).strip() for value in scope.get("cmts") or [] if str(value).strip()})
+        cmts_names = sorted(
+            {str(value).strip() for value in scope.get("cmts") or [] if str(value).strip()}
+        )
+        fiber_nodes = sorted(
+            {
+                str(value).strip()
+                for value in scope.get("fiber_nodes") or []
+                if str(value).strip()
+            }
+        )
         if scope_type not in {"all_network", "cmts"}:
             raise ValueError("unsupported RxMER scope type")
         if scope_type == "cmts" and not cmts_names:
             raise ValueError("cmts scope requires at least one CMTS")
         if scope_type == "all_network" and cmts_names:
             raise ValueError("all_network scope cannot include CMTS selections")
+        if scope_type == "all_network" and fiber_nodes:
+            raise ValueError("fiber-node selection requires CMTS scope")
+        if any(len(value) > 128 for value in fiber_nodes):
+            raise ValueError("fiber-node names must not exceed 128 characters")
+
+        modem_count_raw = payload.get("modem_count")
+        modem_count = None if modem_count_raw is None else int(modem_count_raw)
+        if modem_count is not None and not 1 <= modem_count <= 100000:
+            raise ValueError("modem_count must be between 1 and 100000")
 
         online_only = bool(payload.get("online_only", True))
         requested_by = str(payload.get("requested_by") or "api").strip()[:64]
         idempotency_key = payload.get("idempotency_key")
         if idempotency_key is not None:
             idempotency_key = str(idempotency_key).strip()[:128]
-        scope_document = {
+        scope_document: dict[str, Any] = {
             "type": scope_type,
             "cmts": cmts_names,
             "online_only": online_only,
             "channel_mode": "all",
             "topology_source": "latest_topology_with_inventory_fallback",
         }
+        if fiber_nodes:
+            scope_document["fiber_nodes"] = fiber_nodes
+        if modem_count is not None:
+            scope_document["modem_count"] = modem_count
+            scope_document["sampling"] = "balanced_by_cmts_and_fiber_node"
         scope_json = json.dumps(scope_document, sort_keys=True, separators=(",", ":"))
         scope_hash = self._scope_hash(scope_document, online_only)
         public_id = str(uuid.uuid4())
@@ -657,32 +680,102 @@ class RxMerAnalyticsService:
                 # Materialize the immutable target set inside MySQL. Latest
                 # topology takes precedence; persisted inventory remains the
                 # fallback for MACs absent from that topology snapshot.
-                cursor.execute(
-                    f"""
-                    INSERT INTO rxmer_job_target
-                    (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
-                     inventory_snapshot_id, state, expected_channels,
-                     created_at, updated_at)
-                    SELECT %s, i.mac, i.ip, i.cmts, i.cmts_ip,
-                           COALESCE(
-                               t.fiber_node,
-                               NULLIF(LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), '')
-                           ),
-                           i.snapshot_id, 'planned',
-                           COALESCE(i.ofdm_channel_count, 0), %s, %s
-                    FROM modem_inventory_current AS i
+                normalized_mac_sql = """
+                    (CONVERT(
+                        LOWER(REPLACE(REPLACE(REPLACE(
+                            i.mac, ':', ''), '-', ''), '.', ''))
+                        USING ascii
+                    ) COLLATE ascii_bin)
+                """
+                effective_fiber_sql = """
+                    COALESCE(
+                        t.fiber_node,
+                        NULLIF(LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), '')
+                    )
+                """
+                topology_join_sql = f"""
                     LEFT JOIN rxmer_plan_topology AS t
-                      ON t.bare_mac=(
-                          CONVERT(
-                              LOWER(REPLACE(REPLACE(REPLACE(
-                                  i.mac, ':', ''), '-', ''), '.', ''))
-                              USING ascii
-                          ) COLLATE ascii_bin
-                      )
-                    WHERE {where_sql}
-                    """,
-                    (job_id, now, now, *where_params),
-                )
+                      ON t.bare_mac={normalized_mac_sql}
+                """
+                material_where_parts = list(where_parts)
+                material_where_params = list(where_params)
+                if fiber_nodes:
+                    placeholders = ",".join(["%s"] * len(fiber_nodes))
+                    material_where_parts.append(
+                        f"({effective_fiber_sql}) IN ({placeholders})"
+                    )
+                    material_where_params.extend(fiber_nodes)
+                material_where_sql = " AND ".join(material_where_parts)
+
+                if modem_count is None:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO rxmer_job_target
+                        (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
+                         inventory_snapshot_id, state, expected_channels,
+                         created_at, updated_at)
+                        SELECT %s, i.mac, i.ip, i.cmts, i.cmts_ip,
+                               {effective_fiber_sql},
+                               i.snapshot_id, 'planned',
+                               COALESCE(i.ofdm_channel_count, 0), %s, %s
+                        FROM modem_inventory_current AS i
+                        {topology_join_sql}
+                        WHERE {material_where_sql}
+                        """,
+                        (job_id, now, now, *material_where_params),
+                    )
+                else:
+                    # A finite plan is deterministic and balanced. Ranking by
+                    # round within each CMTS/fiber-node group prevents large
+                    # nodes from consuming the whole sample. Unmapped modems
+                    # remain a separate group for each CMTS.
+                    cursor.execute(
+                        f"""
+                        INSERT INTO rxmer_job_target
+                        (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node,
+                         inventory_snapshot_id, state, expected_channels,
+                         created_at, updated_at)
+                        SELECT %s, sampled.mac, sampled.modem_ip,
+                               sampled.cmts, sampled.cmts_ip, sampled.fiber_node,
+                               sampled.inventory_snapshot_id, 'planned',
+                               sampled.expected_channels, %s, %s
+                        FROM (
+                            SELECT candidates.*,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY candidates.cmts,
+                                           CASE WHEN candidates.fiber_node IS NULL
+                                                THEN 1 ELSE 0 END,
+                                           candidates.fiber_node
+                                       ORDER BY candidates.sample_hash,
+                                                candidates.normalized_mac
+                                   ) AS sample_round
+                            FROM (
+                                SELECT i.mac, i.ip AS modem_ip, i.cmts, i.cmts_ip,
+                                       {effective_fiber_sql} AS fiber_node,
+                                       i.snapshot_id AS inventory_snapshot_id,
+                                       COALESCE(i.ofdm_channel_count, 0)
+                                           AS expected_channels,
+                                       {normalized_mac_sql} AS normalized_mac,
+                                       CRC32(CONCAT(
+                                           %s, ':', {normalized_mac_sql}
+                                       )) AS sample_hash
+                                FROM modem_inventory_current AS i
+                                {topology_join_sql}
+                                WHERE {material_where_sql}
+                            ) AS candidates
+                        ) AS sampled
+                        ORDER BY sampled.sample_round, sampled.sample_hash,
+                                 sampled.normalized_mac
+                        LIMIT {modem_count}
+                        """,
+                        (
+                            job_id,
+                            now,
+                            now,
+                            scope_hash,
+                            *material_where_params,
+                        ),
+                    )
                 target_count = max(0, int(cursor.rowcount or 0))
                 if target_count <= 0:
                     raise ValueError("no eligible operational OFDM modems found in the selected inventory scope")
@@ -758,6 +851,84 @@ class RxMerAnalyticsService:
             (*params, safe_limit),
         )
         return [str(row["cmts"]) for row in rows]
+
+    def list_fiber_node_options(
+        self,
+        *,
+        cmts: list[str],
+        query: str | None = None,
+        limit: int = 5000,
+    ) -> list[str]:
+        """Return effective persisted fiber nodes for selected CMTS systems."""
+        self.ensure_schema()
+        cmts_names = sorted({str(value).strip() for value in cmts if str(value).strip()})
+        if not cmts_names:
+            raise ValueError("select at least one CMTS before loading fiber nodes")
+        if len(cmts_names) > 256:
+            raise ValueError("too many CMTS selections")
+        if any("ccap" not in value.casefold() for value in cmts_names):
+            raise ValueError("fiber-node options accept only CCAP hostnames")
+
+        safe_limit = max(1, min(int(limit), 50000))
+        query_value = str(query or "").strip()
+        placeholders = ",".join(["%s"] * len(cmts_names))
+        table_rows = self._query(
+            "SELECT COUNT(*) AS table_count FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN "
+            "('topology_snapshots', 'topology_fiber_node_map', "
+            "'topology_fiber_node_map_state')"
+        )
+        topology_tables_ready = int(
+            (table_rows[0] if table_rows else {}).get("table_count") or 0
+        ) == 3
+
+        if topology_tables_ready:
+            effective_fiber_sql = """
+                COALESCE(
+                    NULLIF(TRIM(m.fiber_node), ''),
+                    NULLIF(LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), '')
+                )
+            """
+            source_sql = f"""
+                SELECT {effective_fiber_sql} AS fiber_node
+                FROM modem_inventory_current AS i
+                LEFT JOIN topology_fiber_node_map AS m
+                  ON m.snapshot_id=(
+                      SELECT s.id
+                      FROM topology_snapshots AS s
+                      JOIN topology_fiber_node_map_state AS ms
+                        ON ms.snapshot_id=s.id AND ms.state='complete'
+                      ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
+                  )
+                 AND m.bare_mac=(
+                     CONVERT(
+                         LOWER(REPLACE(REPLACE(REPLACE(
+                             i.mac, ':', ''), '-', ''), '.', ''))
+                         USING ascii
+                     ) COLLATE ascii_bin
+                 )
+                WHERE i.cmts IN ({placeholders})
+            """
+        else:
+            source_sql = f"""
+                SELECT NULLIF(
+                    LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), ''
+                ) AS fiber_node
+                FROM modem_inventory_current AS i
+                WHERE i.cmts IN ({placeholders})
+            """
+
+        params: list[Any] = list(cmts_names)
+        option_where = "fiber_node IS NOT NULL AND TRIM(fiber_node)<>''"
+        if query_value:
+            option_where += " AND fiber_node LIKE %s"
+            params.append(f"%{query_value}%")
+        rows = self._query(
+            f"SELECT DISTINCT fiber_node FROM ({source_sql}) AS options "
+            f"WHERE {option_where} ORDER BY fiber_node LIMIT %s",
+            (*params, safe_limit),
+        )
+        return [str(row["fiber_node"]) for row in rows]
 
     def get_job_filter_options(self, public_id: str) -> dict[str, Any]:
         self.ensure_schema()
