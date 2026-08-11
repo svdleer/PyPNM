@@ -538,7 +538,8 @@ class RxMerAnalyticsService:
                 cursor.execute(
                     """
                     CREATE TEMPORARY TABLE rxmer_plan_topology (
-                        bare_mac CHAR(12) NOT NULL PRIMARY KEY,
+                        bare_mac CHAR(12) CHARACTER SET ascii COLLATE ascii_bin
+                            NOT NULL PRIMARY KEY,
                         fiber_node VARCHAR(128) NOT NULL
                     ) ENGINE=InnoDB
                     """
@@ -671,8 +672,13 @@ class RxMerAnalyticsService:
                            COALESCE(i.ofdm_channel_count, 0), %s, %s
                     FROM modem_inventory_current AS i
                     LEFT JOIN rxmer_plan_topology AS t
-                      ON t.bare_mac=LOWER(REPLACE(REPLACE(REPLACE(
-                          i.mac, ':', ''), '-', ''), '.', ''))
+                      ON t.bare_mac=(
+                          CONVERT(
+                              LOWER(REPLACE(REPLACE(REPLACE(
+                                  i.mac, ':', ''), '-', ''), '.', ''))
+                              USING ascii
+                          ) COLLATE ascii_bin
+                      )
                     WHERE {where_sql}
                     """,
                     (job_id, now, now, *where_params),
