@@ -173,6 +173,8 @@ class RxMerSpectrumResponse(BaseModel):
     frequency_start_hz: int | None = None
     frequency_end_hz: int | None = None
     bin_width_hz: int | None = None
+    filters: dict[str, str | None] = Field(default_factory=dict)
+    statistic: str = "average"
     points: list[RxMerSpectrumPoint] = Field(default_factory=list, max_length=4000)
     best_subcarriers: list[RxMerSpectrumRanking] = Field(default_factory=list, max_length=10)
     worst_subcarriers: list[RxMerSpectrumRanking] = Field(default_factory=list, max_length=10)

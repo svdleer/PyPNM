@@ -1757,6 +1757,491 @@ class RxMerAnalyticsService:
 
         return generate()
 
+    @staticmethod
+    def _subcarrier_statistic(value: str | None) -> str:
+        statistic = str(value or "average").strip().lower()
+        if statistic not in {"average", "best", "worst"}:
+            raise ValueError("subcarrier statistic must be average, best, or worst")
+        return statistic
+
+    @staticmethod
+    def _filtered_spectrum_max_samples() -> int:
+        raw = os.environ.get("RXMER_FILTERED_SPECTRUM_MAX_SAMPLES", "500000000")
+        try:
+            return max(1_000_000, min(int(raw), 5_000_000_000))
+        except (TypeError, ValueError):
+            return 500_000_000
+
+    def _filtered_spectrum_rollup(
+        self,
+        job_id: int,
+        *,
+        cmts: str | None,
+        fiber_node: str | None,
+    ) -> dict[str, Any]:
+        """Build a bounded in-memory rollup from matching stored vectors only."""
+        from pypnm.api.routes.rxmer_analytics.analytics import CODEC, decode_vector
+
+        filters = ["r.job_id=%s"]
+        filter_params: list[Any] = [job_id]
+        if cmts:
+            filters.append("t.cmts=%s")
+            filter_params.append(cmts)
+        if fiber_node:
+            filters.append("t.fiber_node=%s")
+            filter_params.append(fiber_node)
+        where_sql = " AND ".join(filters)
+        connection = self._connect(autocommit=True)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) AS source_channels,
+                           COUNT(v.capture_attempt_id) AS available_channels,
+                           COUNT(DISTINCT r.target_id) AS source_modems,
+                           COALESCE(SUM(r.sample_count), 0) AS source_samples,
+                           MIN(r.zero_frequency_hz +
+                               r.first_active_index * r.spacing_hz) AS start_hz,
+                           MAX(r.zero_frequency_hz +
+                               (r.first_active_index + r.sample_count - 1) *
+                               r.spacing_hz) AS end_hz
+                    FROM rxmer_channel_result r
+                    JOIN rxmer_target_channel c
+                      ON c.successful_attempt_id=r.capture_attempt_id
+                    JOIN rxmer_job_target t
+                      ON t.id=r.target_id AND t.job_id=r.job_id
+                    LEFT JOIN rxmer_vector v
+                      ON v.capture_attempt_id=r.capture_attempt_id
+                    WHERE {where_sql}
+                    """,
+                    tuple(filter_params),
+                )
+                stats = cursor.fetchone() or {}
+
+            source_channels = int(stats.get("source_channels") or 0)
+            available_channels = int(stats.get("available_channels") or 0)
+            source_modems = int(stats.get("source_modems") or 0)
+            source_samples = int(stats.get("source_samples") or 0)
+            if available_channels != source_channels:
+                raise FileNotFoundError(
+                    "One or more matching raw RxMER vectors are unavailable or expired"
+                )
+            sample_limit = self._filtered_spectrum_max_samples()
+            if source_samples > sample_limit:
+                raise OverflowError(
+                    f"Filtered spectrum contains {source_samples:,} samples; "
+                    f"narrow the CMTS/fiber-node filters below the {sample_limit:,}-sample limit"
+                )
+            if source_channels == 0:
+                return {
+                    "source_channels": 0,
+                    "source_modems": 0,
+                    "source_samples": 0,
+                    "frequency_start_hz": None,
+                    "frequency_end_hz": None,
+                    "bins": [],
+                }
+
+            start_hz = int(stats["start_hz"])
+            end_hz = int(stats["end_hz"])
+            grid_start_hz = (start_hz // _SPECTRUM_GRID_HZ) * _SPECTRUM_GRID_HZ
+            grid_end_hz = math.ceil(end_hz / _SPECTRUM_GRID_HZ) * _SPECTRUM_GRID_HZ
+            grid_points = ((grid_end_hz - grid_start_hz) // _SPECTRUM_GRID_HZ) + 1
+            if grid_points <= 0 or grid_points > _SPECTRUM_MAX_GRID_POINTS:
+                raise ValueError("RxMER spectrum frequency range exceeds the supported grid")
+
+            counts = np.zeros(grid_points, dtype=np.uint64)
+            sums = np.zeros(grid_points, dtype=np.uint64)
+            worst = np.full(grid_points, 255, dtype=np.uint16)
+            maximum = np.zeros(grid_points, dtype=np.uint8)
+            last_attempt_id = 0
+            processed_channels = 0
+            while True:
+                page_filters = ["r.job_id=%s", "r.capture_attempt_id>%s"]
+                page_params: list[Any] = [job_id, last_attempt_id]
+                if cmts:
+                    page_filters.append("t.cmts=%s")
+                    page_params.append(cmts)
+                if fiber_node:
+                    page_filters.append("t.fiber_node=%s")
+                    page_params.append(fiber_node)
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT r.capture_attempt_id, r.zero_frequency_hz,
+                               r.first_active_index, r.spacing_hz, r.sample_count,
+                               r.vector_sha256, v.codec, v.payload
+                        FROM rxmer_channel_result r
+                        JOIN rxmer_target_channel c
+                          ON c.successful_attempt_id=r.capture_attempt_id
+                        JOIN rxmer_job_target t
+                          ON t.id=r.target_id AND t.job_id=r.job_id
+                        JOIN rxmer_vector v
+                          ON v.capture_attempt_id=r.capture_attempt_id
+                        WHERE {' AND '.join(page_filters)}
+                        ORDER BY r.capture_attempt_id ASC LIMIT 250
+                        """,
+                        tuple(page_params),
+                    )
+                    rows = list(cursor.fetchall())
+                if not rows:
+                    break
+                for row in rows:
+                    if str(row.get("codec") or "") != CODEC:
+                        raise ValueError("unsupported persisted RxMER vector codec")
+                    sample_count = int(row["sample_count"])
+                    vector = decode_vector(
+                        bytes(row["payload"]),
+                        expected_sha256=bytes(row["vector_sha256"]),
+                        expected_size=sample_count,
+                    )
+                    spacing_hz = int(row["spacing_hz"])
+                    first_frequency_hz = int(row["zero_frequency_hz"]) + (
+                        int(row["first_active_index"]) * spacing_hz
+                    )
+                    if (
+                        spacing_hz <= 0
+                        or spacing_hz % _SPECTRUM_GRID_HZ != 0
+                        or (first_frequency_hz - grid_start_hz) % _SPECTRUM_GRID_HZ != 0
+                    ):
+                        raise ValueError("RxMER vector is not aligned to the 25 kHz spectrum grid")
+                    start_index = (first_frequency_hz - grid_start_hz) // _SPECTRUM_GRID_HZ
+                    stride = spacing_hz // _SPECTRUM_GRID_HZ
+                    stop_index = start_index + stride * sample_count
+                    if start_index < 0 or stop_index > grid_points + stride - 1:
+                        raise ValueError("RxMER vector exceeds the calculated spectrum grid")
+                    positions = slice(start_index, stop_index, stride)
+                    values = np.frombuffer(vector, dtype=np.uint8)
+                    counts[positions] += 1
+                    sums[positions] += values.astype(np.uint64)
+                    np.minimum(worst[positions], values, out=worst[positions])
+                    np.maximum(maximum[positions], values, out=maximum[positions])
+                    last_attempt_id = int(row["capture_attempt_id"])
+                    processed_channels += 1
+            if processed_channels != source_channels:
+                raise FileNotFoundError(
+                    "One or more matching raw RxMER vectors are unavailable or expired"
+                )
+            occupied = np.flatnonzero(counts)
+            bins = [
+                {
+                    "frequency_hz": grid_start_hz + int(index) * _SPECTRUM_GRID_HZ,
+                    "sample_count": int(counts[index]),
+                    "sum_qdb": int(sums[index]),
+                    "worst_qdb": int(worst[index]),
+                    "max_qdb": int(maximum[index]),
+                }
+                for index in occupied
+            ]
+            return {
+                "source_channels": source_channels,
+                "source_modems": source_modems,
+                "source_samples": source_samples,
+                "frequency_start_hz": start_hz,
+                "frequency_end_hz": end_hz,
+                "bins": bins,
+            }
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _subcarrier_row(row: dict[str, Any], statistic: str) -> dict[str, Any]:
+        sample_count = int(row["sample_count"])
+        if statistic == "best":
+            value = int(row["max_qdb"]) / 4.0
+        elif statistic == "worst":
+            value = int(row["worst_qdb"]) / 4.0
+        else:
+            value = int(row["sum_qdb"]) / (4.0 * sample_count)
+        return {
+            "frequency_hz": int(row["frequency_hz"]),
+            "rxmer_db": round(value, 3),
+            "sample_count": sample_count,
+        }
+
+    def _format_filtered_spectrum(
+        self,
+        public_id: str,
+        rollup: dict[str, Any],
+        *,
+        max_points: int,
+        statistic: str,
+        cmts: str | None,
+        fiber_node: str | None,
+    ) -> dict[str, Any]:
+        bins = list(rollup["bins"])
+        base: dict[str, Any] = {
+            "job_public_id": public_id,
+            "state": "ready",
+            "message": "Filtered spectrum ready" if bins else "No successful channel vectors match the filters",
+            "source_revision": 0,
+            "source_channels": int(rollup["source_channels"]),
+            "source_modems": int(rollup["source_modems"]),
+            "source_samples": int(rollup["source_samples"]),
+            "frequency_start_hz": rollup["frequency_start_hz"],
+            "frequency_end_hz": rollup["frequency_end_hz"],
+            "bin_width_hz": None,
+            "points": [],
+            "best_subcarriers": [],
+            "worst_subcarriers": [],
+            "channel_spans": [],
+            "span_groups_omitted": 0,
+            "filters": {"cmts": cmts, "fiber_node": fiber_node},
+            "statistic": statistic,
+        }
+        if not bins:
+            return base
+
+        def score(row: dict[str, Any]) -> float:
+            return self._subcarrier_row(row, statistic)["rxmer_db"]
+
+        ordered = sorted(bins, key=lambda row: (score(row), -int(row["frequency_hz"])))
+        def ranking_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "frequency_hz": int(row["frequency_hz"]),
+                    "average_db": round(
+                        int(row["sum_qdb"]) / (4.0 * int(row["sample_count"])), 3
+                    ),
+                    "max_db": round(int(row["max_qdb"]) / 4.0, 3),
+                    "worst_db": round(int(row["worst_qdb"]) / 4.0, 3),
+                    "sample_count": int(row["sample_count"]),
+                }
+                for row in rows
+            ]
+
+        base["best_subcarriers"] = ranking_rows(list(reversed(ordered[-10:])))
+        base["worst_subcarriers"] = ranking_rows(ordered[:10])
+
+        safe_max_points = max(200, min(int(max_points), 4000))
+        start_hz = int(rollup["frequency_start_hz"])
+        end_hz = int(rollup["frequency_end_hz"])
+        raw_width = max(1, math.ceil((end_hz - start_hz) / max(safe_max_points - 1, 1)))
+        bin_width_hz = max(
+            _SPECTRUM_GRID_HZ,
+            math.ceil(raw_width / _SPECTRUM_GRID_HZ) * _SPECTRUM_GRID_HZ,
+        )
+        grouped: dict[int, dict[str, int]] = {}
+        for row in bins:
+            bucket = start_hz + (
+                (int(row["frequency_hz"]) - start_hz) // bin_width_hz
+            ) * bin_width_hz
+            target = grouped.setdefault(
+                bucket,
+                {"sample_count": 0, "sum_qdb": 0, "worst_qdb": 255, "max_qdb": 0},
+            )
+            target["sample_count"] += int(row["sample_count"])
+            target["sum_qdb"] += int(row["sum_qdb"])
+            target["worst_qdb"] = min(target["worst_qdb"], int(row["worst_qdb"]))
+            target["max_qdb"] = max(target["max_qdb"], int(row["max_qdb"]))
+        lattice_end_hz = start_hz + ((end_hz - start_hz) // bin_width_hz) * bin_width_hz
+        points: list[dict[str, Any]] = []
+        for frequency_hz in range(start_hz, lattice_end_hz + 1, bin_width_hz):
+            row = grouped.get(frequency_hz)
+            if not row:
+                points.append(
+                    {"frequency_hz": frequency_hz, "average_db": None,
+                     "max_db": None, "worst_db": None, "sample_count": 0}
+                )
+                continue
+            sample_count = int(row["sample_count"])
+            points.append(
+                {
+                    "frequency_hz": frequency_hz,
+                    "average_db": round(int(row["sum_qdb"]) / (4.0 * sample_count), 3),
+                    "max_db": round(int(row["max_qdb"]) / 4.0, 3),
+                    "worst_db": round(int(row["worst_qdb"]) / 4.0, 3),
+                    "sample_count": sample_count,
+                }
+            )
+        base["bin_width_hz"] = bin_width_hz
+        base["points"] = points
+        return base
+
+    def get_filtered_spectrum(
+        self,
+        public_id: str,
+        *,
+        max_points: int = 1600,
+        cmts: str | None = None,
+        fiber_node: str | None = None,
+        statistic: str = "average",
+    ) -> dict[str, Any]:
+        """Return display-only spectrum output for the selected persisted-result filters."""
+        clean_cmts = str(cmts or "").strip() or None
+        clean_fiber_node = str(fiber_node or "").strip() or None
+        clean_statistic = self._subcarrier_statistic(statistic)
+        if clean_cmts or clean_fiber_node:
+            self.ensure_schema()
+            jobs = self._query(
+                "SELECT id FROM rxmer_job WHERE public_id=%s LIMIT 1", (public_id,)
+            )
+            if not jobs:
+                raise KeyError(public_id)
+            rollup = self._filtered_spectrum_rollup(
+                int(jobs[0]["id"]), cmts=clean_cmts, fiber_node=clean_fiber_node
+            )
+            return self._format_filtered_spectrum(
+                public_id,
+                rollup,
+                max_points=max_points,
+                statistic=clean_statistic,
+                cmts=clean_cmts,
+                fiber_node=clean_fiber_node,
+            )
+
+        payload = self.get_spectrum(public_id, max_points=max_points)
+        payload["filters"] = {"cmts": None, "fiber_node": None}
+        payload["statistic"] = clean_statistic
+        if payload.get("state") != "ready" or not payload.get("points"):
+            return payload
+        jobs = self._query(
+            "SELECT id, aggregate_revision FROM rxmer_job WHERE public_id=%s LIMIT 1",
+            (public_id,),
+        )
+        expression = {
+            "average": "(sum_qdb / sample_count)",
+            "best": "max_qdb",
+            "worst": "worst_qdb",
+        }[clean_statistic]
+        ranking_sql = f"""
+            SELECT frequency_hz, sample_count, sum_qdb, worst_qdb, max_qdb
+            FROM rxmer_spectrum_bin
+            WHERE job_id=%s AND source_revision=%s
+            ORDER BY {expression} {{direction}}, frequency_hz ASC LIMIT 10
+        """
+        job_id = int(jobs[0]["id"])
+        revision = int(jobs[0].get("aggregate_revision") or 0)
+        best = self._query(ranking_sql.format(direction="DESC"), (job_id, revision))
+        worst = self._query(ranking_sql.format(direction="ASC"), (job_id, revision))
+        def ranking_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "frequency_hz": int(row["frequency_hz"]),
+                    "average_db": round(int(row["sum_qdb"]) / (4.0 * int(row["sample_count"])), 3),
+                    "max_db": round(int(row["max_qdb"]) / 4.0, 3),
+                    "worst_db": round(int(row["worst_qdb"]) / 4.0, 3),
+                    "sample_count": int(row["sample_count"]),
+                }
+                for row in rows
+            ]
+        payload["best_subcarriers"] = ranking_rows(best)
+        payload["worst_subcarriers"] = ranking_rows(worst)
+        return payload
+
+    def stream_subcarrier_report(
+        self,
+        public_id: str,
+        *,
+        report_format: str,
+        cmts: str | None = None,
+        fiber_node: str | None = None,
+        statistic: str = "average",
+    ) -> Iterator[str]:
+        """Stream one selected RxMER statistic per subcarrier frequency."""
+        self.ensure_schema()
+        jobs = self._query(
+            "SELECT id, aggregate_revision FROM rxmer_job WHERE public_id=%s LIMIT 1",
+            (public_id,),
+        )
+        if not jobs:
+            raise KeyError(public_id)
+        normalized_format = str(report_format or "").lower()
+        if normalized_format not in {"json", "csv"}:
+            raise ValueError("report format must be json or csv")
+        clean_statistic = self._subcarrier_statistic(statistic)
+        clean_cmts = str(cmts or "").strip() or None
+        clean_fiber_node = str(fiber_node or "").strip() or None
+        job_id = int(jobs[0]["id"])
+        revision = int(jobs[0].get("aggregate_revision") or 0)
+        filtered_bins: list[dict[str, Any]] | None = None
+        if clean_cmts or clean_fiber_node:
+            filtered_bins = self._filtered_spectrum_rollup(
+                job_id, cmts=clean_cmts, fiber_node=clean_fiber_node
+            )["bins"]
+        else:
+            builds = self._query(
+                "SELECT state, source_revision FROM rxmer_spectrum_build WHERE job_id=%s LIMIT 1",
+                (job_id,),
+            )
+            if (
+                not builds
+                or str(builds[0].get("state") or "") != "ready"
+                or int(builds[0].get("source_revision") or -1) != revision
+            ):
+                raise FileNotFoundError(
+                    "The job-wide subcarrier spectrum must be built before it can be exported"
+                )
+
+        metadata = {
+            "job_public_id": public_id,
+            "filters": {"cmts": clean_cmts, "fiber_node": clean_fiber_node},
+            "statistic": clean_statistic,
+            "units": {"frequency": "Hz", "rxmer": "dB"},
+        }
+        field_names = [
+            "job_public_id", "cmts_filter", "fiber_node_filter", "statistic",
+            "frequency_hz", "rxmer_db", "sample_count",
+        ]
+
+        def source_rows() -> Iterator[dict[str, Any]]:
+            if filtered_bins is not None:
+                yield from filtered_bins
+                return
+            connection = self._connect(autocommit=True)
+            try:
+                with connection.cursor(pymysql.cursors.SSDictCursor) as cursor:
+                    cursor.execute(
+                        """
+                        SELECT frequency_hz, sample_count, sum_qdb, worst_qdb, max_qdb
+                        FROM rxmer_spectrum_bin
+                        WHERE job_id=%s AND source_revision=%s
+                        ORDER BY frequency_hz ASC
+                        """,
+                        (job_id, revision),
+                    )
+                    for row in cursor:
+                        yield dict(row)
+            finally:
+                connection.close()
+
+        def generate() -> Iterator[str]:
+            if normalized_format == "json":
+                yield json.dumps(metadata, separators=(",", ":"))[:-1] + ',"results":['
+                first = True
+                for source in source_rows():
+                    if not first:
+                        yield ","
+                    first = False
+                    yield json.dumps(
+                        self._subcarrier_row(source, clean_statistic),
+                        separators=(",", ":"),
+                    )
+                yield "]}"
+                return
+            buffer = io.StringIO()
+            writer = csv.DictWriter(buffer, fieldnames=field_names)
+            writer.writeheader()
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+            for source in source_rows():
+                value = self._subcarrier_row(source, clean_statistic)
+                writer.writerow(
+                    {
+                        "job_public_id": public_id,
+                        "cmts_filter": clean_cmts,
+                        "fiber_node_filter": clean_fiber_node,
+                        "statistic": clean_statistic,
+                        **value,
+                    }
+                )
+                yield buffer.getvalue()
+                buffer.seek(0)
+                buffer.truncate(0)
+
+        return generate()
+
     def request_spectrum_build(self, public_id: str) -> dict[str, Any]:
         """Acquire a DB lease for post-processing persisted RxMER vectors."""
         self.ensure_schema()

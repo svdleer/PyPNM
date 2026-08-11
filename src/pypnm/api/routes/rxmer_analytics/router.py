@@ -171,18 +171,66 @@ def download_job_report(
     )
 
 
+@router.get("/jobs/{public_id}/subcarriers/report")
+def download_job_subcarrier_report(
+    public_id: str,
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    cmts: str | None = Query(default=None, max_length=128),
+    fiber_node: str | None = Query(default=None, max_length=128),
+    statistic: str = Query(default="average", pattern="^(average|best|worst)$"),
+) -> StreamingResponse:
+    try:
+        stream = rxmer_analytics_service.stream_subcarrier_report(
+            public_id,
+            report_format=format,
+            cmts=cmts,
+            fiber_node=fiber_node,
+            statistic=statistic,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc
+    except OverflowError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("RxMER subcarrier report creation failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RxMER subcarrier report unavailable") from exc
+    media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
+    filename = f"network-rxmer-subcarriers-{public_id}.{format}"
+    return StreamingResponse(
+        stream,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/jobs/{public_id}/spectrum", response_model=RxMerSpectrumResponse)
 def get_job_spectrum(
     public_id: str,
     max_points: int = Query(default=1600, ge=200, le=4000),
+    cmts: str | None = Query(default=None, max_length=128),
+    fiber_node: str | None = Query(default=None, max_length=128),
+    statistic: str = Query(default="average", pattern="^(average|best|worst)$"),
 ) -> RxMerSpectrumResponse:
     try:
-        payload = rxmer_analytics_service.get_spectrum(
+        payload = rxmer_analytics_service.get_filtered_spectrum(
             public_id,
             max_points=max_points,
+            cmts=cmts,
+            fiber_node=fiber_node,
+            statistic=statistic,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc
+    except OverflowError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("RxMER spectrum lookup failed: %s", exc)
         raise HTTPException(status_code=503, detail="RxMER spectrum unavailable") from exc
