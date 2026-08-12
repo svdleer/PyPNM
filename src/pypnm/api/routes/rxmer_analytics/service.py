@@ -563,7 +563,8 @@ class RxMerAnalyticsService:
                     CREATE TEMPORARY TABLE rxmer_plan_topology (
                         bare_mac CHAR(12) CHARACTER SET ascii COLLATE ascii_bin
                             NOT NULL PRIMARY KEY,
-                        fiber_node VARCHAR(128) NOT NULL
+                        fiber_node VARCHAR(128) CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_bin NOT NULL
                     ) ENGINE=InnoDB
                     """
                 )
@@ -689,8 +690,13 @@ class RxMerAnalyticsService:
                 """
                 effective_fiber_sql = """
                     COALESCE(
-                        t.fiber_node,
-                        NULLIF(LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), '')
+                        CONVERT(t.fiber_node USING utf8mb4) COLLATE utf8mb4_bin,
+                        CONVERT(
+                            NULLIF(
+                                LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), ''
+                            )
+                            USING utf8mb4
+                        ) COLLATE utf8mb4_bin
                     )
                 """
                 topology_join_sql = f"""
@@ -700,7 +706,12 @@ class RxMerAnalyticsService:
                 material_where_parts = list(where_parts)
                 material_where_params = list(where_params)
                 if fiber_nodes:
-                    placeholders = ",".join(["%s"] * len(fiber_nodes))
+                    placeholders = ",".join(
+                        [
+                            "(CONVERT(%s USING utf8mb4) COLLATE utf8mb4_bin)"
+                            for _ in fiber_nodes
+                        ]
+                    )
                     material_where_parts.append(
                         f"({effective_fiber_sql}) IN ({placeholders})"
                     )
@@ -885,8 +896,15 @@ class RxMerAnalyticsService:
         if topology_tables_ready:
             effective_fiber_sql = """
                 COALESCE(
-                    NULLIF(TRIM(m.fiber_node), ''),
-                    NULLIF(LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), '')
+                    CONVERT(
+                        NULLIF(TRIM(m.fiber_node), '') USING utf8mb4
+                    ) COLLATE utf8mb4_bin,
+                    CONVERT(
+                        NULLIF(
+                            LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), ''
+                        )
+                        USING utf8mb4
+                    ) COLLATE utf8mb4_bin
                 )
             """
             source_sql = f"""
@@ -911,9 +929,12 @@ class RxMerAnalyticsService:
             """
         else:
             source_sql = f"""
-                SELECT NULLIF(
-                    LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), ''
-                ) AS fiber_node
+                SELECT CONVERT(
+                    NULLIF(
+                        LEFT(TRIM(COALESCE(i.fiber_node, '')), 128), ''
+                    )
+                    USING utf8mb4
+                ) COLLATE utf8mb4_bin AS fiber_node
                 FROM modem_inventory_current AS i
                 WHERE i.cmts IN ({placeholders})
             """
@@ -921,7 +942,10 @@ class RxMerAnalyticsService:
         params: list[Any] = list(cmts_names)
         option_where = "fiber_node IS NOT NULL AND TRIM(fiber_node)<>''"
         if query_value:
-            option_where += " AND fiber_node LIKE %s"
+            option_where += (
+                " AND fiber_node LIKE "
+                "(CONVERT(%s USING utf8mb4) COLLATE utf8mb4_bin)"
+            )
             params.append(f"%{query_value}%")
         rows = self._query(
             f"SELECT DISTINCT fiber_node FROM ({source_sql}) AS options "
