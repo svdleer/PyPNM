@@ -288,10 +288,16 @@ class CmResetService:
                 raise ValueError("fiber_node scope requires at least one fiber node")
             fn_placeholders = ",".join(["%s"] * len(fiber_nodes))
             rows = self._query(
-                f"SELECT mac, ip, cmts, cmts_ip, fiber_node "
-                f"FROM modem_inventory_current WHERE cmts=%s "
-                f"AND fiber_node IN ({fn_placeholders}) "
-                f"AND status IN ('operational','registrationComplete','ipComplete','online')",
+                f"""
+                SELECT m.mac, m.ip, m.cmts, m.cmts_ip, t.fiber_node
+                FROM modem_inventory_current m
+                JOIN topology_fiber_node_map t
+                  ON t.bare_mac = LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+                WHERE m.cmts = %s
+                  AND t.fiber_node IN ({fn_placeholders})
+                  AND t.snapshot_id = (SELECT MAX(id) FROM topology_snapshots)
+                  AND m.status IN ('operational','registrationComplete','ipComplete','online')
+                """,
                 (cmts_name, *fiber_nodes),
             )
             return [{"mac": r["mac"], "ip": r.get("ip"), "cmts": r.get("cmts"),
@@ -508,11 +514,18 @@ class CmResetService:
         return [str(r["cmts"]) for r in rows]
 
     def get_fiber_node_options(self, cmts: str) -> list[str]:
-        """Return distinct fiber nodes for a given CMTS."""
+        """Return distinct fiber nodes for a given CMTS (from topology mapping)."""
         rows = self._query(
-            "SELECT DISTINCT fiber_node FROM modem_inventory_current "
-            "WHERE cmts=%s AND fiber_node IS NOT NULL AND TRIM(fiber_node)<>'' "
-            "ORDER BY fiber_node",
+            """
+            SELECT DISTINCT t.fiber_node
+            FROM topology_fiber_node_map t
+            JOIN modem_inventory_current m
+              ON t.bare_mac = LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+            WHERE m.cmts = %s
+              AND t.snapshot_id = (SELECT MAX(id) FROM topology_snapshots)
+              AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
+            ORDER BY t.fiber_node
+            """,
             (cmts,),
         )
         return [str(r["fiber_node"]) for r in rows]
