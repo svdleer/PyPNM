@@ -502,7 +502,8 @@ class CmResetService:
         rows = self._query(
             "SELECT DISTINCT cmts FROM modem_inventory_current "
             "WHERE cmts IS NOT NULL AND TRIM(cmts)<>'' "
-            "AND LOWER(cmts) LIKE '%ccap%' ORDER BY cmts"
+            "AND LOWER(cmts) LIKE %s ORDER BY cmts",
+            ("%ccap%",),
         )
         return [str(r["cmts"]) for r in rows]
 
