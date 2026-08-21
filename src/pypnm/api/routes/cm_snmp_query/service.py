@@ -421,12 +421,34 @@ class CmSnmpQueryService:
             "completed_at=%s, updated_at=%s WHERE id=%s",
             (json.dumps(results, separators=(",", ":")), now, now, target_id),
         )
+        # Update live counter on the job
+        self._execute(
+            "UPDATE snmp_query_job SET targets_succeeded = ("
+            "  SELECT COUNT(*) FROM snmp_query_target WHERE job_id = ("
+            "    SELECT job_id FROM snmp_query_target WHERE id=%s"
+            "  ) AND state='complete'"
+            "), updated_at=%s WHERE id = ("
+            "  SELECT job_id FROM snmp_query_target WHERE id=%s"
+            ")",
+            (target_id, now, target_id),
+        )
 
     def mark_target_failed(self, target_id: int, error: str) -> None:
         now = self._now()
         self._execute(
             "UPDATE snmp_query_target SET state='failed', error_text=%s, updated_at=%s WHERE id=%s",
             (error[:500], now, target_id),
+        )
+        # Update live counter on the job
+        self._execute(
+            "UPDATE snmp_query_job SET targets_failed = ("
+            "  SELECT COUNT(*) FROM snmp_query_target WHERE job_id = ("
+            "    SELECT job_id FROM snmp_query_target WHERE id=%s"
+            "  ) AND state='failed'"
+            "), updated_at=%s WHERE id = ("
+            "  SELECT job_id FROM snmp_query_target WHERE id=%s"
+            ")",
+            (target_id, now, target_id),
         )
 
     def finish_job(self, job_id: int, error_text: Optional[str] = None) -> None:
