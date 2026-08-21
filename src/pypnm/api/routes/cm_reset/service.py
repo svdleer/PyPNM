@@ -498,10 +498,11 @@ class CmResetService:
     # ── Options (for UI selectors) ────────────────────────────
 
     def get_cmts_options(self) -> list[str]:
-        """Return distinct CMTS names from inventory for the scope selector."""
+        """Return distinct CMTS names from inventory for the scope selector (CCAP only)."""
         rows = self._query(
             "SELECT DISTINCT cmts FROM modem_inventory_current "
-            "WHERE cmts IS NOT NULL AND TRIM(cmts)<>'' ORDER BY cmts"
+            "WHERE cmts IS NOT NULL AND TRIM(cmts)<>'' "
+            "AND LOWER(cmts) LIKE '%ccap%' ORDER BY cmts"
         )
         return [str(r["cmts"]) for r in rows]
 
