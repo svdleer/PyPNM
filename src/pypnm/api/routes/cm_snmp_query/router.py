@@ -296,3 +296,23 @@ def mib_search(q: str = Query(default="", max_length=64), limit: int = Query(def
     from pypnm.api.routes.cm_snmp_query.mib_catalog import search_catalog
     results = search_catalog(q, limit=limit)
     return {"status": "success", "results": results}
+
+
+@router.delete("/jobs")
+def delete_all_jobs() -> dict:
+    """Delete all non-running custom SNMP jobs."""
+    try:
+        cm_snmp_query_service.ensure_schema()
+        rows = cm_snmp_query_service._query(
+            "SELECT id FROM snmp_query_job WHERE status != 'running'"
+        )
+        count = 0
+        for row in rows:
+            job_id = int(row["id"])
+            cm_snmp_query_service._execute("DELETE FROM snmp_query_target WHERE job_id=%s", (job_id,))
+            cm_snmp_query_service._execute("DELETE FROM snmp_query_job WHERE id=%s", (job_id,))
+            count += 1
+        return {"status": "success", "deleted": count}
+    except Exception as exc:
+        logger.error("Delete all SNMP jobs failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Delete failed") from exc
