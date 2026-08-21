@@ -196,3 +196,91 @@ def download_report(
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/verify-oid")
+async def verify_oid(payload: dict) -> dict:
+    """Test an OID against a sample modem to verify it returns data.
+
+    POST body: {"oid": "sysUpTime.0", "cmts": "CMTS-NAME"}
+    Returns: {"success": true, "oid": "...", "value": "12345", "modem_ip": "10.x.x.x"}
+    """
+    import os
+
+    oid = str(payload.get("oid") or "").strip()
+    cmts = str(payload.get("cmts") or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="oid is required")
+
+    # Find a sample online modem to test against
+    cm_snmp_query_service.ensure_schema()
+    if cmts:
+        modems = cm_snmp_query_service._query(
+            "SELECT ip FROM modem_inventory_current "
+            "WHERE cmts=%s AND ip IS NOT NULL AND TRIM(ip)<>'' "
+            "AND status IN ('operational','registrationComplete','ipComplete','online') "
+            "ORDER BY RAND() LIMIT 1",
+            (cmts,),
+        )
+    else:
+        modems = cm_snmp_query_service._query(
+            "SELECT ip FROM modem_inventory_current "
+            "WHERE ip IS NOT NULL AND TRIM(ip)<>'' "
+            "AND status IN ('operational','registrationComplete','ipComplete','online') "
+            "ORDER BY RAND() LIMIT 1",
+        )
+
+    if not modems:
+        raise HTTPException(status_code=404, detail="No online modem found to test against")
+
+    modem_ip = modems[0]["ip"]
+
+    # Send SNMP GET via cm-agent
+    from pypnm.api.agent.manager import get_agent_manager
+    from pypnm.config.pnm_config_manager import PnmConfigManager
+
+    agent_manager = get_agent_manager()
+    if not agent_manager:
+        raise HTTPException(status_code=503, detail="Agent manager not available")
+
+    agent = (
+        agent_manager.get_agent_for_capability("cm_reachable")
+        or agent_manager.get_agent_for_capability("snmp_get")
+    )
+    if not agent:
+        raise HTTPException(status_code=503, detail="No cm-agent connected")
+
+    community = (
+        os.environ.get("MODEM_COMMUNITY")
+        or os.environ.get("CM_SNMP_COMMUNITY")
+        or str(PnmConfigManager.get_write_community())
+    )
+
+    import asyncio
+    task_id = await agent_manager.send_task(
+        agent.agent_id,
+        "snmp_get",
+        {"target_ip": modem_ip, "oid": oid, "community": community, "timeout": 5, "retries": 1},
+        timeout=15,
+        priority="interactive",
+    )
+    result = await agent_manager.wait_for_task_async(task_id, timeout=15)
+
+    if not result or result.get("type") != "response":
+        return {"success": False, "oid": oid, "error": "Agent timeout", "modem_ip": modem_ip}
+
+    res_data = result.get("result", {})
+    if not res_data.get("success"):
+        return {"success": False, "oid": oid, "error": res_data.get("error", "SNMP GET failed"), "modem_ip": modem_ip}
+
+    # Parse the value
+    output = str(res_data.get("output") or "")
+    if " = " in output:
+        value = output.split(" = ", 1)[1].strip()
+    else:
+        value = output.strip() or None
+
+    if not value or value.lower() in ("no such object", "no such instance", ""):
+        return {"success": False, "oid": oid, "error": f"OID not found on modem ({value or 'empty'})", "modem_ip": modem_ip}
+
+    return {"success": True, "oid": oid, "value": value, "modem_ip": modem_ip}
