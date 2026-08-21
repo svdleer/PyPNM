@@ -188,8 +188,20 @@ class CmSnmpQueryWorker:
 
                     if result and result.get("type") == "response":
                         res_data = result.get("result", {})
-                        if res_data.get("success") and res_data.get("results"):
-                            value = res_data["results"][0].get("value")
+                        if res_data.get("success"):
+                            # Agent returns 'results' list (parallel_walk style)
+                            # or 'output' string (get style: "OID = value")
+                            if res_data.get("results"):
+                                value = res_data["results"][0].get("value")
+                            elif res_data.get("output"):
+                                # Parse "OID = value" format
+                                raw = str(res_data["output"])
+                                if " = " in raw:
+                                    value = raw.split(" = ", 1)[1].strip()
+                                else:
+                                    value = raw.strip()
+                            else:
+                                value = None
                             results[label] = value
                         else:
                             results[label] = None
