@@ -288,3 +288,11 @@ async def verify_oid(payload: dict) -> dict:
         return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": f"OID not found on modem ({value or 'empty'})", "modem_ip": modem_ip}
 
     return {"success": True, "oid": oid_raw, "numeric_oid": oid, "value": value, "modem_ip": modem_ip}
+
+
+@router.get("/mib-search")
+def mib_search(q: str = Query(default="", max_length=64), limit: int = Query(default=20, ge=1, le=50)) -> dict:
+    """Search known MIB object names for autocomplete."""
+    from pypnm.api.routes.cm_snmp_query.mib_catalog import search_catalog
+    results = search_catalog(q, limit=limit)
+    return {"status": "success", "results": results}

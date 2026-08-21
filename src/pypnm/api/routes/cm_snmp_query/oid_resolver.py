@@ -46,6 +46,13 @@ def resolve_oid(oid_input: str) -> str:
     if _NUMERIC_OID_RE.match(oid_input):
         return oid_input
 
+    # Check static catalog first (fast, no pysnmp needed)
+    from pypnm.api.routes.cm_snmp_query.mib_catalog import resolve_from_catalog
+    catalog_result = resolve_from_catalog(oid_input)
+    if catalog_result:
+        logger.debug(f"Resolved OID '{oid_input}' → '{catalog_result}' (from catalog)")
+        return catalog_result
+
     # Split name and instance index (e.g., "sysUpTime.0" → ("sysUpTime", "0"))
     parts = oid_input.split(".", 1)
     name = parts[0]
