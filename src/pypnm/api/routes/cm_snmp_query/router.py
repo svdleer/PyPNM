@@ -203,14 +203,18 @@ async def verify_oid(payload: dict) -> dict:
     """Test an OID against a sample modem to verify it returns data.
 
     POST body: {"oid": "sysUpTime.0", "cmts": "CMTS-NAME"}
-    Returns: {"success": true, "oid": "...", "value": "12345", "modem_ip": "10.x.x.x"}
+    Returns: {"success": true, "oid": "...", "numeric_oid": "1.3.6...", "value": "12345", "modem_ip": "10.x.x.x"}
     """
     import os
+    from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
 
-    oid = str(payload.get("oid") or "").strip()
+    oid_raw = str(payload.get("oid") or "").strip()
     cmts = str(payload.get("cmts") or "").strip()
-    if not oid:
+    if not oid_raw:
         raise HTTPException(status_code=400, detail="oid is required")
+
+    # Resolve MIB name to numeric OID server-side
+    oid = resolve_oid(oid_raw)
 
     # Find a sample online modem to test against
     cm_snmp_query_service.ensure_schema()
@@ -267,11 +271,11 @@ async def verify_oid(payload: dict) -> dict:
     result = await agent_manager.wait_for_task_async(task_id, timeout=15)
 
     if not result or result.get("type") != "response":
-        return {"success": False, "oid": oid, "error": "Agent timeout", "modem_ip": modem_ip}
+        return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": "Agent timeout", "modem_ip": modem_ip}
 
     res_data = result.get("result", {})
     if not res_data.get("success"):
-        return {"success": False, "oid": oid, "error": res_data.get("error", "SNMP GET failed"), "modem_ip": modem_ip}
+        return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": res_data.get("error", "SNMP GET failed"), "modem_ip": modem_ip}
 
     # Parse the value
     output = str(res_data.get("output") or "")
@@ -281,6 +285,6 @@ async def verify_oid(payload: dict) -> dict:
         value = output.strip() or None
 
     if not value or value.lower() in ("no such object", "no such instance", ""):
-        return {"success": False, "oid": oid, "error": f"OID not found on modem ({value or 'empty'})", "modem_ip": modem_ip}
+        return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": f"OID not found on modem ({value or 'empty'})", "modem_ip": modem_ip}
 
-    return {"success": True, "oid": oid, "value": value, "modem_ip": modem_ip}
+    return {"success": True, "oid": oid_raw, "numeric_oid": oid, "value": value, "modem_ip": modem_ip}

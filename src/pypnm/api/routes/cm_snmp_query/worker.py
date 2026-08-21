@@ -170,13 +170,17 @@ class CmSnmpQueryWorker:
                 oid = entry.get("oid", "")
                 label = entry.get("label") or oid
 
+                # Resolve MIB name to numeric OID server-side
+                from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
+                numeric_oid = resolve_oid(oid)
+
                 try:
                     task_id = await agent_manager.send_task(
                         agent.agent_id,
                         "snmp_get",
                         {
                             "target_ip": modem_ip,
-                            "oid": oid,
+                            "oid": numeric_oid,
                             "community": community,
                             "timeout": 5,
                             "retries": 1,
