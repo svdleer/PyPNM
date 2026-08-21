@@ -281,12 +281,27 @@ class CmSnmpQueryService:
     def _resolve_targets(self, scope_type: str, scope: dict, max_modems: int | None) -> list[dict]:
         limit_clause = f"LIMIT {int(max_modems)}" if max_modems else ""
         online_filter = "AND m.status IN ('operational','registrationComplete','ipComplete','online')"
+        # Topology join for fiber_node resolution (same as network RxMER)
+        topology_join = """
+            LEFT JOIN topology_fiber_node_map t
+              ON t.bare_mac = CONVERT(
+                  LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+                  USING ascii
+              ) COLLATE ascii_bin
+              AND t.snapshot_id = (
+                  SELECT s.id FROM topology_snapshots s
+                  JOIN topology_fiber_node_map_state ms
+                    ON ms.snapshot_id = s.id AND ms.state = 'complete'
+                  ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
+              )
+        """
+        fiber_node_col = "COALESCE(t.fiber_node, m.fiber_node) AS fiber_node"
 
         if scope_type == "all_network":
             rows = self._query(
-                f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
-                f"FROM modem_inventory_current m WHERE 1=1 {online_filter} "
-                f"ORDER BY RAND() {limit_clause}"
+                f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
+                f"FROM modem_inventory_current m {topology_join} "
+                f"WHERE 1=1 {online_filter} ORDER BY RAND() {limit_clause}"
             )
         elif scope_type == "cmts":
             cmts_names = [str(c).strip() for c in (scope.get("cmts") or []) if str(c).strip()]
@@ -294,9 +309,10 @@ class CmSnmpQueryService:
                 raise ValueError("cmts scope requires at least one CMTS name")
             placeholders = ",".join(["%s"] * len(cmts_names))
             rows = self._query(
-                f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
-                f"FROM modem_inventory_current m WHERE m.cmts IN ({placeholders}) "
-                f"{online_filter} ORDER BY RAND() {limit_clause}",
+                f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
+                f"FROM modem_inventory_current m {topology_join} "
+                f"WHERE m.cmts IN ({placeholders}) {online_filter} "
+                f"ORDER BY RAND() {limit_clause}",
                 cmts_names,
             )
         elif scope_type == "fiber_node":
