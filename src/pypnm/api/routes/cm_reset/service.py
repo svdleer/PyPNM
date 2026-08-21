@@ -292,10 +292,18 @@ class CmResetService:
                 SELECT m.mac, m.ip, m.cmts, m.cmts_ip, t.fiber_node
                 FROM modem_inventory_current m
                 JOIN topology_fiber_node_map t
-                  ON t.bare_mac = LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+                  ON t.bare_mac = CONVERT(
+                      LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+                      USING ascii
+                  ) COLLATE ascii_bin
                 WHERE m.cmts = %s
                   AND t.fiber_node IN ({fn_placeholders})
-                  AND t.snapshot_id = (SELECT MAX(id) FROM topology_snapshots)
+                  AND t.snapshot_id = (
+                      SELECT s.id FROM topology_snapshots s
+                      JOIN topology_fiber_node_map_state ms
+                        ON ms.snapshot_id = s.id AND ms.state = 'complete'
+                      ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
+                  )
                   AND m.status IN ('operational','registrationComplete','ipComplete','online')
                 """,
                 (cmts_name, *fiber_nodes),
@@ -514,16 +522,30 @@ class CmResetService:
         return [str(r["cmts"]) for r in rows]
 
     def get_fiber_node_options(self, cmts: str) -> list[str]:
-        """Return distinct fiber nodes for a given CMTS (from topology mapping)."""
+        """Return distinct fiber nodes for a given CMTS (from topology mapping).
+
+        Uses the same topology_fiber_node_map + modem_inventory_current join as
+        the RxMER analytics module, with proper collation for indexed lookups.
+        """
         rows = self._query(
             """
             SELECT DISTINCT t.fiber_node
             FROM topology_fiber_node_map t
-            JOIN modem_inventory_current m
-              ON t.bare_mac = LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
-            WHERE m.cmts = %s
-              AND t.snapshot_id = (SELECT MAX(id) FROM topology_snapshots)
-              AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
+            WHERE t.snapshot_id = (
+                SELECT s.id FROM topology_snapshots s
+                JOIN topology_fiber_node_map_state ms
+                  ON ms.snapshot_id = s.id AND ms.state = 'complete'
+                ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
+            )
+            AND t.bare_mac IN (
+                SELECT CONVERT(
+                    LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+                    USING ascii
+                ) COLLATE ascii_bin
+                FROM modem_inventory_current m
+                WHERE m.cmts = %s
+            )
+            AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
             ORDER BY t.fiber_node
             """,
             (cmts,),
