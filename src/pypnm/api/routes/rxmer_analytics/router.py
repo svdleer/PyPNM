@@ -279,6 +279,37 @@ def download_job_subcarrier_report(
     )
 
 
+@router.get("/jobs/{public_id}/modems/subcarriers/report")
+def download_per_modem_subcarrier_report(
+    public_id: str,
+    format: str = Query(default="csv", pattern="^(json|csv)$"),
+    cmts: str | None = Query(default=None, max_length=128),
+    fiber_node: str | None = Query(default=None, max_length=128),
+) -> StreamingResponse:
+    """Per-modem subcarrier detail: mac, channel_id, frequency_hz, rxmer_db for every subcarrier."""
+    try:
+        stream = rxmer_analytics_service.stream_per_modem_subcarrier_report(
+            public_id,
+            report_format=format,
+            cmts=cmts,
+            fiber_node=fiber_node,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("RxMER per-modem subcarrier report failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Report unavailable") from exc
+    media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
+    filename = _build_report_filename(public_id, "modem-subcarriers", format)
+    return StreamingResponse(
+        stream,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/jobs/{public_id}/spectrum", response_model=RxMerSpectrumResponse)
 def get_job_spectrum(
     public_id: str,

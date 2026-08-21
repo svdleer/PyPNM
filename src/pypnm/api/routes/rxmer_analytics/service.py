@@ -2534,6 +2534,157 @@ class RxMerAnalyticsService:
 
         return generate()
 
+    def stream_per_modem_subcarrier_report(
+        self,
+        public_id: str,
+        *,
+        report_format: str,
+        cmts: str | None = None,
+        fiber_node: str | None = None,
+    ) -> Iterator[str]:
+        """Stream per-modem per-subcarrier RxMER data (mac, channel, frequency, rxmer_db).
+
+        This is the detailed export: one row per subcarrier per channel per modem.
+        Can produce very large output (3800+ subcarriers x channels x modems).
+        """
+        import numpy as np
+        from pypnm.api.routes.rxmer_analytics.analytics import CODEC, decode_vector
+
+        self.ensure_schema()
+        jobs = self._query("SELECT id FROM rxmer_job WHERE public_id=%s LIMIT 1", (public_id,))
+        if not jobs:
+            raise KeyError(public_id)
+        job_id = int(jobs[0]["id"])
+        normalized_format = str(report_format or "").lower()
+        if normalized_format not in {"json", "csv"}:
+            raise ValueError("report format must be json or csv")
+
+        # Build target filter
+        filters = ["t.job_id=%s"]
+        params: list[Any] = [job_id]
+        if cmts:
+            filters.append("t.cmts=%s")
+            params.append(str(cmts).strip())
+        if fiber_node:
+            filters.append("t.fiber_node=%s")
+            params.append(str(fiber_node).strip())
+        where_sql = " AND ".join(filters)
+
+        field_names = ["mac", "modem_ip", "cmts", "fiber_node", "channel_id", "frequency_hz", "rxmer_db"]
+
+        def generate() -> Iterator[str]:
+            connection = self._connect(autocommit=True)
+            try:
+                with connection.cursor(pymysql.cursors.SSDictCursor) as cursor:
+                    # Get targets with their successful channel results + vectors
+                    cursor.execute(
+                        f"""
+                        SELECT t.mac, t.modem_ip, t.cmts, t.fiber_node,
+                               r.channel_id, r.zero_frequency_hz, r.first_active_index,
+                               r.spacing_hz, r.sample_count, r.vector_sha256,
+                               v.codec, v.uncompressed_bytes, v.payload
+                        FROM rxmer_job_target t
+                        JOIN rxmer_target_channel c
+                          ON c.target_id = t.id AND c.successful_attempt_id IS NOT NULL
+                        JOIN rxmer_channel_result r
+                          ON r.capture_attempt_id = c.successful_attempt_id
+                        JOIN rxmer_vector v
+                          ON v.capture_attempt_id = r.capture_attempt_id
+                        WHERE {where_sql}
+                        ORDER BY t.id, r.channel_id
+                        """,
+                        tuple(params),
+                    )
+
+                    if normalized_format == "json":
+                        yield '{"results":['
+                        first = True
+                        for row in cursor:
+                            if str(row.get("codec") or "") != CODEC:
+                                continue
+                            mac = row["mac"]
+                            modem_ip = row.get("modem_ip") or ""
+                            row_cmts = row.get("cmts") or ""
+                            row_fn = row.get("fiber_node") or ""
+                            channel_id = int(row["channel_id"])
+                            sample_count = int(row["sample_count"])
+                            try:
+                                vector = decode_vector(
+                                    bytes(row["payload"]),
+                                    expected_sha256=bytes(row["vector_sha256"]),
+                                    expected_size=sample_count,
+                                )
+                            except Exception:
+                                continue
+                            spacing_hz = int(row["spacing_hz"])
+                            first_freq = int(row["zero_frequency_hz"]) + (
+                                int(row["first_active_index"]) * spacing_hz
+                            )
+                            values = np.frombuffer(vector, dtype=np.uint8)
+                            for i, qdb in enumerate(values):
+                                if not first:
+                                    yield ","
+                                first = False
+                                freq = first_freq + i * spacing_hz
+                                yield json.dumps({
+                                    "mac": mac,
+                                    "modem_ip": modem_ip,
+                                    "cmts": row_cmts,
+                                    "fiber_node": row_fn,
+                                    "channel_id": channel_id,
+                                    "frequency_hz": freq,
+                                    "rxmer_db": round(int(qdb) / 4.0, 2),
+                                }, separators=(",", ":"))
+                        yield "]}"
+                    else:
+                        # CSV
+                        buffer = io.StringIO()
+                        writer = csv.DictWriter(buffer, fieldnames=field_names)
+                        writer.writeheader()
+                        yield buffer.getvalue()
+                        buffer.seek(0)
+                        buffer.truncate(0)
+                        for row in cursor:
+                            if str(row.get("codec") or "") != CODEC:
+                                continue
+                            mac = row["mac"]
+                            modem_ip = row.get("modem_ip") or ""
+                            row_cmts = row.get("cmts") or ""
+                            row_fn = row.get("fiber_node") or ""
+                            channel_id = int(row["channel_id"])
+                            sample_count = int(row["sample_count"])
+                            try:
+                                vector = decode_vector(
+                                    bytes(row["payload"]),
+                                    expected_sha256=bytes(row["vector_sha256"]),
+                                    expected_size=sample_count,
+                                )
+                            except Exception:
+                                continue
+                            spacing_hz = int(row["spacing_hz"])
+                            first_freq = int(row["zero_frequency_hz"]) + (
+                                int(row["first_active_index"]) * spacing_hz
+                            )
+                            values = np.frombuffer(vector, dtype=np.uint8)
+                            for i, qdb in enumerate(values):
+                                freq = first_freq + i * spacing_hz
+                                writer.writerow({
+                                    "mac": mac,
+                                    "modem_ip": modem_ip,
+                                    "cmts": row_cmts,
+                                    "fiber_node": row_fn,
+                                    "channel_id": channel_id,
+                                    "frequency_hz": freq,
+                                    "rxmer_db": round(int(qdb) / 4.0, 2),
+                                })
+                                yield buffer.getvalue()
+                                buffer.seek(0)
+                                buffer.truncate(0)
+            finally:
+                connection.close()
+
+        return generate()
+
     def request_spectrum_build(self, public_id: str) -> dict[str, Any]:
         """Acquire a DB lease for post-processing persisted RxMER vectors."""
         self.ensure_schema()
