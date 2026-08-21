@@ -284,6 +284,7 @@ class AgentSnmpTransport:
         timeout: int = 10,
         retries: int = 3,
         agent_id: str | None = None,
+        priority: str = 'interactive',
     ) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
         self._host = host.inet if hasattr(host, 'inet') else str(host)
@@ -291,6 +292,7 @@ class AgentSnmpTransport:
         self._timeout = timeout
         self._retries = retries
         self._agent_id = agent_id  # pin to a specific agent when set
+        self._priority = priority  # 'interactive' (GUI) or 'bulk' (background jobs)
 
         if read_community is not None:
             self._read_community = str(read_community)
@@ -342,6 +344,7 @@ class AgentSnmpTransport:
         mgr, agent = self._get_manager_and_agent(capability, self._agent_id)
         task_id = await mgr.send_task(
             agent.agent_id, command, params, timeout=timeout,
+            priority=self._priority,
         )
         # send_task may have bumped the timeout (e.g. LONG_COMMANDS → 90s).
         # Always wait as long as the task itself is configured for.

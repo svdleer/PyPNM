@@ -171,7 +171,7 @@ class CmSnmpOperation:
         _SNMPv2C = 0
         _SNMPv3  = 1
 
-    def __init__(self, inet: Inet, write_community: str, port: int = Snmp_v2c.SNMP_PORT) -> None:
+    def __init__(self, inet: Inet, write_community: str, port: int = Snmp_v2c.SNMP_PORT, priority: str = 'interactive') -> None:
         """
         Initialize a CmSnmpOperation instance.
 
@@ -179,6 +179,7 @@ class CmSnmpOperation:
             inet (str): IP address of the Cable Modem.
             write_community (str): SNMP community string (usually 'private' for read/write access).
             port (int, optional): SNMP port number. Defaults to standard SNMP port 161.
+            priority (str, optional): Agent task priority ('interactive' for GUI, 'bulk' for background jobs).
 
         """
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -190,6 +191,7 @@ class CmSnmpOperation:
         self._inet:Inet = inet
         self._community = write_community
         self._port = port
+        self._priority = priority
         self._snmp = self.__load_snmp_version()
 
     def __load_snmp_version(self) -> Snmp_v2c | Snmp_v3:
@@ -233,6 +235,7 @@ class CmSnmpOperation:
                             timeout=10,
                             retries=3,
                             agent_id=agent.agent_id,
+                            priority=self._priority,
                         )
                     else:
                         print("DEBUG: No agent with snmp_get capability")

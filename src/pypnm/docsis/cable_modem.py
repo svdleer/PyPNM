@@ -24,7 +24,8 @@ class CableModem(CmSnmpOperation):
 
     def __init__(self, mac_address: MacAddress,
                  inet: Inet,
-                 write_community: str | None = None) -> None:
+                 write_community: str | None = None,
+                 priority: str = 'interactive') -> None:
         """
         Initialize the CableModem instance.
 
@@ -33,10 +34,11 @@ class CableModem(CmSnmpOperation):
             inet (Inet): The IP address of the cable modem.
             write_community (str, optional): SNMP write community string. When omitted,
                 resolves the current configured value at construction time.
+            priority (str, optional): Agent task priority ('interactive' for GUI, 'bulk' for background jobs).
         """
         if write_community is None:
             write_community = str(PnmConfigManager.get_write_community())
-        super().__init__(inet=inet, write_community=write_community)
+        super().__init__(inet=inet, write_community=write_community, priority=priority)
         self.logger = logging.getLogger(self.__class__.__name__)
         self._mac_address: MacAddress = mac_address
 

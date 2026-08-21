@@ -1025,7 +1025,11 @@ async def discover_rf_port(request: UtscDiscoverRequest) -> UtscDiscoverResponse
         )
         
         result = await asyncio.wait_for(
-            service.discover(request.cm_mac_address),
+            service.discover(
+                request.cm_mac_address,
+                ofdma_ifindex=request.ofdma_ifindex,
+                cm_index=request.cm_index,
+            ),
             timeout=60.0
         )
         

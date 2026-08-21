@@ -139,6 +139,8 @@ class UtscResponse(BaseModel):
 
 class UtscDiscoverRequest(CmtsUtscRequest):
     cm_mac_address: str = Field(description="Cable modem MAC address")
+    ofdma_ifindex: int | None = Field(default=None, description="Known OFDMA ifIndex (skips CM MAC + OFDMA table walks when provided)")
+    cm_index: int | None = Field(default=None, description="Known CM index (skips CM MAC table walk when provided)")
 
 
 class UtscDiscoverResponse(BaseModel):

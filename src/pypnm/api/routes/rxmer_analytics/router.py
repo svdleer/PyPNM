@@ -28,6 +28,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin/rxmer-analytics", tags=["RxMER analytics"])
 
 
+def _build_report_filename(public_id: str, suffix: str, fmt: str) -> str:
+    """Build a human-readable report filename from job metadata.
+
+    Format: network-rxmer-{scope}-{date}-{short_id}.{ext}
+    Example: network-rxmer-MND-GT0002-CCAP101-20260820-26aacbf8.csv
+    """
+    import json as _json
+
+    short_id = public_id[:8]
+    scope_label = "network"
+    date_label = ""
+    try:
+        rows = rxmer_analytics_service._query(
+            "SELECT scope_json, created_at FROM rxmer_job WHERE public_id=%s LIMIT 1",
+            (public_id,),
+        )
+        if rows:
+            row = rows[0]
+            scope_raw = row.get("scope_json")
+            if isinstance(scope_raw, str):
+                scope_doc = _json.loads(scope_raw)
+            elif isinstance(scope_raw, dict):
+                scope_doc = scope_raw
+            else:
+                scope_doc = {}
+            cmts_list = scope_doc.get("cmts") or []
+            if cmts_list:
+                # Use first CMTS name, sanitized for filenames
+                scope_label = str(cmts_list[0]).replace(" ", "_").replace("/", "-")[:40]
+            created = row.get("created_at")
+            if created:
+                from datetime import datetime
+                if isinstance(created, datetime):
+                    date_label = created.strftime("%Y%m%d")
+                else:
+                    date_label = str(created)[:10].replace("-", "")
+    except Exception:
+        pass
+    parts = ["network-rxmer"]
+    if suffix:
+        parts.append(suffix)
+    if scope_label:
+        parts.append(scope_label)
+    if date_label:
+        parts.append(date_label)
+    parts.append(short_id)
+    return f"{'-'.join(parts)}.{fmt}"
+
+
 @router.get("/capabilities")
 def get_capabilities() -> dict:
     return {"status": "success", **rxmer_analytics_service.capabilities()}
@@ -186,7 +235,7 @@ def download_job_report(
         logger.error("RxMER report creation failed: %s", exc)
         raise HTTPException(status_code=503, detail="RxMER report unavailable") from exc
     media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
-    filename = f"network-rxmer-{public_id}.{format}"
+    filename = _build_report_filename(public_id, "", format)
     return StreamingResponse(
         stream,
         media_type=media_type,
@@ -222,7 +271,7 @@ def download_job_subcarrier_report(
         logger.error("RxMER subcarrier report creation failed: %s", exc)
         raise HTTPException(status_code=503, detail="RxMER subcarrier report unavailable") from exc
     media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
-    filename = f"network-rxmer-subcarriers-{public_id}.{format}"
+    filename = _build_report_filename(public_id, "subcarriers", format)
     return StreamingResponse(
         stream,
         media_type=media_type,

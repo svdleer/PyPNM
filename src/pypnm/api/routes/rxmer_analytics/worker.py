@@ -176,6 +176,7 @@ class RxMerCollectionWorker:
                 mac_address=MacAddress(str(target["mac"])),
                 inet=Inet(str(target["modem_ip"])),
                 write_community=_configured_modem_community(),
+                priority='bulk',
             )
             cm_agent_id = getattr(getattr(modem, "_snmp", None), "_agent_id", None)
             channels = await modem.getDocsIf31CmDsOfdmChannelIdIndexStack()

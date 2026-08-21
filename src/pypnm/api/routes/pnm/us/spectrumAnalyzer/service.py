@@ -729,15 +729,20 @@ class UtscRfPortDiscoveryService:
     def normalize_mac(mac: str) -> str:
         return mac.upper().replace(':', '').replace('-', '').replace('.', '')
     
-    async def discover(self, mac_address: str) -> dict:
+    async def discover(self, mac_address: str, ofdma_ifindex: Optional[int] = None, cm_index: Optional[int] = None) -> dict:
         """Discover the correct UTSC RF port for a modem.
         
         Uses one parallel SNMP walk to collect modem/channel and mapping tables.
         All business logic runs in PyPNM, agent is just an SNMP proxy.
         
+        When ofdma_ifindex is provided (e.g. from inventory or prior discovery),
+        the expensive CM MAC and OFDMA table walks are skipped entirely — only
+        CoreToRpdMap, UTSC logical rows, and ifDescr are walked.  This avoids
+        the 10000-row walk truncation on large CMTSes (>10000 registered CMs).
+        
         Flow:
-        1. Parallel walk: ifDescr + CM MAC + OFDMA status + UTSC logical rows + RPHY map
-        2. Parse results: find CM index, find OFDMA channel
+        1. Resolve ofdma_ifindex: use provided value, or inventory lookup, or SNMP walk
+        2. Parallel walk: ifDescr + UTSC logical rows + RPHY map (+ CM/OFDMA only if needed)
         3. Primary mapping: correlate OFDMA ifIndex with UTSC logical rows
         4. Core-CCAP mapping: DOCS-RPHY CoreToRpdMap (authoritative relation)
         5. Casa mapping: logical->physical transform when needed
@@ -745,6 +750,7 @@ class UtscRfPortDiscoveryService:
         Supports:
         - Arris/CommScope Core-CCAP: CoreToRpdMap relation (no name-based fallback)
         - Arris/CommScope I-CCAP: logical-row based mapping when available
+        - CommScope EVO vCCAP: CoreToRpdMap (OFDMA 160M → RF 120M)
         - Casa: logical->physical mapping (16M -> 4M) when needed
         """
         import re
@@ -762,15 +768,65 @@ class UtscRfPortDiscoveryService:
         mac_normalized = self.normalize_mac(mac_address)
         self.logger.info(f"Discovering RF port for {mac_normalized} on {self.cmts_ip}")
         
-        # One agent call: collect all trees needed for deterministic correlation.
-        walk_result = await self._snmp_parallel_walk([
-            self.OID_IF_DESCR,       # All interface descriptions (us-conn ports + channel names)
-            self.CM_REG_STATUS_MAC,   # All registered CM MACs -> CM index
-            self.CM_OFDMA_STATUS,     # All OFDMA channel assignments -> CM -> OFDMA ifIndex
-            self.UTSC_CFG_LOGICAL_CH, # UTSC rows: <rf_ifindex>.<cfg_idx> -> logical channel
-            self.CORE_TO_RPD_RF_CHAN_TYPE,
-            self.CORE_TO_RPD_RF_CHAN_INDEX,
-        ])
+        # --- Resolve OFDMA ifIndex from inventory if not provided ---
+        # This avoids walking the full CM MAC + OFDMA tables which truncate
+        # at 10000 rows on large CMTSes (e.g. CommScope EVO with >10000 CMs).
+        if not ofdma_ifindex:
+            try:
+                from pypnm.api.routes.poller.service import poller_service
+                inv = poller_service.get_inventory_modem_by_mac(mac_address)
+                if inv:
+                    if not ofdma_ifindex and inv.get('ofdma_ifindex'):
+                        ofdma_ifindex = int(inv['ofdma_ifindex'])
+                        self.logger.info(f"Inventory fast-path: ofdma_ifindex={ofdma_ifindex} for {mac_normalized}")
+                    if not cm_index and inv.get('cmts_index'):
+                        cm_index = int(inv['cmts_index'])
+                        self.logger.info(f"Inventory fast-path: cm_index={cm_index} for {mac_normalized}")
+            except Exception as e:
+                self.logger.debug(f"Inventory lookup failed (non-fatal): {e}")
+        
+        # --- Also try in-memory enrichment cache ---
+        if not ofdma_ifindex:
+            try:
+                from pypnm.api.routes.cmts.service import _enrichment_cache
+                cached_entry = _enrichment_cache.get(self.cmts_ip, {})
+                if cached_entry.get('cmts_enriched') or cached_entry.get('enriched'):
+                    for m in cached_entry.get('modems', []):
+                        if self.normalize_mac(m.get('mac_address', '')) == mac_normalized:
+                            ifidx = m.get('ofdma_ifindex')
+                            if ifidx:
+                                ofdma_ifindex = int(ifidx)
+                                self.logger.info(f"Memory-cache fast-path: ofdma_ifindex={ofdma_ifindex}")
+                            if not cm_index and m.get('cmts_index'):
+                                cm_index = int(m['cmts_index'])
+                            break
+            except Exception as e:
+                self.logger.debug(f"Enrichment cache lookup failed (non-fatal): {e}")
+        
+        # --- Determine which OID trees to walk ---
+        # When ofdma_ifindex is already known, skip CM MAC and OFDMA table walks
+        # (these are the tables that exceed 10000 rows on large CMTSes).
+        if ofdma_ifindex:
+            self.logger.info(
+                f"OFDMA ifIndex {ofdma_ifindex} known — skipping CM MAC + OFDMA table walks"
+            )
+            walk_oids = [
+                self.OID_IF_DESCR,
+                self.UTSC_CFG_LOGICAL_CH,
+                self.CORE_TO_RPD_RF_CHAN_TYPE,
+                self.CORE_TO_RPD_RF_CHAN_INDEX,
+            ]
+        else:
+            walk_oids = [
+                self.OID_IF_DESCR,
+                self.CM_REG_STATUS_MAC,
+                self.CM_OFDMA_STATUS,
+                self.UTSC_CFG_LOGICAL_CH,
+                self.CORE_TO_RPD_RF_CHAN_TYPE,
+                self.CORE_TO_RPD_RF_CHAN_INDEX,
+            ]
+        
+        walk_result = await self._snmp_parallel_walk(walk_oids)
         
         if not walk_result.get('success') or not walk_result.get('results'):
             result["error"] = f"SNMP parallel walk failed: {walk_result.get('error', 'no data')}"
@@ -790,42 +846,43 @@ class UtscRfPortDiscoveryService:
             f"{len(core_map_type_data)} CoreToRpdMap type rows"
         )
         
-        # --- Parse CM index from MAC table ---
-        cm_index = None
-        for entry in cm_mac_data:
-            found_mac = self.normalize_mac(str(entry.get('value', '')))
-            if found_mac == mac_normalized:
-                cm_index = int(str(entry['oid']).split('.')[-1])
-                break
-        
+        # --- Parse CM index from MAC table (only if not already known) ---
         if not cm_index:
-            result["error"] = f"Modem {mac_address} not found on CMTS"
-            return result
-        result["cm_index"] = cm_index
-        self.logger.info(f"CM index: {cm_index}")
-        
-        # --- Parse OFDMA channel for this CM ---
-        ofdma_ifindex = None
-        for entry in ofdma_data:
-            oid_str = str(entry.get('oid', ''))
-            # Strip the base OID to get just the instance part: {cm_index}.{ofdma_ifindex}
-            # Base OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2
-            # Full OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cm_index}.{ofdma_ifindex}
-            # Without stripping, ".{cm_index}." matches inside the base OID itself
-            # (e.g. cm_index=2 matches "4491.2.1" → returns ofdma_ifindex=1 → "eth 6/0")
-            instance = oid_str
-            if self.CM_OFDMA_STATUS in oid_str:
-                instance = oid_str[len(self.CM_OFDMA_STATUS):]
-            if f".{cm_index}." in instance:
-                parts = instance.strip('.').split(".")
-                for i, part in enumerate(parts):
-                    if part == str(cm_index) and i + 1 < len(parts):
-                        candidate = int(parts[i + 1])
-                        if candidate > 0:
-                            ofdma_ifindex = candidate
-                            break
-                if ofdma_ifindex:
+            for entry in cm_mac_data:
+                found_mac = self.normalize_mac(str(entry.get('value', '')))
+                if found_mac == mac_normalized:
+                    cm_index = int(str(entry['oid']).split('.')[-1])
                     break
+        
+        if not cm_index and not ofdma_ifindex:
+            result["error"] = f"Modem {mac_address} not found on CMTS (CM table may be truncated at 10000 rows)"
+            return result
+        if cm_index:
+            result["cm_index"] = cm_index
+            self.logger.info(f"CM index: {cm_index}")
+        
+        # --- Parse OFDMA channel for this CM (only if not already known) ---
+        if not ofdma_ifindex and cm_index:
+            for entry in ofdma_data:
+                oid_str = str(entry.get('oid', ''))
+                # Strip the base OID to get just the instance part: {cm_index}.{ofdma_ifindex}
+                # Base OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2
+                # Full OID: 1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cm_index}.{ofdma_ifindex}
+                # Without stripping, ".{cm_index}." matches inside the base OID itself
+                # (e.g. cm_index=2 matches "4491.2.1" → returns ofdma_ifindex=1 → "eth 6/0")
+                instance = oid_str
+                if self.CM_OFDMA_STATUS in oid_str:
+                    instance = oid_str[len(self.CM_OFDMA_STATUS):]
+                if f".{cm_index}." in instance:
+                    parts = instance.strip('.').split(".")
+                    for i, part in enumerate(parts):
+                        if part == str(cm_index) and i + 1 < len(parts):
+                            candidate = int(parts[i + 1])
+                            if candidate > 0:
+                                ofdma_ifindex = candidate
+                                break
+                    if ofdma_ifindex:
+                        break
         
         # --- Build ifDescr lookup and detect vendor families ---
         if_descr_map = {}  # ifindex -> description
