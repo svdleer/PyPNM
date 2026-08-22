@@ -37,7 +37,7 @@ class CmResetWorker:
         self._tasks: dict[str, asyncio.Task] = {}
         self._task_lock = asyncio.Lock()
 
-    async def start(self, public_id: str, max_concurrency: int = 5) -> dict[str, Any]:
+    async def start(self, public_id: str, max_concurrency: int = 5, skip_window_check: bool = False) -> dict[str, Any]:
         """Start execution of a planned reset job."""
         concurrency = max(1, min(int(max_concurrency), 10))
         lease_owner = f"cm-reset-worker-{uuid.uuid4()}"
@@ -50,8 +50,8 @@ class CmResetWorker:
             if job["status"] not in ("planned", "queued"):
                 raise ValueError(f"Job is in state '{job['status']}', cannot start")
 
-            # Check execution window
-            if not cm_reset_service.is_within_execution_window():
+            # Check execution window (unless godmode)
+            if not skip_window_check and not cm_reset_service.is_within_execution_window():
                 next_start = cm_reset_service.next_execution_window_start()
                 raise ValueError(
                     f"Resets can only run between 01:00 and 06:00. "

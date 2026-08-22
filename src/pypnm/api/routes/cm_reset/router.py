@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin/cm-reset", tags=["CM bulk reset"])
 
 _CONFIRMATION_PASSPHRASE = "have you tried turning it on and off again?"
+_GODMODE_PASSPHRASE = "its always dns"
 
 
 @router.get("/capabilities", response_model=CmResetCapabilitiesResponse)
@@ -100,11 +101,18 @@ async def start_job(public_id: str, payload: CmResetJobStartRequest) -> CmResetJ
             "Please type: have you tried turning it on and off again?",
         )
 
+    # Godmode: bypass execution window
+    godmode = (
+        payload.godmode_passphrase is not None
+        and payload.godmode_passphrase.strip().lower() == _GODMODE_PASSPHRASE
+    )
+
     try:
         job = await cm_reset_worker.start(
-            public_id, max_concurrency=payload.max_concurrency
+            public_id, max_concurrency=payload.max_concurrency, skip_window_check=godmode
         )
-        return CmResetJobActionResponse(job=CmResetJob(**job), message="Job started")
+        msg = "Job started (GODMODE — window bypassed)" if godmode else "Job started"
+        return CmResetJobActionResponse(job=CmResetJob(**job), message=msg)
     except KeyError:
         raise HTTPException(status_code=404, detail="Job not found")
     except ValueError as exc:

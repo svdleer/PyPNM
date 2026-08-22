@@ -38,6 +38,10 @@ class CmResetJobStartRequest(BaseModel):
     confirmation_passphrase: str = Field(
         description="Must be exactly: have you tried turning it on and off again?"
     )
+    godmode_passphrase: str | None = Field(
+        default=None,
+        description="Optional: bypass execution window. Must be: its always dns"
+    )
 
 
 class CmResetJobCancelRequest(BaseModel):
