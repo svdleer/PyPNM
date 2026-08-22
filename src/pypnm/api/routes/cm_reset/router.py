@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin/cm-reset", tags=["CM bulk reset"])
 
 _CONFIRMATION_PASSPHRASE = "have you tried turning it on and off again?"
-_GODMODE_PASSPHRASE = "its always dns"
+_GODMODE_PASSPHRASE = "iddqd"
 
 
 @router.get("/capabilities", response_model=CmResetCapabilitiesResponse)
