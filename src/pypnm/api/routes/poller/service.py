@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import os
-import json
 import ipaddress
+import json
 import logging
+import os
 import threading
 import time
 import uuid
-from datetime import datetime, time as datetime_time, timezone
-from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
+from datetime import datetime, timedelta, timezone
+from datetime import time as datetime_time
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pymysql
 import pymysql.cursors
@@ -23,6 +26,10 @@ _CPE_TASK_TYPE = "cpe_address_refresh"
 _CPE_TASK_SYSTEM_KEY = "cpe-address-refresh"
 _CPE_TASK_NAME = "CPE address refresh"
 _CPE_TASK_SCHEDULE = (datetime_time(hour=0), datetime_time(hour=12))
+
+
+class _PollerJobNotRunning(RuntimeError):
+    """Raised when a cancelled poller job must not persist fetched data."""
 
 
 class PollerService:
@@ -239,6 +246,7 @@ class PollerService:
                 max_runtime_sec INT NOT NULL DEFAULT 3600,
                 last_target_offset INT NOT NULL DEFAULT 0,
                 last_scheduled_slot_utc DATETIME NULL,
+                last_interval_enqueue_utc DATETIME NULL,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
                 UNIQUE KEY uk_poller_setting_name (name),
@@ -383,10 +391,31 @@ class PollerService:
             missing_setting_columns.append(
                 "ADD COLUMN `last_scheduled_slot_utc` DATETIME NULL"
             )
+        if "last_interval_enqueue_utc" not in setting_columns:
+            missing_setting_columns.append(
+                "ADD COLUMN `last_interval_enqueue_utc` DATETIME NULL"
+            )
         if missing_setting_columns:
             self._execute(
                 "ALTER TABLE poller_setting " + ", ".join(missing_setting_columns)
             )
+        self._execute(
+            """
+            UPDATE poller_setting p
+            LEFT JOIN (
+                SELECT poller_id, MAX(created_at) AS last_created_at
+                FROM poller_job
+                GROUP BY poller_id
+            ) j ON j.poller_id = p.id
+            SET p.last_interval_enqueue_utc = j.last_created_at
+            WHERE p.task_type = 'inventory'
+              AND j.last_created_at IS NOT NULL
+              AND (
+                  p.last_interval_enqueue_utc IS NULL
+                  OR p.last_interval_enqueue_utc < j.last_created_at
+              )
+            """
+        )
 
         job_columns = {
             str(row.get("Field"))
@@ -449,7 +478,7 @@ class PollerService:
                 "UPDATE poller_setting SET task_type=%s, system_key=%s, name=%s, "
                 "scope_type='all_cmts', scope_json=NULL, collect_identity=FALSE, "
                 "collect_scqam=FALSE, collect_rxmer=FALSE, interval_minutes=720, "
-                "max_runtime_sec=43200, updated_at=%s WHERE id=%s",
+                "max_concurrency=4, max_runtime_sec=43200, updated_at=%s WHERE id=%s",
                 (
                     _CPE_TASK_TYPE,
                     _CPE_TASK_SYSTEM_KEY,
@@ -469,7 +498,7 @@ class PollerService:
                      retention_days, heavy_max_modems, heavy_delay_ms,
                      max_runtime_sec, last_target_offset, created_at, updated_at)
                 VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,FALSE,FALSE,FALSE,
-                        720,1,20,30,300,0,43200,0,%s,%s)
+                        720,4,20,30,300,0,43200,0,%s,%s)
                 """,
                 (_CPE_TASK_NAME, _CPE_TASK_TYPE, _CPE_TASK_SYSTEM_KEY, now, now),
             )
@@ -587,6 +616,23 @@ class PollerService:
                     worker_kind,
                     self._db_name(),
                 )
+                return conn
+        except Exception:
+            conn.close()
+            raise
+        conn.close()
+        return None
+
+    def _try_acquire_scheduler_lock(self):
+        """Return a dedicated connection holding the scheduler singleton lock."""
+        conn = self._connect()
+        lock_name = f"pypnm-poller-scheduler:{self._db_name()}"[:64]
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT GET_LOCK(%s, 0) AS acquired", (lock_name,))
+            row = cur.fetchone() or {}
+            cur.close()
+            if int(row.get("acquired") or 0) == 1:
                 return conn
         except Exception:
             conn.close()
@@ -1285,6 +1331,7 @@ class PollerService:
         snapshot_id: str,
         complete: bool,
         truncated: bool,
+        job_id: Optional[int] = None,
     ) -> int:
         """Replace one CMTS CPE generation only after a complete walk."""
         if not complete or truncated:
@@ -1334,6 +1381,19 @@ class PollerService:
             try:
                 conn.begin()
                 cur = conn.cursor()
+                if job_id is not None:
+                    cur.execute(
+                        "SELECT status FROM poller_job WHERE id=%s FOR UPDATE",
+                        (int(job_id),),
+                    )
+                    job = cur.fetchone()
+                    if (
+                        not job
+                        or str(job.get("status") or "").lower() != "running"
+                    ):
+                        raise _PollerJobNotRunning(
+                            f"Poller job {job_id} is no longer running"
+                        )
                 for offset in range(0, len(values), 1000):
                     cur.executemany(sql, values[offset:offset + 1000])
                 cur.execute(
@@ -1585,215 +1645,299 @@ class PollerService:
         subtask_retries = max(
             0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
         )
+        try:
+            max_concurrency = max(
+                1, min(int(poller.get("max_concurrency") or 1), 4)
+            )
+        except (TypeError, ValueError):
+            max_concurrency = 1
         total_targets = len(targets)
         if total_targets == 0:
             fatal_error = "No CMTS targets resolved (check scope/appdb config)"
 
-        for idx, target in enumerate(targets, start=1):
-            if fatal_error or idx <= start_offset:
-                continue
+        def _job_is_running() -> bool:
             status_rows = self._query(
                 "SELECT status FROM poller_job WHERE id=%s", (job_id,)
             )
-            current_status = (
-                str((status_rows[0] or {}).get("status") or "").lower()
-                if status_rows else ""
-            )
-            if current_status != "running":
-                self._execute(
-                    "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
-                    "WHERE id=%s",
-                    (self._now(), poller_id),
-                )
-                return
-
-            cmts_ip = target.get("ip")
-            cmts_name = target.get("name") or cmts_ip
-            if not cmts_ip:
-                continue
-            self._update_running_job_progress(
-                job_id,
-                f"CPE {idx}/{total_targets}: walking {cmts_name}",
-                rows_collected=rows_collected,
-                modems_attempted=targets_attempted,
-                modems_succeeded=targets_succeeded,
-                modems_failed=targets_failed,
+            return bool(
+                status_rows
+                and str((status_rows[0] or {}).get("status") or "").lower()
+                == "running"
             )
 
-            fetch_result = None
+        def _fetch_target(cmts_ip: str) -> Dict[str, Any]:
+            attempt_errors = []
             last_target_error = None
             for attempt in range(subtask_retries + 1):
+                if not _job_is_running():
+                    return {
+                        "cancelled": True,
+                        "fetch_result": None,
+                        "last_target_error": last_target_error,
+                        "attempt_errors": attempt_errors,
+                    }
                 try:
-                    fetch_result = self._fetch_cmts_cpe(
-                        cmts_ip, timeout_sec=subtask_timeout_sec
-                    )
-                    break
+                    return {
+                        "cancelled": False,
+                        "fetch_result": self._fetch_cmts_cpe(
+                            cmts_ip, timeout_sec=subtask_timeout_sec
+                        ),
+                        "last_target_error": last_target_error,
+                        "attempt_errors": attempt_errors,
+                    }
                 except Exception as exc:
-                    last_target_error = exc
-                    self._update_running_job_progress(
-                        job_id,
-                        f"CPE {idx}/{total_targets}: {cmts_name} attempt "
-                        f"{attempt + 1}/{subtask_retries + 1} failed ({exc})",
-                        rows_collected=rows_collected,
-                        modems_attempted=targets_attempted,
-                        modems_succeeded=targets_succeeded,
-                        modems_failed=targets_failed,
-                    )
-                    status_rows = self._query(
-                        "SELECT status FROM poller_job WHERE id=%s", (job_id,)
-                    )
-                    current_status = (
-                        str((status_rows[0] or {}).get("status") or "").lower()
-                        if status_rows else ""
-                    )
-                    if current_status != "running":
-                        self._execute(
-                            "UPDATE poller_setting SET last_target_offset=0, "
-                            "updated_at=%s WHERE id=%s",
-                            (self._now(), poller_id),
-                        )
-                        return
-            if fetch_result is None:
-                # A non-responsive CMTS is a per-target failure. Preserve its
-                # previous CPE rows, record the failure, and continue the run.
-                status_rows = self._query(
-                    "SELECT status FROM poller_job WHERE id=%s", (job_id,)
-                )
-                if (
-                    not status_rows
-                    or str(status_rows[0].get("status") or "") != "running"
-                ):
-                    self._execute(
-                        "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
-                        "WHERE id=%s",
-                        (self._now(), poller_id),
-                    )
-                    return
+                    last_target_error = str(exc)
+                    attempt_errors.append((attempt + 1, last_target_error))
+                    if not _job_is_running():
+                        return {
+                            "cancelled": True,
+                            "fetch_result": None,
+                            "last_target_error": last_target_error,
+                            "attempt_errors": attempt_errors,
+                        }
+            return {
+                "cancelled": False,
+                "fetch_result": None,
+                "last_target_error": last_target_error,
+                "attempt_errors": attempt_errors,
+            }
 
-                targets_attempted += 1
-                targets_failed += 1
-                incomplete_targets += 1
-                validation_error = (
-                    f"CPE fetch failed after {subtask_retries + 1} attempt(s): "
-                    f"{last_target_error}"
+        work_targets = []
+        if not fatal_error:
+            for idx, target in enumerate(targets, start=1):
+                if idx <= start_offset:
+                    continue
+                cmts_ip = target.get("ip")
+                if not cmts_ip:
+                    continue
+                work_targets.append(
+                    (idx, cmts_ip, target.get("name") or cmts_ip)
                 )
-                breakdown.append({
-                    "cmts": cmts_name,
-                    "cmts_ip": cmts_ip,
-                    "row_count": 0,
-                    "cpe_row_count": 0,
-                    "skipped_cpe_rows": 0,
-                    "cpe_complete": False,
-                    "completion_source": None,
-                    "cpe_truncated": False,
-                    "cpe_oid_errors": {},
-                    "validation_error": validation_error,
-                    "requested_limit": None,
-                    "collected_at": None,
-                    "raw_d3_mac_count": None,
-                    "raw_cpe_type_count": None,
-                    "raw_cpe_address_count": None,
-                    "raw_cpe_prefix_count": None,
-                })
-                self._execute(
-                    "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
-                    (json.dumps(breakdown), job_id),
+
+        executor = None
+        pending = []
+        next_target = 0
+        cancelled = False
+        try:
+            if work_targets:
+                executor = ThreadPoolExecutor(
+                    max_workers=max_concurrency,
+                    thread_name_prefix="poller-cpe-fetch",
                 )
-                self._execute(
-                    "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
-                    "WHERE id=%s",
-                    (idx, self._now(), poller_id),
-                )
+                while next_target < min(max_concurrency, len(work_targets)):
+                    idx, cmts_ip, cmts_name = work_targets[next_target]
+                    pending.append(
+                        (
+                            idx,
+                            cmts_ip,
+                            cmts_name,
+                            executor.submit(_fetch_target, cmts_ip),
+                        )
+                    )
+                    next_target += 1
+
+            while pending:
+                idx, cmts_ip, cmts_name, future = pending[0]
+                if not _job_is_running():
+                    cancelled = True
+                    break
                 self._update_running_job_progress(
                     job_id,
-                    f"CPE {idx}/{total_targets}: {cmts_name} skipped "
-                    f"after {subtask_retries + 1} failed attempt(s)",
+                    f"CPE {idx}/{total_targets}: walking {cmts_name}",
                     rows_collected=rows_collected,
                     modems_attempted=targets_attempted,
                     modems_succeeded=targets_succeeded,
                     modems_failed=targets_failed,
                 )
-                continue
 
-            # Kill is cooperative. Never persist a generation returned after the
-            # administrator cancelled the job while its SNMP request was in flight.
-            status_rows = self._query(
-                "SELECT status FROM poller_job WHERE id=%s", (job_id,)
-            )
-            if not status_rows or str(status_rows[0].get("status") or "") != "running":
-                self._execute(
-                    "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
-                    "WHERE id=%s",
-                    (self._now(), poller_id),
-                )
-                return
+                while True:
+                    done, _ = wait_for_futures((future,), timeout=1.0)
+                    if done:
+                        outcome = future.result()
+                        break
+                    if not _job_is_running():
+                        cancelled = True
+                        break
+                if cancelled:
+                    break
+                if outcome.get("cancelled") or not _job_is_running():
+                    cancelled = True
+                    break
 
-            targets_attempted += 1
-            cpe_rows = fetch_result.get("cpe_addresses") or []
-            complete = fetch_result.get("complete") is True
-            truncated = fetch_result.get("truncated") is True
-            validation_error = fetch_result.get("validation_error")
-            written = 0
-            if complete and not truncated:
-                try:
-                    written = self._persist_cpe_generation(
-                        cpe_rows,
-                        cmts_ip=cmts_ip,
-                        snapshot_id=str(uuid.uuid4()),
-                        complete=True,
-                        truncated=False,
+                for attempt, error_text in outcome.get("attempt_errors") or []:
+                    self._update_running_job_progress(
+                        job_id,
+                        f"CPE {idx}/{total_targets}: {cmts_name} attempt "
+                        f"{attempt}/{subtask_retries + 1} failed ({error_text})",
+                        rows_collected=rows_collected,
+                        modems_attempted=targets_attempted,
+                        modems_succeeded=targets_succeeded,
+                        modems_failed=targets_failed,
                     )
-                    targets_succeeded += 1
-                except Exception as exc:
-                    complete = False
-                    validation_error = str(exc)
-            if not complete or truncated:
-                targets_failed += 1
-                incomplete_targets += 1
+                if not _job_is_running():
+                    cancelled = True
+                    break
 
-            breakdown.append({
-                "cmts": cmts_name,
-                "cmts_ip": cmts_ip,
-                "row_count": written,
-                "cpe_row_count": written,
-                "skipped_cpe_rows": int(fetch_result.get("skipped_cpe_rows") or 0),
-                "cpe_complete": complete,
-                "completion_source": fetch_result.get("completion_source"),
-                "cpe_truncated": truncated,
-                "cpe_oid_errors": fetch_result.get("oid_errors") or {},
-                "validation_error": validation_error,
-                "requested_limit": fetch_result.get("requested_limit"),
-                "collected_at": fetch_result.get("collected_at"),
-                "raw_d3_mac_count": fetch_result.get("raw_d3_mac_count"),
-                "raw_cpe_type_count": fetch_result.get("raw_cpe_type_count"),
-                "raw_cpe_address_count": fetch_result.get("raw_cpe_address_count"),
-                "raw_cpe_prefix_count": fetch_result.get("raw_cpe_prefix_count"),
-            })
+                fetch_result = outcome.get("fetch_result")
+                last_target_error = outcome.get("last_target_error")
+                if fetch_result is None:
+                    # A non-responsive CMTS is a per-target failure. Preserve its
+                    # previous CPE rows, record the failure, and continue the run.
+                    targets_attempted += 1
+                    targets_failed += 1
+                    incomplete_targets += 1
+                    validation_error = (
+                        f"CPE fetch failed after {subtask_retries + 1} attempt(s): "
+                        f"{last_target_error}"
+                    )
+                    breakdown.append({
+                        "cmts": cmts_name,
+                        "cmts_ip": cmts_ip,
+                        "row_count": 0,
+                        "cpe_row_count": 0,
+                        "skipped_cpe_rows": 0,
+                        "cpe_complete": False,
+                        "completion_source": None,
+                        "cpe_truncated": False,
+                        "cpe_oid_errors": {},
+                        "validation_error": validation_error,
+                        "requested_limit": None,
+                        "collected_at": None,
+                        "raw_d3_mac_count": None,
+                        "raw_cpe_type_count": None,
+                        "raw_cpe_address_count": None,
+                        "raw_cpe_prefix_count": None,
+                    })
+                    self._execute(
+                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                        (json.dumps(breakdown), job_id),
+                    )
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
+                        "WHERE id=%s",
+                        (idx, self._now(), poller_id),
+                    )
+                    self._update_running_job_progress(
+                        job_id,
+                        f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                        f"after {subtask_retries + 1} failed attempt(s)",
+                        rows_collected=rows_collected,
+                        modems_attempted=targets_attempted,
+                        modems_succeeded=targets_succeeded,
+                        modems_failed=targets_failed,
+                    )
+                else:
+                    # Kill is cooperative. Never persist a generation returned after
+                    # the administrator cancelled the job while its request was in flight.
+                    if not _job_is_running():
+                        cancelled = True
+                        break
+
+                    targets_attempted += 1
+                    cpe_rows = fetch_result.get("cpe_addresses") or []
+                    complete = fetch_result.get("complete") is True
+                    truncated = fetch_result.get("truncated") is True
+                    validation_error = fetch_result.get("validation_error")
+                    written = 0
+                    if complete and not truncated:
+                        try:
+                            written = self._persist_cpe_generation(
+                                cpe_rows,
+                                cmts_ip=cmts_ip,
+                                snapshot_id=str(uuid.uuid4()),
+                                complete=True,
+                                truncated=False,
+                                job_id=job_id,
+                            )
+                            targets_succeeded += 1
+                        except _PollerJobNotRunning:
+                            cancelled = True
+                            break
+                        except Exception as exc:
+                            complete = False
+                            validation_error = str(exc)
+                    if not complete or truncated:
+                        targets_failed += 1
+                        incomplete_targets += 1
+
+                    breakdown.append({
+                        "cmts": cmts_name,
+                        "cmts_ip": cmts_ip,
+                        "row_count": written,
+                        "cpe_row_count": written,
+                        "skipped_cpe_rows": int(
+                            fetch_result.get("skipped_cpe_rows") or 0
+                        ),
+                        "cpe_complete": complete,
+                        "completion_source": fetch_result.get("completion_source"),
+                        "cpe_truncated": truncated,
+                        "cpe_oid_errors": fetch_result.get("oid_errors") or {},
+                        "validation_error": validation_error,
+                        "requested_limit": fetch_result.get("requested_limit"),
+                        "collected_at": fetch_result.get("collected_at"),
+                        "raw_d3_mac_count": fetch_result.get("raw_d3_mac_count"),
+                        "raw_cpe_type_count": fetch_result.get("raw_cpe_type_count"),
+                        "raw_cpe_address_count": fetch_result.get(
+                            "raw_cpe_address_count"
+                        ),
+                        "raw_cpe_prefix_count": fetch_result.get(
+                            "raw_cpe_prefix_count"
+                        ),
+                    })
+                    self._execute(
+                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                        (json.dumps(breakdown), job_id),
+                    )
+                    rows_collected += written
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
+                        "WHERE id=%s",
+                        (idx, self._now(), poller_id),
+                    )
+                    progress_message = (
+                        f"CPE {idx}/{total_targets}: {cmts_name} done "
+                        f"({written} addresses, complete=True)"
+                        if complete and not truncated
+                        else f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                        "(incomplete generation; previous rows preserved)"
+                    )
+                    self._update_running_job_progress(
+                        job_id,
+                        progress_message,
+                        rows_collected=rows_collected,
+                        modems_attempted=targets_attempted,
+                        modems_succeeded=targets_succeeded,
+                        modems_failed=targets_failed,
+                    )
+
+                pending.pop(0)
+                if next_target < len(work_targets):
+                    next_idx, next_ip, next_name = work_targets[next_target]
+                    pending.append(
+                        (
+                            next_idx,
+                            next_ip,
+                            next_name,
+                            executor.submit(_fetch_target, next_ip),
+                        )
+                    )
+                    next_target += 1
+        finally:
+            if executor is not None:
+                if cancelled:
+                    for _, _, _, future in pending:
+                        future.cancel()
+                    executor.shutdown(wait=True, cancel_futures=True)
+                else:
+                    executor.shutdown(wait=True)
+
+        if cancelled:
             self._execute(
-                "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
-                (json.dumps(breakdown), job_id),
-            )
-            rows_collected += written
-            self._execute(
-                "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
+                "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
                 "WHERE id=%s",
-                (idx, self._now(), poller_id),
+                (self._now(), poller_id),
             )
-            progress_message = (
-                f"CPE {idx}/{total_targets}: {cmts_name} done "
-                f"({written} addresses, complete=True)"
-                if complete and not truncated
-                else f"CPE {idx}/{total_targets}: {cmts_name} skipped "
-                "(incomplete generation; previous rows preserved)"
-            )
-            self._update_running_job_progress(
-                job_id,
-                progress_message,
-                rows_collected=rows_collected,
-                modems_attempted=targets_attempted,
-                modems_succeeded=targets_succeeded,
-                modems_failed=targets_failed,
-            )
+            return
 
         self._execute(
             "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
@@ -1836,13 +1980,76 @@ class PollerService:
         )
 
     def _process_one_job(self) -> None:
-        queued = self._query("SELECT id, poller_id FROM poller_job WHERE status='queued' ORDER BY id ASC LIMIT 1")
+        queued = self._query(
+            "SELECT j.id, j.poller_id, j.error_text, p.id AS setting_id, "
+            "p.enabled, p.task_type, p.run_window_start, p.run_window_end "
+            "FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
+            "WHERE j.status='queued' ORDER BY j.id ASC"
+        )
         if not queued:
             return
 
-        job = queued[0]
+        job = None
+        for candidate in queued:
+            setting_missing = candidate.get("setting_id") is None
+            disabled = int(candidate.get("enabled") or 0) != 1
+            is_cpe_task = (
+                str(candidate.get("task_type") or "inventory") == _CPE_TASK_TYPE
+            )
+            inside_window = self._inside_run_window(
+                candidate.get("run_window_start"),
+                candidate.get("run_window_end"),
+            )
+            if setting_missing or disabled or is_cpe_task or inside_window:
+                job = candidate
+                break
+
+            window = self._run_window_label(
+                candidate.get("run_window_start"),
+                candidate.get("run_window_end"),
+            )
+            waiting_message = f"Waiting for configured run window ({window})"
+            if str(candidate.get("error_text") or "") != waiting_message:
+                self._execute(
+                    "UPDATE poller_job SET error_text=%s "
+                    "WHERE id=%s AND status='queued'",
+                    (waiting_message, int(candidate.get("id") or 0)),
+                )
+
+        if job is None:
+            return
+
         job_id = int(job.get("id"))
         poller_id = int(job.get("poller_id") or 0)
+
+        current_setting_rows = self._query(
+            "SELECT enabled, task_type, run_window_start, run_window_end "
+            "FROM poller_setting WHERE id=%s",
+            (poller_id,),
+        )
+        if current_setting_rows:
+            current_setting = current_setting_rows[0]
+            is_enabled_inventory = (
+                int(current_setting.get("enabled") or 0) == 1
+                and str(current_setting.get("task_type") or "inventory")
+                != _CPE_TASK_TYPE
+            )
+            if is_enabled_inventory and not self._inside_run_window(
+                current_setting.get("run_window_start"),
+                current_setting.get("run_window_end"),
+            ):
+                window = self._run_window_label(
+                    current_setting.get("run_window_start"),
+                    current_setting.get("run_window_end"),
+                )
+                waiting_message = f"Waiting for configured run window ({window})"
+                self._execute(
+                    "UPDATE poller_job SET error_text=%s "
+                    "WHERE id=%s AND status='queued' "
+                    "AND COALESCE(error_text, '')<>%s",
+                    (waiting_message, job_id, waiting_message),
+                )
+                return
 
         self._execute(
             "UPDATE poller_job SET status=%s, started_at=%s WHERE id=%s",
@@ -2202,16 +2409,9 @@ class PollerService:
         poller_id: int,
         source: Optional[str] = None,
         scheduled_slot_utc: Optional[str] = None,
+        enforce_interval_due: bool = False,
     ) -> int:
         pid = int(poller_id)
-        active = self._query(
-            "SELECT id FROM poller_job WHERE poller_id=%s "
-            "AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
-            (pid,),
-        )
-        if active:
-            return int((active[0] or {}).get("id") or 0)
-
         now = self._now()
         trigger = "scheduler" if (source or "api") == "scheduler" else "manual"
         payload = json.dumps({"source": source or "api"})
@@ -2220,26 +2420,91 @@ class PollerService:
             "(poller_id, trigger_type, status, requested_by, request_payload, "
             "scheduled_slot_utc, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)"
         )
-        job_id = int(self._execute(
-            sql,
-            (
-                pid,
-                trigger,
-                "queued",
-                source or "api",
-                payload,
-                scheduled_slot_utc,
-                now,
-            ),
-        ) or 0)
-        if job_id or not scheduled_slot_utc:
+        conn = self._connect()
+        try:
+            conn.begin()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT enabled, task_type, interval_minutes, run_window_start, "
+                "run_window_end FROM poller_setting WHERE id=%s FOR UPDATE",
+                (pid,),
+            )
+            setting = cur.fetchone()
+            if not setting:
+                conn.rollback()
+                return 0
+
+            if enforce_interval_due:
+                if (
+                    int(setting.get("enabled") or 0) != 1
+                    or str(setting.get("task_type") or "inventory") != "inventory"
+                    or not self._inside_run_window(
+                        setting.get("run_window_start"),
+                        setting.get("run_window_end"),
+                    )
+                ):
+                    conn.rollback()
+                    return 0
+                minutes = max(1, int(setting.get("interval_minutes") or 360))
+                cur.execute(
+                    "SELECT id FROM poller_setting WHERE id=%s "
+                    "AND last_interval_enqueue_utc >= "
+                    "(UTC_TIMESTAMP() - INTERVAL %s MINUTE) LIMIT 1",
+                    (pid, minutes),
+                )
+                if cur.fetchone():
+                    conn.rollback()
+                    return 0
+
+            cur.execute(
+                "SELECT id FROM poller_job WHERE poller_id=%s "
+                "AND status IN ('queued','running') "
+                "ORDER BY id DESC LIMIT 1",
+                (pid,),
+            )
+            active = cur.fetchone()
+            if active:
+                conn.commit()
+                if enforce_interval_due or trigger == "scheduler":
+                    return 0
+                return int(active.get("id") or 0)
+
+            cur.execute(
+                sql,
+                (
+                    pid,
+                    trigger,
+                    "queued",
+                    source or "api",
+                    payload,
+                    scheduled_slot_utc,
+                    now,
+                ),
+            )
+            job_id = int(cur.lastrowid or 0)
+            if job_id and str(setting.get("task_type") or "inventory") == "inventory":
+                cur.execute(
+                    "UPDATE poller_setting SET "
+                    "last_interval_enqueue_utc="
+                    "GREATEST(COALESCE(last_interval_enqueue_utc, %s), %s), "
+                    "updated_at=%s WHERE id=%s",
+                    (now, now, now, pid),
+                )
+            if not job_id and scheduled_slot_utc:
+                cur.execute(
+                    "SELECT id FROM poller_job WHERE poller_id=%s "
+                    "AND scheduled_slot_utc=%s LIMIT 1",
+                    (pid, scheduled_slot_utc),
+                )
+                existing = cur.fetchone()
+                job_id = int((existing or {}).get("id") or 0)
+            conn.commit()
             return job_id
-        existing = self._query(
-            "SELECT id FROM poller_job WHERE poller_id=%s "
-            "AND scheduled_slot_utc=%s LIMIT 1",
-            (pid, scheduled_slot_utc),
-        )
-        return int((existing[0] or {}).get("id") or 0) if existing else 0
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def list_jobs(self, limit: int = 30) -> List[Dict[str, Any]]:
         lim = max(1, int(limit))
@@ -2313,6 +2578,106 @@ class PollerService:
     def _schedule_zone() -> ZoneInfo:
         return ZoneInfo("Europe/Amsterdam")
 
+    @staticmethod
+    def _coerce_schedule_time(value: object) -> datetime_time | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime_time):
+            return value.replace(tzinfo=None)
+        if isinstance(value, timedelta):
+            total_seconds = int(value.total_seconds())
+            if total_seconds < 0 or total_seconds >= 24 * 60 * 60:
+                return None
+            hours, remainder = divmod(total_seconds, 60 * 60)
+            minutes, seconds = divmod(remainder, 60)
+            return datetime_time(hour=hours, minute=minutes, second=seconds)
+
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            if text.startswith("PT"):
+                duration = text[2:]
+                hours = 0
+                minutes = 0
+                if "H" in duration:
+                    hour_text, duration = duration.split("H", 1)
+                    hours = int(hour_text or 0)
+                if "M" in duration:
+                    minute_text, _ = duration.split("M", 1)
+                    minutes = int(minute_text or 0)
+                return datetime_time(hour=hours, minute=minutes)
+            parts = text.split(":")
+            if len(parts) < 2:
+                return None
+            seconds = int(float(parts[2])) if len(parts) > 2 else 0
+            return datetime_time(
+                hour=int(parts[0]),
+                minute=int(parts[1]),
+                second=seconds,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _inside_run_window(
+        cls,
+        run_window_start: object,
+        run_window_end: object,
+        now_utc: datetime | None = None,
+    ) -> bool:
+        if run_window_start is None and run_window_end is None:
+            return True
+
+        start = cls._coerce_schedule_time(run_window_start)
+        end = cls._coerce_schedule_time(run_window_end)
+        if (run_window_start is not None and start is None) or (
+            run_window_end is not None and end is None
+        ):
+            return False
+
+        current_utc = now_utc or datetime.now(timezone.utc)
+        if current_utc.tzinfo is None:
+            current_utc = current_utc.replace(tzinfo=timezone.utc)
+        current = current_utc.astimezone(cls._schedule_zone()).time().replace(
+            tzinfo=None
+        )
+        if start is None:
+            return end is not None and current < end
+        if end is None:
+            return current >= start
+        if start == end:
+            return True
+        if start < end:
+            return start <= current < end
+        return current >= start or current < end
+
+    @classmethod
+    def _run_window_label(
+        cls,
+        run_window_start: object,
+        run_window_end: object,
+    ) -> str:
+        start = cls._coerce_schedule_time(run_window_start)
+        end = cls._coerce_schedule_time(run_window_end)
+        start_text = start.strftime("%H:%M:%S") if start is not None else "any"
+        end_text = end.strftime("%H:%M:%S") if end is not None else "any"
+        return f"Europe/Amsterdam {start_text}-{end_text}"
+
+    @classmethod
+    def _run_window_detail(
+        cls,
+        run_window_start: object,
+        run_window_end: object,
+        now_utc: datetime | None = None,
+    ) -> str:
+        current_utc = now_utc or datetime.now(timezone.utc)
+        if current_utc.tzinfo is None:
+            current_utc = current_utc.replace(tzinfo=timezone.utc)
+        local_now = current_utc.astimezone(cls._schedule_zone())
+        window = cls._run_window_label(run_window_start, run_window_end)
+        return f"{window}; local time {local_now.strftime('%H:%M:%S')}"
+
     def _latest_cpe_slot_utc(self, now_utc: datetime | None = None) -> str:
         current_utc = now_utc or datetime.now(timezone.utc)
         local_now = current_utc.astimezone(self._schedule_zone())
@@ -2328,7 +2693,11 @@ class PollerService:
         )
 
     def run_scheduler_once(self) -> int:
+        scheduler_lock_conn = self._try_acquire_scheduler_lock()
+        if scheduler_lock_conn is None:
+            return 0
         if self._scheduler.get("running"):
+            scheduler_lock_conn.close()
             return 0
 
         self._scheduler["running"] = True
@@ -2339,14 +2708,39 @@ class PollerService:
         decisions = []
         try:
             max_global_active = max(1, int(os.environ.get("DATA_STORE_MAX_ACTIVE_JOBS", "10")))
-            global_active_rows = self._query(
-                "SELECT COUNT(*) AS c FROM poller_job WHERE status IN ('queued','running')"
+            active_job_rows = self._query(
+                "SELECT j.status, p.id AS setting_id, p.enabled, p.task_type, "
+                "p.run_window_start, p.run_window_end "
+                "FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
+                "WHERE j.status IN ('queued','running')"
             )
-            global_active = int((global_active_rows[0] or {}).get("c") or 0) if global_active_rows else 0
+            global_active = 0
+            for active_job in active_job_rows:
+                status = str(active_job.get("status") or "").lower()
+                setting_missing = active_job.get("setting_id") is None
+                disabled = int(active_job.get("enabled") or 0) != 1
+                is_cpe_task = (
+                    str(active_job.get("task_type") or "inventory")
+                    == _CPE_TASK_TYPE
+                )
+                inside_window = self._inside_run_window(
+                    active_job.get("run_window_start"),
+                    active_job.get("run_window_end"),
+                )
+                if (
+                    status == "running"
+                    or setting_missing
+                    or disabled
+                    or is_cpe_task
+                    or inside_window
+                ):
+                    global_active += 1
 
             pollers = self._query(
                 "SELECT id, name, enabled, interval_minutes, task_type, "
-                "last_scheduled_slot_utc FROM poller_setting ORDER BY id ASC"
+                "run_window_start, run_window_end, "
+                "last_scheduled_slot_utc, last_interval_enqueue_utc "
+                "FROM poller_setting ORDER BY id ASC"
             )
             for p in pollers:
                 pid = int(p.get("id") or 0)
@@ -2432,12 +2826,29 @@ class PollerService:
                         })
                     continue
 
+                if not self._inside_run_window(
+                    p.get("run_window_start"),
+                    p.get("run_window_end"),
+                ):
+                    decisions.append({
+                        "poller_id": pid,
+                        "poller_name": pname,
+                        "decision": "skip",
+                        "reason": "outside_run_window",
+                        "detail": self._run_window_detail(
+                            p.get("run_window_start"),
+                            p.get("run_window_end"),
+                        ),
+                    })
+                    continue
+
                 minutes = max(1, int(p.get("interval_minutes") or 360))
                 due = self._query(
                     """
-                    SELECT id FROM poller_job
-                    WHERE poller_id=%s
-                      AND created_at >= (UTC_TIMESTAMP() - INTERVAL %s MINUTE)
+                    SELECT id FROM poller_setting
+                    WHERE id=%s
+                      AND last_interval_enqueue_utc >=
+                          (UTC_TIMESTAMP() - INTERVAL %s MINUTE)
                     LIMIT 1
                     """,
                     (pid, minutes),
@@ -2446,7 +2857,11 @@ class PollerService:
                     decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "interval_not_due"})
                     continue
 
-                new_id = self.enqueue_run(pid, source="scheduler")
+                new_id = self.enqueue_run(
+                    pid,
+                    source="scheduler",
+                    enforce_interval_due=True,
+                )
                 if new_id:
                     queued += 1
                     global_active += 1
@@ -2454,9 +2869,12 @@ class PollerService:
                 else:
                     decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "enqueue_rejected"})
         finally:
-            self._scheduler["decisions"] = decisions[:100]
-            self._log_scheduler_decisions(tick_sql, decisions)
-            self._scheduler["running"] = False
+            try:
+                self._scheduler["decisions"] = decisions[:100]
+                self._log_scheduler_decisions(tick_sql, decisions)
+            finally:
+                self._scheduler["running"] = False
+                scheduler_lock_conn.close()
         return queued
 
     def snapshots_by_day(self, lookback_days: int = 14, limit: int = 300) -> List[Dict[str, Any]]:
