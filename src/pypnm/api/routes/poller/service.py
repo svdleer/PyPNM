@@ -478,7 +478,7 @@ class PollerService:
                 "UPDATE poller_setting SET task_type=%s, system_key=%s, name=%s, "
                 "scope_type='all_cmts', scope_json=NULL, collect_identity=FALSE, "
                 "collect_scqam=FALSE, collect_rxmer=FALSE, interval_minutes=720, "
-                "max_concurrency=4, max_runtime_sec=43200, updated_at=%s WHERE id=%s",
+                "max_concurrency=10, max_runtime_sec=43200, updated_at=%s WHERE id=%s",
                 (
                     _CPE_TASK_TYPE,
                     _CPE_TASK_SYSTEM_KEY,
@@ -498,7 +498,7 @@ class PollerService:
                      retention_days, heavy_max_modems, heavy_delay_ms,
                      max_runtime_sec, last_target_offset, created_at, updated_at)
                 VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,FALSE,FALSE,FALSE,
-                        720,4,20,30,300,0,43200,0,%s,%s)
+                        720,10,20,30,300,0,43200,0,%s,%s)
                 """,
                 (_CPE_TASK_NAME, _CPE_TASK_TYPE, _CPE_TASK_SYSTEM_KEY, now, now),
             )
@@ -1647,7 +1647,7 @@ class PollerService:
         )
         try:
             max_concurrency = max(
-                1, min(int(poller.get("max_concurrency") or 1), 4)
+                1, min(int(poller.get("max_concurrency") or 1), 10)
             )
         except (TypeError, ValueError):
             max_concurrency = 1
