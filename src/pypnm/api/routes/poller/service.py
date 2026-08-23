@@ -1645,6 +1645,20 @@ class PollerService:
         subtask_retries = max(
             0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
         )
+        subtask_retry_delay_sec = max(
+            1,
+            min(
+                int(os.environ.get("DATA_STORE_SUBTASK_RETRY_DELAY_SEC", "5")),
+                60,
+            ),
+        )
+        agent_startup_grace_sec = max(
+            0,
+            min(
+                int(os.environ.get("DATA_STORE_AGENT_STARTUP_GRACE_SEC", "30")),
+                120,
+            ),
+        )
         try:
             max_concurrency = max(
                 1, min(int(poller.get("max_concurrency") or 1), 10)
@@ -1665,17 +1679,38 @@ class PollerService:
                 == "running"
             )
 
-        def _fetch_target(cmts_ip: str) -> Dict[str, Any]:
-            attempt_errors = []
-            last_target_error = None
-            for attempt in range(subtask_retries + 1):
+        def _wait_while_running(delay_sec: float) -> bool:
+            deadline = time.monotonic() + max(0.0, delay_sec)
+            while True:
                 if not _job_is_running():
-                    return {
-                        "cancelled": True,
-                        "fetch_result": None,
-                        "last_target_error": last_target_error,
-                        "attempt_errors": attempt_errors,
-                    }
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return True
+                time.sleep(min(1.0, remaining))
+
+        def _cancelled_fetch_outcome(
+            last_target_error: Optional[str],
+            attempt_errors: List[tuple[int, str]],
+        ) -> Dict[str, Any]:
+            return {
+                "cancelled": True,
+                "fetch_result": None,
+                "last_target_error": last_target_error,
+                "attempt_errors": attempt_errors,
+            }
+
+        def _fetch_target(cmts_ip: str) -> Dict[str, Any]:
+            attempt_errors: List[tuple[int, str]] = []
+            last_target_error = None
+            attempt = 0
+            startup_grace_deadline = time.monotonic() + agent_startup_grace_sec
+            while attempt <= subtask_retries:
+                if not _job_is_running():
+                    return _cancelled_fetch_outcome(
+                        last_target_error,
+                        attempt_errors,
+                    )
                 try:
                     return {
                         "cancelled": False,
@@ -1687,14 +1722,33 @@ class PollerService:
                     }
                 except Exception as exc:
                     last_target_error = str(exc)
-                    attempt_errors.append((attempt + 1, last_target_error))
+                    response = getattr(exc, "response", None)
+                    status_code = getattr(response, "status_code", None)
+                    remaining_grace = startup_grace_deadline - time.monotonic()
+                    if status_code == 503 and remaining_grace > 0:
+                        if not _wait_while_running(
+                            min(subtask_retry_delay_sec, remaining_grace)
+                        ):
+                            return _cancelled_fetch_outcome(
+                                last_target_error,
+                                attempt_errors,
+                            )
+                        continue
+
+                    attempt += 1
+                    attempt_errors.append((attempt, last_target_error))
                     if not _job_is_running():
-                        return {
-                            "cancelled": True,
-                            "fetch_result": None,
-                            "last_target_error": last_target_error,
-                            "attempt_errors": attempt_errors,
-                        }
+                        return _cancelled_fetch_outcome(
+                            last_target_error,
+                            attempt_errors,
+                        )
+                    if attempt <= subtask_retries and not _wait_while_running(
+                        subtask_retry_delay_sec
+                    ):
+                        return _cancelled_fetch_outcome(
+                            last_target_error,
+                            attempt_errors,
+                        )
             return {
                 "cancelled": False,
                 "fetch_result": None,
