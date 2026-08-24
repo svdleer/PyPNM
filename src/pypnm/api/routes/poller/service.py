@@ -812,14 +812,19 @@ class PollerService:
             ("timed_out", self._now(), max_queue_age, max_queue_age),
         )
     def _log_scheduler_decisions(self, tick_at: str, decisions: List[Dict[str, Any]]) -> None:
-        if not decisions:
+        persisted_decisions = [
+            decision
+            for decision in decisions
+            if decision.get("reason") != "outside_run_window"
+        ]
+        if not persisted_decisions:
             return
 
         try:
             with self._db_lock:
                 conn = self._connect()
                 cur = conn.cursor()
-                for d in decisions:
+                for d in persisted_decisions:
                     vals = (
                         tick_at,
                         d.get("poller_id"),
