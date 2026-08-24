@@ -57,6 +57,9 @@ class CPECollectionRequest(BaseModel):
     cmts_ip: str = Field(..., description="CMTS IP address")
     community: str = Field(default="public", description="SNMP community for CMTS")
     limit: Optional[int] = Field(default=None, ge=1, le=500000)
+    overall_timeout_sec: int = Field(default=270, ge=30, le=900)
+    agent_command_timeout_sec: int = Field(default=300, ge=60, le=930)
+    min_remaining_tree_reserve_sec: float = Field(default=0, ge=0, le=300)
 
 
 class CPECollectionResponse(BaseModel):

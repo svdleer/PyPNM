@@ -198,6 +198,11 @@ async def query_cpe_addresses(payload: CPECollectionRequest) -> CPECollectionRes
             cmts_ip=payload.cmts_ip,
             community=payload.community,
             limit=payload.limit,
+            overall_timeout_sec=payload.overall_timeout_sec,
+            agent_command_timeout_sec=payload.agent_command_timeout_sec,
+            min_remaining_tree_reserve_sec=(
+                payload.min_remaining_tree_reserve_sec
+            ),
         )
         return CPECollectionResponse(**result)
     except Exception as exc:

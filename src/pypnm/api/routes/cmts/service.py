@@ -757,6 +757,9 @@ class CMTSModemService:
         cmts_ip: str,
         community: str = "public",
         limit: int | None = None,
+        overall_timeout_sec: int = 270,
+        agent_command_timeout_sec: int = 300,
+        min_remaining_tree_reserve_sec: float = 0,
     ) -> Dict[str, Any]:
         """Collect one authoritative CPE generation without full inventory."""
         self.cmts_ip = cmts_ip
@@ -768,6 +771,18 @@ class CMTSModemService:
         )
         requested_limit = max(1, min(int(requested_limit), 500000))
         walk_oids = (OID_D3_MAC, OID_CPE_ADDR_TYPE, OID_CPE_ADDR, OID_CPE_PREFIX)
+        overall_timeout_sec = max(30, min(int(overall_timeout_sec), 900))
+        agent_command_timeout_sec = max(
+            overall_timeout_sec + 30,
+            min(int(agent_command_timeout_sec), 930),
+        )
+        min_remaining_tree_reserve_sec = max(
+            0.0,
+            min(
+                float(min_remaining_tree_reserve_sec),
+                overall_timeout_sec / len(walk_oids),
+            ),
+        )
 
         live_lock = await _get_live_walk_lock(cmts_ip)
         await live_lock.acquire()
@@ -780,9 +795,12 @@ class CMTSModemService:
                     'community': community,
                     'timeout': 5,
                     'limit': requested_limit,
-                    'overall_timeout': 270,
+                    'overall_timeout': overall_timeout_sec,
+                    'min_remaining_tree_reserve': (
+                        min_remaining_tree_reserve_sec
+                    ),
                 },
-                timeout=300,
+                timeout=agent_command_timeout_sec,
             )
         finally:
             live_lock.release()

@@ -1143,14 +1143,30 @@ class PollerService:
             }
         raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {response_payload}")
 
-    def _fetch_cmts_cpe(self, cmts_ip: str, timeout_sec: int = 300) -> Dict[str, Any]:
+    def _fetch_cmts_cpe(
+        self,
+        cmts_ip: str,
+        *,
+        overall_timeout_sec: int = 270,
+        agent_command_timeout_sec: int = 300,
+        min_remaining_tree_reserve_sec: float = 0,
+        http_timeout_sec: int = 330,
+    ) -> Dict[str, Any]:
         """Fetch one fresh CPE-only generation from a CMTS."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
         payload = {
             "cmts_ip": cmts_ip,
             "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
+            "overall_timeout_sec": int(overall_timeout_sec),
+            "agent_command_timeout_sec": int(agent_command_timeout_sec),
+            "min_remaining_tree_reserve_sec": float(
+                min_remaining_tree_reserve_sec
+            ),
         }
-        request_timeout = max(330, int(timeout_sec or 300) + 30)
+        request_timeout = max(
+            int(agent_command_timeout_sec) + 30,
+            int(http_timeout_sec),
+        )
         response = requests.post(
             f"{base}/cmts/cpe/query",
             json=payload,
@@ -1634,14 +1650,11 @@ class PollerService:
         targets_attempted = 0
         targets_succeeded = 0
         targets_failed = 0
-        breakdown: List[Dict[str, Any]] = []
+        breakdown_by_index: Dict[int, Dict[str, Any]] = {}
         fatal_error = None
         incomplete_targets = 0
         poller_id = int(poller.get("id") or 0)
         start_offset = max(0, int(poller.get("last_target_offset") or 0))
-        subtask_timeout_sec = max(
-            30, int(os.environ.get("DATA_STORE_SUBTASK_TIMEOUT_SEC", "300"))
-        )
         subtask_retries = max(
             0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
         )
@@ -1660,6 +1673,32 @@ class PollerService:
             ),
         )
         try:
+            incomplete_retry_backoff_sec = max(
+                0,
+                min(
+                    int(
+                        os.environ.get(
+                            "DATA_STORE_CPE_INCOMPLETE_RETRY_BACKOFF_SEC", "15"
+                        )
+                    ),
+                    300,
+                ),
+            )
+        except (TypeError, ValueError):
+            incomplete_retry_backoff_sec = 15
+        first_pass_envelope = {
+            "overall_timeout_sec": 270,
+            "agent_command_timeout_sec": 300,
+            "min_remaining_tree_reserve_sec": 0,
+            "http_timeout_sec": 330,
+        }
+        retry_envelope = {
+            "overall_timeout_sec": 600,
+            "agent_command_timeout_sec": 630,
+            "min_remaining_tree_reserve_sec": 120,
+            "http_timeout_sec": 660,
+        }
+        try:
             max_concurrency = max(
                 1, min(int(poller.get("max_concurrency") or 1), 10)
             )
@@ -1668,6 +1707,11 @@ class PollerService:
         total_targets = len(targets)
         if total_targets == 0:
             fatal_error = "No CMTS targets resolved (check scope/appdb config)"
+
+        checkpoint_offset = min(start_offset, total_targets)
+        finalized_indices = set(range(1, checkpoint_offset + 1))
+        semantic_retry_targets = []
+        cancelled = False
 
         def _job_is_running() -> bool:
             status_rows = self._query(
@@ -1700,7 +1744,10 @@ class PollerService:
                 "attempt_errors": attempt_errors,
             }
 
-        def _fetch_target(cmts_ip: str) -> Dict[str, Any]:
+        def _fetch_target(
+            cmts_ip: str,
+            envelope: Dict[str, Any],
+        ) -> Dict[str, Any]:
             attempt_errors: List[tuple[int, str]] = []
             last_target_error = None
             attempt = 0
@@ -1715,7 +1762,15 @@ class PollerService:
                     return {
                         "cancelled": False,
                         "fetch_result": self._fetch_cmts_cpe(
-                            cmts_ip, timeout_sec=subtask_timeout_sec
+                            cmts_ip,
+                            overall_timeout_sec=envelope["overall_timeout_sec"],
+                            agent_command_timeout_sec=envelope[
+                                "agent_command_timeout_sec"
+                            ],
+                            min_remaining_tree_reserve_sec=envelope[
+                                "min_remaining_tree_reserve_sec"
+                            ],
+                            http_timeout_sec=envelope["http_timeout_sec"],
                         ),
                         "last_target_error": last_target_error,
                         "attempt_errors": attempt_errors,
@@ -1756,234 +1811,327 @@ class PollerService:
                 "attempt_errors": attempt_errors,
             }
 
+        def _finalize_target(
+            idx: int,
+            cmts_ip: str,
+            cmts_name: str,
+            outcome: Dict[str, Any],
+            *,
+            retry_attempted: bool,
+        ) -> bool:
+            nonlocal checkpoint_offset
+            nonlocal incomplete_targets
+            nonlocal rows_collected
+            nonlocal targets_attempted
+            nonlocal targets_failed
+            nonlocal targets_succeeded
+
+            if idx in finalized_indices:
+                raise RuntimeError(f"CPE target index {idx} finalized more than once")
+            if not _job_is_running():
+                return False
+
+            fetch_result = outcome.get("fetch_result")
+            last_target_error = outcome.get("last_target_error")
+            written = 0
+            if fetch_result is None:
+                complete = False
+                truncated = False
+                failure_reason = outcome.get("validation_error")
+                if failure_reason:
+                    validation_error = str(failure_reason)
+                    progress_message = (
+                        f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                        f"({validation_error})"
+                    )
+                else:
+                    validation_error = (
+                        f"CPE fetch failed after {subtask_retries + 1} attempt(s): "
+                        f"{last_target_error}"
+                    )
+                    progress_message = (
+                        f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                        f"after {subtask_retries + 1} failed attempt(s)"
+                    )
+                entry = {
+                    "cmts": cmts_name,
+                    "cmts_ip": cmts_ip,
+                    "row_count": 0,
+                    "cpe_row_count": 0,
+                    "skipped_cpe_rows": 0,
+                    "cpe_complete": False,
+                    "completion_source": None,
+                    "cpe_truncated": False,
+                    "cpe_oid_errors": {},
+                    "validation_error": validation_error,
+                    "requested_limit": None,
+                    "collected_at": None,
+                    "raw_d3_mac_count": None,
+                    "raw_cpe_type_count": None,
+                    "raw_cpe_address_count": None,
+                    "raw_cpe_prefix_count": None,
+                    "retry_attempted": retry_attempted,
+                }
+            else:
+                cpe_rows = fetch_result.get("cpe_addresses") or []
+                complete = fetch_result.get("complete") is True
+                truncated = fetch_result.get("truncated") is True
+                validation_error = fetch_result.get("validation_error")
+                if complete and not truncated:
+                    try:
+                        written = self._persist_cpe_generation(
+                            cpe_rows,
+                            cmts_ip=cmts_ip,
+                            snapshot_id=str(uuid.uuid4()),
+                            complete=True,
+                            truncated=False,
+                            job_id=job_id,
+                        )
+                    except _PollerJobNotRunning:
+                        return False
+                    except Exception as exc:
+                        complete = False
+                        validation_error = str(exc)
+
+                entry = {
+                    "cmts": cmts_name,
+                    "cmts_ip": cmts_ip,
+                    "row_count": written,
+                    "cpe_row_count": written,
+                    "skipped_cpe_rows": int(
+                        fetch_result.get("skipped_cpe_rows") or 0
+                    ),
+                    "cpe_complete": complete,
+                    "completion_source": fetch_result.get("completion_source"),
+                    "cpe_truncated": truncated,
+                    "cpe_oid_errors": fetch_result.get("oid_errors") or {},
+                    "validation_error": validation_error,
+                    "requested_limit": fetch_result.get("requested_limit"),
+                    "collected_at": fetch_result.get("collected_at"),
+                    "raw_d3_mac_count": fetch_result.get("raw_d3_mac_count"),
+                    "raw_cpe_type_count": fetch_result.get("raw_cpe_type_count"),
+                    "raw_cpe_address_count": fetch_result.get(
+                        "raw_cpe_address_count"
+                    ),
+                    "raw_cpe_prefix_count": fetch_result.get(
+                        "raw_cpe_prefix_count"
+                    ),
+                    "retry_attempted": retry_attempted,
+                }
+                progress_message = (
+                    f"CPE {idx}/{total_targets}: {cmts_name} done "
+                    f"({written} addresses, complete=True)"
+                    if complete and not truncated
+                    else f"CPE {idx}/{total_targets}: {cmts_name} skipped "
+                    "(incomplete generation; previous rows preserved)"
+                )
+
+            targets_attempted += 1
+            rows_collected += written
+            if complete and not truncated:
+                targets_succeeded += 1
+            else:
+                targets_failed += 1
+                incomplete_targets += 1
+
+            breakdown_by_index[idx] = entry
+            finalized_indices.add(idx)
+            ordered_breakdown = [
+                value
+                for _, value in sorted(breakdown_by_index.items())
+            ]
+            self._execute(
+                "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                (json.dumps(ordered_breakdown), job_id),
+            )
+
+            previous_checkpoint = checkpoint_offset
+            while checkpoint_offset + 1 in finalized_indices:
+                checkpoint_offset += 1
+            if checkpoint_offset > previous_checkpoint:
+                self._execute(
+                    "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
+                    "WHERE id=%s",
+                    (checkpoint_offset, self._now(), poller_id),
+                )
+
+            self._update_running_job_progress(
+                job_id,
+                progress_message,
+                rows_collected=rows_collected,
+                modems_attempted=targets_attempted,
+                modems_succeeded=targets_succeeded,
+                modems_failed=targets_failed,
+            )
+            return True
+
         work_targets = []
+        invalid_targets = []
         if not fatal_error:
             for idx, target in enumerate(targets, start=1):
                 if idx <= start_offset:
                     continue
                 cmts_ip = target.get("ip")
+                cmts_name = target.get("name") or cmts_ip or f"target-{idx}"
                 if not cmts_ip:
+                    invalid_targets.append((idx, "", cmts_name))
                     continue
-                work_targets.append(
-                    (idx, cmts_ip, target.get("name") or cmts_ip)
-                )
+                work_targets.append((idx, cmts_ip, cmts_name))
 
-        executor = None
-        pending = []
-        next_target = 0
-        cancelled = False
-        try:
-            if work_targets:
-                executor = ThreadPoolExecutor(
-                    max_workers=max_concurrency,
-                    thread_name_prefix="poller-cpe-fetch",
-                )
-                while next_target < min(max_concurrency, len(work_targets)):
-                    idx, cmts_ip, cmts_name = work_targets[next_target]
-                    pending.append(
-                        (
-                            idx,
-                            cmts_ip,
-                            cmts_name,
-                            executor.submit(_fetch_target, cmts_ip),
-                        )
+        def _run_phase(
+            phase_targets: List[tuple[int, str, str]],
+            *,
+            concurrency: int,
+            envelope: Dict[str, Any],
+            retry_attempted: bool,
+        ) -> None:
+            nonlocal cancelled
+            executor = None
+            pending = []
+            next_target = 0
+            try:
+                if phase_targets:
+                    executor = ThreadPoolExecutor(
+                        max_workers=concurrency,
+                        thread_name_prefix="poller-cpe-fetch",
                     )
-                    next_target += 1
-
-            while pending:
-                idx, cmts_ip, cmts_name, future = pending[0]
-                if not _job_is_running():
-                    cancelled = True
-                    break
-                self._update_running_job_progress(
-                    job_id,
-                    f"CPE {idx}/{total_targets}: walking {cmts_name}",
-                    rows_collected=rows_collected,
-                    modems_attempted=targets_attempted,
-                    modems_succeeded=targets_succeeded,
-                    modems_failed=targets_failed,
-                )
-
-                while True:
-                    done, _ = wait_for_futures((future,), timeout=1.0)
-                    if done:
-                        outcome = future.result()
-                        break
-                    if not _job_is_running():
-                        cancelled = True
-                        break
-                if cancelled:
-                    break
-                if outcome.get("cancelled") or not _job_is_running():
-                    cancelled = True
-                    break
-
-                for attempt, error_text in outcome.get("attempt_errors") or []:
-                    self._update_running_job_progress(
-                        job_id,
-                        f"CPE {idx}/{total_targets}: {cmts_name} attempt "
-                        f"{attempt}/{subtask_retries + 1} failed ({error_text})",
-                        rows_collected=rows_collected,
-                        modems_attempted=targets_attempted,
-                        modems_succeeded=targets_succeeded,
-                        modems_failed=targets_failed,
-                    )
-                if not _job_is_running():
-                    cancelled = True
-                    break
-
-                fetch_result = outcome.get("fetch_result")
-                last_target_error = outcome.get("last_target_error")
-                if fetch_result is None:
-                    # A non-responsive CMTS is a per-target failure. Preserve its
-                    # previous CPE rows, record the failure, and continue the run.
-                    targets_attempted += 1
-                    targets_failed += 1
-                    incomplete_targets += 1
-                    validation_error = (
-                        f"CPE fetch failed after {subtask_retries + 1} attempt(s): "
-                        f"{last_target_error}"
-                    )
-                    breakdown.append({
-                        "cmts": cmts_name,
-                        "cmts_ip": cmts_ip,
-                        "row_count": 0,
-                        "cpe_row_count": 0,
-                        "skipped_cpe_rows": 0,
-                        "cpe_complete": False,
-                        "completion_source": None,
-                        "cpe_truncated": False,
-                        "cpe_oid_errors": {},
-                        "validation_error": validation_error,
-                        "requested_limit": None,
-                        "collected_at": None,
-                        "raw_d3_mac_count": None,
-                        "raw_cpe_type_count": None,
-                        "raw_cpe_address_count": None,
-                        "raw_cpe_prefix_count": None,
-                    })
-                    self._execute(
-                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
-                        (json.dumps(breakdown), job_id),
-                    )
-                    self._execute(
-                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
-                        "WHERE id=%s",
-                        (idx, self._now(), poller_id),
-                    )
-                    self._update_running_job_progress(
-                        job_id,
-                        f"CPE {idx}/{total_targets}: {cmts_name} skipped "
-                        f"after {subtask_retries + 1} failed attempt(s)",
-                        rows_collected=rows_collected,
-                        modems_attempted=targets_attempted,
-                        modems_succeeded=targets_succeeded,
-                        modems_failed=targets_failed,
-                    )
-                else:
-                    # Kill is cooperative. Never persist a generation returned after
-                    # the administrator cancelled the job while its request was in flight.
-                    if not _job_is_running():
-                        cancelled = True
-                        break
-
-                    targets_attempted += 1
-                    cpe_rows = fetch_result.get("cpe_addresses") or []
-                    complete = fetch_result.get("complete") is True
-                    truncated = fetch_result.get("truncated") is True
-                    validation_error = fetch_result.get("validation_error")
-                    written = 0
-                    if complete and not truncated:
-                        try:
-                            written = self._persist_cpe_generation(
-                                cpe_rows,
-                                cmts_ip=cmts_ip,
-                                snapshot_id=str(uuid.uuid4()),
-                                complete=True,
-                                truncated=False,
-                                job_id=job_id,
+                    while next_target < min(concurrency, len(phase_targets)):
+                        idx, cmts_ip, cmts_name = phase_targets[next_target]
+                        pending.append(
+                            (
+                                idx,
+                                cmts_ip,
+                                cmts_name,
+                                executor.submit(_fetch_target, cmts_ip, envelope),
                             )
-                            targets_succeeded += 1
-                        except _PollerJobNotRunning:
+                        )
+                        next_target += 1
+
+                while pending:
+                    idx, cmts_ip, cmts_name, future = pending[0]
+                    if not _job_is_running():
+                        cancelled = True
+                        break
+                    self._update_running_job_progress(
+                        job_id,
+                        f"CPE {idx}/{total_targets}: walking {cmts_name}",
+                        rows_collected=rows_collected,
+                        modems_attempted=targets_attempted,
+                        modems_succeeded=targets_succeeded,
+                        modems_failed=targets_failed,
+                    )
+
+                    while True:
+                        done, _ = wait_for_futures((future,), timeout=1.0)
+                        if done:
+                            outcome = future.result()
+                            break
+                        if not _job_is_running():
                             cancelled = True
                             break
-                        except Exception as exc:
-                            complete = False
-                            validation_error = str(exc)
-                    if not complete or truncated:
-                        targets_failed += 1
-                        incomplete_targets += 1
+                    if cancelled:
+                        break
+                    if outcome.get("cancelled") or not _job_is_running():
+                        cancelled = True
+                        break
 
-                    breakdown.append({
-                        "cmts": cmts_name,
-                        "cmts_ip": cmts_ip,
-                        "row_count": written,
-                        "cpe_row_count": written,
-                        "skipped_cpe_rows": int(
-                            fetch_result.get("skipped_cpe_rows") or 0
-                        ),
-                        "cpe_complete": complete,
-                        "completion_source": fetch_result.get("completion_source"),
-                        "cpe_truncated": truncated,
-                        "cpe_oid_errors": fetch_result.get("oid_errors") or {},
-                        "validation_error": validation_error,
-                        "requested_limit": fetch_result.get("requested_limit"),
-                        "collected_at": fetch_result.get("collected_at"),
-                        "raw_d3_mac_count": fetch_result.get("raw_d3_mac_count"),
-                        "raw_cpe_type_count": fetch_result.get("raw_cpe_type_count"),
-                        "raw_cpe_address_count": fetch_result.get(
-                            "raw_cpe_address_count"
-                        ),
-                        "raw_cpe_prefix_count": fetch_result.get(
-                            "raw_cpe_prefix_count"
-                        ),
-                    })
-                    self._execute(
-                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
-                        (json.dumps(breakdown), job_id),
-                    )
-                    rows_collected += written
-                    self._execute(
-                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s "
-                        "WHERE id=%s",
-                        (idx, self._now(), poller_id),
-                    )
-                    progress_message = (
-                        f"CPE {idx}/{total_targets}: {cmts_name} done "
-                        f"({written} addresses, complete=True)"
-                        if complete and not truncated
-                        else f"CPE {idx}/{total_targets}: {cmts_name} skipped "
-                        "(incomplete generation; previous rows preserved)"
-                    )
-                    self._update_running_job_progress(
-                        job_id,
-                        progress_message,
-                        rows_collected=rows_collected,
-                        modems_attempted=targets_attempted,
-                        modems_succeeded=targets_succeeded,
-                        modems_failed=targets_failed,
-                    )
-
-                pending.pop(0)
-                if next_target < len(work_targets):
-                    next_idx, next_ip, next_name = work_targets[next_target]
-                    pending.append(
-                        (
-                            next_idx,
-                            next_ip,
-                            next_name,
-                            executor.submit(_fetch_target, next_ip),
+                    for attempt, error_text in outcome.get("attempt_errors") or []:
+                        self._update_running_job_progress(
+                            job_id,
+                            f"CPE {idx}/{total_targets}: {cmts_name} attempt "
+                            f"{attempt}/{subtask_retries + 1} failed ({error_text})",
+                            rows_collected=rows_collected,
+                            modems_attempted=targets_attempted,
+                            modems_succeeded=targets_succeeded,
+                            modems_failed=targets_failed,
                         )
-                    )
-                    next_target += 1
-        finally:
-            if executor is not None:
-                if cancelled:
-                    for _, _, _, future in pending:
-                        future.cancel()
-                    executor.shutdown(wait=True, cancel_futures=True)
-                else:
-                    executor.shutdown(wait=True)
+                    if not _job_is_running():
+                        cancelled = True
+                        break
+
+                    fetch_result = outcome.get("fetch_result")
+                    if (
+                        not retry_attempted
+                        and fetch_result is not None
+                        and fetch_result.get("complete") is not True
+                        and fetch_result.get("truncated") is not True
+                    ):
+                        semantic_retry_targets.append(
+                            (idx, cmts_ip, cmts_name)
+                        )
+                    elif not _finalize_target(
+                        idx,
+                        cmts_ip,
+                        cmts_name,
+                        outcome,
+                        retry_attempted=retry_attempted,
+                    ):
+                        cancelled = True
+                        break
+
+                    pending.pop(0)
+                    if next_target < len(phase_targets):
+                        next_idx, next_ip, next_name = phase_targets[next_target]
+                        pending.append(
+                            (
+                                next_idx,
+                                next_ip,
+                                next_name,
+                                executor.submit(_fetch_target, next_ip, envelope),
+                            )
+                        )
+                        next_target += 1
+            finally:
+                if executor is not None:
+                    if cancelled:
+                        for _, _, _, future in pending:
+                            future.cancel()
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    else:
+                        executor.shutdown(wait=True)
+
+        for idx, cmts_ip, cmts_name in invalid_targets:
+            if not _finalize_target(
+                idx,
+                cmts_ip,
+                cmts_name,
+                {
+                    "fetch_result": None,
+                    "last_target_error": "missing CMTS IP",
+                    "attempt_errors": [],
+                    "validation_error": "CMTS target is missing an IP address",
+                },
+                retry_attempted=False,
+            ):
+                cancelled = True
+                break
+
+        if not cancelled:
+            _run_phase(
+                work_targets,
+                concurrency=max_concurrency,
+                envelope=first_pass_envelope,
+                retry_attempted=False,
+            )
+        if not cancelled and semantic_retry_targets:
+            self._update_running_job_progress(
+                job_id,
+                f"CPE retry: waiting {incomplete_retry_backoff_sec}s for "
+                f"{len(semantic_retry_targets)} incomplete target(s)",
+                rows_collected=rows_collected,
+                modems_attempted=targets_attempted,
+                modems_succeeded=targets_succeeded,
+                modems_failed=targets_failed,
+            )
+            if not _wait_while_running(incomplete_retry_backoff_sec):
+                cancelled = True
+            else:
+                _run_phase(
+                    semantic_retry_targets,
+                    concurrency=min(3, len(semantic_retry_targets)),
+                    envelope=retry_envelope,
+                    retry_attempted=True,
+                )
 
         if cancelled:
             self._execute(
