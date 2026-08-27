@@ -281,21 +281,34 @@ class CmSnmpQueryService:
     def _resolve_targets(self, scope_type: str, scope: dict, max_modems: int | None) -> list[dict]:
         limit_clause = f"LIMIT {int(max_modems)}" if max_modems else ""
         online_filter = "AND m.status IN ('operational','registrationComplete','ipComplete','online')"
-        # Topology join for fiber_node resolution (same as network RxMER)
-        topology_join = """
-            LEFT JOIN topology_fiber_node_map t
-              ON t.bare_mac = CONVERT(
-                  LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
-                  USING ascii
-              ) COLLATE ascii_bin
-              AND t.snapshot_id = (
-                  SELECT s.id FROM topology_snapshots s
-                  JOIN topology_fiber_node_map_state ms
-                    ON ms.snapshot_id = s.id AND ms.state = 'complete'
-                  ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
-              )
-        """
-        fiber_node_col = "COALESCE(t.fiber_node, m.fiber_node) AS fiber_node"
+        table_rows = self._query(
+            "SELECT COUNT(*) AS table_count FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN "
+            "('topology_snapshots', 'topology_fiber_node_map', "
+            "'topology_fiber_node_map_state')"
+        )
+        topology_tables_ready = int(
+            (table_rows[0] if table_rows else {}).get("table_count") or 0
+        ) == 3
+
+        if topology_tables_ready:
+            topology_join = """
+                LEFT JOIN topology_fiber_node_map t
+                  ON t.bare_mac = CONVERT(
+                      LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
+                      USING ascii
+                  ) COLLATE ascii_bin
+                  AND t.snapshot_id = (
+                      SELECT s.id FROM topology_snapshots s
+                      JOIN topology_fiber_node_map_state ms
+                        ON ms.snapshot_id = s.id AND ms.state = 'complete'
+                      ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
+                  )
+            """
+            fiber_node_col = "COALESCE(t.fiber_node, m.fiber_node) AS fiber_node"
+        else:
+            topology_join = ""
+            fiber_node_col = "m.fiber_node AS fiber_node"
 
         if scope_type == "all_network":
             rows = self._query(
@@ -322,6 +335,8 @@ class CmSnmpQueryService:
                 raise ValueError("fiber_node scope requires 'cmts'")
             if not fiber_nodes:
                 raise ValueError("fiber_node scope requires at least one fiber node")
+            if not topology_tables_ready:
+                raise ValueError("Fiber-node topology data is unavailable")
             fn_placeholders = ",".join(["%s"] * len(fiber_nodes))
             rows = self._query(
                 f"""
