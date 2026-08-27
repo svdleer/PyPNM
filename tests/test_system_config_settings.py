@@ -342,13 +342,13 @@ def test_sftp_port_and_private_key_defaults_and_logs(
     assert "Missing configuration value for 'PnmFileRetrieval.retrieval_method.methods.sftp.private_key_path'" in text
 
 
-def test_snmp_read_community_defaults_to_public(
+def test_snmp_read_community_defaults_to_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeConfigManager()
     monkeypatch.setattr(SystemConfigSettings, "_cfg", fake)
 
-    assert SystemConfigSettings.snmp_read_community() == "public"
+    assert SystemConfigSettings.snmp_read_community() == ""
 
 
 def test_snmp_write_community_defaults_to_empty(

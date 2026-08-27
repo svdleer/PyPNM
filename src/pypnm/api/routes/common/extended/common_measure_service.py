@@ -97,7 +97,7 @@ class CommonMeasureService(CommonMessagingService):
         cable_modem (CableModem): The cable modem instance used for the test.
         tftp_servers (Inet,Inet): (IPv4,IPv6)
         tftp_path (str, optional): The path on the TFTP server where test result files are stored. Default is an empty string.
-        snmp_write_community (str, optional): The SNMP community string for write access. Default is "private".
+        snmp_write_community (str, optional): The SNMP community string for write access. When omitted, transport configuration is used.
         **extra_options (dict, optional): Additional keyword arguments specific to the test type, such as:
             - fec_summary_type (FecSummaryType): Required for tests involving FEC summary metrics.
             - Other parameters based on the test type.
@@ -116,7 +116,7 @@ class CommonMeasureService(CommonMessagingService):
                  cable_modem: CableModem,
                  tftp_servers: tuple[Inet,Inet],
                  tftp_path: str = "",
-                 snmp_write_community: str = "private",
+                 snmp_write_community: str | None = None,
                  **extra_options) -> None:
         super().__init__()
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -129,7 +129,7 @@ class CommonMeasureService(CommonMessagingService):
         self.cm:CableModem                          = cable_modem
         self.tftp_servers:tuple[Inet,Inet]          = tftp_servers
         self.tftp_path:str                          = tftp_path
-        self.snmp_write_community:str               = snmp_write_community
+        self.snmp_write_community: str | None    = snmp_write_community
         self.extra_options                          = extra_options
         self.config_mgr:ConfigManager               = ConfigManager()
         self.log_prefix:str                         = f"MAC: {self.cm.get_mac_address} - INET: {self.cm.get_inet_address}"

@@ -17,17 +17,15 @@ logger = logging.getLogger(__name__)
 _DOCS_DEV_RESET_NOW_OID = "1.3.6.1.2.1.69.1.1.3.0"
 
 
-def _configured_modem_community() -> str:
-    """Resolve the modem write community from environment."""
+def _configured_modem_community() -> str | None:
+    """Resolve the optional modem write community from environment/config."""
     from pypnm.config.pnm_config_manager import PnmConfigManager
     community = (
         os.environ.get("MODEM_COMMUNITY")
         or os.environ.get("CM_SNMP_COMMUNITY")
         or PnmConfigManager.get_write_community()
     )
-    if not community:
-        raise RuntimeError("Cable-modem SNMP community is not configured")
-    return str(community)
+    return str(community) if community else None
 
 
 class CmResetWorker:
@@ -193,42 +191,50 @@ class CmResetWorker:
             if not agent_manager:
                 raise RuntimeError("Agent manager not available")
 
-            # Get cm-agent (modem-reachable)
-            agent = (
-                agent_manager.get_agent_for_capability("cm_reachable")
-                or agent_manager.get_agent_for_capability("snmp_set")
-            )
+            # Get cm-agent (modem-reachable) without a generic SNMP fallback.
+            agent = agent_manager.get_agent_for_capability("cm_reachable")
             if not agent:
-                raise RuntimeError("No cm-agent connected with cm_reachable capability")
+                raise RuntimeError("No cm_reachable agent connected")
 
             community = _configured_modem_community()
+            params = {
+                "target_ip": modem_ip,
+                "oid": _DOCS_DEV_RESET_NOW_OID,
+                "value": 1,
+                "type": "i",
+                "target_role": "cm",
+                "timeout": 3,
+                "retries": 0,
+            }
+            if community:
+                params["community"] = community
 
             # Fire-and-forget: send the SET but don't wait long for confirmation
             # (modem will reset and drop the connection anyway)
             task_id = await agent_manager.send_task(
                 agent.agent_id,
                 "snmp_set",
-                {
-                    "target_ip": modem_ip,
-                    "oid": _DOCS_DEV_RESET_NOW_OID,
-                    "value": 1,
-                    "type": "i",
-                    "community": community,
-                    "timeout": 3,
-                    "retries": 0,
-                },
+                params,
                 timeout=10,
                 priority="bulk",
             )
 
-            # Brief wait — modem may or may not respond before rebooting
+            # Brief wait — a timeout/disconnect can be consistent with the modem
+            # rebooting, but an explicit agent rejection must fail the target.
             try:
                 result = await agent_manager.wait_for_task_async(task_id, timeout=8)
             except Exception:
-                # Expected: modem resets before responding
                 result = None
 
-            # Mark as done regardless of SNMP response (fire-and-forget)
+            if result and result.get("type") == "error":
+                raise RuntimeError(result.get("error") or "Agent rejected CM reset")
+            if result and result.get("type") == "response":
+                operation = result.get("result") or {}
+                if not operation.get("success"):
+                    raise RuntimeError(
+                        operation.get("error") or "Agent CM reset SET failed"
+                    )
+
             await asyncio.to_thread(cm_reset_service.mark_target_done, target_id)
             logger.debug(f"CM reset sent: {mac} ({modem_ip})")
 

@@ -74,7 +74,7 @@ class BulkDestinationRouter:
         )
         async def get_bulk_destinations(
             cmts_ip: str,
-            community: str = "public",
+            community: Optional[str] = None,
             write_community: Optional[str] = None
         ) -> BulkDestinationsResponse:
             """
@@ -88,12 +88,12 @@ class BulkDestinationRouter:
             rxmer_svc = CmtsUsOfdmaRxMerService(
                 cmts_ip=cmts_ip,
                 community=community,
-                write_community=write_community or community
+                write_community=write_community
             )
             utsc_svc = CmtsUtscService(
                 cmts_ip=cmts_ip,
                 community=community,
-                write_community=write_community or community
+                write_community=write_community
             )
             try:
                 result = await rxmer_svc.get_bulk_destinations()

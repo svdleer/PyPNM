@@ -19,6 +19,13 @@ from typing import Dict, List, Any, Optional
 from pypnm.api.agent.manager import get_agent_manager
 
 
+def _agent_snmp_context(target_role: str, community: str | None) -> dict[str, str]:
+    context = {'target_role': target_role}
+    if community:
+        context['community'] = community
+    return context
+
+
 class PNMDiagnosticsService:
     """
     Service for PNM modem diagnostics.
@@ -47,10 +54,18 @@ class PNMDiagnosticsService:
     # Pre-Equalization OIDs
     OID_PRE_EQ = '1.3.6.1.4.1.4491.2.1.20.1.2.1.5'       # docsIf3CmStatusUsEqData
     
-    def __init__(self, modem_ip: str, community: str = "public", mac_address: str = None, write_community: str = None):
+    def __init__(self, modem_ip: str, community: str | None = None, mac_address: str = None, write_community: str | None = None):
         self.modem_ip = modem_ip
-        self.community = community
-        self.write_community = write_community or community  # For SNMP SET operations
+        self.community = (
+            community
+            if community is not None and str(community).strip()
+            else None
+        )
+        self.write_community = (
+            write_community
+            if write_community is not None and str(write_community).strip()
+            else None
+        )
         self.mac_address = mac_address
         self.logger = logging.getLogger("PNMDiagnosticsService")
         self.agent_manager = get_agent_manager()
@@ -77,7 +92,7 @@ class PNMDiagnosticsService:
                 params={
                     'target_ip': self.modem_ip,
                     'oid': oid,
-                    'community': self.community,
+                    **_agent_snmp_context('cm', self.community),
                     'timeout': 10
                 },
                 timeout=120
@@ -113,7 +128,7 @@ class PNMDiagnosticsService:
                 params={
                     'target_ip': target_ip or self.modem_ip,
                     'oid': oid,
-                    'community': self.community,
+                    **_agent_snmp_context('cm', self.community),
                     'timeout': 10
                 },
                 timeout=120
@@ -151,7 +166,7 @@ class PNMDiagnosticsService:
                     'oid': oid,
                     'value': value,
                     'value_type': value_type,
-                    'community': self.write_community,
+                    **_agent_snmp_context('cm', self.write_community),
                     'timeout': 10
                 },
                 timeout=120
@@ -187,7 +202,7 @@ class PNMDiagnosticsService:
                 params={
                     'ip': self.modem_ip,
                     'oids': oids,
-                    'community': self.community,
+                    **_agent_snmp_context('cm', self.community),
                     'timeout': 10
                 },
                 timeout=60
@@ -1387,28 +1402,31 @@ class USRxMERService:
     Manages US RxMER captures on CMTS (start, status, data retrieval).
     """
     
-    def __init__(self, cmts_ip: str, community: str = "public"):
+    def __init__(self, cmts_ip: str, community: str | None = None):
         self.cmts_ip = cmts_ip
         self.community = community
         self.logger = logging.getLogger("USRxMERService")
         self.agent_manager = get_agent_manager()
     
     async def _send_agent_command(self, command: str, params: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
-        """Send command to agent and wait for response."""
+        """Send command to a CMTS-capable agent and wait for response."""
         if not self.agent_manager:
             return {'success': False, 'error': 'Agent manager not available'}
-        
-        agents = self.agent_manager.get_available_agents()
-        if not agents:
-            return {'success': False, 'error': 'No agents available'}
-        
-        agent_id = self._get_cm_agent_id()
-        
+
+        agent_id = self.agent_manager.get_agent_id_for_capability('cmts_reachable')
+        if not agent_id:
+            return {'success': False, 'error': 'No CMTS-reachable agent available'}
+
+        task_params = dict(params)
+        task_params['target_role'] = 'cmts'
+        if not task_params.get('community'):
+            task_params.pop('community', None)
+
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id,
                 command=command,
-                params=params,
+                params=task_params,
                 timeout=timeout
             )
             

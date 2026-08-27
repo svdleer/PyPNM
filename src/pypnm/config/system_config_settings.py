@@ -40,7 +40,7 @@ class SystemConfigSettings:
     _DEFAULT_LOG_LEVEL: str                 = "INFO"
     _DEFAULT_LOG_DIR: str                   = "logs"
     _DEFAULT_LOG_FILENAME: str              = "pypnm.log"
-    _DEFAULT_SNMP_READ_COMMUNITY: str       = "public"
+    _DEFAULT_SNMP_READ_COMMUNITY: str       = ""
     _DEFAULT_SNMP_WRITE_COMMUNITY: str      = ""
     _DEFAULT_PNM_DIR: str                   = ".data/pnm"
     _DEFAULT_CSV_DIR: str                   = ".data/csv"

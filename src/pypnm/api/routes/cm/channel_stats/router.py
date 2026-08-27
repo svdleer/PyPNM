@@ -167,11 +167,18 @@ def _parse_ds_profile_id_map(result: dict | None, cm_index: int | None) -> dict[
     return parsed
 
 
+def _agent_snmp_context(target_role: str, community: str | None) -> dict[str, str]:
+    context = {"target_role": target_role}
+    if community:
+        context["community"] = community
+    return context
+
+
 class ChannelStatsRequest(BaseModel):
     """Request model for channel stats."""
     mac_address: str = Field(..., description="Cable modem MAC address")
     modem_ip: str = Field(..., description="Cable modem IP address")
-    community: str = Field(default="public", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
     cmts_ip: Optional[str] = Field(default=None, description="CMTS IP address for fiber node lookup")
     cmts_community: Optional[str] = Field(default=None, description="CMTS SNMP community string")
     cm_index: Optional[int] = Field(default=None, description="Known CM registration index on CMTS (skip MAC walk)")
@@ -319,7 +326,7 @@ class ChannelStatsRouter:
                     # Quick SNMP check
                     check_task_id = await agent_manager.send_task(
                         cm_agent_id, "snmp_get",
-                        {"target_ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", "community": request.community},
+                        {"target_ip": request.modem_ip, "oid": "1.3.6.1.2.1.1.1.0", **_agent_snmp_context("cm", request.community)},
                         timeout=5.0
                     )
                     check_result = await agent_manager.wait_for_task_async(check_task_id, timeout=5.0)
@@ -341,7 +348,7 @@ class ChannelStatsRouter:
                     {
                         "ip": request.modem_ip,
                         "oids": table_oids,
-                        "community": request.community,
+                        **_agent_snmp_context("cm", request.community),
                         "timeout": 3,
                         "max_repetitions": 25,
                     },
@@ -386,7 +393,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=5.0,
                             )
@@ -401,7 +408,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.20.1.3.1.2',  # docsIf3CmtsCmRegStatusMacAddr
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -415,7 +422,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.2.1.1.1.0',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=5.0,
                         )
@@ -425,7 +432,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.4',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -436,7 +443,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.4.1.2.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -447,7 +454,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.20.1.4.1.4.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -456,7 +463,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.5.1.1.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -465,7 +472,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -474,7 +481,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cached_cm_index}',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -485,7 +492,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.4.1.2',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -496,7 +503,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": '1.3.6.1.4.1.4491.2.1.28.1.5.1.1',
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -513,7 +520,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": _partial_oid,
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -523,7 +530,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.4.1.4491.2.1.28.1.24',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -533,7 +540,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.4.1.4491.2.1.28.1.20',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -543,7 +550,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.4.1.4491.2.1.28.1.21',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -553,7 +560,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": '1.3.6.1.2.1.31.1.1.1.1',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -738,7 +745,7 @@ class ChannelStatsRouter:
                                     {
                                         "target_ip": request.cmts_ip,
                                         "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}',
-                                        "community": request.cmts_community or "public",
+                                        **_agent_snmp_context("cmts", request.cmts_community),
                                     },
                                     timeout=5.0,
                                 )
@@ -761,7 +768,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cm_index}',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -781,7 +788,7 @@ class ChannelStatsRouter:
                             {
                                 "target_ip": request.cmts_ip,
                                 "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cm_index}',
-                                "community": request.cmts_community or "public",
+                                **_agent_snmp_context("cmts", request.cmts_community),
                             },
                             timeout=cmts_task_timeout,
                         )
@@ -908,7 +915,7 @@ class ChannelStatsRouter:
                                 {
                                     "target_ip": request.cmts_ip,
                                     "oid": f"{base_col_oid}.{ifidx}",
-                                    "community": request.cmts_community or "public",
+                                    **_agent_snmp_context("cmts", request.cmts_community),
                                 },
                                 timeout=cmts_task_timeout,
                             )
@@ -942,7 +949,7 @@ class ChannelStatsRouter:
                                     {
                                         "target_ip": request.cmts_ip,
                                         "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.3.{cm_index}',
-                                        "community": request.cmts_community or "public",
+                                        **_agent_snmp_context("cmts", request.cmts_community),
                                     },
                                     timeout=cmts_task_timeout,
                                 )
@@ -1062,7 +1069,7 @@ class ChannelStatsRouter:
                                     {
                                         "target_ip": request.cmts_ip,
                                         "oid": f'1.3.6.1.4.1.4491.2.1.28.1.3.1.2.{cm_index}',
-                                        "community": request.cmts_community or "public",
+                                        **_agent_snmp_context("cmts", request.cmts_community),
                                     },
                                     timeout=cmts_task_timeout,
                                 )
@@ -1196,7 +1203,7 @@ class ChannelStatsRouter:
                             if cm_sg_id:
                                 fn_task_id = await agent_manager.send_task(
                                     cmts_agent_id, "snmp_walk",
-                                    {"target_ip": request.cmts_ip, "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3', "community": request.cmts_community or "public"},
+                                    {"target_ip": request.cmts_ip, "oid": '1.3.6.1.4.1.4491.2.1.20.1.12.1.3', **_agent_snmp_context("cmts", request.cmts_community)},
                                     timeout=10.0,
                                 )
                                 fn_result = await agent_manager.wait_for_task_async(fn_task_id, timeout=10.0)
@@ -1242,7 +1249,7 @@ class ChannelStatsRouter:
                                 # First call: full sequential lookup (also caches cm_index)
                                 fiber_node = await self._get_fiber_node_from_cmts(
                                     agent_manager, cmts_agent_id, request.cmts_ip,
-                                    request.mac_address, request.cmts_community or "public",
+                                    request.mac_address, request.cmts_community,
                                     walk_timeout=cmts_task_timeout,
                                 )
                     except Exception as fn_err:
@@ -1351,7 +1358,7 @@ class ChannelStatsRouter:
     
     async def _get_fiber_node_from_cmts(
         self, agent_manager, agent_id: str, cmts_ip: str, 
-        mac_address: str, community: str, walk_timeout: float = 30.0
+        mac_address: str, community: str | None, walk_timeout: float = 30.0
     ) -> str:
         """Lookup fiber node from CMTS using agent SNMP commands."""
         try:
@@ -1364,7 +1371,7 @@ class ChannelStatsRouter:
             
             # Walk docsIf3CmtsCmRegStatusMacAddr to find CM index
             oid = '1.3.6.1.4.1.4491.2.1.20.1.3.1.2'  # docsIf3CmtsCmRegStatusMacAddr
-            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, "community": community}, timeout=walk_timeout)
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": oid, **_agent_snmp_context("cmts", community)}, timeout=walk_timeout)
             result = await agent_manager.wait_for_task_async(task_id, timeout=walk_timeout)
             
             if not result or not result.get("result", {}).get("success"):
@@ -1395,7 +1402,7 @@ class ChannelStatsRouter:
             _set_cached_cm_index(cmts_ip, mac_address, int(cm_index))
             
             # Get CM's Service Group ID via snmpget (direct, no walk needed)
-            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}', "community": community}, timeout=5.0)
+            task_id = await agent_manager.send_task(agent_id, "snmp_get", {"target_ip": cmts_ip, "oid": f'1.3.6.1.4.1.4491.2.1.20.1.3.1.8.{cm_index}', **_agent_snmp_context("cmts", community)}, timeout=5.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
             
             cm_sg_id = None
@@ -1409,7 +1416,7 @@ class ChannelStatsRouter:
             # Walk the full fiber node table and match by SG ID directly
             # Uses shared fiber_node_utils for OID parsing (unified with rxmer/router.py)
             self.logger.info(f"Walking full fiber node table to find SG ID {cm_sg_id}: {OID_MD_NODE_STATUS_MD_DS_SG_ID}")
-            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": OID_MD_NODE_STATUS_MD_DS_SG_ID, "community": community}, timeout=10.0)
+            task_id = await agent_manager.send_task(agent_id, "snmp_walk", {"target_ip": cmts_ip, "oid": OID_MD_NODE_STATUS_MD_DS_SG_ID, **_agent_snmp_context("cmts", community)}, timeout=10.0)
             result = await agent_manager.wait_for_task_async(task_id, timeout=10.0)
             
             if result and result.get("result", {}).get("success"):

@@ -59,6 +59,13 @@ class SnmpQueryPlanRequest(BaseModel):
 
 class SnmpQueryJobStartRequest(BaseModel):
     max_concurrency: int = Field(default=10, ge=1, le=20)
+    community: str | None = Field(default=None, description="Optional cable-modem SNMP community")
+
+
+class SnmpOidVerifyRequest(BaseModel):
+    oid: str = Field(min_length=1)
+    cmts: str | None = Field(default=None, max_length=128)
+    community: str | None = Field(default=None, description="Optional cable-modem SNMP community")
 
 
 # ── Job responses ────────────────────────────────────────────

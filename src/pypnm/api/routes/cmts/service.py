@@ -105,7 +105,7 @@ class CMTSModemService:
     proxy via ``snmp_parallel_walk``, ``snmp_walk`` and ``snmp_get``.
     """
     
-    def __init__(self, cmts_ip: str = None, community: str = "public"):
+    def __init__(self, cmts_ip: str = None, community: str | None = None):
         self.logger = logging.getLogger(__name__)
         self.cmts_ip = cmts_ip
         self.community = community
@@ -120,10 +120,14 @@ class CMTSModemService:
         if not agent_id:
             raise Exception("No cmts_reachable agent available")
 
+        task_params = dict(params)
+        task_params['target_role'] = 'cmts'
+        if not task_params.get('community'):
+            task_params.pop('community', None)
         task_id = await agent_manager.send_task(
             agent_id=agent_id,
             command=command,
-            params=params,
+            params=task_params,
             timeout=timeout
         )
 
@@ -145,10 +149,14 @@ class CMTSModemService:
         if not agent_id:
             raise Exception("No cm_reachable agent available")
 
+        task_params = dict(params)
+        task_params['target_role'] = 'cm'
+        if not task_params.get('community'):
+            task_params.pop('community', None)
         task_id = await agent_manager.send_task(
             agent_id=agent_id,
             command=command,
-            params=params,
+            params=task_params,
             timeout=timeout,
             priority=priority,
         )
@@ -188,7 +196,7 @@ class CMTSModemService:
         self,
         cmts_ip: str,
         docsif3_index: int,
-        community: str = 'public',
+        community: str | None = None,
         modem_ip: str | None = None,
     ) -> dict:
         """Resolve one modem's CMTS interface, Fiber Node, and DOCSIS version."""
@@ -755,7 +763,7 @@ class CMTSModemService:
     async def collect_cpe_addresses(
         self,
         cmts_ip: str,
-        community: str = "public",
+        community: str | None = None,
         limit: int | None = None,
         overall_timeout_sec: int = 270,
         agent_command_timeout_sec: int = 300,
@@ -925,12 +933,12 @@ class CMTSModemService:
     async def discover_modems(
         self, 
         cmts_ip: str, 
-        community: str = "public", 
+        community: str | None = None,
         limit: int = 50000,
         enrich: bool = False,
         refresh: bool = False,
         collect_cpe: bool = False,
-        modem_community: str = "private",
+        modem_community: str | None = None,
         cmts_hostname: str = "",
     ) -> Dict[str, Any]:
         """Discover cable modems from a CMTS.
@@ -2030,7 +2038,7 @@ class CMTSModemService:
             'total_count': len(modems)
         }
 
-    async def _enrich_modems_direct(self, modems: list, modem_community: str = 'private', cmts_ip: str = None) -> list:
+    async def _enrich_modems_direct(self, modems: list, modem_community: str | None = None, cmts_ip: str = None) -> list:
         """
         Query each modem directly via agent SNMP to get sysDescr + DOCSIS cap.
         Uses snmp_bulk_get (all OIDs per modem in one call) and asyncio.gather

@@ -4,25 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from typing import Any
 
 from pypnm.api.routes.cm_snmp_query.service import cm_snmp_query_service
 
 logger = logging.getLogger(__name__)
-
-
-def _configured_modem_community() -> str:
-    from pypnm.config.pnm_config_manager import PnmConfigManager
-    community = (
-        os.environ.get("MODEM_COMMUNITY")
-        or os.environ.get("CM_SNMP_COMMUNITY")
-        or PnmConfigManager.get_write_community()
-    )
-    if not community:
-        raise RuntimeError("Cable-modem SNMP community is not configured")
-    return str(community)
 
 
 class CmSnmpQueryWorker:
@@ -32,7 +19,12 @@ class CmSnmpQueryWorker:
         self._tasks: dict[str, asyncio.Task] = {}
         self._task_lock = asyncio.Lock()
 
-    async def start(self, public_id: str, max_concurrency: int = 10) -> dict[str, Any]:
+    async def start(
+        self,
+        public_id: str,
+        max_concurrency: int = 10,
+        community: str | None = None,
+    ) -> dict[str, Any]:
         concurrency = max(1, min(int(max_concurrency), 20))
         lease_owner = f"snmp-query-worker-{uuid.uuid4()}"
 
@@ -50,6 +42,7 @@ class CmSnmpQueryWorker:
                     job_id=cm_snmp_query_service.get_job_id_by_public_id(public_id),
                     lease_owner=lease_owner,
                     max_concurrency=concurrency,
+                    community=community,
                 ),
                 name=f"snmp-query-{public_id}",
             )
@@ -66,6 +59,7 @@ class CmSnmpQueryWorker:
         job_id: int,
         lease_owner: str,
         max_concurrency: int,
+        community: str | None,
     ) -> None:
         heartbeat: asyncio.Task | None = None
         try:
@@ -100,7 +94,7 @@ class CmSnmpQueryWorker:
                     for target in targets:
                         active_targets.add(
                             asyncio.create_task(
-                                self._query_target(target, oids),
+                                self._query_target(target, oids, community),
                                 name=f"snmp-query-target-{target['id']}",
                             )
                         )
@@ -138,8 +132,13 @@ class CmSnmpQueryWorker:
                 logger.warning(f"SNMP query heartbeat failed: {exc}")
                 return
 
-    async def _query_target(self, target: dict[str, Any], oids: list[dict]) -> None:
-        """SNMP GET each OID for this modem via cm-agent."""
+    async def _query_target(
+        self,
+        target: dict[str, Any],
+        oids: list[dict],
+        community: str | None,
+    ) -> None:
+        """Query all requested OIDs for one modem in a single bulk task."""
         target_id = int(target["id"])
         modem_ip = target.get("modem_ip")
 
@@ -151,68 +150,59 @@ class CmSnmpQueryWorker:
 
         try:
             from pypnm.api.agent.manager import get_agent_manager
+            from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
 
             agent_manager = get_agent_manager()
             if not agent_manager:
                 raise RuntimeError("Agent manager not available")
 
-            agent = (
-                agent_manager.get_agent_for_capability("cm_reachable")
-                or agent_manager.get_agent_for_capability("snmp_get")
-            )
+            agent = agent_manager.get_agent_for_capability("cm_reachable")
             if not agent:
-                raise RuntimeError("No cm-agent connected")
+                raise RuntimeError("No cm_reachable agent connected")
 
-            community = _configured_modem_community()
-            results: dict[str, Any] = {}
+            resolved_entries = [
+                (entry.get("label") or entry.get("oid", ""), resolve_oid(entry.get("oid", "")))
+                for entry in oids
+            ]
+            results: dict[str, Any] = {label: None for label, _ in resolved_entries}
+            params = {
+                "target_ip": modem_ip,
+                "oids": [numeric_oid for _, numeric_oid in resolved_entries],
+                "target_role": "cm",
+                "timeout": 5,
+                "retries": 1,
+                # Preserve the previous one-request-at-a-time modem load shape.
+                "max_concurrent": 1,
+            }
+            if community:
+                params["community"] = community
 
-            for entry in oids:
-                oid = entry.get("oid", "")
-                label = entry.get("label") or oid
+            task_id = await agent_manager.send_task(
+                agent.agent_id,
+                "snmp_bulk_get",
+                params,
+                timeout=30,
+                priority="bulk",
+            )
+            result = await agent_manager.wait_for_task_async(task_id, timeout=30)
+            if not result or result.get("type") != "response":
+                raise RuntimeError("Agent bulk SNMP task timed out")
+            response = result.get("result", {})
+            if not response.get("success"):
+                raise RuntimeError(response.get("error") or "Agent bulk SNMP task failed")
+            oid_results = response.get("results", {})
 
-                # Resolve MIB name to numeric OID server-side
-                from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
-                numeric_oid = resolve_oid(oid)
-
-                try:
-                    task_id = await agent_manager.send_task(
-                        agent.agent_id,
-                        "snmp_get",
-                        {
-                            "target_ip": modem_ip,
-                            "oid": numeric_oid,
-                            "community": community,
-                            "timeout": 5,
-                            "retries": 1,
-                        },
-                        timeout=15,
-                        priority="bulk",
-                    )
-                    result = await agent_manager.wait_for_task_async(task_id, timeout=15)
-
-                    if result and result.get("type") == "response":
-                        res_data = result.get("result", {})
-                        if res_data.get("success"):
-                            # Agent returns 'results' list (parallel_walk style)
-                            # or 'output' string (get style: "OID = value")
-                            if res_data.get("results"):
-                                value = res_data["results"][0].get("value")
-                            elif res_data.get("output"):
-                                # Parse "OID = value" format
-                                raw = str(res_data["output"])
-                                if " = " in raw:
-                                    value = raw.split(" = ", 1)[1].strip()
-                                else:
-                                    value = raw.strip()
-                            else:
-                                value = None
-                            results[label] = value
-                        else:
-                            results[label] = None
-                    else:
-                        results[label] = None
-                except Exception:
-                    results[label] = None
+            for label, numeric_oid in resolved_entries:
+                oid_result = oid_results.get(numeric_oid) or oid_results.get(numeric_oid.lstrip("."))
+                if not isinstance(oid_result, dict) or not oid_result.get("success"):
+                    continue
+                value = oid_result.get("value")
+                if value is None and oid_result.get("results"):
+                    value = oid_result["results"][0].get("value")
+                if value is None and oid_result.get("output") is not None:
+                    raw = str(oid_result["output"])
+                    value = raw.split(" = ", 1)[1].strip() if " = " in raw else raw.strip()
+                results[label] = value
 
             await asyncio.to_thread(
                 cm_snmp_query_service.record_target_result, target_id, results

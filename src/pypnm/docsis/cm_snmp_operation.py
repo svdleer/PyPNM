@@ -171,7 +171,7 @@ class CmSnmpOperation:
         _SNMPv2C = 0
         _SNMPv3  = 1
 
-    def __init__(self, inet: Inet, write_community: str, port: int = Snmp_v2c.SNMP_PORT, priority: str = 'interactive') -> None:
+    def __init__(self, inet: Inet, write_community: str | None, port: int = Snmp_v2c.SNMP_PORT, priority: str = 'interactive') -> None:
         """
         Initialize a CmSnmpOperation instance.
 
@@ -220,28 +220,27 @@ class CmSnmpOperation:
                 print(f"DEBUG: Agent manager: {agent_manager}")
                 
                 if agent_manager:
-                    # Use cm_reachable capability so cm-agent (not ctms-agent) handles
-                    # modem-side SNMP.  Fall back to snmp_get if no cm_reachable agent.
-                    agent = (agent_manager.get_agent_for_capability('cm_reachable')
-                             or agent_manager.get_agent_for_capability('snmp_get'))
-                    print(f"DEBUG: Agent for snmp_get: {agent}")
+                    # Modem-side SNMP must use a CM-reachable agent only.
+                    agent = agent_manager.get_agent_for_capability('cm_reachable')
+                    print(f"DEBUG: Agent for cm_reachable: {agent}")
                     
                     if agent:
                         print("DEBUG: Using agent SNMP transport")
                         return AgentSnmpTransport(
                             host=self._inet,
-                            community=self._community,
+                            write_community=self._community,
                             port=self._port,
                             timeout=10,
                             retries=3,
                             agent_id=agent.agent_id,
                             priority=self._priority,
+                            target_role='cm',
                         )
                     else:
-                        print("DEBUG: No agent with snmp_get capability")
+                        print("DEBUG: No agent with cm_reachable capability")
                         if not allow_direct_fallback:
                             raise RuntimeError(
-                                "PYPNM_USE_AGENT_SNMP=true but no agent with cm_reachable/snmp_get capability is connected"
+                                "PYPNM_USE_AGENT_SNMP=true but no agent with cm_reachable capability is connected"
                             )
                 else:
                     print("DEBUG: No agent manager available")
@@ -293,9 +292,22 @@ class CmSnmpOperation:
                 "Disable SNMPv3 to use SNMPv2c.")
 
         if SystemConfigSettings.snmp_enable():
+            direct_read_community = SystemConfigSettings.snmp_read_community()
+            direct_write_community = (
+                self._community or SystemConfigSettings.snmp_write_community()
+            )
+            if not direct_read_community:
+                raise ValueError("SNMP read community is required for direct SNMP mode")
             self.logger.debug("Using SNMPv2c")
-            # Use a longer timeout (10s) for operations like Spectrum Analyzer that take time
-            return Snmp_v2c(host=self._inet, community=self._community, port=self._port, timeout=10, retries=3)
+            # Keep direct-mode reads and writes independent.
+            return Snmp_v2c(
+                host=self._inet,
+                read_community=direct_read_community,
+                write_community=direct_write_community,
+                port=self._port,
+                timeout=10,
+                retries=3,
+            )
 
         # Neither protocol is usable
         msg = "No SNMP protocol enabled or properly configured (v3 disabled/invalid and v2c disabled)."

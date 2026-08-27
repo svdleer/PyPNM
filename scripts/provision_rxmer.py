@@ -27,8 +27,8 @@ Usage:
     python3 provision_rxmer.py 172.16.6.200 1376387073 aa:bb:cc:dd:ee:ff  # E6000
 
 Environment:
-    SNMP_READ   — read community  (default: public)
-    SNMP_WRITE  — write community (default: private)
+    SNMP_READ   — required read community
+    SNMP_WRITE  — required write community
     TFTP_IP     — TFTP server IP  (default: 212.178.218.234)
     TFTP_IP_CCAP  — CCAP (Casa/Cisco) TFTP IP (default: 127.0.0.1)
 """
@@ -50,8 +50,16 @@ CMTS_IP   = sys.argv[1]
 OFDMA_IDX = int(sys.argv[2])
 CM_MAC    = sys.argv[3]          # aa:bb:cc:dd:ee:ff
 
-SNMP_READ  = os.environ.get("SNMP_READ",  "public")
-SNMP_WRITE = os.environ.get("SNMP_WRITE", "private")
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        raise SystemExit(f"{name} must be set to a non-blank value")
+    return value
+
+
+SNMP_READ  = _required_env("SNMP_READ")
+SNMP_WRITE = _required_env("SNMP_WRITE")
 TFTP_IP    = os.environ.get("TFTP_IP",    "212.178.218.234")
 TFTP_IP_CCAP  = os.environ.get("TFTP_IP_CCAP",  "127.0.0.1")
 TFTP_PATH  = "./"

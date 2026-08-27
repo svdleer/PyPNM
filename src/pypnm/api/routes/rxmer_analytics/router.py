@@ -413,6 +413,7 @@ async def start_job(
         job = await rxmer_collection_worker.start(
             public_id,
             max_concurrency=payload.max_concurrency,
+            community=payload.community,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="RxMER analytics job not found") from exc

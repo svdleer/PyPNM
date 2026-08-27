@@ -73,7 +73,7 @@ class MeasStatus(IntEnum):
 class CmtsSnmpConfig(BaseModel):
     """CMTS SNMP configuration."""
     cmts_ip: str = Field(..., description="CMTS IP address")
-    community: str = Field(default="private", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
     write_community: Optional[str] = Field(default=None, description="SNMP write community (defaults to community)")
 
 
@@ -236,7 +236,7 @@ class UtscBulkDestResponse(BaseModel):
 class UtscDiscoverRequest(BaseModel):
     """Request to discover RF port for a cable modem."""
     cmts_ip: str
-    community: str = "public"
+    community: Optional[str] = None
     cm_mac_address: str
 
 

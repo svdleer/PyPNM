@@ -99,15 +99,18 @@ class Snmp_v2c:
         else:
             self._read_community = str(SystemConfigSettings.snmp_read_community())
 
-        if write_community is not None:
-            self._write_community = str(write_community)
-        elif community is not None:
-            self._write_community = str(community)
-        else:
-            self._write_community = str(SystemConfigSettings.snmp_write_community())
-
-        if self._write_community == "":
-            self._write_community = self._read_community
+        write_value = (
+            write_community
+            if write_community is not None
+            else community
+            if community is not None
+            else SystemConfigSettings.snmp_write_community()
+        )
+        self._write_community = (
+            str(write_value)
+            if write_value is not None and str(write_value).strip()
+            else None
+        )
         self._timeout   = timeout
         self._retries   = retries
         self._snmp_engine = SnmpEngine()
@@ -401,6 +404,8 @@ class Snmp_v2c:
         """
         if value_type is None:
             raise ValueError("value_type must be explicitly specified")
+        if self._write_community is None:
+            raise ValueError("SNMP write community is required for SET")
 
         self.logger.debug(f'SNMP-SET-OID: {oid} -> {value_type} -> {value}')
 

@@ -111,7 +111,7 @@ class UtscRouter:
         )
         async def list_rf_ports(
             cmts_ip: str,
-            community: str = "public",
+            community: Optional[str] = None,
             write_community: Optional[str] = None
         ) -> UtscListPortsResponse:
             """
@@ -124,7 +124,7 @@ class UtscRouter:
             service = CmtsUtscService(
                 cmts_ip=cmts_ip,
                 community=community,
-                write_community=write_community or community
+                write_community=write_community
             )
             try:
                 result = await service.list_rf_ports()
@@ -140,7 +140,7 @@ class UtscRouter:
         async def get_config(
             cmts_ip: str,
             rf_port_ifindex: int,
-            community: str = "public",
+            community: Optional[str] = None,
             write_community: Optional[str] = None,
             cfg_index: int = 1
         ) -> UtscGetConfigResponse:
@@ -156,7 +156,7 @@ class UtscRouter:
             service = CmtsUtscService(
                 cmts_ip=cmts_ip,
                 community=community,
-                write_community=write_community or community
+                write_community=write_community
             )
             try:
                 result = await service.get_config(
@@ -355,7 +355,7 @@ class UtscRouter:
         async def get_status(
             cmts_ip: str,
             rf_port_ifindex: int,
-            community: str = "public",
+            community: Optional[str] = None,
             write_community: Optional[str] = None,
             cfg_index: int = 1
         ) -> UtscStatusResponse:
@@ -378,7 +378,7 @@ class UtscRouter:
             service = CmtsUtscService(
                 cmts_ip=cmts_ip,
                 community=community,
-                write_community=write_community or community
+                write_community=write_community
             )
             try:
                 result = await service.get_status(

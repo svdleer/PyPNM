@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 class CmtsSnmpConfig(BaseModel):
     """CMTS SNMP configuration."""
     cmts_ip: str = Field(..., description="CMTS IP address")
-    community: str = Field(default="private", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
     write_community: Optional[str] = Field(default=None, description="SNMP write community (defaults to community)")
 
 

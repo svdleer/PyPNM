@@ -4,6 +4,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Maurice Garcia
 import logging
+import os
 
 from pypnm.config.pnm_config_manager import PnmConfigManager
 from pypnm.docsis.cm_snmp_operation import CmSnmpOperation
@@ -25,19 +26,24 @@ class CableModem(CmSnmpOperation):
     def __init__(self, mac_address: MacAddress,
                  inet: Inet,
                  write_community: str | None = None,
-                 priority: str = 'interactive') -> None:
+                 priority: str = 'interactive',
+                 resolve_configured_community: bool = True) -> None:
         """
         Initialize the CableModem instance.
 
         Args:
             mac_address (MacAddress): The MAC address of the cable modem.
             inet (Inet): The IP address of the cable modem.
-            write_community (str, optional): SNMP write community string. When omitted,
-                resolves the current configured value at construction time.
+            write_community (str, optional): SNMP write community string.
             priority (str, optional): Agent task priority ('interactive' for GUI, 'bulk' for background jobs).
+            resolve_configured_community: Resolve the PyPNM configured community for
+                direct SNMP when ``write_community`` is absent. Agent mode always
+                leaves the value absent for agent-side role resolution.
         """
-        if write_community is None:
-            write_community = str(PnmConfigManager.get_write_community())
+        agent_enabled = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
+        if write_community is None and resolve_configured_community and not agent_enabled:
+            configured = PnmConfigManager.get_write_community()
+            write_community = str(configured) if configured else None
         super().__init__(inet=inet, write_community=write_community, priority=priority)
         self.logger = logging.getLogger(self.__class__.__name__)
         self._mac_address: MacAddress = mac_address

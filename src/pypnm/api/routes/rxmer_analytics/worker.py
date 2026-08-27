@@ -4,26 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from typing import Any
 
 from pypnm.api.routes.rxmer_analytics.service import rxmer_analytics_service
-from pypnm.config.pnm_config_manager import PnmConfigManager
 
 logger = logging.getLogger(__name__)
-
-
-def _configured_modem_community() -> str:
-    """Resolve the modem community supplied by the deployment environment."""
-    community = (
-        os.environ.get("MODEM_COMMUNITY")
-        or os.environ.get("CM_SNMP_COMMUNITY")
-        or PnmConfigManager.get_write_community()
-    )
-    if not community:
-        raise RuntimeError("Cable-modem SNMP community is not configured")
-    return str(community)
 
 
 class RxMerCollectionWorker:
@@ -33,7 +19,12 @@ class RxMerCollectionWorker:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
 
-    async def start(self, public_id: str, max_concurrency: int = 10) -> dict[str, Any]:
+    async def start(
+        self,
+        public_id: str,
+        max_concurrency: int = 10,
+        community: str | None = None,
+    ) -> dict[str, Any]:
         concurrency = max(1, min(int(max_concurrency), 20))
         lease_owner = f"rxmer-worker-{uuid.uuid4()}"
         async with self._task_lock:
@@ -51,6 +42,7 @@ class RxMerCollectionWorker:
                     job_id=int(job["id"]),
                     lease_owner=lease_owner,
                     max_concurrency=concurrency,
+                    community=community,
                 ),
                 name=f"rxmer-job-{public_id}",
             )
@@ -67,6 +59,7 @@ class RxMerCollectionWorker:
         job_id: int,
         lease_owner: str,
         max_concurrency: int,
+        community: str | None,
     ) -> None:
         heartbeat: asyncio.Task[None] | None = None
         try:
@@ -99,7 +92,7 @@ class RxMerCollectionWorker:
                         target_id = int(target["id"])
                         active_targets.add(
                             asyncio.create_task(
-                                self._process_target(job_id, target),
+                                self._process_target(job_id, target, community),
                                 name=f"rxmer-target-{target_id}",
                             )
                         )
@@ -158,7 +151,12 @@ class RxMerCollectionWorker:
                 lease_owner,
             )
 
-    async def _process_target(self, job_id: int, target: dict[str, Any]) -> None:
+    async def _process_target(
+        self,
+        job_id: int,
+        target: dict[str, Any],
+        community: str | None,
+    ) -> None:
         from pypnm.api.routes.common.extended.common_measure_schema import (
             DownstreamOfdmParameters,
         )
@@ -175,7 +173,8 @@ class RxMerCollectionWorker:
             modem = CableModem(
                 mac_address=MacAddress(str(target["mac"])),
                 inet=Inet(str(target["modem_ip"])),
-                write_community=_configured_modem_community(),
+                write_community=community,
+                resolve_configured_community=False,
                 priority='bulk',
             )
             cm_agent_id = getattr(getattr(modem, "_snmp", None), "_agent_id", None)

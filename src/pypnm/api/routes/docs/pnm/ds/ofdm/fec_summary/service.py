@@ -25,7 +25,7 @@ class CmDsOfdmFecSummaryService(CommonMeasureService):
         fec_summary_type (FecSummaryType): The FEC summary interval type (e.g., TEN_MIN, ONE_DAY).
         tftp_server_inet (Inet): The IP address of the TFTP server used for result file retrieval.
         tftp_path (str, optional): The path on the TFTP server where test results are stored. Defaults to "".
-        snmp_write_community (str, optional): The SNMP write community string. Defaults to "private".
+        snmp_write_community (str, optional): The cable modem's configured SNMP write community is used.
     """
     def __init__(self, cable_modem: CableModem,
                  fec_summary_type: FecSummaryType,

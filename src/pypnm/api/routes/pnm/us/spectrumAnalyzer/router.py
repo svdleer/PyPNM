@@ -26,6 +26,23 @@ from pypnm.lib.inet import Inet
 router = APIRouter(prefix="/pnm/us/spectrumAnalyzer", tags=["PNM - Upstream Spectrum (UTSC)"])
 logger = logging.getLogger(__name__)
 
+
+def _first_community(*values):
+    """Return the first non-blank community without modifying it."""
+    for value in values:
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _agent_snmp_context(community: str | None) -> dict[str, str]:
+    context = {'target_role': 'cmts'}
+    configured = _first_community(community)
+    if configured is not None:
+        context['community'] = configured
+    return context
+
+
 # Store active WebSocket connections for spectrum streaming
 _spectrum_connections: list[WebSocket] = []
 
@@ -301,7 +318,8 @@ async def spectrum_stream(websocket: WebSocket):
                 cmts_ip = config.get("cmts_ip")
                 rf_port_ifindex = config.get("rf_port_ifindex")
                 logical_channel_ifindex = config.get("logical_channel_ifindex")  # Optional SC-QAM channel
-                community = config.get("community", "private")
+                community = config.get("community")
+                write_community = config.get("write_community")
                 interval_ms = config.get("interval_ms", 500)
                 trigger_mode = config.get("trigger_mode", 2)  # Default to FreeRunning (2)
                 skip_configure = config.get("skip_configure", False)  # Skip if already configured via REST
@@ -321,7 +339,8 @@ async def spectrum_stream(websocket: WebSocket):
                 
                 # Start streaming spectrum data
                 await _stream_spectrum_data(
-                    websocket, cmts_ip, rf_port_ifindex, community, interval_ms, trigger_mode,
+                    websocket, cmts_ip, rf_port_ifindex, community,
+                    write_community, interval_ms, trigger_mode,
                     logical_channel_ifindex, skip_configure,
                     center_freq_hz=center_freq_hz,
                     span_hz=span_hz,
@@ -429,19 +448,17 @@ async def spectrum_stream_fake(websocket: WebSocket):
         logger.error(f"Fake spectrum error: {e}")
 
 
-async def _poll_utsc_status(cmts_ip: str, rf_port_ifindex: int, community: str) -> int | None:
+async def _poll_utsc_status(cmts_ip: str, rf_port_ifindex: int, community: str | None) -> int | None:
     """Poll UTSC MeasStatus via SNMP GET. Returns integer status or None."""
     from pypnm.api.agent.manager import get_agent_manager
-    from pypnm.config.pnm_config_manager import PnmConfigManager
     
     agent_manager = get_agent_manager()
     if not agent_manager:
         return None
-    agent = agent_manager.get_agent_for_capability('snmp_get')
-    if not agent:
+    agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable')
+    if not agent_id:
         return None
     
-    write_community = os.environ.get('CMTS_WRITE_COMMUNITY') or PnmConfigManager.get_write_community() or community
     oid = f"1.3.6.1.4.1.4491.2.1.27.1.3.10.4.1.1.{rf_port_ifindex}.1"
     
     if not hasattr(_poll_utsc_status, '_logged_raw'):
@@ -449,12 +466,12 @@ async def _poll_utsc_status(cmts_ip: str, rf_port_ifindex: int, community: str) 
     
     try:
         task_id = await agent_manager.send_task(
-            agent_id=agent.agent_id,
+            agent_id=agent_id,
             command='snmp_get',
             params={
                 'target_ip': cmts_ip,
                 'oid': oid,
-                'community': write_community,
+                **_agent_snmp_context(community),
                 'timeout': 5
             },
             timeout=10.0
@@ -489,7 +506,8 @@ async def _stream_spectrum_data(
     websocket: WebSocket,
     cmts_ip: str,
     rf_port_ifindex: int,
-    community: str,
+    community: str | None,
+    write_community: str | None,
     interval_ms: int,
     trigger_mode: int = 2,
     logical_channel_ifindex: int = None,
@@ -579,7 +597,7 @@ async def _stream_spectrum_data(
             logger.info(f"Configuring UTSC on {cmts_ip} port {rf_port_ifindex}")
             try:
                 await _configure_utsc(
-                    cmts_ip, rf_port_ifindex, community,
+                    cmts_ip, rf_port_ifindex, community, write_community,
                     trigger_mode=trigger_mode,
                     center_freq_hz=center_freq_hz,
                     span_hz=span_hz,
@@ -590,7 +608,7 @@ async def _stream_spectrum_data(
                     freerun_duration_ms=freerun_duration_ms,
                     logical_channel_ifindex=logical_channel_ifindex
                 )
-                await _trigger_utsc(cmts_ip, rf_port_ifindex, community)
+                await _trigger_utsc(cmts_ip, rf_port_ifindex, community, write_community)
                 run_counter += 1
                 last_trigger_time = time.time()
             except Exception as e:
@@ -677,7 +695,7 @@ async def _stream_spectrum_data(
                             status_val = await _poll_utsc_status(cmts_ip, rf_port_ifindex, community)
                             if status_val == 4:
                                 logger.info(f"sampleReady detected at {seconds_since_trigger:.0f}s, re-triggering UTSC...")
-                                await _trigger_utsc(cmts_ip, rf_port_ifindex, community)
+                                await _trigger_utsc(cmts_ip, rf_port_ifindex, community, write_community)
                                 retrigger_count += 1
                                 run_counter += 1
                                 last_trigger_time = current_time
@@ -691,7 +709,7 @@ async def _stream_spectrum_data(
                     elif seconds_since_trigger >= fallback_retrigger_s:
                         try:
                             logger.info(f"Fallback retrigger at {seconds_since_trigger:.0f}s (sampleReady not detected in window)")
-                            await _trigger_utsc(cmts_ip, rf_port_ifindex, community)
+                            await _trigger_utsc(cmts_ip, rf_port_ifindex, community, write_community)
                             retrigger_count += 1
                             run_counter += 1
                             last_trigger_time = current_time
@@ -795,7 +813,7 @@ async def _stream_spectrum_data(
     finally:
         # Stop capture on CMTS
         try:
-            await _abort_utsc(cmts_ip, rf_port_ifindex, community)
+            await _abort_utsc(cmts_ip, rf_port_ifindex, community, write_community)
         except Exception:
             pass
         # Final FTP cleanup
@@ -806,7 +824,8 @@ async def _stream_spectrum_data(
 async def _configure_utsc(
     cmts_ip: str,
     rf_port_ifindex: int,
-    community: str,
+    community: str | None,
+    write_community: str | None = None,
     trigger_mode: int = 2,
     logical_channel_ifindex: int = None,
     center_freq_hz: int = 37000000,
@@ -826,7 +845,11 @@ async def _configure_utsc(
     from pypnm.config.pnm_config_manager import PnmConfigManager
     from pypnm.api.routes.pnm.us.spectrumAnalyzer.service import CmtsUtscService
 
-    write_community = os.environ.get('CMTS_WRITE_COMMUNITY') or PnmConfigManager.get_write_community() or community
+    write_community = _first_community(
+        write_community,
+        os.environ.get('CMTS_WRITE_COMMUNITY'),
+        PnmConfigManager.get_write_community(),
+    )
 
     svc = CmtsUtscService(
         cmts_ip=cmts_ip,
@@ -851,7 +874,12 @@ async def _configure_utsc(
     logger.info(f"UTSC configured on {cmts_ip} port {rf_port_ifindex} — trigger_mode={trigger_mode}")
 
 
-async def _trigger_utsc(cmts_ip: str, rf_port_ifindex: int, community: str):
+async def _trigger_utsc(
+    cmts_ip: str,
+    rf_port_ifindex: int,
+    community: str | None,
+    write_community: str | None = None,
+):
     """Trigger UTSC capture via SNMP set through agent (fire-and-forget)."""
     from pypnm.api.agent.manager import get_agent_manager
     from pypnm.config.pnm_config_manager import PnmConfigManager
@@ -859,28 +887,31 @@ async def _trigger_utsc(cmts_ip: str, rf_port_ifindex: int, community: str):
     agent_manager = get_agent_manager()
     if not agent_manager:
         raise Exception("Agent manager not available")
-    
-    # Find agent with snmp_set capability
-    agent = agent_manager.get_agent_for_capability('snmp_set')
-    if not agent:
-        raise Exception("No agent with snmp_set capability")
+
+    agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable')
+    if not agent_id:
+        raise Exception("No CMTS-reachable agent")
     
     # Use configured write community from env or config
-    write_community = os.environ.get('CMTS_WRITE_COMMUNITY') or PnmConfigManager.get_write_community() or community
+    write_community = _first_community(
+        write_community,
+        os.environ.get('CMTS_WRITE_COMMUNITY'),
+        PnmConfigManager.get_write_community(),
+    )
     
     # OID for UTSC control: docsPnmCmtsUtscCtrlCmd
     oid = f"1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.1.{rf_port_ifindex}.1"
     
     # Fire and forget - don't wait for response, SNMP set is slow
     task_id = await agent_manager.send_task(
-        agent_id=agent.agent_id,
+        agent_id=agent_id,
         command='snmp_set',
         params={
             'target_ip': cmts_ip,
             'oid': oid,
             'value': 1,  # 1 = start
             'type': 'i',
-            'community': write_community
+            **_agent_snmp_context(write_community),
         },
         timeout=10.0
     )
@@ -888,7 +919,12 @@ async def _trigger_utsc(cmts_ip: str, rf_port_ifindex: int, community: str):
     logger.info(f"UTSC trigger sent to {cmts_ip} port {rf_port_ifindex} (task {task_id})")
 
 
-async def _abort_utsc(cmts_ip: str, rf_port_ifindex: int, community: str):
+async def _abort_utsc(
+    cmts_ip: str,
+    rf_port_ifindex: int,
+    community: str | None,
+    write_community: str | None = None,
+):
     """Abort/reset UTSC capture via SNMP set through agent."""
     from pypnm.api.agent.manager import get_agent_manager
     from pypnm.config.pnm_config_manager import PnmConfigManager
@@ -896,25 +932,29 @@ async def _abort_utsc(cmts_ip: str, rf_port_ifindex: int, community: str):
     agent_manager = get_agent_manager()
     if not agent_manager:
         raise Exception("Agent manager not available")
+
+    agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable')
+    if not agent_id:
+        raise Exception("No CMTS-reachable agent")
     
-    agent = agent_manager.get_agent_for_capability('snmp_set')
-    if not agent:
-        raise Exception("No agent with snmp_set capability")
-    
-    write_community = os.environ.get('CMTS_WRITE_COMMUNITY') or PnmConfigManager.get_write_community() or community
+    write_community = _first_community(
+        write_community,
+        os.environ.get('CMTS_WRITE_COMMUNITY'),
+        PnmConfigManager.get_write_community(),
+    )
     
     # OID for UTSC control: docsPnmCmtsUtscCtrlCmd - value 2 = abort
     oid = f"1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.1.{rf_port_ifindex}.1"
     
     task_id = await agent_manager.send_task(
-        agent_id=agent.agent_id,
+        agent_id=agent_id,
         command='snmp_set',
         params={
             'target_ip': cmts_ip,
             'oid': oid,
             'value': 2,  # 2 = abort
             'type': 'i',
-            'community': write_community
+            **_agent_snmp_context(write_community),
         },
         timeout=5.0
     )

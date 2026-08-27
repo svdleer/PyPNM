@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from pypnm.api.routes.cm_snmp_query.schema import (
     OidEntry,
+    SnmpOidVerifyRequest,
     SnmpQueryCapabilitiesResponse,
     SnmpQueryJob,
     SnmpQueryJobActionResponse,
@@ -133,7 +134,11 @@ def get_job(public_id: str) -> SnmpQueryJobDetailResponse:
 @router.post("/jobs/{public_id}/start", response_model=SnmpQueryJobActionResponse)
 async def start_job(public_id: str, payload: SnmpQueryJobStartRequest) -> SnmpQueryJobActionResponse:
     try:
-        job = await cm_snmp_query_worker.start(public_id, max_concurrency=payload.max_concurrency)
+        job = await cm_snmp_query_worker.start(
+            public_id,
+            max_concurrency=payload.max_concurrency,
+            community=payload.community,
+        )
         return SnmpQueryJobActionResponse(job=SnmpQueryJob(**job), message="Job started")
     except KeyError:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -199,24 +204,17 @@ def download_report(
 
 
 @router.post("/verify-oid")
-async def verify_oid(payload: dict) -> dict:
-    """Test an OID against a sample modem to verify it returns data.
-
-    POST body: {"oid": "sysUpTime.0", "cmts": "CMTS-NAME"}
-    Returns: {"success": true, "oid": "...", "numeric_oid": "1.3.6...", "value": "12345", "modem_ip": "10.x.x.x"}
-    """
-    import os
+async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
+    """Test an OID against a sample modem to verify it returns data."""
     from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
 
-    oid_raw = str(payload.get("oid") or "").strip()
-    cmts = str(payload.get("cmts") or "").strip()
+    oid_raw = payload.oid.strip()
+    cmts = (payload.cmts or "").strip()
     if not oid_raw:
         raise HTTPException(status_code=400, detail="oid is required")
 
-    # Resolve MIB name to numeric OID server-side
     oid = resolve_oid(oid_raw)
 
-    # Find a sample online modem to test against
     cm_snmp_query_service.ensure_schema()
     if cmts:
         modems = cm_snmp_query_service._query(
@@ -239,32 +237,30 @@ async def verify_oid(payload: dict) -> dict:
 
     modem_ip = modems[0]["ip"]
 
-    # Send SNMP GET via cm-agent
     from pypnm.api.agent.manager import get_agent_manager
-    from pypnm.config.pnm_config_manager import PnmConfigManager
 
     agent_manager = get_agent_manager()
     if not agent_manager:
         raise HTTPException(status_code=503, detail="Agent manager not available")
 
-    agent = (
-        agent_manager.get_agent_for_capability("cm_reachable")
-        or agent_manager.get_agent_for_capability("snmp_get")
-    )
+    agent = agent_manager.get_agent_for_capability("cm_reachable")
     if not agent:
-        raise HTTPException(status_code=503, detail="No cm-agent connected")
+        raise HTTPException(status_code=503, detail="No cm_reachable agent connected")
 
-    community = (
-        os.environ.get("MODEM_COMMUNITY")
-        or os.environ.get("CM_SNMP_COMMUNITY")
-        or str(PnmConfigManager.get_write_community())
-    )
+    params = {
+        "target_ip": modem_ip,
+        "oid": oid,
+        "target_role": "cm",
+        "timeout": 5,
+        "retries": 1,
+    }
+    if payload.community:
+        params["community"] = payload.community
 
-    import asyncio
     task_id = await agent_manager.send_task(
         agent.agent_id,
         "snmp_get",
-        {"target_ip": modem_ip, "oid": oid, "community": community, "timeout": 5, "retries": 1},
+        params,
         timeout=15,
         priority="interactive",
     )
@@ -277,7 +273,6 @@ async def verify_oid(payload: dict) -> dict:
     if not res_data.get("success"):
         return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": res_data.get("error", "SNMP GET failed"), "modem_ip": modem_ip}
 
-    # Parse the value
     output = str(res_data.get("output") or "")
     if " = " in output:
         value = output.split(" = ", 1)[1].strip()

@@ -285,7 +285,11 @@ class AgentSnmpTransport:
         retries: int = 3,
         agent_id: str | None = None,
         priority: str = 'interactive',
+        target_role: str = 'cm',
     ) -> None:
+        if target_role not in {'cm', 'cmts'}:
+            raise ValueError("target_role must be 'cm' or 'cmts'")
+
         self.logger = logging.getLogger(self.__class__.__name__)
         self._host = host.inet if hasattr(host, 'inet') else str(host)
         self._port = port
@@ -293,38 +297,40 @@ class AgentSnmpTransport:
         self._retries = retries
         self._agent_id = agent_id  # pin to a specific agent when set
         self._priority = priority  # 'interactive' (GUI) or 'bulk' (background jobs)
+        self._target_role = target_role
 
-        if read_community is not None:
-            self._read_community = str(read_community)
-        elif community is not None:
-            self._read_community = str(community)
-        else:
-            self._read_community = 'public'
+        read_value = read_community if read_community is not None else community
+        self._read_community = str(read_value) if read_value else None
 
         if write_community is not None:
-            self._write_community = str(write_community)
+            self._write_community = str(write_community) if write_community else None
         elif community is not None:
-            self._write_community = str(community)
+            self._write_community = str(community) if community else None
         else:
-            self._write_community = self._read_community
+            self._write_community = None
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_manager_and_agent(capability: str = 'snmp_get', agent_id: str | None = None):
-        """Return (agent_manager, agent) or raise RuntimeError."""
+    def _get_manager_and_agent(target_role: str, agent_id: str | None = None):
+        """Return the manager and an agent reachable for the requested role."""
         from pypnm.api.agent.manager import get_agent_manager
 
         mgr = get_agent_manager()
         if not mgr:
             raise RuntimeError("Agent manager not initialized")
-        # If a specific agent is pinned, use it directly
+        capability = f'{target_role}_reachable'
+        # A pinned agent must remain pinned for every operation, including bulk walks.
         if agent_id:
             agent = mgr.get_agent(agent_id)
             if not agent:
                 raise RuntimeError(f"Pinned agent '{agent_id}' is not connected")
+            if capability not in agent.capabilities:
+                raise RuntimeError(
+                    f"Pinned agent '{agent_id}' lacks '{capability}' capability"
+                )
             return mgr, agent
         agent = mgr.get_agent_for_capability(capability)
         if not agent:
@@ -340,10 +346,14 @@ class AgentSnmpTransport:
 
     async def _send_and_wait(self, capability: str, command: str,
                              params: dict, timeout: float) -> dict | None:
-        """Send a command and async-wait for the response."""
-        mgr, agent = self._get_manager_and_agent(capability, self._agent_id)
+        """Send a role-routed command and async-wait for the response."""
+        mgr, agent = self._get_manager_and_agent(self._target_role, self._agent_id)
+        task_params = dict(params)
+        task_params['target_role'] = self._target_role
+        if not task_params.get('community'):
+            task_params.pop('community', None)
         task_id = await mgr.send_task(
-            agent.agent_id, command, params, timeout=timeout,
+            agent.agent_id, command, task_params, timeout=timeout,
             priority=self._priority,
         )
         # send_task may have bumped the timeout (e.g. LONG_COMMANDS → 90s).
@@ -551,23 +561,12 @@ class AgentSnmpTransport:
         max_repetitions: int = 25,
         suppress_no_such_name: bool = True,
     ) -> list[AgentVarBind] | None:
-        """
-        SNMP BULK WALK via agent (uses the agent's snmp_bulk_walk command).
-
-        Falls back to regular walk if bulk_walk capability is not available.
-        """
+        """SNMP BULK WALK via the same role-selected or pinned agent."""
         resolved = _resolve_oid(oid)
-
-        from pypnm.api.agent.manager import get_agent_manager
-        mgr = get_agent_manager()
-        if not mgr:
-            raise RuntimeError("Agent manager not initialized")
-
-        # Try bulk_walk first, fall back to regular walk
-        agent = mgr.get_agent_for_capability('snmp_bulk_walk')
-        if agent:
-            task_id = await mgr.send_task(
-                agent.agent_id, 'snmp_bulk_walk',
+        try:
+            data = await self._send_and_wait(
+                'snmp_bulk_walk',
+                'snmp_bulk_walk',
                 {
                     'target_ip': self._host,
                     'oid': resolved,
@@ -576,18 +575,19 @@ class AgentSnmpTransport:
                 },
                 timeout=self._timeout,
             )
-            result = await mgr.wait_for_task_async(task_id, timeout=self._timeout)
-            if result and result.get('type') == 'response':
-                data = result.get('result', {})
-                if data.get('success'):
-                    results = data.get('results')
-                    if results and isinstance(results, list):
-                        varbinds = _parse_results_to_varbinds(results)
-                    else:
-                        varbinds = _parse_output_to_varbinds(data.get('output', ''))
-                    return varbinds if varbinds else None
+        except RuntimeError as exc:
+            self.logger.debug("Agent bulk walk unavailable, using regular walk: %s", exc)
+            data = None
 
-        # Fallback to regular walk
+        if data and data.get('success'):
+            results = data.get('results')
+            if results and isinstance(results, list):
+                varbinds = _parse_results_to_varbinds(results)
+            else:
+                varbinds = _parse_output_to_varbinds(data.get('output', ''))
+            return varbinds if varbinds else None
+
+        # The fallback remains on the same pinned agent or target role.
         return await self.walk(oid)
 
     async def set(

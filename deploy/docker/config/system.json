@@ -1,9 +1,7 @@
 {
     "CmtsOrchestrator": {
         "adapter": {
-            "community": "cmtspublic",
-            "hostname": "172.19.122.228",
-            "write_community": "cmtspublic"
+            "hostname": "172.19.122.228"
         }
     },
     "FastApiRequestDefault": {
@@ -95,9 +93,7 @@
         "version": {
             "2c": {
                 "enable": true,
-                "read_community": "public",
-                "retries": 3,
-                "write_community": "public"
+                "retries": 3
             },
             "3": {
                 "authPassword": "",
@@ -142,9 +138,7 @@
                         "2c": {
                             "enable": true,
                             "port": 161,
-                            "read_community": "cmtspublic",
-                            "retries": 3,
-                            "write_community": "cmtspublic"
+                            "retries": 3
                         },
                         "3": {
                             "authPassword": "",

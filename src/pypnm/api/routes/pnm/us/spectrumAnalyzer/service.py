@@ -44,12 +44,20 @@ class CmtsUtscService:
     UTSC_CTRL_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1"
     UTSC_STATUS_BASE = "1.3.6.1.4.1.4491.2.1.27.1.3.10.4.1"
     
-    def __init__(self, cmts_ip: str, rf_port_ifindex: int, community: str = "private", write_community: Optional[str] = None) -> None:
+    def __init__(self, cmts_ip: str, rf_port_ifindex: int, community: Optional[str] = None, write_community: Optional[str] = None) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cmts_ip = str(cmts_ip)
         self.rf_port_ifindex = rf_port_ifindex
-        self.community = community
-        self.write_community = write_community or community
+        self.community = (
+            community
+            if community is not None and str(community).strip()
+            else None
+        )
+        self.write_community = (
+            write_community
+            if write_community is not None and str(write_community).strip()
+            else None
+        )
         self.agent_manager = get_agent_manager()
         self.cfg_idx = 1  # Use index .1 which exists on this CMTS
     
@@ -83,7 +91,8 @@ class CmtsUtscService:
                     'oid': oid,
                     'value': value,
                     'type': value_type,
-                    'community': self.write_community,
+                    'target_role': 'cmts',
+                    **({'community': self.write_community} if self.write_community else {}),
                     'timeout': 10
                 },
                 timeout=30
@@ -119,7 +128,8 @@ class CmtsUtscService:
                 params={
                     'target_ip': self.cmts_ip,
                     'oid': oid,
-                    'community': self.community,
+                    'target_role': 'cmts',
+                    **({'community': self.community} if self.community else {}),
                     'timeout': 10
                 },
                 timeout=30
@@ -649,7 +659,7 @@ class UtscRfPortDiscoveryService:
     # ifDescr
     OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
     
-    def __init__(self, cmts_ip: str, community: str = "private") -> None:
+    def __init__(self, cmts_ip: str, community: Optional[str] = None) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.cmts_ip = str(cmts_ip)
         self.community = community
@@ -667,7 +677,13 @@ class UtscRfPortDiscoveryService:
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id, command='snmp_walk',
-                params={'target_ip': self.cmts_ip, 'oid': oid, 'community': self.community, 'timeout': 15},
+                params={
+                    'target_ip': self.cmts_ip,
+                    'oid': oid,
+                    'target_role': 'cmts',
+                    **({'community': self.community} if self.community else {}),
+                    'timeout': 15,
+                },
                 timeout=timeout
             )
             result = await self.agent_manager.wait_for_task_async(task_id, timeout=timeout)
@@ -686,7 +702,13 @@ class UtscRfPortDiscoveryService:
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id, command='snmp_parallel_walk',
-                params={'ip': self.cmts_ip, 'oids': oids, 'community': self.community, 'timeout': 30},
+                params={
+                    'ip': self.cmts_ip,
+                    'oids': oids,
+                    'target_role': 'cmts',
+                    **({'community': self.community} if self.community else {}),
+                    'timeout': 30,
+                },
                 timeout=timeout
             )
             result = await self.agent_manager.wait_for_task_async(task_id, timeout=timeout)
@@ -704,7 +726,13 @@ class UtscRfPortDiscoveryService:
         try:
             task_id = await self.agent_manager.send_task(
                 agent_id=agent_id, command='snmp_get',
-                params={'target_ip': self.cmts_ip, 'oid': oid, 'community': self.community, 'timeout': 10},
+                params={
+                    'target_ip': self.cmts_ip,
+                    'oid': oid,
+                    'target_role': 'cmts',
+                    **({'community': self.community} if self.community else {}),
+                    'timeout': 10,
+                },
                 timeout=30
             )
             result = await self.agent_manager.wait_for_task_async(task_id, timeout=30)

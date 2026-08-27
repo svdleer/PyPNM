@@ -20,7 +20,7 @@ def _cm_modem_limit_default() -> int:
 class CMTSModemRequest(BaseModel):
     """Request model for CMTS modem discovery."""
     cmts_ip: str = Field(..., description="CMTS IP address")
-    community: str = Field(default="public", description="SNMP community for CMTS")
+    community: Optional[str] = Field(default=None, description="SNMP community for CMTS")
     limit: int = Field(
         default_factory=_cm_modem_limit_default,
         ge=1,
@@ -30,7 +30,7 @@ class CMTSModemRequest(BaseModel):
     enrich: bool = Field(default=False, description="Whether to enrich modems with firmware/model from sysDescr")
     refresh: bool = Field(default=False, description="Bypass cached inventory and perform a live CMTS walk")
     collect_cpe: bool = Field(default=False, description="Collect DOCS-SUBMGT3 CPE addresses for scheduled inventory")
-    modem_community: str = Field(default="private", description="SNMP community for modem enrichment")
+    modem_community: Optional[str] = Field(default=None, description="SNMP community for modem enrichment")
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
 
 
@@ -38,7 +38,7 @@ class CMTSModemInterfaceRequest(BaseModel):
     """Request targeted CMTS-side enrichment for one modem."""
     cmts_ip: str = Field(..., description="CMTS IP address")
     docsif3_index: int = Field(..., ge=1, description="DOCS-IF3 modem registration index")
-    community: str = Field(default="public", description="SNMP community for CMTS")
+    community: Optional[str] = Field(default=None, description="SNMP community for CMTS")
     modem_ip: Optional[str] = Field(default=None, description="Optional modem IP for direct capability fallback")
 
 
@@ -55,7 +55,7 @@ class CMTSModemInterfaceResponse(BaseModel):
 class CPECollectionRequest(BaseModel):
     """Request model for the dedicated scheduled CPE collection."""
     cmts_ip: str = Field(..., description="CMTS IP address")
-    community: str = Field(default="public", description="SNMP community for CMTS")
+    community: Optional[str] = Field(default=None, description="SNMP community for CMTS")
     limit: Optional[int] = Field(default=None, ge=1, le=500000)
     overall_timeout_sec: int = Field(default=270, ge=30, le=900)
     agent_command_timeout_sec: int = Field(default=300, ge=60, le=930)
@@ -142,7 +142,7 @@ class CMTSModemResponse(BaseModel):
 class EnrichModemRequest(BaseModel):
     """Request model for modem enrichment."""
     modems: List[Dict[str, Any]] = Field(..., description="List of modems to enrich")
-    modem_community: str = Field(default="private", description="SNMP community for modem queries")
+    modem_community: Optional[str] = Field(default=None, description="SNMP community for modem queries")
 
 
 class EnrichModemResponse(BaseModel):

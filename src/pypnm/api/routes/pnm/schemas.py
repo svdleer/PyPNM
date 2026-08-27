@@ -22,7 +22,7 @@ class PNMModemRequest(BaseModel):
     """Base request model for PNM modem diagnostics."""
     modem_ip: str = Field(..., description="Cable modem IP address")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
-    community: str = Field(default="public", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
 
 
 # ============================================
@@ -129,7 +129,7 @@ class USRxMERStartRequest(BaseModel):
     cmts_ip: str = Field(..., description="CMTS IP address")
     ofdma_ifindex: int = Field(..., description="OFDMA channel interface index")
     cm_mac_address: str = Field(..., description="Cable modem MAC address")
-    community: str = Field(default="public", description="SNMP write community string")
+    community: Optional[str] = Field(default=None, description="SNMP write community string")
     filename: str = Field(default="us_rxmer", description="Output filename")
     pre_eq: bool = Field(default=True, description="Include pre-equalization")
 
@@ -148,7 +148,7 @@ class USRxMERStatusRequest(BaseModel):
     """Request to get US RxMER measurement status."""
     cmts_ip: str = Field(..., description="CMTS IP address")
     ofdma_ifindex: int = Field(..., description="OFDMA channel interface index")
-    community: str = Field(default="public", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
 
 
 class USRxMERStatusResponse(BaseModel):
@@ -168,7 +168,7 @@ class USRxMERDataRequest(BaseModel):
     cmts_ip: str = Field(..., description="CMTS IP address")
     ofdma_ifindex: Optional[int] = Field(default=None, description="OFDMA channel interface index")
     filename: str = Field(default="us_rxmer", description="Capture filename")
-    community: str = Field(default="public", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
 
 
 class USRxMERData(BaseModel):
@@ -194,7 +194,7 @@ class SpectrumRequest(BaseModel):
     """Request to trigger spectrum analyzer capture."""
     modem_ip: str = Field(..., description="Cable modem IP address")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
-    community: str = Field(default="public", description="SNMP write community string")
+    community: Optional[str] = Field(default=None, description="SNMP write community string")
     tftp_server: Optional[str] = Field(default=None, description="TFTP server IP for file upload")
 
 
@@ -240,7 +240,7 @@ class USChannel(BaseModel):
 class ChannelInfoRequest(BaseModel):
     """Request for comprehensive channel info."""
     modem_ip: str = Field(..., description="Cable modem IP address")
-    community: str = Field(default="public", description="SNMP community string")
+    community: Optional[str] = Field(default=None, description="SNMP community string")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
 
 
@@ -262,7 +262,7 @@ class ChannelEstimationRequest(BaseModel):
     """Request for OFDM channel estimation coefficients."""
     modem_ip: str = Field(..., description="Cable modem IP address")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
-    community: str = Field(default="private", description="SNMP write community string")
+    community: Optional[str] = Field(default=None, description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
     tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
@@ -293,7 +293,7 @@ class ModulationProfileRequest(BaseModel):
     """Request for OFDM modulation profile."""
     modem_ip: str = Field(..., description="Cable modem IP address")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
-    community: str = Field(default="private", description="SNMP write community string")
+    community: Optional[str] = Field(default=None, description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
     tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
@@ -325,7 +325,7 @@ class HistogramRequest(BaseModel):
     """Request for downstream histogram."""
     modem_ip: str = Field(..., description="Cable modem IP address")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
-    community: str = Field(default="private", description="SNMP write community string")
+    community: Optional[str] = Field(default=None, description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
     tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 
@@ -357,7 +357,7 @@ class ConstellationRequest(BaseModel):
     """Request for constellation display."""
     modem_ip: str = Field(..., description="Cable modem IP address")
     mac_address: Optional[str] = Field(default=None, description="Cable modem MAC address")
-    community: str = Field(default="private", description="SNMP write community string")
+    community: Optional[str] = Field(default=None, description="SNMP write community string")
     channel_ids: Optional[List[int]] = Field(default=None, description="Specific channel IDs (empty = all)")
     tftp_server: Optional[str] = Field(default_factory=_default_cm_tftp, description="TFTP server IP")
 

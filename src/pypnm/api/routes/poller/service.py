@@ -1113,14 +1113,19 @@ class PollerService:
         """Fetch a fresh base CMTS inventory and its completeness metadata."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
         requested_limit = self._cm_modem_limit_default()
+        community = (
+            os.environ.get("CMTS_COMMUNITY")
+            or os.environ.get("CMTS_SNMP_COMMUNITY")
+        )
         payload = {
             "cmts_ip": cmts_ip,
-            "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
             "limit": requested_limit,
             "enrich": False,
             "refresh": True,
             "collect_cpe": False,
         }
+        if community:
+            payload["community"] = community
         request_timeout = max(330, int(timeout_sec or 300) + 30)
         r = requests.post(
             f"{base}/cmts/modems/query",
@@ -1159,15 +1164,20 @@ class PollerService:
     ) -> Dict[str, Any]:
         """Fetch one fresh CPE-only generation from a CMTS."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
+        community = (
+            os.environ.get("CMTS_COMMUNITY")
+            or os.environ.get("CMTS_SNMP_COMMUNITY")
+        )
         payload = {
             "cmts_ip": cmts_ip,
-            "community": os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public",
             "overall_timeout_sec": int(overall_timeout_sec),
             "agent_command_timeout_sec": int(agent_command_timeout_sec),
             "min_remaining_tree_reserve_sec": float(
                 min_remaining_tree_reserve_sec
             ),
         }
+        if community:
+            payload["community"] = community
         request_timeout = max(
             int(agent_command_timeout_sec) + 30,
             int(http_timeout_sec),
@@ -3521,16 +3531,21 @@ class PollerService:
         cmts_ip = (rows[0] or {}).get("cmts_ip") if rows else None
         if not cmts_ip:
             return None
-        cmts_community = os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public"
+        cmts_community = (
+            os.environ.get("CMTS_COMMUNITY")
+            or os.environ.get("CMTS_SNMP_COMMUNITY")
+        )
+        query_payload = {
+            "cmts_ip": cmts_ip,
+            "enrich": False,
+            "limit": self._cm_modem_limit_default(),
+        }
+        if cmts_community:
+            query_payload["community"] = cmts_community
         try:
             r = requests.post(
                 f"{base}/cmts/modems/query",
-                json={
-                    "cmts_ip": cmts_ip,
-                    "community": cmts_community,
-                    "enrich": False,
-                    "limit": self._cm_modem_limit_default(),
-                },
+                json=query_payload,
                 timeout=120,
                 verify=False,
             )
@@ -3604,15 +3619,20 @@ class PollerService:
         if docsif3_index_value <= 0:
             return existing
 
-        community = os.environ.get("CMTS_COMMUNITY") or os.environ.get("CMTS_SNMP_COMMUNITY") or "public"
+        community = (
+            os.environ.get("CMTS_COMMUNITY")
+            or os.environ.get("CMTS_SNMP_COMMUNITY")
+        )
+        query_payload = {
+            "cmts_ip": cmts_ip,
+            "docsif3_index": docsif3_index_value,
+            "modem_ip": modem.get("ip_address") or modem.get("ip"),
+        }
+        if community:
+            query_payload["community"] = community
         response = requests.post(
             f"{base}/cmts/modem-interface/query",
-            json={
-                "cmts_ip": cmts_ip,
-                "docsif3_index": docsif3_index_value,
-                "community": community,
-                "modem_ip": modem.get("ip_address") or modem.get("ip"),
-            },
+            json=query_payload,
             timeout=180,
         )
         response.raise_for_status()
@@ -3671,7 +3691,10 @@ class PollerService:
             return
         try:
             base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
-            community = os.environ.get("MODEM_COMMUNITY") or os.environ.get("CM_SNMP_COMMUNITY") or "private"
+            community = (
+                os.environ.get("MODEM_COMMUNITY")
+                or os.environ.get("CM_SNMP_COMMUNITY")
+            )
             # Look up modem IP from inventory; if missing, do a live CMTS walk fallback
             modem = self.get_inventory_modem_by_mac(mac)
             cmts_fallback_modem = None

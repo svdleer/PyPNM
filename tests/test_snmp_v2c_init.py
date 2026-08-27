@@ -29,7 +29,7 @@ def test_snmp_v2c_legacy_community_sets_both() -> None:
     assert snmp._write_community == "legacy"
 
 
-def test_snmp_v2c_write_falls_back_to_read() -> None:
+def test_snmp_v2c_blank_write_remains_unconfigured() -> None:
     snmp = Snmp_v2c(
         host=Inet("127.0.0.1"),
         read_community=SnmpReadCommunity("read"),
@@ -37,4 +37,4 @@ def test_snmp_v2c_write_falls_back_to_read() -> None:
     )
 
     assert snmp._read_community == "read"
-    assert snmp._write_community == "read"
+    assert snmp._write_community is None

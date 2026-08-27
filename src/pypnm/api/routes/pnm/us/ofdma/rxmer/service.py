@@ -96,7 +96,7 @@ class CmtsUsOfdmaRxMerService:
     def __init__(
         self,
         cmts_ip: str,
-        community: str = "private",
+        community: Optional[str] = None,
         write_community: Optional[str] = None
     ):
         """
@@ -105,11 +105,19 @@ class CmtsUsOfdmaRxMerService:
         Args:
             cmts_ip: CMTS IP address
             community: SNMP read community
-            write_community: SNMP write community (defaults to community)
+            write_community: SNMP write community; agent config is used when omitted
         """
         self.cmts_ip = cmts_ip
-        self.community = community
-        self.write_community = write_community or community
+        self.community = (
+            community
+            if community is not None and str(community).strip()
+            else None
+        )
+        self.write_community = (
+            write_community
+            if write_community is not None and str(write_community).strip()
+            else None
+        )
         self.agent_manager = get_agent_manager()
         self.logger = logging.getLogger(self.__class__.__name__)
     
@@ -170,7 +178,8 @@ class CmtsUsOfdmaRxMerService:
                 params={
                     'target_ip': self.cmts_ip,
                     'oid': oid,
-                    'community': self.community,
+                    'target_role': 'cmts',
+                    **({'community': self.community} if self.community else {}),
                     'timeout': 10
                 },
                 timeout=30
@@ -199,7 +208,8 @@ class CmtsUsOfdmaRxMerService:
                 params={
                     'target_ip': self.cmts_ip,
                     'oid': oid,
-                    'community': self.community,
+                    'target_role': 'cmts',
+                    **({'community': self.community} if self.community else {}),
                     'timeout': 30,   # SNMP PDU timeout; outer timeout governs total walk
                 },
                 timeout=timeout
@@ -234,7 +244,8 @@ class CmtsUsOfdmaRxMerService:
                     'oid': oid,
                     'value': value,
                     'type': value_type,  # Agent reads params['type']
-                    'community': self.write_community,
+                    'target_role': 'cmts',
+                    **({'community': self.write_community} if self.write_community else {}),
                     'timeout': 10
                 },
                 timeout=30

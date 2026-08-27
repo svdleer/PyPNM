@@ -42,9 +42,9 @@ Usage:
     python3 provision_utsc.py 212.178.218.234 150994984 1    # E6000
     python3 provision_utsc.py 172.16.6.160 838860800 1    # Casa 100G
 
-Environment variables (override defaults):
-    SNMP_READ       SNMP read community  (default: public)
-    SNMP_WRITE      SNMP write community (default: private)
+Environment variables:
+    SNMP_READ       Required SNMP read community
+    SNMP_WRITE      Required SNMP write community
     TFTP_IP         TFTP server IP       (default: 212.178.218.234)
     TFTP_PATH       TFTP upload path     (default: ./)
     SSH_HOST        Jump server hostname (default: access-engineering.nl)
@@ -69,8 +69,16 @@ CMTS_IP    = sys.argv[1]
 RF_PORT    = int(sys.argv[2])
 CFG_INDEX  = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 
-SNMP_READ  = os.environ.get("SNMP_READ",  "public")
-SNMP_WRITE = os.environ.get("SNMP_WRITE", "private")
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        raise SystemExit(f"{name} must be set to a non-blank value")
+    return value
+
+
+SNMP_READ  = _required_env("SNMP_READ")
+SNMP_WRITE = _required_env("SNMP_WRITE")
 TFTP_IP    = os.environ.get("TFTP_IP",    "212.178.218.234")
 TFTP_IP_CCAP  = os.environ.get("TFTP_IP_CCAP",  "127.0.0.1")  # CCAP (Casa/Cisco) use separate TFTP reachable from device
 TFTP_PATH  = os.environ.get("TFTP_PATH",  "./")
@@ -374,7 +382,10 @@ def configure_bdt_cisco(row: int):
     # Confirm row is active — arms the guestshell auto-upload service
     print(f"  RowStatus.{row} = active(1)")
     r = snmpset(f"{OID_BDT_E6000}.9.{row}", "i", RS_ACTIVE)
-    print(f"    {r}")(row: int):
+    print(f"    {r}")
+
+
+def configure_bdt_e6000(row: int):
     """E6000 BDT: docsPnmBulkDataTransferCfgTable.
 
     Row may already be active from a previous run — don't destroy it first.

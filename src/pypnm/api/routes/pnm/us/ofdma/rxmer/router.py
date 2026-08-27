@@ -1000,7 +1000,7 @@ class UsOfdmaRxMerRouter:
         async def get_status(
             cmts_ip: str,
             ofdma_ifindex: int,
-            community: str = "public",
+            community: Optional[str] = None,
             write_community: Optional[str] = None
         ) -> UsOfdmaRxMerStatusResponse:
             """
@@ -1013,7 +1013,7 @@ class UsOfdmaRxMerRouter:
             service = CmtsUsOfdmaRxMerService(
                 cmts_ip=cmts_ip,
                 community=community,
-                write_community=write_community or community
+                write_community=write_community
             )
             try:
                 result = await service.get_status(ofdma_ifindex)
@@ -2047,7 +2047,7 @@ class UsOfdmaRxMerRouter:
         )
         async def get_channel_list(
             cmts_ip: str,
-            community: str = "public",
+            community: Optional[str] = None,
             refresh: bool = False,
         ):
             """
@@ -2081,7 +2081,7 @@ class UsOfdmaRxMerRouter:
             # ── 3. Live SNMP walk ───────────────────────────────────────
             import re as _re
             service = CmtsUsOfdmaRxMerService(
-                cmts_ip=cmts_ip, community=community, write_community=community
+                cmts_ip=cmts_ip, community=community
             )
             try:
                 OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
@@ -2284,7 +2284,7 @@ class UsOfdmaRxMerRouter:
         async def get_channel_modems(
             cmts_ip: str,
             ofdma_ifindex: int,
-            community: str = "public",
+            community: Optional[str] = None,
             max_modems: int = 50,
         ):
             """
@@ -2294,7 +2294,7 @@ class UsOfdmaRxMerRouter:
             Returns [{cm_mac_address, cm_index}].
             """
             service = CmtsUsOfdmaRxMerService(
-                cmts_ip=cmts_ip, community=community, write_community=community
+                cmts_ip=cmts_ip, community=community
             )
             try:
                 # docsIf31CmtsCmUsOfdmaChannelStatus  1.3.6.1.4.1.4491.2.1.28.1.4.1.2

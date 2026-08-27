@@ -32,12 +32,12 @@ init_agent_manager(_auth_token)
 @router.get("/modems", response_model=CMTSModemResponse)
 async def get_cmts_modems(
     cmts_ip: str,
-    community: str = "public",
+    community: str | None = None,
     limit: int | None = Query(default=None, ge=1, le=50000),
     enrich: bool = False,
     refresh: bool = False,
     collect_cpe: bool = False,
-    modem_community: str = "private",
+    modem_community: str | None = None,
     cmts_hostname: str = "",
 ) -> CMTSModemResponse:
     """
