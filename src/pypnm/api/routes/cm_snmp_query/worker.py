@@ -4,12 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import Any
 
 from pypnm.api.routes.cm_snmp_query.service import cm_snmp_query_service
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_modem_community() -> str:
+    from pypnm.config.pnm_config_manager import PnmConfigManager
+    community = (
+        os.environ.get("MODEM_COMMUNITY")
+        or os.environ.get("CM_SNMP_COMMUNITY")
+        or PnmConfigManager.get_write_community()
+    )
+    if not community:
+        raise RuntimeError("Cable-modem SNMP community is not configured")
+    return str(community)
 
 
 class CmSnmpQueryWorker:
@@ -150,6 +163,7 @@ class CmSnmpQueryWorker:
             if not agent:
                 raise RuntimeError("No cm-agent connected")
 
+            community = _configured_modem_community()
             results: dict[str, Any] = {}
 
             for entry in oids:
@@ -167,6 +181,7 @@ class CmSnmpQueryWorker:
                         {
                             "target_ip": modem_ip,
                             "oid": numeric_oid,
+                            "community": community,
                             "timeout": 5,
                             "retries": 1,
                         },

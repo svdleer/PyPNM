@@ -205,6 +205,7 @@ async def verify_oid(payload: dict) -> dict:
     POST body: {"oid": "sysUpTime.0", "cmts": "CMTS-NAME"}
     Returns: {"success": true, "oid": "...", "numeric_oid": "1.3.6...", "value": "12345", "modem_ip": "10.x.x.x"}
     """
+    import os
     from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
 
     oid_raw = str(payload.get("oid") or "").strip()
@@ -238,8 +239,9 @@ async def verify_oid(payload: dict) -> dict:
 
     modem_ip = modems[0]["ip"]
 
-    # Send SNMP GET via cm-agent; the agent owns the modem community.
+    # Send SNMP GET via cm-agent
     from pypnm.api.agent.manager import get_agent_manager
+    from pypnm.config.pnm_config_manager import PnmConfigManager
 
     agent_manager = get_agent_manager()
     if not agent_manager:
@@ -252,11 +254,17 @@ async def verify_oid(payload: dict) -> dict:
     if not agent:
         raise HTTPException(status_code=503, detail="No cm-agent connected")
 
+    community = (
+        os.environ.get("MODEM_COMMUNITY")
+        or os.environ.get("CM_SNMP_COMMUNITY")
+        or str(PnmConfigManager.get_write_community())
+    )
+
     import asyncio
     task_id = await agent_manager.send_task(
         agent.agent_id,
         "snmp_get",
-        {"target_ip": modem_ip, "oid": oid, "timeout": 5, "retries": 1},
+        {"target_ip": modem_ip, "oid": oid, "community": community, "timeout": 5, "retries": 1},
         timeout=15,
         priority="interactive",
     )
