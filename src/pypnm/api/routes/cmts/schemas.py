@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -32,6 +32,10 @@ class CMTSModemRequest(BaseModel):
     collect_cpe: bool = Field(default=False, description="Collect DOCS-SUBMGT3 CPE addresses for scheduled inventory")
     modem_community: Optional[str] = Field(default=None, description="SNMP community for modem enrichment")
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
+    agent_priority: Literal["interactive", "bulk"] = Field(
+        default="interactive",
+        description="Agent execution pool; poller requests use bulk",
+    )
 
 
 class CMTSModemInterfaceRequest(BaseModel):
@@ -60,6 +64,10 @@ class CPECollectionRequest(BaseModel):
     overall_timeout_sec: int = Field(default=270, ge=30, le=900)
     agent_command_timeout_sec: int = Field(default=300, ge=60, le=930)
     min_remaining_tree_reserve_sec: float = Field(default=0, ge=0, le=300)
+    agent_priority: Literal["interactive", "bulk"] = Field(
+        default="interactive",
+        description="Agent execution pool; poller requests use bulk",
+    )
 
 
 class CPECollectionResponse(BaseModel):
@@ -128,6 +136,7 @@ class CMTSModemResponse(BaseModel):
     requested_limit: Optional[int] = Field(default=None, description="Safety limit used for the inventory walk")
     collected_at: Optional[str] = Field(default=None, description="Inventory collection timestamp")
     revision_at: Optional[str] = Field(default=None, description="Latest full or targeted inventory revision timestamp")
+    snapshot_id: Optional[str] = Field(default=None, description="Authoritative inventory generation identifier")
     critical_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from critical modem MAC tables")
     raw_legacy_mac_count: Optional[int] = Field(default=None, description="Rows returned by the legacy registration MAC table")
     raw_d3_mac_count: Optional[int] = Field(default=None, description="Rows returned by the DOCSIS 3.x registration MAC table")

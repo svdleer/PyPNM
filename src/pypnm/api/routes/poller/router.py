@@ -54,6 +54,12 @@ def run_poller_setting(poller_id: int, payload: PollerRunRequest) -> dict:
         raise HTTPException(status_code=404, detail="Poller not found")
     if state == "disabled":
         raise HTTPException(status_code=409, detail="Poller is disabled")
+    if state == "outside_run_window":
+        detail = out.get("detail")
+        message = "Poller is outside its configured run window"
+        if detail:
+            message = f"{message} ({detail})"
+        raise HTTPException(status_code=409, detail=message)
     if state == "rejected":
         raise HTTPException(status_code=409, detail="Poller run could not be queued")
     return {"status": "success", **out}

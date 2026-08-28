@@ -32,6 +32,22 @@ class _PollerJobNotRunning(RuntimeError):
     """Raised when a cancelled poller job must not persist fetched data."""
 
 
+class _PollerRunAlreadyActive(RuntimeError):
+    """Raised when an explicit run loses a race to another active job."""
+
+    def __init__(self, job_id: int) -> None:
+        self.job_id = int(job_id)
+        super().__init__(f"Poller job {self.job_id} is already active")
+
+
+class _PollerOutsideRunWindow(RuntimeError):
+    """Raised when an explicit run is outside its locked setting window."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 class PollerService:
     def __init__(self) -> None:
         self._db_lock = threading.Lock()
@@ -108,14 +124,16 @@ class PollerService:
 
     @staticmethod
     def _normalize_mac(mac: str) -> str:
-        raw = (mac or "").strip().lower().replace("-", ":").replace(".", "")
-        # If MAC has no separators and is 12 hex chars, format as aa:bb:cc:dd:ee:ff
-        if ":" not in raw:
-            compact = "".join(ch for ch in raw if ch in "0123456789abcdef")
-            if len(compact) == 12:
-                return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
-            return compact
-        return raw
+        compact = (
+            (mac or "").strip().lower()
+            .replace(":", "")
+            .replace("-", "")
+            .replace(".", "")
+            .replace(" ", "")
+        )
+        if len(compact) != 12 or any(ch not in "0123456789abcdef" for ch in compact):
+            return ""
+        return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
 
     def _rows(self, cur):
         return cur.fetchall()
@@ -1115,6 +1133,7 @@ class PollerService:
         requested_limit = self._cm_modem_limit_default()
         payload = {
             "cmts_ip": cmts_ip,
+            "agent_priority": "bulk",
             "limit": requested_limit,
             "enrich": False,
             "refresh": True,
@@ -1160,6 +1179,7 @@ class PollerService:
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
         payload = {
             "cmts_ip": cmts_ip,
+            "agent_priority": "bulk",
             "overall_timeout_sec": int(overall_timeout_sec),
             "agent_command_timeout_sec": int(agent_command_timeout_sec),
             "min_remaining_tree_reserve_sec": float(
@@ -1234,8 +1254,8 @@ class PollerService:
 
         all_values = []
         for r in rows:
-            mac = (r.get("mac_address") or r.get("mac") or "").lower().replace("-", ":")
-            if not mac:
+            mac = self._normalize_mac(r.get("mac_address") or r.get("mac") or "")
+            if len(mac) != 17:
                 continue
             all_values.append((
                 mac,
@@ -1527,7 +1547,13 @@ class PollerService:
                 critical_oid_errors=VALUES(critical_oid_errors),
                 raw_legacy_mac_count=VALUES(raw_legacy_mac_count),
                 raw_d3_mac_count=VALUES(raw_d3_mac_count),
-                revision_at=VALUES(revision_at)
+                revision_at=GREATEST(
+                    VALUES(revision_at),
+                    DATE_ADD(
+                        COALESCE(revision_at, collected_at, '1970-01-01 00:00:00'),
+                        INTERVAL 1 SECOND
+                    )
+                )
             """,
             (
                 cmts_ip,
@@ -1608,7 +1634,7 @@ class PollerService:
     def _touch_inventory_revision(self, cmts: str | None, cmts_ip: str | None = None) -> None:
         """Advance cache revision after a targeted inventory-row refresh."""
         where = []
-        params: List[Any] = [self._now()]
+        params: List[Any] = []
         if cmts:
             where.append("LOWER(cmts)=LOWER(%s)")
             params.append(str(cmts))
@@ -1617,7 +1643,9 @@ class PollerService:
             params.append(str(cmts_ip))
         if where:
             self._execute(
-                f"UPDATE cmts_inventory_snapshot SET revision_at=%s WHERE {' OR '.join(where)}",
+                "UPDATE cmts_inventory_snapshot SET revision_at="
+                "GREATEST(UTC_TIMESTAMP(), DATE_ADD(COALESCE(revision_at, collected_at, '1970-01-01 00:00:00'), INTERVAL 1 SECOND)) "
+                f"WHERE {' OR '.join(where)}",
                 tuple(params),
             )
 
@@ -2618,12 +2646,14 @@ class PollerService:
         """Validate and queue an explicit run request."""
         pid = int(poller_id)
         pollers = self._query(
-            "SELECT id, enabled FROM poller_setting WHERE id=%s",
+            "SELECT id, enabled, task_type, run_window_start, run_window_end "
+            "FROM poller_setting WHERE id=%s",
             (pid,),
         )
         if not pollers:
             return {"state": "not_found", "job_id": 0}
-        if int(pollers[0].get("enabled") or 0) != 1:
+        poller = pollers[0]
+        if int(poller.get("enabled") or 0) != 1:
             return {"state": "disabled", "job_id": 0}
 
         active = self._query(
@@ -2637,7 +2667,36 @@ class PollerService:
                 "job_id": int(active[0].get("id") or 0),
             }
 
-        job_id = self.enqueue_run(pid, source=source)
+        if (
+            str(poller.get("task_type") or "inventory") != _CPE_TASK_TYPE
+            and not self._inside_run_window(
+                poller.get("run_window_start"),
+                poller.get("run_window_end"),
+            )
+        ):
+            return {
+                "state": "outside_run_window",
+                "job_id": 0,
+                "detail": self._run_window_detail(
+                    poller.get("run_window_start"),
+                    poller.get("run_window_end"),
+                ),
+            }
+
+        try:
+            job_id = self.enqueue_run(
+                pid,
+                source=source,
+                explicit_request=True,
+            )
+        except _PollerRunAlreadyActive as exc:
+            return {"state": "already_active", "job_id": exc.job_id}
+        except _PollerOutsideRunWindow as exc:
+            return {
+                "state": "outside_run_window",
+                "job_id": 0,
+                "detail": exc.detail,
+            }
         return {"state": "queued" if job_id else "rejected", "job_id": job_id}
 
     def enqueue_run(
@@ -2646,6 +2705,7 @@ class PollerService:
         source: Optional[str] = None,
         scheduled_slot_utc: Optional[str] = None,
         enforce_interval_due: bool = False,
+        explicit_request: bool = False,
     ) -> int:
         pid = int(poller_id)
         now = self._now()
@@ -2700,10 +2760,30 @@ class PollerService:
             )
             active = cur.fetchone()
             if active:
+                active_job_id = int(active.get("id") or 0)
+                if explicit_request:
+                    conn.rollback()
+                    raise _PollerRunAlreadyActive(active_job_id)
                 conn.commit()
                 if enforce_interval_due or trigger == "scheduler":
                     return 0
-                return int(active.get("id") or 0)
+                return active_job_id
+
+            if (
+                explicit_request
+                and str(setting.get("task_type") or "inventory")
+                != _CPE_TASK_TYPE
+                and not self._inside_run_window(
+                    setting.get("run_window_start"),
+                    setting.get("run_window_end"),
+                )
+            ):
+                detail = self._run_window_detail(
+                    setting.get("run_window_start"),
+                    setting.get("run_window_end"),
+                )
+                conn.rollback()
+                raise _PollerOutsideRunWindow(detail)
 
             cur.execute(
                 sql,
@@ -3262,11 +3342,14 @@ class PollerService:
                 )
                 marker = "%s"
                 if len(mac_norm) == 12:
-                    # Full MAC — use exact match on the primary key column
-                    # (stored as aa:bb:cc:dd:ee:ff) so the PK index is used.
+                    # Full MAC — use indexed primary-key candidates. Canonical
+                    # rows are first; bare/dotted candidates preserve upgrade
+                    # compatibility without applying functions to the column.
                     formatted = ":".join(mac_norm[i:i+2] for i in range(0, 12, 2))
-                    where.append(f"LOWER(mac) = {marker}")
-                    params.append(formatted)
+                    dotted = ".".join(mac_norm[i:i+4] for i in range(0, 12, 4))
+                    where.append(f"mac IN ({marker}, {marker}, {marker})")
+                    params.extend([formatted, mac_norm, dotted])
+                    limit = 1
                 else:
                     # Partial MAC — fall back to normalised LIKE scan
                     expr = "LOWER(REPLACE(REPLACE(COALESCE(mac,''),':',''),'-',''))"
@@ -3302,7 +3385,11 @@ class PollerService:
 
     def get_inventory_modem_by_mac(self, mac_address: str) -> Optional[Dict[str, Any]]:
         marker = "%s"
-        mac_norm = (mac_address or "").lower().replace(":", "").replace("-", "")
+        formatted = self._normalize_mac(mac_address)
+        if len(formatted) != 17:
+            return None
+        compact = formatted.replace(":", "")
+        dotted = ".".join(compact[i:i+4] for i in range(0, 12, 4))
         rows = self._query(
             "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
             "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
@@ -3310,8 +3397,9 @@ class PollerService:
             "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
             "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
             "partial_service_upstream, partial_service_state, software_version, updated_at "
-            f"FROM modem_inventory_current WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = {marker} LIMIT 1",
-            (mac_norm,),
+            f"FROM modem_inventory_current WHERE mac IN ({marker}, {marker}, {marker}) "
+            f"ORDER BY FIELD(mac, {marker}, {marker}, {marker}) LIMIT 1",
+            (formatted, compact, dotted, formatted, compact, dotted),
         )
         if not rows:
             return None

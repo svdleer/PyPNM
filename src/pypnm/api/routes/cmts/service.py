@@ -105,10 +105,20 @@ class CMTSModemService:
     proxy via ``snmp_parallel_walk``, ``snmp_walk`` and ``snmp_get``.
     """
     
-    def __init__(self, cmts_ip: str = None, community: str | None = None):
+    def __init__(
+        self,
+        cmts_ip: str = None,
+        community: str | None = None,
+        agent_priority: str = "interactive",
+    ):
         self.logger = logging.getLogger(__name__)
         self.cmts_ip = cmts_ip
         self.community = community
+        self.agent_priority = (
+            agent_priority
+            if agent_priority in {"interactive", "bulk"}
+            else "interactive"
+        )
     
     async def _send_agent_command(self, command: str, params: dict, timeout: float = 60) -> dict:
         """Send command to CMTS-reachable agent."""
@@ -128,7 +138,8 @@ class CMTSModemService:
             agent_id=agent_id,
             command=command,
             params=task_params,
-            timeout=timeout
+            timeout=timeout,
+            priority=self.agent_priority,
         )
 
         result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
@@ -741,7 +752,7 @@ class CMTSModemService:
         }
         for key in (
             'capability_enriched', 'source', 'complete', 'truncated',
-            'requested_limit', 'collected_at', 'revision_at',
+            'requested_limit', 'collected_at', 'revision_at', 'snapshot_id',
             'critical_oid_errors', 'raw_legacy_mac_count',
             'raw_d3_mac_count', 'cmts_enriched', 'enrich_progress',
         ):
@@ -1031,6 +1042,7 @@ class CMTSModemService:
                     'requested_limit': (snapshot or {}).get('requested_limit'),
                     'collected_at': snapshot_collected_at,
                     'revision_at': (snapshot or {}).get('revision_at'),
+                    'snapshot_id': (snapshot or {}).get('snapshot_id'),
                     'critical_oid_errors': (snapshot or {}).get('critical_oid_errors') or {},
                     'raw_legacy_mac_count': (snapshot or {}).get('raw_legacy_mac_count'),
                     'raw_d3_mac_count': (snapshot or {}).get('raw_d3_mac_count'),
@@ -1373,11 +1385,17 @@ class CMTSModemService:
                     )
                     persisted_snapshot = poller_service.get_inventory_snapshot(cmts_ip)
                     persisted_revision = (persisted_snapshot or {}).get('revision_at')
+                    persisted_snapshot_id = (persisted_snapshot or {}).get('snapshot_id')
                     if persisted_revision:
                         inventory_meta['revision_at'] = persisted_revision
-                        cached_generation = _enrichment_cache.get(cmts_ip)
-                        if cached_generation is not None:
+                    if persisted_snapshot_id:
+                        inventory_meta['snapshot_id'] = persisted_snapshot_id
+                    cached_generation = _enrichment_cache.get(cmts_ip)
+                    if cached_generation is not None:
+                        if persisted_revision:
                             cached_generation['revision_at'] = persisted_revision
+                        if persisted_snapshot_id:
+                            cached_generation['snapshot_id'] = persisted_snapshot_id
                 except Exception as db_exc:
                     self.logger.warning(
                         "Live inventory persistence failed for %s: %s",

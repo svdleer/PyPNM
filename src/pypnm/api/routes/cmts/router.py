@@ -39,6 +39,7 @@ async def get_cmts_modems(
     collect_cpe: bool = False,
     modem_community: str | None = None,
     cmts_hostname: str = "",
+    agent_priority: str = "interactive",
 ) -> CMTSModemResponse:
     """
     **CMTS Modem Discovery**
@@ -66,7 +67,7 @@ async def get_cmts_modems(
     """
     logger.info(f"CMTS modem discovery request: {cmts_ip} (enrich={enrich})")
 
-    service = CMTSModemService()
+    service = CMTSModemService(agent_priority=agent_priority)
 
     if limit is None:
         raw = os.environ.get("CM_MODEM_LIMIT", "50000")
@@ -125,6 +126,7 @@ async def get_cmts_modems(
             requested_limit=result.get('requested_limit'),
             collected_at=result.get('collected_at'),
             revision_at=result.get('revision_at'),
+            snapshot_id=result.get('snapshot_id'),
             critical_oid_errors=result.get('critical_oid_errors') or {},
             raw_legacy_mac_count=result.get('raw_legacy_mac_count'),
             raw_d3_mac_count=result.get('raw_d3_mac_count'),
@@ -158,6 +160,7 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         collect_cpe=payload.collect_cpe,
         modem_community=payload.modem_community,
         cmts_hostname=payload.cmts_hostname,
+        agent_priority=payload.agent_priority,
     )
 
 
@@ -194,7 +197,9 @@ async def query_cpe_addresses(payload: CPECollectionRequest) -> CPECollectionRes
     if not agent_manager or not agent_manager.get_available_agents():
         raise HTTPException(status_code=503, detail="No agents available")
     try:
-        result = await CMTSModemService().collect_cpe_addresses(
+        result = await CMTSModemService(
+            agent_priority=payload.agent_priority
+        ).collect_cpe_addresses(
             cmts_ip=payload.cmts_ip,
             community=payload.community,
             limit=payload.limit,
