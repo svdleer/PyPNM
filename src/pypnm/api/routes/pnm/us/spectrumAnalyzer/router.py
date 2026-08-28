@@ -842,14 +842,9 @@ async def _configure_utsc(
     Setting TriggerMode on an already-active row is rejected by some vendors,
     so we always destroy and recreate to guarantee a clean slate.
     """
-    from pypnm.config.pnm_config_manager import PnmConfigManager
     from pypnm.api.routes.pnm.us.spectrumAnalyzer.service import CmtsUtscService
 
-    write_community = _first_community(
-        write_community,
-        os.environ.get('CMTS_WRITE_COMMUNITY'),
-        PnmConfigManager.get_write_community(),
-    )
+    write_community = _first_community(write_community)
 
     svc = CmtsUtscService(
         cmts_ip=cmts_ip,
@@ -882,8 +877,7 @@ async def _trigger_utsc(
 ):
     """Trigger UTSC capture via SNMP set through agent (fire-and-forget)."""
     from pypnm.api.agent.manager import get_agent_manager
-    from pypnm.config.pnm_config_manager import PnmConfigManager
-    
+
     agent_manager = get_agent_manager()
     if not agent_manager:
         raise Exception("Agent manager not available")
@@ -893,11 +887,7 @@ async def _trigger_utsc(
         raise Exception("No CMTS-reachable agent")
     
     # Use configured write community from env or config
-    write_community = _first_community(
-        write_community,
-        os.environ.get('CMTS_WRITE_COMMUNITY'),
-        PnmConfigManager.get_write_community(),
-    )
+    write_community = _first_community(write_community)
     
     # OID for UTSC control: docsPnmCmtsUtscCtrlCmd
     oid = f"1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.1.{rf_port_ifindex}.1"
@@ -927,8 +917,7 @@ async def _abort_utsc(
 ):
     """Abort/reset UTSC capture via SNMP set through agent."""
     from pypnm.api.agent.manager import get_agent_manager
-    from pypnm.config.pnm_config_manager import PnmConfigManager
-    
+
     agent_manager = get_agent_manager()
     if not agent_manager:
         raise Exception("Agent manager not available")
@@ -937,11 +926,7 @@ async def _abort_utsc(
     if not agent_id:
         raise Exception("No CMTS-reachable agent")
     
-    write_community = _first_community(
-        write_community,
-        os.environ.get('CMTS_WRITE_COMMUNITY'),
-        PnmConfigManager.get_write_community(),
-    )
+    write_community = _first_community(write_community)
     
     # OID for UTSC control: docsPnmCmtsUtscCtrlCmd - value 2 = abort
     oid = f"1.3.6.1.4.1.4491.2.1.27.1.3.10.3.1.1.{rf_port_ifindex}.1"
