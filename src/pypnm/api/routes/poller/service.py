@@ -2398,13 +2398,45 @@ class PollerService:
                         return
 
                     if fetch_result is None:
+                        target_error = str(last_target_error or "unknown CMTS fetch failure")
+                        breakdown_entry = {
+                            "cmts": cmts_name,
+                            "cmts_ip": cmts_ip,
+                            "row_count": 0,
+                            "complete": False,
+                            "truncated": False,
+                            "capability_enriched": False,
+                            "requested_limit": None,
+                            "collected_at": None,
+                            "critical_oid_errors": {},
+                            "error": target_error,
+                        }
+                        cmts_breakdown.append(breakdown_entry)
+                        self._execute(
+                            "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                            (json.dumps(cmts_breakdown), job_id),
+                        )
+                        modems_failed += 1
+                        error_text = (
+                            f"CMTS collection failed at {idx}/{total_targets} "
+                            f"({cmts_name}): {target_error}"
+                        )
+                        # Finalize the failed target without replacing its previous
+                        # inventory generation, then continue collecting later CMTSes.
                         self._execute(
                             "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
-                            (idx - 1, self._now(), poller_id),
+                            (idx, self._now(), poller_id),
                         )
-                        error_text = f"Subtask timeout/failure at CMTS {idx}/{total_targets} ({cmts_name}): {last_target_error}"
-                        modems_failed = max(modems_failed, 1)
-                        break
+                        self._update_running_job_progress(
+                            job_id,
+                            f"CMTS {idx}/{total_targets}: {cmts_name} skipped after "
+                            f"{subtask_retries + 1} failed attempt(s)",
+                            rows_collected=rows_collected,
+                            modems_attempted=modems_attempted,
+                            modems_succeeded=modems_succeeded,
+                            modems_failed=modems_failed,
+                        )
+                        continue
 
                     modems = fetch_result.get("modems") or []
                     modems_attempted += len(modems)
@@ -2466,11 +2498,12 @@ class PollerService:
                 except Exception:
                     pass
 
-                if not error_text:
-                    self._execute(
-                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
-                        (0, self._now(), poller_id),
-                    )
+                # Every target has now been finalized (including skipped failures),
+                # so the next scheduled run must start a fresh full pass.
+                self._execute(
+                    "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
+                    (0, self._now(), poller_id),
+                )
 
         except Exception as exc:
             error_text = str(exc)
@@ -2480,8 +2513,6 @@ class PollerService:
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
             ("done" if not error_text else "failed", self._now(), int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), error_text, job_id),
         )
-        if error_text and 'Subtask timeout/failure' in str(error_text):
-            self.enqueue_run(poller_id, source="resume")
 
     def _update_running_job_progress(
         self,
