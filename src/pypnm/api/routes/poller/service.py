@@ -3492,6 +3492,56 @@ class PollerService:
             'prefix': True,
         }
 
+    @staticmethod
+    def normalize_cpe_suggestion(value: str) -> Dict[str, Any]:
+        """Normalize canonical CPE text prefixes for autocomplete only."""
+        query = str(value or '').strip().lower()
+        if ':' not in query:
+            try:
+                return PollerService.normalize_cpe_search(query)
+            except ValueError:
+                if 1 <= len(query) <= 4 and all(
+                    character in '0123456789abcdef' for character in query
+                ):
+                    if len(query) > 1 and query.startswith('0'):
+                        raise ValueError('Enter a canonical IPv6 address prefix')
+                    return {'family': 'ipv6', 'value': query, 'prefix': True}
+                raise
+
+        try:
+            address = ipaddress.ip_address(query)
+        except ValueError:
+            if any(character not in '0123456789abcdef:' for character in query):
+                raise ValueError('Enter a valid IPv6 address prefix')
+            if query.startswith(':') and not query.startswith('::'):
+                raise ValueError('Enter a valid IPv6 address prefix')
+            if ':::' in query or query.count('::') > 1:
+                raise ValueError('Enter a valid IPv6 address prefix')
+            groups = query.split(':')
+            if any(len(group) > 4 for group in groups):
+                raise ValueError('Enter a valid IPv6 address prefix')
+            if any(len(group) > 1 and group.startswith('0') for group in groups):
+                raise ValueError('Enter a canonical IPv6 address prefix')
+            if '::' in query:
+                left, right = query.split('::', 1)
+                if (
+                    left == '0'
+                    or left.endswith(':0')
+                    or right == '0'
+                    or right.startswith('0:')
+                ):
+                    raise ValueError('Enter a canonical IPv6 address prefix')
+            populated_groups = sum(bool(group) for group in groups)
+            if ('::' in query and populated_groups > 7) or (
+                '::' not in query and len(groups) > 8
+            ):
+                raise ValueError('Enter a valid IPv6 address prefix')
+            return {'family': 'ipv6', 'value': query, 'prefix': True}
+
+        if address.version != 6:
+            raise ValueError('Enter a valid IPv6 address prefix')
+        return {'family': 'ipv6', 'value': address.compressed, 'prefix': True}
+
     def list_inventory_modems(
         self,
         cmts: Optional[str] = None,
@@ -3647,7 +3697,7 @@ class PollerService:
         }
 
     def suggest_cpe_addresses(self, query: str, limit: int = 10) -> List[str]:
-        normalized = self.normalize_cpe_search(query)
+        normalized = self.normalize_cpe_suggestion(query)
         capped = max(1, min(int(limit or 10), 50))
         comparator = 'LIKE %s' if normalized['prefix'] else '= %s'
         value = normalized['value'] + '%' if normalized['prefix'] else normalized['value']
