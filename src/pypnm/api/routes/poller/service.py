@@ -2214,8 +2214,9 @@ class PollerService:
 
     def _process_one_job(self) -> None:
         queued = self._query(
-            "SELECT j.id, j.poller_id, j.error_text, p.id AS setting_id, "
-            "p.enabled, p.task_type, p.run_window_start, p.run_window_end "
+            "SELECT j.id, j.poller_id, j.error_text, j.request_payload, "
+            "p.id AS setting_id, p.enabled, p.task_type, "
+            "p.run_window_start, p.run_window_end "
             "FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
             "WHERE j.status='queued' ORDER BY j.id ASC"
         )
@@ -2297,8 +2298,6 @@ class PollerService:
         modems_succeeded = 0
         modems_failed = 0
         error_text = None
-        all_rows = []  # kept for potential future use; upserts are now per-CMTS
-        cmts_breakdown: List[Dict[str, Any]] = []
         self._update_running_job_progress(
             job_id,
             "Starting poller job: loading settings",
@@ -2326,17 +2325,112 @@ class PollerService:
                     modems_succeeded=0,
                     modems_failed=0,
                 )
-                targets = self._cmts_targets_for_poller(poller)
-                if str(poller.get("task_type") or "inventory") == _CPE_TASK_TYPE:
+                task_type = str(poller.get("task_type") or "inventory")
+                if task_type == _CPE_TASK_TYPE:
+                    targets = self._cmts_targets_for_poller(poller)
                     self._process_cpe_job(job_id, poller, targets)
                     return
+
+                start_offset = max(
+                    0,
+                    int(poller.get("last_target_offset") or 0),
+                )
+                raw_request_payload = job.get("request_payload")
+                try:
+                    request_payload = (
+                        dict(raw_request_payload)
+                        if isinstance(raw_request_payload, dict)
+                        else json.loads(raw_request_payload or "{}")
+                    )
+                except (TypeError, ValueError):
+                    request_payload = {}
+                if not isinstance(request_payload, dict):
+                    request_payload = {}
+
+                def _normalize_inventory_targets(
+                    raw_targets: Any,
+                    *,
+                    reject_duplicates: bool,
+                ) -> List[Dict[str, str]]:
+                    if not isinstance(raw_targets, list):
+                        raise RuntimeError("Inventory target manifest is not a list")
+                    normalized_targets = []
+                    seen_ips = set()
+                    for target in raw_targets:
+                        if not isinstance(target, dict):
+                            raise RuntimeError(
+                                "Inventory target manifest contains an invalid entry"
+                            )
+                        cmts_ip = str(target.get("ip") or "").strip()
+                        if not cmts_ip:
+                            raise RuntimeError(
+                                "Inventory target manifest contains a blank CMTS IP"
+                            )
+                        ip_key = cmts_ip.lower()
+                        if ip_key in seen_ips:
+                            if reject_duplicates:
+                                raise RuntimeError(
+                                    "Inventory target manifest contains duplicate CMTS IPs"
+                                )
+                            continue
+                        seen_ips.add(ip_key)
+                        normalized_targets.append(
+                            {
+                                "name": str(
+                                    target.get("name") or cmts_ip
+                                ).strip(),
+                                "ip": cmts_ip,
+                            }
+                        )
+                    return normalized_targets
+
+                if "inventory_targets" in request_payload:
+                    if request_payload.get(
+                        "inventory_target_manifest_version"
+                    ) != 1:
+                        raise RuntimeError(
+                            "Unsupported inventory target manifest version"
+                        )
+                    targets = _normalize_inventory_targets(
+                        request_payload.get("inventory_targets"),
+                        reject_duplicates=True,
+                    )
+                else:
+                    if start_offset:
+                        raise RuntimeError(
+                            "Cannot safely resume inventory without a target manifest"
+                        )
+                    targets = _normalize_inventory_targets(
+                        self._cmts_targets_for_poller(poller),
+                        reject_duplicates=False,
+                    )
+                    request_payload["inventory_targets"] = targets
+                    request_payload["inventory_target_manifest_version"] = 1
+                    self._execute(
+                        "UPDATE poller_job SET request_payload=%s "
+                        "WHERE id=%s AND status='running'",
+                        (json.dumps(request_payload), job_id),
+                    )
                 total_targets = len(targets)
-                start_offset = max(0, int(poller.get("last_target_offset") or 0))
-                subtask_timeout_sec = max(30, int(os.environ.get("DATA_STORE_SUBTASK_TIMEOUT_SEC", "300")))
-                subtask_retries = max(0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1")))
+                subtask_timeout_sec = max(
+                    30,
+                    int(os.environ.get("DATA_STORE_SUBTASK_TIMEOUT_SEC", "300")),
+                )
+                subtask_retries = max(
+                    0,
+                    int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1")),
+                )
+                try:
+                    max_concurrency = max(
+                        1,
+                        min(int(poller.get("max_concurrency") or 1), 4),
+                    )
+                except (TypeError, ValueError):
+                    max_concurrency = 1
                 self._update_running_job_progress(
                     job_id,
-                    f"Resolved {total_targets} CMTS target(s) (resume offset={start_offset})",
+                    f"Resolved {total_targets} CMTS target(s) "
+                    f"(resume offset={start_offset}, concurrency={max_concurrency})",
                     rows_collected=0,
                     modems_attempted=0,
                     modems_succeeded=0,
@@ -2344,89 +2438,103 @@ class PollerService:
                 )
                 if total_targets == 0:
                     error_text = "No CMTS targets resolved (check scope/appdb config)"
-                for idx, t in enumerate(targets, start=1):
-                    if idx <= start_offset:
-                        continue
 
+                checkpoint_offset = min(start_offset, total_targets)
+                finalized_indices = set(range(1, checkpoint_offset + 1))
+                breakdown_by_index: Dict[int, Dict[str, Any]] = {}
+                cancelled = False
+
+                def _job_is_running() -> bool:
                     status_rows = self._query(
                         "SELECT status FROM poller_job WHERE id=%s",
                         (job_id,),
                     )
-                    current_status = (
-                        str((status_rows[0] or {}).get("status") or "").lower()
-                        if status_rows else ""
+                    return bool(
+                        status_rows
+                        and str((status_rows[0] or {}).get("status") or "").lower()
+                        == "running"
                     )
-                    if current_status != "running":
-                        self._execute(
-                            "UPDATE poller_setting SET last_target_offset=0, "
-                            "updated_at=%s WHERE id=%s",
-                            (self._now(), poller_id),
-                        )
-                        return
-                    cmts_ip = t.get("ip")
-                    cmts_name = t.get("name") or cmts_ip
-                    if not cmts_ip:
-                        continue
-                    self._update_running_job_progress(
-                        job_id,
-                        f"CMTS {idx}/{total_targets}: walking {cmts_name}",
-                        rows_collected=rows_collected,
-                        modems_attempted=modems_attempted,
-                        modems_succeeded=modems_succeeded,
-                        modems_failed=modems_failed,
-                    )
-                    fetch_result = None
+
+                def _fetch_target(cmts_ip: str) -> Dict[str, Any]:
+                    attempt_errors = []
                     last_target_error = None
-                    for attempt in range(subtask_retries + 1):
+                    if not cmts_ip:
+                        return {
+                            "cancelled": False,
+                            "fetch_result": None,
+                            "last_target_error": "missing CMTS IP",
+                            "attempt_errors": [],
+                        }
+                    for attempt in range(1, subtask_retries + 2):
+                        if not _job_is_running():
+                            return {
+                                "cancelled": True,
+                                "fetch_result": None,
+                                "last_target_error": last_target_error,
+                                "attempt_errors": attempt_errors,
+                            }
                         try:
-                            fetch_result = self._fetch_cmts_modems(cmts_ip, timeout_sec=subtask_timeout_sec)
-                            break
+                            return {
+                                "cancelled": False,
+                                "fetch_result": self._fetch_cmts_modems(
+                                    cmts_ip,
+                                    timeout_sec=subtask_timeout_sec,
+                                ),
+                                "last_target_error": last_target_error,
+                                "attempt_errors": attempt_errors,
+                            }
                         except Exception as exc:
-                            last_target_error = exc
-                            self._update_running_job_progress(
-                                job_id,
-                                f"CMTS {idx}/{total_targets}: {cmts_name} attempt {attempt + 1}/{subtask_retries + 1} failed ({exc})",
-                                rows_collected=rows_collected,
-                                modems_attempted=modems_attempted,
-                                modems_succeeded=modems_succeeded,
-                                modems_failed=modems_failed,
-                            )
-                            status_rows = self._query(
-                                "SELECT status FROM poller_job WHERE id=%s",
-                                (job_id,),
-                            )
-                            if (
-                                not status_rows
-                                or str(status_rows[0].get("status") or "").lower()
-                                != "running"
+                            last_target_error = str(exc)
+                            attempt_errors.append((attempt, last_target_error))
+                            timeout_text = last_target_error.lower()
+                            if isinstance(exc, requests.Timeout) or any(
+                                marker in timeout_text
+                                for marker in ("timed out", "timeout")
                             ):
-                                self._execute(
-                                    "UPDATE poller_setting SET last_target_offset=0, "
-                                    "updated_at=%s WHERE id=%s",
-                                    (self._now(), poller_id),
-                                )
-                                return
+                                # The API cannot cancel a task already running on
+                                # an agent. Retrying a timeout could overlap two
+                                # physical walks against the same CMTS.
+                                break
+                    return {
+                        "cancelled": False,
+                        "fetch_result": None,
+                        "last_target_error": last_target_error,
+                        "attempt_errors": attempt_errors,
+                    }
 
-                    # Cancellation is cooperative: discard an in-flight result
-                    # returned after the administrator stopped or cleared the job.
-                    status_rows = self._query(
-                        "SELECT status FROM poller_job WHERE id=%s",
-                        (job_id,),
-                    )
-                    if (
-                        not status_rows
-                        or str(status_rows[0].get("status") or "").lower()
-                        != "running"
-                    ):
-                        self._execute(
-                            "UPDATE poller_setting SET last_target_offset=0, "
-                            "updated_at=%s WHERE id=%s",
-                            (self._now(), poller_id),
+                def _finalize_target(
+                    idx: int,
+                    cmts_ip: str,
+                    cmts_name: str,
+                    outcome: Dict[str, Any],
+                ) -> bool:
+                    nonlocal checkpoint_offset
+                    nonlocal error_text
+                    nonlocal modems_attempted
+                    nonlocal modems_failed
+                    nonlocal modems_succeeded
+                    nonlocal rows_collected
+
+                    if not _job_is_running():
+                        return False
+                    for attempt, attempt_error in outcome.get("attempt_errors") or []:
+                        self._update_running_job_progress(
+                            job_id,
+                            f"CMTS {idx}/{total_targets}: {cmts_name} attempt "
+                            f"{attempt}/{subtask_retries + 1} failed "
+                            f"({attempt_error})",
+                            rows_collected=rows_collected,
+                            modems_attempted=modems_attempted,
+                            modems_succeeded=modems_succeeded,
+                            modems_failed=modems_failed,
                         )
-                        return
 
+                    fetch_result = outcome.get("fetch_result")
                     if fetch_result is None:
-                        target_error = str(last_target_error or "unknown CMTS fetch failure")
+                        target_error = str(
+                            outcome.get("last_target_error")
+                            or "unknown CMTS fetch failure"
+                        )
                         breakdown_entry = {
                             "cmts": cmts_name,
                             "cmts_ip": cmts_ip,
@@ -2439,90 +2547,180 @@ class PollerService:
                             "critical_oid_errors": {},
                             "error": target_error,
                         }
-                        cmts_breakdown.append(breakdown_entry)
-                        self._execute(
-                            "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
-                            (json.dumps(cmts_breakdown), job_id),
-                        )
                         modems_failed += 1
                         error_text = (
                             f"CMTS collection failed at {idx}/{total_targets} "
                             f"({cmts_name}): {target_error}"
                         )
-                        # Finalize the failed target without replacing its previous
-                        # inventory generation, then continue collecting later CMTSes.
-                        self._execute(
-                            "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
-                            (idx, self._now(), poller_id),
+                        failed_attempts = max(
+                            1,
+                            len(outcome.get("attempt_errors") or []),
                         )
-                        self._update_running_job_progress(
-                            job_id,
+                        progress_message = (
                             f"CMTS {idx}/{total_targets}: {cmts_name} skipped after "
-                            f"{subtask_retries + 1} failed attempt(s)",
-                            rows_collected=rows_collected,
-                            modems_attempted=modems_attempted,
-                            modems_succeeded=modems_succeeded,
-                            modems_failed=modems_failed,
+                            f"{failed_attempts} failed attempt(s)"
                         )
-                        continue
+                    else:
+                        modems = fetch_result.get("modems") or []
+                        modems_attempted += len(modems)
+                        for modem in modems:
+                            modem["cmts"] = cmts_name
+                            modem["cmts_ip"] = cmts_ip
 
-                    modems = fetch_result.get("modems") or []
-                    modems_attempted += len(modems)
-                    for m in modems:
-                        m["cmts"] = cmts_name
-                        m["cmts_ip"] = cmts_ip
+                        snapshot_id = str(uuid.uuid4())
+                        written = self._upsert_inventory_rows(
+                            modems,
+                            source_poller=poller.get("name"),
+                            snapshot_id=snapshot_id,
+                        )
+                        self._record_inventory_snapshot(
+                            cmts=cmts_name,
+                            cmts_ip=cmts_ip,
+                            snapshot_id=snapshot_id,
+                            metadata=fetch_result,
+                            row_count=written,
+                            source_poller=poller.get("name"),
+                        )
+                        breakdown_entry = {
+                            "cmts": cmts_name,
+                            "cmts_ip": cmts_ip,
+                            "row_count": written,
+                            "complete": fetch_result.get("complete") is True,
+                            "truncated": fetch_result.get("truncated") is True,
+                            "capability_enriched": (
+                                fetch_result.get("capability_enriched") is True
+                            ),
+                            "requested_limit": fetch_result.get("requested_limit"),
+                            "collected_at": fetch_result.get("collected_at"),
+                            "critical_oid_errors": (
+                                fetch_result.get("critical_oid_errors") or {}
+                            ),
+                        }
+                        rows_collected += written
+                        modems_succeeded += len(modems)
+                        progress_message = (
+                            f"CMTS {idx}/{total_targets}: {cmts_name} done "
+                            f"({len(modems)} modems)"
+                        )
 
-                    # Every collection receives an immutable generation ID. The
-                    # snapshot row proves whether fewer rows than the safety cap
-                    # represents a complete walk or a partial result.
-                    snapshot_id = str(uuid.uuid4())
-                    written = self._upsert_inventory_rows(
-                        modems,
-                        source_poller=poller.get("name"),
-                        snapshot_id=snapshot_id,
-                    )
-                    self._record_inventory_snapshot(
-                        cmts=cmts_name,
-                        cmts_ip=cmts_ip,
-                        snapshot_id=snapshot_id,
-                        metadata=fetch_result,
-                        row_count=written,
-                        source_poller=poller.get("name"),
-                    )
-                    breakdown_entry = {
-                        "cmts": cmts_name,
-                        "cmts_ip": cmts_ip,
-                        "row_count": written,
-                        "complete": fetch_result.get("complete") is True,
-                        "truncated": fetch_result.get("truncated") is True,
-                        "capability_enriched": fetch_result.get("capability_enriched") is True,
-                        "requested_limit": fetch_result.get("requested_limit"),
-                        "collected_at": fetch_result.get("collected_at"),
-                        "critical_oid_errors": fetch_result.get("critical_oid_errors") or {},
-                    }
-                    cmts_breakdown.append(breakdown_entry)
+                    breakdown_by_index[idx] = breakdown_entry
+                    finalized_indices.add(idx)
+                    ordered_breakdown = [
+                        value
+                        for _, value in sorted(breakdown_by_index.items())
+                    ]
                     self._execute(
                         "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
-                        (json.dumps(cmts_breakdown), job_id),
+                        (json.dumps(ordered_breakdown), job_id),
                     )
-                    rows_collected += written
-                    modems_succeeded += len(modems)
-                    all_rows.extend(modems)
-                    self._execute(
-                        "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
-                        (idx, self._now(), poller_id),
-                    )
+
+                    previous_checkpoint = checkpoint_offset
+                    while checkpoint_offset + 1 in finalized_indices:
+                        checkpoint_offset += 1
+                    if checkpoint_offset > previous_checkpoint:
+                        self._execute(
+                            "UPDATE poller_setting SET last_target_offset=%s, "
+                            "updated_at=%s WHERE id=%s",
+                            (checkpoint_offset, self._now(), poller_id),
+                        )
                     self._update_running_job_progress(
                         job_id,
-                        f"CMTS {idx}/{total_targets}: {cmts_name} done ({len(modems)} modems) [checkpoint={idx}]",
+                        f"{progress_message} [checkpoint={checkpoint_offset}]",
                         rows_collected=rows_collected,
                         modems_attempted=modems_attempted,
                         modems_succeeded=modems_succeeded,
                         modems_failed=modems_failed,
                     )
+                    return True
+
+                work_targets = [
+                    (
+                        idx,
+                        str(target.get("ip") or "").strip(),
+                        target.get("name")
+                        or target.get("ip")
+                        or f"target-{idx}",
+                    )
+                    for idx, target in enumerate(targets, start=1)
+                    if idx > start_offset
+                ]
+                executor = None
+                pending: Dict[Any, tuple[int, str, str]] = {}
+                next_target = 0
+                try:
+                    if work_targets:
+                        executor = ThreadPoolExecutor(
+                            max_workers=max_concurrency,
+                            thread_name_prefix="poller-inventory-fetch",
+                        )
+                        while next_target < min(max_concurrency, len(work_targets)):
+                            idx, cmts_ip, cmts_name = work_targets[next_target]
+                            pending[executor.submit(_fetch_target, cmts_ip)] = (
+                                idx,
+                                cmts_ip,
+                                cmts_name,
+                            )
+                            next_target += 1
+
+                    while pending:
+                        if not _job_is_running():
+                            cancelled = True
+                            break
+                        done, _ = wait_for_futures(
+                            tuple(pending.keys()),
+                            timeout=1.0,
+                        )
+                        if not done:
+                            continue
+                        finished = sorted(
+                            done,
+                            key=lambda future: pending[future][0],
+                        )
+                        for future in finished:
+                            idx, cmts_ip, cmts_name = pending.pop(future)
+                            outcome = future.result()
+                            if outcome.get("cancelled") or not _finalize_target(
+                                idx,
+                                cmts_ip,
+                                cmts_name,
+                                outcome,
+                            ):
+                                cancelled = True
+                                break
+                        if cancelled:
+                            break
+                        while (
+                            next_target < len(work_targets)
+                            and len(pending) < max_concurrency
+                        ):
+                            idx, cmts_ip, cmts_name = work_targets[next_target]
+                            pending[executor.submit(_fetch_target, cmts_ip)] = (
+                                idx,
+                                cmts_ip,
+                                cmts_name,
+                            )
+                            next_target += 1
+                finally:
+                    if executor is not None:
+                        if cancelled:
+                            for future in pending:
+                                future.cancel()
+                            executor.shutdown(wait=True, cancel_futures=True)
+                        else:
+                            executor.shutdown(wait=True)
+
+                if cancelled:
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=0, "
+                        "updated_at=%s WHERE id=%s",
+                        (self._now(), poller_id),
+                    )
+                    return
 
                 try:
-                    self._purge_stale_inventory(int(poller.get("retention_days") or 30))
+                    self._purge_stale_inventory(
+                        int(poller.get("retention_days") or 30)
+                    )
                 except Exception:
                     pass
 
@@ -2536,6 +2734,18 @@ class PollerService:
         except Exception as exc:
             error_text = str(exc)
             modems_failed = max(modems_failed, 1)
+            try:
+                self._execute(
+                    "UPDATE poller_setting SET last_target_offset=0, "
+                    "updated_at=%s WHERE id=%s",
+                    (self._now(), poller_id),
+                )
+            except Exception as checkpoint_exc:
+                logger.warning(
+                    "Failed to reset inventory checkpoint after job %s error: %s",
+                    job_id,
+                    checkpoint_exc,
+                )
 
         self._execute(
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",

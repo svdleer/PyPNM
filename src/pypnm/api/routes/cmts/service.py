@@ -1138,15 +1138,11 @@ class CMTSModemService:
                 except (TypeError, ValueError):
                     cpe_limit = max(10000, walk_limit * 8)
                 walk_limit = max(walk_limit, min(cpe_limit, 500000))
-            # Regular persisted-inventory refreshes are the only caller allowed
-            # to overlap CMTS table walks. Two balanced tasks reduce wall time
-            # without changing the OID set, row cap, or completeness gates.
-            # Interactive and CPE collections retain the serial behavior.
-            regular_inventory_refresh = bool(
-                refresh and not enrich and not collect_cpe
-                and not str(cmts_hostname or '').strip()
-            )
-            walk_group_count = 2 if regular_inventory_refresh else 1
+            # Poller inventory parallelism is bounded across CMTS targets by
+            # PollerService. Keep every request as one agent task so four target
+            # slots distribute approximately two-per-agent when two healthy
+            # agents are connected.
+            walk_group_count = 1
             walk_params = {
                 'ip': cmts_ip,
                 'community': community,
