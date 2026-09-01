@@ -4392,20 +4392,31 @@ class PollerService:
                 for r in (rows or [])
             ]
 
-        vendors = _top_counts("vendor")
-        models = _top_counts("model")
-        firmwares = _top_counts("software_version")
-        docsis = _top_counts("docsis_version")
+        # Run the four GROUP BY breakdowns concurrently to reduce wall time.
+        # Each uses its own thread-local DB connection so there is no lock
+        # contention with the main coordinator thread.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        columns = ["vendor", "model", "software_version", "docsis_version"]
+        results: dict = {}
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="inv-summary") as ex:
+            futures = {ex.submit(_top_counts, col): col for col in columns}
+            for fut in as_completed(futures):
+                col = futures[fut]
+                try:
+                    results[col] = fut.result()
+                except Exception:
+                    results[col] = []
 
         return {
             "total": total,
             "enriched": enriched,
             "enriched_pct": round(enriched / total * 100, 1) if total else 0.0,
             "last_updated": last_updated,
-            "vendors": vendors,
-            "models": models,
-            "firmwares": firmwares,
-            "docsis_versions": docsis,
+            "vendors": results.get("vendor", []),
+            "models": results.get("model", []),
+            "firmwares": results.get("software_version", []),
+            "docsis_versions": results.get("docsis_version", []),
         }
 
     # ── Queue head (admin dashboard) ─────────────────────────────
