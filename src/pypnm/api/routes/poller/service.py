@@ -4330,6 +4330,88 @@ class PollerService:
             "percentage": round(enriched / total * 100, 1) if total > 0 else 0.0,
         }
 
+    # ── Inventory summary (admin dashboard) ──────────────────────
+
+    def get_inventory_summary(
+        self,
+        cmts: Optional[str] = None,
+        top_n: int = 25,
+    ) -> dict:
+        """Return vendor/model/firmware/DOCSIS count breakdowns from MySQL."""
+        where_base = ""
+        params_base: list = []
+        if cmts:
+            where_base = (
+                " WHERE (LOWER(COALESCE(cmts,'')) = LOWER(%s)"
+                " OR LOWER(COALESCE(cmts_ip,'')) = LOWER(%s))"
+            )
+            params_base = [cmts, cmts]
+
+        top = max(1, min(int(top_n), 100))
+
+        # Total count
+        total_rows = self._query(
+            f"SELECT COUNT(*) AS c FROM modem_inventory_current{where_base}",
+            tuple(params_base),
+        )
+        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+
+        # Last updated
+        updated_rows = self._query(
+            f"SELECT MAX(updated_at) AS ts FROM modem_inventory_current{where_base}",
+            tuple(params_base),
+        )
+        last_updated = str((updated_rows[0] or {}).get("ts") or "") if updated_rows else ""
+
+        def _top_counts(column: str, extra_where: str = "") -> list:
+            and_clause = (
+                (" AND" if where_base else " WHERE") + extra_where
+                if extra_where else ""
+            )
+            rows = self._query(
+                f"""
+                SELECT COALESCE(NULLIF(TRIM({column}),''), '(unknown)') AS value,
+                       COUNT(*) AS count
+                FROM modem_inventory_current{where_base}{and_clause}
+                GROUP BY 1 ORDER BY 2 DESC LIMIT %s
+                """,
+                tuple(params_base + [top]),
+            )
+            return [
+                {"value": str(r.get("value") or ""), "count": int(r.get("count") or 0)}
+                for r in (rows or [])
+            ]
+
+        vendors = _top_counts("vendor")
+        models = _top_counts("model")
+        firmwares = _top_counts("software_version")
+        docsis = _top_counts("docsis_version")
+
+        # Enrichment counts
+        enrich_extra = (
+            " LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('','unknown','n/a')"
+            " AND (TRIM(COALESCE(software_version,''))<>''"
+            " OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('','unknown','n/a'))"
+        )
+        and_word = " AND" if where_base else " WHERE"
+        enrich_rows = self._query(
+            f"SELECT COUNT(*) AS c FROM modem_inventory_current{where_base}"
+            f"{and_word}{enrich_extra}",
+            tuple(params_base),
+        )
+        enriched = int((enrich_rows[0] or {}).get("c") or 0) if enrich_rows else 0
+
+        return {
+            "total": total,
+            "enriched": enriched,
+            "enriched_pct": round(enriched / total * 100, 1) if total else 0.0,
+            "last_updated": last_updated,
+            "vendors": vendors,
+            "models": models,
+            "firmwares": firmwares,
+            "docsis_versions": docsis,
+        }
+
     # ── Queue head (admin dashboard) ─────────────────────────────
 
     def get_queue_heads(self) -> dict:

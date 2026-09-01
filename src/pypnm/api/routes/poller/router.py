@@ -192,6 +192,20 @@ def suggest_cpe_addresses(
     return {"status": "success", "suggestions": suggestions}
 
 
+@router.get("/inventory/summary")
+def inventory_summary(
+    cmts: str | None = None,
+    top_n: int = Query(default=25, ge=1, le=100),
+) -> dict:
+    """Return vendor/model/firmware/DOCSIS count breakdowns for the inventory dashboard."""
+    try:
+        data = poller_service.get_inventory_summary(cmts=cmts, top_n=top_n)
+    except Exception as exc:
+        logger.error("inventory/summary DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "source": "mysql", **data}
+
+
 @router.get("/inventory/modems/{mac_address}")
 def get_inventory_modem(mac_address: str) -> dict:
     try:
