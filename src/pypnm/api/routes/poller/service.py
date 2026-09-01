@@ -4337,7 +4337,11 @@ class PollerService:
         cmts: Optional[str] = None,
         top_n: int = 25,
     ) -> dict:
-        """Return vendor/model/firmware/DOCSIS count breakdowns from MySQL."""
+        """Return vendor/model/firmware/DOCSIS count breakdowns from MySQL.
+
+        Uses a single table scan with subqueries to avoid the overhead of five
+        separate GROUP BY queries against 3M+ rows.
+        """
         where_base = ""
         params_base: list = []
         if cmts:
@@ -4349,30 +4353,36 @@ class PollerService:
 
         top = max(1, min(int(top_n), 100))
 
-        # Total count
-        total_rows = self._query(
-            f"SELECT COUNT(*) AS c FROM modem_inventory_current{where_base}",
+        # Last updated + total + enriched in one pass.
+        summary_rows = self._query(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                MAX(updated_at) AS last_updated,
+                SUM(
+                    CASE WHEN
+                        LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('','unknown','n/a')
+                        AND (
+                            TRIM(COALESCE(software_version,'')) <> ''
+                            OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('','unknown','n/a')
+                        )
+                    THEN 1 ELSE 0 END
+                ) AS enriched
+            FROM modem_inventory_current{where_base}
+            """,
             tuple(params_base),
         )
-        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+        row0 = (summary_rows[0] if summary_rows else {}) or {}
+        total = int(row0.get("total") or 0)
+        enriched = int(row0.get("enriched") or 0)
+        last_updated = str(row0.get("last_updated") or "")
 
-        # Last updated
-        updated_rows = self._query(
-            f"SELECT MAX(updated_at) AS ts FROM modem_inventory_current{where_base}",
-            tuple(params_base),
-        )
-        last_updated = str((updated_rows[0] or {}).get("ts") or "") if updated_rows else ""
-
-        def _top_counts(column: str, extra_where: str = "") -> list:
-            and_clause = (
-                (" AND" if where_base else " WHERE") + extra_where
-                if extra_where else ""
-            )
+        def _top_counts(column: str) -> list:
             rows = self._query(
                 f"""
                 SELECT COALESCE(NULLIF(TRIM({column}),''), '(unknown)') AS value,
                        COUNT(*) AS count
-                FROM modem_inventory_current{where_base}{and_clause}
+                FROM modem_inventory_current{where_base}
                 GROUP BY 1 ORDER BY 2 DESC LIMIT %s
                 """,
                 tuple(params_base + [top]),
@@ -4386,20 +4396,6 @@ class PollerService:
         models = _top_counts("model")
         firmwares = _top_counts("software_version")
         docsis = _top_counts("docsis_version")
-
-        # Enrichment counts
-        enrich_extra = (
-            " LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('','unknown','n/a')"
-            " AND (TRIM(COALESCE(software_version,''))<>''"
-            " OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('','unknown','n/a'))"
-        )
-        and_word = " AND" if where_base else " WHERE"
-        enrich_rows = self._query(
-            f"SELECT COUNT(*) AS c FROM modem_inventory_current{where_base}"
-            f"{and_word}{enrich_extra}",
-            tuple(params_base),
-        )
-        enriched = int((enrich_rows[0] or {}).get("c") or 0) if enrich_rows else 0
 
         return {
             "total": total,
