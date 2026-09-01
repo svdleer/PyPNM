@@ -1685,6 +1685,7 @@ class PollerService:
         fatal_error = None
         incomplete_targets = 0
         poller_id = int(poller.get("id") or 0)
+        collect_identity = bool(int(poller.get("collect_identity") or 0))
         start_offset = max(0, int(poller.get("last_target_offset") or 0))
         subtask_retries = max(
             0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
@@ -1923,6 +1924,107 @@ class PollerService:
                     except Exception as exc:
                         complete = False
                         validation_error = str(exc)
+
+                    # ── Identity enrichment via CM agents ──────────────────
+                    # When collect_identity is enabled, use the fresh CPE IPs
+                    # to populate vendor/model/software_version for each modem
+                    # via CM-agent sysDescr SNMP. Runs on a background daemon
+                    # thread so it never blocks the CPE job coordinator.
+                    if complete and collect_identity and cpe_rows:
+                        poller_service_ref = self
+                        cmts_ip_cap = cmts_ip
+                        cmts_name_cap = cmts_name
+
+                        def _run_identity_enrichment(
+                            rows: List[Dict[str, Any]],
+                            svc_ref: "PollerService",
+                            cmts_ip_val: str,
+                            cmts_name_val: str,
+                        ) -> None:
+                            import asyncio
+                            from pypnm.api.routes.cmts.service import CMTSModemService
+
+                            try:
+                                # Deduplicate by modem MAC, preferring IPv4.
+                                mac_to_ip: Dict[str, str] = {}
+                                for row in rows:
+                                    mac = str(row.get("modem_mac") or "").strip()
+                                    ip = str(row.get("ip_address") or "").strip()
+                                    if not mac or not ip:
+                                        continue
+                                    family = str(
+                                        row.get("address_family") or ""
+                                    ).lower()
+                                    if mac not in mac_to_ip or family == "ipv4":
+                                        mac_to_ip[mac] = ip
+
+                                modem_dicts = [
+                                    {
+                                        "mac_address": mac,
+                                        "ip_address": ip,
+                                        "status": "operational",
+                                    }
+                                    for mac, ip in mac_to_ip.items()
+                                ]
+                                if not modem_dicts:
+                                    return
+
+                                logger.info(
+                                    "Identity enrichment: starting for %s "
+                                    "(%d modems)",
+                                    cmts_name_val,
+                                    len(modem_dicts),
+                                )
+                                service = CMTSModemService(
+                                    agent_priority="bulk"
+                                )
+                                loop = asyncio.new_event_loop()
+                                try:
+                                    loop.run_until_complete(
+                                        service._enrich_modems_direct(
+                                            modem_dicts,
+                                            cmts_ip=cmts_ip_val,
+                                        )
+                                    )
+                                finally:
+                                    loop.close()
+
+                                enriched = [
+                                    m
+                                    for m in modem_dicts
+                                    if m.get("vendor") or m.get("model")
+                                ]
+                                if enriched:
+                                    svc_ref._upsert_inventory_rows(
+                                        enriched,
+                                        source_poller="identity-enrichment",
+                                    )
+                                logger.info(
+                                    "Identity enrichment: finished for %s "
+                                    "(%d/%d modems enriched)",
+                                    cmts_name_val,
+                                    len(enriched),
+                                    len(modem_dicts),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Identity enrichment failed for %s: %s",
+                                    cmts_name_val,
+                                    exc,
+                                )
+
+                        t = threading.Thread(
+                            target=_run_identity_enrichment,
+                            args=(
+                                cpe_rows,
+                                poller_service_ref,
+                                cmts_ip_cap,
+                                cmts_name_cap,
+                            ),
+                            daemon=True,
+                            name=f"identity-enrich-{cmts_ip_cap}",
+                        )
+                        t.start()
 
                 entry = {
                     "cmts": cmts_name,
