@@ -3,65 +3,26 @@
 
 from __future__ import annotations
 
-import asyncio
-import ipaddress
-import json
 import logging
 import os
-import secrets
 from inspect import signature
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from pypnm.api.agent.manager import get_agent_manager, init_agent_manager
 from pypnm.api.routes.cmts.schemas import (
+    CPECollectionRequest,
+    CPECollectionResponse,
     CMTSModemInterfaceRequest,
     CMTSModemInterfaceResponse,
     CMTSModemRequest,
     CMTSModemResponse,
-    CMTSRemoteQueryProbeRequest,
-    CMTSRemoteQueryProbeResponse,
-    CPECollectionRequest,
-    CPECollectionResponse,
 )
 from pypnm.api.routes.cmts.service import CMTSModemService, cancel_enrichment
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/cmts", tags=["CMTS Discovery"])
-_remote_query_probe_lock = asyncio.Lock()
-
-
-def _remote_query_probe_target_allowed(cmts_ip: str) -> bool:
-    """Authorize a probe only for an operator-configured CMTS address."""
-    raw = (
-        os.environ.get("PYPNM_REMOTE_QUERY_PROBE_TARGETS")
-        or os.environ.get("POLLER_CMTS_TARGETS")
-        or ""
-    ).strip()
-    if not raw:
-        return False
-    try:
-        requested = str(ipaddress.ip_address(cmts_ip.strip()))
-    except ValueError:
-        return False
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        parsed = [item.strip() for item in raw.replace("\n", ",").split(",")]
-    if not isinstance(parsed, list):
-        return False
-    for item in parsed:
-        candidate = item
-        if isinstance(item, dict):
-            candidate = item.get("ip") or item.get("cmts_ip") or item.get("IPAddress")
-        try:
-            if candidate and str(ipaddress.ip_address(str(candidate).strip())) == requested:
-                return True
-        except ValueError:
-            continue
-    return False
-
 
 # Ensure agent manager is initialized
 _auth_token = os.environ.get("PYPNM_AGENT_TOKEN", "dev-token-change-me")
@@ -256,50 +217,6 @@ async def query_cpe_addresses(payload: CPECollectionRequest) -> CPECollectionRes
             cpe_addresses=[],
             count=0,
             error=str(exc),
-        )
-
-
-@router.post(
-    "/remote-query/probe",
-    response_model=CMTSRemoteQueryProbeResponse,
-)
-async def probe_remote_query_identity(
-    payload: CMTSRemoteQueryProbeRequest,
-    probe_token: str | None = Header(
-        default=None,
-        alias="X-PyPNM-Probe-Token",
-        include_in_schema=False,
-    ),
-) -> CMTSRemoteQueryProbeResponse:
-    """Probe fixed CMTS remote-query identity OIDs without persistence or fallback."""
-    expected_token = os.environ.get("PYPNM_REMOTE_QUERY_PROBE_TOKEN") or ""
-    if not expected_token:
-        raise HTTPException(status_code=503, detail="Remote-query probe disabled")
-    if not probe_token or not secrets.compare_digest(probe_token, expected_token):
-        raise HTTPException(status_code=403, detail="Probe authorization failed")
-    if not _remote_query_probe_target_allowed(payload.cmts_ip):
-        raise HTTPException(status_code=404, detail="CMTS target not found")
-
-    agent_manager = get_agent_manager()
-    if not agent_manager or not agent_manager.get_available_agents():
-        raise HTTPException(status_code=503, detail="No agents available")
-    if _remote_query_probe_lock.locked():
-        raise HTTPException(status_code=429, detail="A remote-query probe is already running")
-    try:
-        async with _remote_query_probe_lock:
-            result = await CMTSModemService(
-                agent_priority="bulk",
-            ).probe_remote_query_identity(
-                cmts_ip=str(ipaddress.ip_address(payload.cmts_ip.strip())),
-                limit=payload.limit,
-                sample_limit=payload.sample_limit,
-            )
-        return CMTSRemoteQueryProbeResponse(**result)
-    except Exception:
-        logger.exception("CMTS remote-query probe failed")
-        return CMTSRemoteQueryProbeResponse(
-            success=False,
-            error_code="internal_error",
         )
 
 

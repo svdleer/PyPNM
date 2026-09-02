@@ -9,13 +9,14 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Dict, List, Any
 
 from pypnm.api.agent.manager import get_agent_manager
 from pypnm.api.routes.common.service.fiber_node_utils import (
     OID_MD_NODE_STATUS_MD_DS_SG_ID,
     parse_fn_name_from_oid,
 )
+
 
 # ── In-memory enrichment cache ──────────────────────────────────────────────
 # Keyed by cmts_ip → {modems, enriched, capability_enriched, enriching,
@@ -75,16 +76,7 @@ OID_OLD_MAC      = '1.3.6.1.2.1.10.127.1.3.3.1.2'       # docsIfCmtsCmStatusMacA
 OID_OLD_IP       = '1.3.6.1.2.1.10.127.1.3.3.1.3'       # docsIfCmtsCmStatusIpAddress
 OID_OLD_STATUS   = '1.3.6.1.2.1.10.127.1.3.3.1.9'       # docsIfCmtsCmStatusValue
 OID_OLD_US_CH_IF = '1.3.6.1.2.1.10.127.1.3.3.1.5'       # docsIfCmtsCmStatusUpChannelIfIndex
-# Standard CMTS identity scalars and Cadant/ARRIS remote-query identity
-# (read-only use only).
-OID_CMTS_SYS_DESCR = '1.3.6.1.2.1.1.1.0'
-OID_CMTS_SYS_OBJECT_ID = '1.3.6.1.2.1.1.2.0'
-OID_SYS_UPTIME = '1.3.6.1.2.1.1.3.0'
-OID_CAD_RQ_POLLER_INTERVAL = '1.3.6.1.4.1.4998.1.1.55.1.1.2.0'
-OID_CAD_RQ_POLLER_START = '1.3.6.1.4.1.4998.1.1.55.1.1.3.0'
-OID_CAD_RQ_POLLER_STOP = '1.3.6.1.4.1.4998.1.1.55.1.1.4.0'
-OID_CAD_RQ_POLL_TIME = '1.3.6.1.4.1.4998.1.1.55.1.2.1.1'
-OID_CAD_RQ_SYS_DESCR = '1.3.6.1.4.1.4998.1.1.55.1.2.1.7'
+OID_SW_REV       = '1.3.6.1.2.1.10.127.1.2.2.1.3'       # docsIfCmtsCmStatusSoftwareRev (firmware)
 # DOCSIS 3.1 supplementary
 OID_US_CH_ID     = '1.3.6.1.4.1.4491.2.1.20.1.4.1.3'    # docsIf3CmtsCmUsStatusChIfIndex
 OID_IF_NAME      = '1.3.6.1.2.1.31.1.1.1.1'              # IF-MIB::ifName
@@ -1131,7 +1123,7 @@ class CMTSModemService:
             # ── Step 1: Parallel SNMP walks via agent ────────────────────
             walk_oids = [
                 OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
-                OID_OLD_US_CH_IF,
+                OID_OLD_US_CH_IF, OID_SW_REV,
                 OID_US_CH_ID, OID_IF_NAME,
                 OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
                 OID_D4_ADV_CAP,
@@ -1486,9 +1478,6 @@ class CMTSModemService:
 
             # Step 1: fast CMTS-level enrichment.
             await self._enrich_cmts_interfaces(modems)
-            if self._enrichment_cancelled(cmts_ip):
-                self.logger.info('Background enrichment cancelled for %s', cmts_ip)
-                return
             # Update cache immediately and preserve inventory-completion metadata.
             existing_cache = _enrichment_cache.get(cmts_ip, {})
             _enrichment_cache[cmts_ip] = {
@@ -1502,16 +1491,8 @@ class CMTSModemService:
             }
             self.logger.info(f"CMTS interface enrichment done for {cmts_ip} — OFDMA/cable-mac visible")
 
-            # Step 2: CMTS remote-query identity, then direct-modem fallback.
-            await self._enrich_modem_identities(
-                modems,
-                cmts_ip=cmts_ip,
-                modem_community=modem_community,
-                progress_cmts_ip=cmts_ip,
-            )
-            if self._enrichment_cancelled(cmts_ip):
-                self.logger.info('Background enrichment cancelled for %s', cmts_ip)
-                return
+            # Step 2: slower per-modem enrichment.
+            await self._enrich_modems_direct(modems, modem_community, cmts_ip=cmts_ip)
 
             existing_cache = _enrichment_cache.get(cmts_ip, {})
             _enrichment_cache[cmts_ip] = {
@@ -1598,6 +1579,12 @@ class CMTSModemService:
             except (ValueError, TypeError):
                 pass
 
+        sw_rev_map: dict[str, str] = {}
+        for item in raw.get(OID_SW_REV, []):
+            fw = str(item['value'])
+            if fw and 'No Such' not in fw and fw != '0':
+                sw_rev_map[self._extract_index(item['oid'], OID_SW_REV)] = fw
+
         # ---- IF-MIB::ifName ----
         if_name_map: dict[int, str] = {}
         for item in raw.get(OID_IF_NAME, []):
@@ -1676,18 +1663,22 @@ class CMTSModemService:
         # ---- correlate old table → MAC-keyed lookups ----
         mac_to_ip: dict[str, str] = {}
         mac_to_status: dict[str, int] = {}
+        mac_to_firmware: dict[str, str] = {}
         mac_to_us_ch_if: dict[str, int] = {}
         for old_index, mac in old_mac_map.items():
             if old_index in old_ip_map:
                 mac_to_ip[mac] = old_ip_map[old_index]
             if old_index in old_status_map:
                 mac_to_status[mac] = old_status_map[old_index]
+            if old_index in sw_rev_map:
+                mac_to_firmware[mac] = sw_rev_map[old_index]
             if old_index in old_us_ch_if_map:
                 mac_to_us_ch_if[mac] = old_us_ch_if_map[old_index]
 
         self.logger.info(
             f"Correlated: {len(mac_to_ip)} IPs, {len(mac_to_status)} statuses, "
-            f"{len(mac_to_us_ch_if)} D3.0 US-CH, {len(us_ch_map)} D3.1 US-CH"
+            f"{len(mac_to_firmware)} firmware, {len(mac_to_us_ch_if)} D3.0 US-CH, "
+            f"{len(us_ch_map)} D3.1 US-CH"
         )
 
         # ---- build modem list from the union of both registration tables ----
@@ -1734,6 +1725,9 @@ class CMTSModemService:
                 sc = mac_to_status[mac]
                 modem['status_code'] = sc
                 modem['status'] = STATUS_MAP.get(sc, 'unknown')
+
+            if mac in mac_to_firmware:
+                modem['firmware'] = mac_to_firmware[mac]
 
             # Positive DOCS-IF31 per-modem state proves DOCSIS 3.1 capability,
             # including state=none (healthy, not partial service). Operational
@@ -2058,618 +2052,6 @@ class CMTSModemService:
             'total_count': len(modems)
         }
 
-    @staticmethod
-    def _enrichment_cancelled(cmts_ip: str | None) -> bool:
-        """Return whether GUI enrichment for this cache key was cancelled."""
-        return bool(
-            cmts_ip
-            and _enrichment_cache.get(cmts_ip, {}).get('cancelled')
-        )
-
-    @staticmethod
-    def _meaningful_identity_value(value: Any) -> bool:
-        """Return whether an identity field contains usable information."""
-        return str(value or '').strip().lower() not in {
-            '', '-', 'unknown', 'n/a', 'none', 'null', 'not available',
-        }
-
-    @classmethod
-    def _needs_identity_enrichment(cls, modem: dict) -> bool:
-        """Return True while any persisted modem identity field is missing."""
-        return any(
-            not cls._meaningful_identity_value(modem.get(field))
-            for field in ('vendor', 'model', 'software_version', 'docsis_version')
-        )
-
-    @classmethod
-    def _merge_parsed_identity(cls, modem: dict, parsed: dict) -> bool:
-        """Fill missing identity fields without replacing meaningful values."""
-        changed = False
-        for target, source in (
-            ('vendor', 'vendor'),
-            ('model', 'model'),
-            ('software_version', 'software'),
-        ):
-            value = parsed.get(source)
-            if (
-                cls._meaningful_identity_value(value)
-                and not cls._meaningful_identity_value(modem.get(target))
-            ):
-                modem[target] = str(value).strip()
-                changed = True
-        return changed
-
-    @staticmethod
-    def _parse_unsigned_counter(value: Any, *, timeticks: bool = False) -> int | None:
-        """Parse a non-negative SNMP counter, optionally converting ticks to seconds."""
-        import re
-
-        if isinstance(value, bool) or value is None:
-            return None
-        if isinstance(value, (int, float)):
-            number = int(value)
-            return number // 100 if timeticks and number >= 0 else number if number >= 0 else None
-        text = str(value).strip()
-        if not text or 'No Such' in text:
-            return None
-        if timeticks:
-            ticks_match = re.search(r'\((\d+)\)', text)
-            if ticks_match:
-                return int(ticks_match.group(1)) // 100
-        for prefix in ('Gauge32:', 'Counter32:', 'Unsigned32:', 'INTEGER:', 'Timeticks:'):
-            if text.startswith(prefix):
-                text = text[len(prefix):].strip()
-                break
-        number_match = re.search(r'(?<![\d.])(\d+)(?![\d.])', text)
-        if not number_match:
-            return None
-        return int(number_match.group(1))
-
-    @staticmethod
-    def _remote_query_mac_from_oid(oid: Any, base_oid: str) -> str | None:
-        """Decode the six-octet Cadant status-table MAC index."""
-        full_oid = str(oid or '').strip().lstrip('.')
-        base = base_oid.strip().lstrip('.')
-        if not full_oid.startswith(f'{base}.'):
-            return None
-        suffix = full_oid[len(base) + 1:]
-        try:
-            octets = [int(part) for part in suffix.split('.') if part != '']
-        except ValueError:
-            return None
-        # Be defensive if an SNMP implementation renders the fixed-size MAC
-        # index with an explicit length prefix.
-        if len(octets) == 7 and octets[0] == 6:
-            octets = octets[1:]
-        if len(octets) != 6 or any(octet < 0 or octet > 255 for octet in octets):
-            return None
-        return ':'.join(f'{octet:02x}' for octet in octets)
-
-    @staticmethod
-    def _remote_query_fresh_window(
-        start: int,
-        stop: int,
-        now: int,
-        interval: int | None,
-    ) -> tuple[int, int, int] | None:
-        """Validate the latest completed Cadant cycle using rollover-safe ages."""
-        if start <= 0 or stop <= 0 or now < 0:
-            return None
-        # sysUpTime is a 32-bit TimeTicks counter. Cadant stores its value in
-        # seconds; retain support for implementations that use a full uint32
-        # seconds counter instead.
-        timeticks_seconds_modulus = ((1 << 32) - 1) // 100 + 1
-        modulus = (
-            timeticks_seconds_modulus
-            if max(start, stop, now) < timeticks_seconds_modulus
-            else 1 << 32
-        )
-        age_start = (now - start) % modulus
-        age_stop = (now - stop) % modulus
-        # A newer start than stop means the table is being overwritten by an
-        # in-progress cycle. Never consume that mixed generation.
-        if age_stop > age_start:
-            return None
-        max_age = max(3600, int(interval or 0) * 2)
-        max_age = min(max_age, 86400)
-        if age_stop > max_age:
-            return None
-        return modulus, age_start, age_stop
-
-    async def _read_cmts_counter(
-        self,
-        cmts_ip: str,
-        oid: str,
-        *,
-        timeticks: bool = False,
-    ) -> int | None:
-        """Read one CMTS scalar through the existing PyPNM API abstraction."""
-        try:
-            result = await self._send_agent_command(
-                'snmp_get',
-                {
-                    'target_ip': cmts_ip,
-                    'oid': oid,
-                    'community': self.community,
-                    'timeout': 5,
-                },
-                timeout=15,
-            )
-            return self._parse_unsigned_counter(
-                self._agent_scalar_value(result),
-                timeticks=timeticks,
-            )
-        except Exception as exc:
-            self.logger.debug('CMTS scalar %s unavailable on %s: %s', oid, cmts_ip, exc)
-            return None
-
-    @staticmethod
-    def _sanitize_probe_text(value: Any, *, max_length: int = 256) -> str | None:
-        """Bound text and redact addresses before returning probe data."""
-        import re
-
-        text = ' '.join(str(value or '').split())
-        if not text or 'No Such' in text:
-            return None
-        text = re.sub(
-            r'(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b|\b[0-9a-f]{4}(?:\.[0-9a-f]{4}){2}\b',
-            '[redacted]',
-            text,
-        )
-
-        def _redact_ip(match: Any) -> str:
-            candidate = match.group(0)
-            try:
-                ipaddress.ip_address(candidate.split('%', 1)[0])
-            except ValueError:
-                return candidate
-            return '[redacted]'
-
-        text = re.sub(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])', _redact_ip, text)
-        text = re.sub(
-            r'(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9_.-]+)?(?![0-9A-Za-z])',
-            _redact_ip,
-            text,
-        )
-        return text[:max_length] or None
-
-    @staticmethod
-    def _normalize_probe_object_id(value: Any) -> str | None:
-        """Return only a numeric dotted sysObjectID value."""
-        import re
-
-        text = str(value or '').strip().replace('iso.', '1.')
-        symbolic_prefixes = {
-            'SNMPv2-SMI::enterprises.': '1.3.6.1.4.1.',
-            'SNMPv2-SMI::mib-2.': '1.3.6.1.2.1.',
-        }
-        for symbolic, numeric in symbolic_prefixes.items():
-            if symbolic in text:
-                text = text.replace(symbolic, numeric)
-        match = re.search(r'(?<!\d)(?:\d+\.){3,}\d+(?!\d)', text)
-        return match.group(0).lstrip('.') if match else None
-
-    async def probe_remote_query_identity(
-        self,
-        *,
-        cmts_ip: str,
-        limit: int = 1000,
-        sample_limit: int = 10,
-    ) -> dict:
-        """Probe fixed remote-query identity OIDs without SET, fallback, or persistence."""
-        limit = max(1, min(int(limit), 1000))
-        sample_limit = max(0, min(int(sample_limit), 20))
-
-        async def _read_scalar(oid: str) -> str | None:
-            try:
-                result = await self._send_agent_command(
-                    'snmp_get',
-                    {
-                        'target_ip': cmts_ip,
-                        'oid': oid,
-                        'timeout': 5,
-                    },
-                    timeout=15,
-                )
-                return self._agent_scalar_value(result)
-            except Exception as exc:
-                self.logger.debug('Probe scalar %s unavailable on %s: %s', oid, cmts_ip, exc)
-                return None
-
-        (
-            sys_object_raw,
-            sys_descr_raw,
-            start_before,
-            stop_before,
-            interval,
-        ) = await asyncio.gather(
-            _read_scalar(OID_CMTS_SYS_OBJECT_ID),
-            _read_scalar(OID_CMTS_SYS_DESCR),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_START),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_STOP),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_INTERVAL),
-        )
-
-        try:
-            walk_result = await self._send_agent_command(
-                'snmp_parallel_walk',
-                {
-                    'ip': cmts_ip,
-                    'oids': [OID_CAD_RQ_POLL_TIME, OID_CAD_RQ_SYS_DESCR],
-                    'timeout': 5,
-                    'limit': limit,
-                    'overall_timeout': 45,
-                },
-                timeout=60,
-            )
-        except Exception:
-            self.logger.exception('Remote-query probe dispatch failed for %s', cmts_ip)
-            return {
-                'success': False,
-                'cmts_sys_object_id': self._normalize_probe_object_id(sys_object_raw),
-                'cmts_sys_descr': self._sanitize_probe_text(sys_descr_raw),
-                'error_code': 'agent_error',
-            }
-
-        start_after, stop_after, now = await asyncio.gather(
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_START),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_STOP),
-            self._read_cmts_counter(cmts_ip, OID_SYS_UPTIME, timeticks=True),
-        )
-
-        required_oids = {OID_CAD_RQ_POLL_TIME, OID_CAD_RQ_SYS_DESCR}
-        errors = walk_result.get('errors') if isinstance(walk_result, dict) else None
-        completed_values = (
-            walk_result.get('completed_oids') if isinstance(walk_result, dict) else None
-        )
-        truncated_values = (
-            walk_result.get('truncated_oids') if isinstance(walk_result, dict) else None
-        )
-        raw_results = walk_result.get('results') if isinstance(walk_result, dict) else None
-        structurally_valid = bool(
-            isinstance(walk_result, dict)
-            and (errors is None or isinstance(errors, dict))
-            and isinstance(completed_values, (list, tuple, set))
-            and (truncated_values is None or isinstance(truncated_values, (list, tuple, set)))
-            and isinstance(raw_results, dict)
-            and all(isinstance(raw_results.get(oid), list) for oid in required_oids)
-        )
-        errors = errors or {} if isinstance(errors, dict) or errors is None else {}
-        completed_oids = set(completed_values or []) if structurally_valid else set()
-        truncated_oids = set(truncated_values or []) if structurally_valid else set()
-        table_success = bool(
-            structurally_valid
-            and walk_result.get('success') is True
-            and OID_CAD_RQ_SYS_DESCR not in errors
-        )
-        remote_query_complete = bool(
-            table_success
-            and not any(oid in errors for oid in required_oids)
-            and required_oids.issubset(completed_oids)
-            and not bool(required_oids & truncated_oids)
-        )
-        remote_query_truncated = bool(required_oids & truncated_oids)
-
-        poll_times: dict[str, int] = {}
-        descriptions: dict[str, str] = {}
-        remote_query_row_count = 0
-        if structurally_valid:
-            for item in raw_results.get(OID_CAD_RQ_POLL_TIME, []):
-                if not isinstance(item, dict):
-                    continue
-                mac = self._remote_query_mac_from_oid(item.get('oid'), OID_CAD_RQ_POLL_TIME)
-                poll_time = self._parse_unsigned_counter(item.get('value'))
-                if mac and poll_time is not None and poll_time > 0:
-                    poll_times[mac] = poll_time
-            for item in raw_results.get(OID_CAD_RQ_SYS_DESCR, []):
-                if not isinstance(item, dict):
-                    continue
-                value = str(item.get('value') or '').strip()
-                if value.startswith('STRING:'):
-                    value = value[len('STRING:'):].strip()
-                value = value.strip('"')
-                if not value or 'No Such' in value:
-                    continue
-                remote_query_row_count += 1
-                mac = self._remote_query_mac_from_oid(item.get('oid'), OID_CAD_RQ_SYS_DESCR)
-                if mac:
-                    descriptions[mac] = value
-
-        generation_stable = bool(
-            start_before is not None
-            and stop_before is not None
-            and start_after == start_before
-            and stop_after == stop_before
-            and now is not None
-        )
-        fresh_window = (
-            self._remote_query_fresh_window(start_after, stop_after, now, interval)
-            if generation_stable
-            else None
-        )
-        freshness_verified = fresh_window is not None
-        fresh_descriptions: list[str] = []
-        if fresh_window is not None:
-            modulus, age_start, age_stop = fresh_window
-            for mac, description in descriptions.items():
-                poll_time = poll_times.get(mac)
-                if poll_time is None:
-                    continue
-                age_poll = (now - poll_time) % modulus
-                if age_stop <= age_poll <= age_start:
-                    fresh_descriptions.append(description)
-
-        identity_samples: list[dict[str, str]] = []
-        seen_samples: set[tuple[str, str, str]] = set()
-        parsed_identity_count = 0
-        for description in fresh_descriptions:
-            parsed = self._parse_sys_descr(description)
-            sample = {
-                'vendor': self._sanitize_probe_text(parsed.get('vendor'), max_length=128),
-                'model': self._sanitize_probe_text(parsed.get('model'), max_length=128),
-                'software_version': self._sanitize_probe_text(
-                    parsed.get('software'), max_length=128
-                ),
-            }
-            sample = {key: value for key, value in sample.items() if value}
-            if not sample or not any(
-                value != '[redacted]' and self._meaningful_identity_value(value)
-                for value in sample.values()
-            ):
-                continue
-            parsed_identity_count += 1
-            if sample_limit == 0:
-                continue
-            sample_key = (
-                sample.get('vendor', ''),
-                sample.get('model', ''),
-                sample.get('software_version', ''),
-            )
-            if sample_key in seen_samples or len(identity_samples) >= sample_limit:
-                continue
-            seen_samples.add(sample_key)
-            identity_samples.append(sample)
-
-        remote_query_supported = table_success
-        enrichment_usable = bool(
-            remote_query_complete
-            and freshness_verified
-            and parsed_identity_count > 0
-        )
-        error_code = None
-        if not structurally_valid:
-            error_code = 'malformed_response'
-        elif not table_success:
-            error_code = 'remote_query_unavailable'
-        elif not remote_query_complete:
-            error_code = 'remote_query_incomplete'
-        elif not freshness_verified:
-            error_code = 'freshness_unverified'
-        elif not fresh_descriptions:
-            error_code = 'no_fresh_rows'
-        elif parsed_identity_count == 0:
-            error_code = 'identity_unparseable'
-
-        return {
-            'success': table_success,
-            'cmts_sys_object_id': self._normalize_probe_object_id(sys_object_raw),
-            'cmts_sys_descr': self._sanitize_probe_text(sys_descr_raw),
-            'remote_query_supported': remote_query_supported,
-            'remote_query_complete': remote_query_complete,
-            'remote_query_truncated': remote_query_truncated,
-            'remote_query_row_count': remote_query_row_count,
-            'freshness_verified': freshness_verified,
-            'fresh_row_count': len(fresh_descriptions),
-            'parsed_identity_count': parsed_identity_count,
-            'enrichment_usable': enrichment_usable,
-            'identity_samples': identity_samples,
-            'error_code': error_code,
-        }
-
-    async def _enrich_modems_cadant_remote_query(
-        self,
-        modems: list,
-        *,
-        cmts_ip: str,
-        cancel_cmts_ip: str | None = None,
-    ) -> int:
-        """Fill missing identity from a fresh, completed Cadant remote-query cycle."""
-        candidates = [modem for modem in modems if self._needs_identity_enrichment(modem)]
-        if (
-            not candidates
-            or not cmts_ip
-            or self._enrichment_cancelled(cancel_cmts_ip)
-        ):
-            return 0
-
-        start_before, stop_before, interval = await asyncio.gather(
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_START),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_STOP),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_INTERVAL),
-        )
-        if self._enrichment_cancelled(cancel_cmts_ip):
-            return 0
-        if (
-            start_before is None
-            or stop_before is None
-            or start_before <= 0
-            or stop_before <= 0
-        ):
-            self.logger.debug('Cadant remote query unsupported or inactive on %s', cmts_ip)
-            return 0
-
-        walk_limit = min(50000, max(1000, len(modems) + 100))
-        try:
-            walk_result = await self._send_agent_command(
-                'snmp_parallel_walk',
-                {
-                    'ip': cmts_ip,
-                    'oids': [OID_CAD_RQ_POLL_TIME, OID_CAD_RQ_SYS_DESCR],
-                    'community': self.community,
-                    'timeout': 5,
-                    'limit': walk_limit,
-                    'overall_timeout': 270,
-                },
-                timeout=300,
-            )
-        except Exception as exc:
-            self.logger.debug('Cadant remote-query table unavailable on %s: %s', cmts_ip, exc)
-            return 0
-
-        if self._enrichment_cancelled(cancel_cmts_ip):
-            return 0
-        if not isinstance(walk_result, dict):
-            self.logger.debug('Cadant remote-query response malformed on %s; using fallback', cmts_ip)
-            return 0
-
-        required_oids = {OID_CAD_RQ_POLL_TIME, OID_CAD_RQ_SYS_DESCR}
-        errors = walk_result.get('errors')
-        completed_values = walk_result.get('completed_oids')
-        truncated_values = walk_result.get('truncated_oids')
-        raw_results = walk_result.get('results')
-        if (
-            errors is not None and not isinstance(errors, dict)
-            or not isinstance(completed_values, (list, tuple, set))
-            or truncated_values is not None
-            and not isinstance(truncated_values, (list, tuple, set))
-            or not isinstance(raw_results, dict)
-            or not all(isinstance(raw_results.get(oid), list) for oid in required_oids)
-        ):
-            self.logger.debug('Cadant remote-query response malformed on %s; using fallback', cmts_ip)
-            return 0
-        errors = errors or {}
-        completed_oids = set(completed_values)
-        truncated_oids = set(truncated_values or [])
-        if (
-            walk_result.get('success') is not True
-            or any(oid in errors for oid in required_oids)
-            or not required_oids.issubset(completed_oids)
-            or bool(required_oids & truncated_oids)
-        ):
-            self.logger.debug('Cadant remote-query table incomplete on %s; using fallback', cmts_ip)
-            return 0
-
-        start_after, stop_after, now = await asyncio.gather(
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_START),
-            self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_STOP),
-            self._read_cmts_counter(cmts_ip, OID_SYS_UPTIME, timeticks=True),
-        )
-        if self._enrichment_cancelled(cancel_cmts_ip):
-            return 0
-        if (
-            start_after is None
-            or stop_after is None
-            or now is None
-            or start_after != start_before
-            or stop_after != stop_before
-        ):
-            self.logger.debug('Cadant remote-query generation changed on %s; using fallback', cmts_ip)
-            return 0
-
-        fresh_window = self._remote_query_fresh_window(
-            start_after,
-            stop_after,
-            now,
-            interval,
-        )
-        if fresh_window is None:
-            self.logger.debug('Cadant remote-query cycle is stale or in progress on %s', cmts_ip)
-            return 0
-        modulus, age_start, age_stop = fresh_window
-
-        poll_times: dict[str, int] = {}
-        for item in raw_results.get(OID_CAD_RQ_POLL_TIME, []):
-            if not isinstance(item, dict):
-                continue
-            mac = self._remote_query_mac_from_oid(item.get('oid'), OID_CAD_RQ_POLL_TIME)
-            poll_time = self._parse_unsigned_counter(item.get('value'))
-            if mac and poll_time is not None and poll_time > 0:
-                poll_times[mac] = poll_time
-
-        descriptions: dict[str, str] = {}
-        for item in raw_results.get(OID_CAD_RQ_SYS_DESCR, []):
-            if not isinstance(item, dict):
-                continue
-            mac = self._remote_query_mac_from_oid(item.get('oid'), OID_CAD_RQ_SYS_DESCR)
-            value = str(item.get('value') or '').strip()
-            if value.startswith('STRING:'):
-                value = value[len('STRING:'):].strip()
-            value = value.strip('"')
-            if mac and value and 'No Such' not in value:
-                descriptions[mac] = value
-
-        if self._enrichment_cancelled(cancel_cmts_ip):
-            return 0
-
-        enriched = 0
-        for modem in candidates:
-            normalized_mac = ''.join(
-                char for char in str(modem.get('mac_address') or '').lower()
-                if char in '0123456789abcdef'
-            )
-            if len(normalized_mac) != 12:
-                continue
-            mac = ':'.join(normalized_mac[index:index + 2] for index in range(0, 12, 2))
-            poll_time = poll_times.get(mac)
-            description = descriptions.get(mac)
-            if poll_time is None or not description:
-                continue
-            age_poll = (now - poll_time) % modulus
-            if not (age_stop <= age_poll <= age_start):
-                continue
-            parsed = self._parse_sys_descr(description)
-            if self._merge_parsed_identity(modem, parsed):
-                enriched += 1
-
-        self.logger.info(
-            'Cadant remote-query identity: %s/%s candidate modems enriched on %s',
-            enriched,
-            len(candidates),
-            cmts_ip,
-        )
-        return enriched
-
-    async def _enrich_modem_identities(
-        self,
-        modems: list,
-        *,
-        cmts_ip: str,
-        modem_community: str | None = None,
-        progress_cmts_ip: str | None = None,
-    ) -> list:
-        """Run existing identity enrichment: CMTS remote query, then direct fallback."""
-        if self._enrichment_cancelled(progress_cmts_ip):
-            return modems
-        if progress_cmts_ip and progress_cmts_ip in _enrichment_cache:
-            _enrichment_cache[progress_cmts_ip]['enrich_progress'] = {
-                'completed': 0,
-                'total': len(modems),
-            }
-        await self._enrich_modems_cadant_remote_query(
-            modems,
-            cmts_ip=cmts_ip,
-            cancel_cmts_ip=progress_cmts_ip,
-        )
-        if self._enrichment_cancelled(progress_cmts_ip):
-            return modems
-        fallback = [modem for modem in modems if self._needs_identity_enrichment(modem)]
-        if fallback:
-            await self._enrich_modems_direct(
-                fallback,
-                modem_community,
-                cmts_ip=progress_cmts_ip,
-            )
-        if (
-            progress_cmts_ip
-            and progress_cmts_ip in _enrichment_cache
-            and not self._enrichment_cancelled(progress_cmts_ip)
-        ):
-            _enrichment_cache[progress_cmts_ip]['enrich_progress'] = {
-                'completed': len(modems),
-                'total': len(modems),
-            }
-        return modems
-
     async def _enrich_modems_direct(self, modems: list, modem_community: str | None = None, cmts_ip: str = None) -> list:
         """
         Query each modem directly via agent SNMP to get sysDescr + DOCSIS cap.
@@ -2680,9 +2062,6 @@ class CMTSModemService:
 
         OID_SYS_DESCR = '1.3.6.1.2.1.1.1.0'
         ALL_OIDS = [OID_SYS_DESCR, OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY]
-
-        if self._enrichment_cancelled(cmts_ip):
-            return modems
 
         online_statuses = {'operational', 'registrationComplete', 'ipComplete', 'online'}
         skip_prefixes = ('10.160.', '10.254.', '10.255.')
@@ -2748,9 +2127,6 @@ class CMTSModemService:
         except Exception as e:
             self.logger.warning(f"Ping sweep unavailable ({e}), proceeding with all modems")
 
-        if self._enrichment_cancelled(cmts_ip):
-            return modems
-
         # Initialise progress in cache so polling clients can track it
         if cmts_ip and cmts_ip in _enrichment_cache:
             _enrichment_cache[cmts_ip]['enrich_progress'] = {'completed': 0, 'total': len(online_modems)}
@@ -2802,14 +2178,14 @@ class CMTSModemService:
                     sys_descr = raw.split('=', 1)[-1].strip() if '=' in raw else raw
                     if sys_descr and 'No Such' not in sys_descr:
                         info = self._parse_sys_descr(sys_descr)
-                        if self._merge_parsed_identity(modem, info):
-                            enriched_count += 1
-                            if not _first_success_logged:
-                                _first_success_logged = True
-                                self.logger.info(
-                                    f"Enrichment sample: {ip} → model={modem.get('model')} "
-                                    f"vendor={modem.get('vendor')} sw={modem.get('software_version')}"
-                                )
+                        modem['model'] = info.get('model', 'Unknown')
+                        modem['software_version'] = info.get('software', '')
+                        if info.get('vendor'):
+                            modem['vendor'] = info['vendor']
+                        enriched_count += 1
+                        if not _first_success_logged:
+                            _first_success_logged = True
+                            self.logger.info(f"Enrichment sample: {ip} → model={modem['model']} vendor={modem.get('vendor')} sw={modem.get('software_version')}")
 
                 # ── DOCSIS capability (modern scalar first, legacy fallback) ──
                 docsis_version = None

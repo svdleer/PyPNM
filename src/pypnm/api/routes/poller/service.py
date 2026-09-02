@@ -376,12 +376,11 @@ class PollerService:
         )
         service = CMTSModemService(agent_priority="bulk")
         asyncio.run(
-            service._enrich_modem_identities(
+            service._enrich_modems_direct(
                 modem_dicts,
-                cmts_ip=cmts_ip,
                 # Poller enrichment must not share GUI cache progress or
                 # cancellation state keyed by CMTS address.
-                progress_cmts_ip=None,
+                cmts_ip=None,
             )
         )
 
@@ -1603,7 +1602,7 @@ class PollerService:
                 _to_bool(r.get("partial_service_downstream")),
                 _to_bool(r.get("partial_service_upstream")),
                 r.get("partial_service_state"),
-                r.get("software_version") or None,
+                r.get("software_version") or r.get("firmware") or None,
                 now,
                 now,
                 now,
@@ -4436,7 +4435,7 @@ class PollerService:
                                 "ofdma_rf_port_ifindex", "ofdm_enabled", "ofdma_enabled",
                                 "partial_service", "partial_service_downstream",
                                 "partial_service_upstream", "partial_service_state",
-                                "software_version", "vendor", "model",
+                                "firmware", "software_version", "vendor", "model",
                             )},
                         }], source_poller="refresh-fallback")
                     out = dict(m)
@@ -4617,7 +4616,7 @@ class PollerService:
                 if not software_ver:
                     software_ver = sys_descr_obj.get("sw_rev") or sys_descr_obj.get("SW_REV") or sys_descr_obj.get("software")
 
-            # Final fallback: valid identity values from the live CMTS row.
+            # Final fallback: values from CMTS walk row (often includes firmware)
             if (not vendor or not model_name or not software_ver) and cmts:
                 if not cmts_fallback_modem:
                     cmts_fallback_modem = self._resolve_modem_from_cmts(mac, cmts, base)
@@ -4627,7 +4626,7 @@ class PollerService:
                     if not model_name:
                         model_name = cmts_fallback_modem.get("model")
                     if not software_ver:
-                        software_ver = cmts_fallback_modem.get("software_version")
+                        software_ver = cmts_fallback_modem.get("software_version") or cmts_fallback_modem.get("firmware")
 
             cable_source = dict(modem or {})
             if isinstance(cmts_fallback_modem, dict):
@@ -4804,7 +4803,7 @@ class PollerService:
 
         vendor_counts: Counter[str] = Counter()
         model_counts: Counter[str] = Counter()
-        software_version_counts: Counter[str] = Counter()
+        firmware_counts: Counter[str] = Counter()
         docsis_counts: Counter[str] = Counter()
         total = 0
         enriched = 0
@@ -4815,23 +4814,23 @@ class PollerService:
             total += count
             vendor_text = str(source.get("vendor") or "").strip()
             model_text = str(source.get("model") or "").strip()
-            software_version_text = str(source.get("software_version") or "").strip()
+            firmware_text = str(source.get("software_version") or "").strip()
             vendor = _meaningful(vendor_text)
             model = _meaningful(model_text)
-            software_version = _meaningful(software_version_text)
+            firmware = _meaningful(firmware_text)
             docsis = _meaningful(source.get("docsis_version"))
             if vendor:
                 vendor_counts[vendor] += count
             if model:
                 model_counts[model] += count
-            if software_version:
-                software_version_counts[software_version] += count
+            if firmware:
+                firmware_counts[firmware] += count
             if docsis:
                 docsis_counts[docsis] += count
             if (
                 vendor_text.lower() not in enriched_placeholders
                 and (
-                    bool(software_version_text)
+                    bool(firmware_text)
                     or model_text.lower() not in enriched_placeholders
                 )
             ):
@@ -4856,8 +4855,7 @@ class PollerService:
             "area": normalized_area or None,
             "vendors": _top(vendor_counts),
             "models": _top(model_counts),
-            # Backward-compatible API key; internal storage/model uses software_version.
-            "firmwares": _top(software_version_counts),
+            "firmwares": _top(firmware_counts),
             "docsis_versions": _top(docsis_counts),
         }
 

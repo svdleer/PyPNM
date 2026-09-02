@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict, List, Literal, Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -91,53 +90,6 @@ class CPECollectionResponse(BaseModel):
     error: Optional[str] = None
 
 
-class CMTSRemoteQueryProbeRequest(BaseModel):
-    """Request a bounded, read-only CMTS remote-query capability probe."""
-
-    cmts_ip: str = Field(..., description="Allowlisted CMTS IP address")
-    limit: int = Field(
-        default=1000,
-        ge=1,
-        le=1000,
-        description="Maximum rows read from each fixed remote-query column",
-    )
-    sample_limit: int = Field(
-        default=10,
-        ge=0,
-        le=20,
-        description="Maximum number of sanitized fresh identity summaries returned",
-    )
-
-    class Config:
-        extra = "forbid"
-
-
-class RemoteQueryIdentitySummary(BaseModel):
-    """Sanitized modem identity parsed from remote-query sysDescr."""
-
-    vendor: Optional[str] = None
-    model: Optional[str] = None
-    software_version: Optional[str] = None
-
-
-class CMTSRemoteQueryProbeResponse(BaseModel):
-    """Non-persistent result from the fixed CMTS remote-query probe."""
-
-    success: bool
-    cmts_sys_object_id: Optional[str] = None
-    cmts_sys_descr: Optional[str] = None
-    remote_query_supported: bool = False
-    remote_query_complete: bool = False
-    remote_query_truncated: bool = False
-    remote_query_row_count: int = 0
-    freshness_verified: bool = False
-    fresh_row_count: int = 0
-    parsed_identity_count: int = 0
-    enrichment_usable: bool = False
-    identity_samples: List[RemoteQueryIdentitySummary] = Field(default_factory=list)
-    error_code: Optional[str] = None
-
-
 class ModemInfo(BaseModel):
     """Modem information from CMTS discovery."""
     mac_address: str = Field(..., description="Modem MAC address")
@@ -154,6 +106,7 @@ class ModemInfo(BaseModel):
     vendor: Optional[str] = Field(default=None, description="Vendor from MAC OUI or sysDescr")
     model: Optional[str] = Field(default=None, description="Model from sysDescr")
     software_version: Optional[str] = Field(default=None, description="Software/firmware version from sysDescr")
+    firmware: Optional[str] = Field(default=None, description="Firmware from CMTS (if available)")
     upstream_interface: Optional[str] = Field(default=None, description="Upstream interface name")
     upstream_ifindex: Optional[int] = Field(default=None, description="Upstream interface ifIndex")
     upstream_channel_id: Optional[int] = Field(default=None, description="Upstream channel ID")
