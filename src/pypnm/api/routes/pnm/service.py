@@ -1390,7 +1390,7 @@ class PNMDiagnosticsService:
 
         return {
             'success': False,
-            'error': f'PNM test type {test_type} not yet implemented via direct SNMP'
+            'error': f'PNM test type {test_type} not yet implemented via SNMP retrieval'
         }
 
 

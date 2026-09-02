@@ -22,10 +22,6 @@ async def main() -> None:
     args = parser.parse_args()
     cm = CableModem(mac_address=MacAddress(args.mac), inet=Inet(args.inet), write_community=str(args.community_write))
 
-    if not cm.is_ping_reachable():
-        logging.error(f"{cm.get_inet_address} not reachable, exiting...")
-        exit(1)
-
     logging.info(f"Connected to: {await cm.getSysDescr()}")
 
     await cm.setDocsPnmBulk(args.tftp)

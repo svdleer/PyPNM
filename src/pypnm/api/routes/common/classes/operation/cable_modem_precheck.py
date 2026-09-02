@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections.abc import Iterable
 from typing import Dict, Tuple
@@ -24,9 +23,6 @@ from pypnm.lib.types import InetAddressStr, MacAddressStr
 
 PreCheckStatus = tuple[ServiceStatusCode, str]
 
-# Check once at import time
-_USE_AGENT = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
-
 # Simple in-memory cache for ping/SNMP reachability checks
 # Cache format: {ip_address: (timestamp, ping_status, snmp_status)}
 _REACHABILITY_CACHE: Dict[str, Tuple[float, ServiceStatusCode, ServiceStatusCode]] = {}
@@ -38,8 +34,7 @@ class CableModemServicePreCheck:
     Performs preliminary connectivity and validation checks against a DOCSIS Cable Modem.
 
     This service supports:
-    - ICMP ping reachability check (via agent when PYPNM_USE_AGENT_SNMP=true)
-    - SNMP reachability check (via agent when PYPNM_USE_AGENT_SNMP=true)
+    - Agent-only modem reachability checks
     - MAC address verification
     - Optional DOCSIS version compatibility validation
     - Optional validation that OFDM (DS) and/or OFDMA (US) channels exist
@@ -117,12 +112,28 @@ class CableModemServicePreCheck:
         return get_agent_manager()
 
     def _get_snmp_agent(self):
-        """Return the agent manager and first authenticated agent with cm_reachable capability."""
+        """Return the manager and a valid modem-capable agent.
+
+        Honor the agent pinned by the CableModem SNMP transport when present;
+        never substitute another connected agent for a stale pinned agent.
+        """
         mgr = self._get_agent_manager()
         if not mgr:
             return None, None
-        agent = mgr.get_agent_for_capability('cm_reachable')
-        return mgr, agent
+
+        pinned_agent_id = getattr(getattr(self.cm, "_snmp", None), "_agent_id", None)
+        if pinned_agent_id:
+            agent = mgr.get_agent(pinned_agent_id)
+            if (
+                agent is None
+                or not agent.authenticated
+                or not agent.is_alive()
+                or "cm_reachable" not in (agent.capabilities or [])
+            ):
+                return mgr, None
+            return mgr, agent
+
+        return mgr, mgr.get_agent_for_capability("cm_reachable")
 
     # ------------------------------------------------------------------
     # Main pre-check
@@ -131,10 +142,10 @@ class CableModemServicePreCheck:
     async def run_precheck(self) -> tuple[ServiceStatusCode, str]:
         """
         Run full pre-check routine:
-          1. Ping modem  (via agent when available)
-          2. Perform SNMP check (via agent when available)
-          3. Does Mac Match CableModem Mac
-          4. Validate DOCSIS version (optional)
+          1. Validate that a connected modem-capable agent is available
+          2. Validate SNMP transport readiness without an additional probe
+          3. Validate DOCSIS version (optional)
+          4. Run requested channel and PNM readiness checks
 
         Returns:
             Tuple[ServiceStatusCode, str]: Status and message.
@@ -143,29 +154,15 @@ class CableModemServicePreCheck:
 
         status = await self.ping_reachable()
         if status != ServiceStatusCode.SUCCESS:
-            msg = f"Ping check failed: {status}"
+            msg = f"Agent availability check failed: {status}"
             self.logger.error(msg)
             return status, msg
 
         status = await self.snmp_reachable()
         if status != ServiceStatusCode.SUCCESS:
-            msg = f"SNMP check failed: {status}"
+            msg = f"SNMP readiness check failed: {status}"
             self.logger.error(msg)
             return status, msg
-
-        if not self._ignore_mac_address_check and not _USE_AGENT:
-            status = await self.isMacCorrect()
-            if status != ServiceStatusCode.SUCCESS:
-
-                try:
-                    mac = await self.getRealMacAddress()
-                except Exception as e:
-                    self.logger.error(f"Error retrieving real MAC address: {e}", exc_info=True)
-                    mac = "Unknown"
-
-                msg = f"Found: {mac} MAC address CableModem Mac check failed: {status}"
-                self.logger.error(msg)
-                return status, msg
 
         if self.check_docsis_version:
             status, msg = await self.validate_docsis_version()
@@ -197,7 +194,7 @@ class CableModemServicePreCheck:
             if status != ServiceStatusCode.SUCCESS:
                 return status, msg
 
-        msg = "Pre-check successful: CableModem reachable via ping and SNMP"
+        msg = "Pre-check successful: modem-capable agent and SNMP transport are ready"
         self.logger.debug(msg)
         return ServiceStatusCode.SUCCESS, msg
 
@@ -206,52 +203,29 @@ class CableModemServicePreCheck:
     # ------------------------------------------------------------------
 
     async def ping_reachable(self) -> ServiceStatusCode:
-        """
-        Perform an ICMP ping test.
-        When PYPNM_USE_AGENT_SNMP is set, the ping is executed by the remote
-        agent (which actually has L3 access to the modem network).
-        
-        Note: For agent-based SNMP, we skip the ping check and rely on SNMP
-        reachability instead, as ping can timeout when multiple parallel
-        requests queue at the agent.
-        
-        Results are cached for 30 seconds to avoid redundant checks when
-        multiple endpoints are called for the same modem.
+        """Validate agent availability without issuing a separate ping probe."""
+        mgr, agent = self._get_snmp_agent()
+        if not mgr or not agent:
+            self.logger.error(
+                "No valid modem-capable agent available; not falling back to local ping"
+            )
+            return ServiceStatusCode.PING_FAILED
 
-        Returns:
-            SUCCESS if reachable, else PING_FAILED.
-        """
-        # Check cache first
+        # Check cache only after revalidating the currently selected/pinned agent.
         cache_entry = _REACHABILITY_CACHE.get(self._ip_address)
         if cache_entry:
             timestamp, ping_status, _ = cache_entry
             if time.time() - timestamp < _CACHE_TTL:
-                self.logger.debug(f"Ping check result from cache: {ping_status}")
+                self.logger.debug(f"Agent availability result from cache: {ping_status}")
                 return ping_status
-        
-        if _USE_AGENT:
-            # Skip ping for agent transport - SNMP check is more reliable
-            self.logger.debug("Skipping ping check for agent transport (will check SNMP instead)")
-            status = ServiceStatusCode.SUCCESS
-        else:
-            status = self._ping_local()
-        
+
+        self.logger.debug("Skipping ping probe; validated modem-capable agent availability")
+        status = ServiceStatusCode.SUCCESS
+
         # Update cache
         snmp_status = cache_entry[2] if cache_entry else None
         _REACHABILITY_CACHE[self._ip_address] = (time.time(), status, snmp_status)
         return status
-
-    def _ping_local(self) -> ServiceStatusCode:
-        """Local ping (direct network access)."""
-        try:
-            if self.cm.is_ping_reachable():
-                self.logger.debug("Ping check passed (local)")
-                return ServiceStatusCode.SUCCESS
-            self.logger.debug("Ping check failed (local)")
-            return ServiceStatusCode.PING_FAILED
-        except Exception as e:
-            self.logger.error(f"Ping check exception: {e}", exc_info=True)
-            return ServiceStatusCode.PING_FAILED
 
     async def _ping_via_agent(self) -> ServiceStatusCode:
         """Ping via pyPNMAgent over WebSocket."""
@@ -286,59 +260,37 @@ class CableModemServicePreCheck:
     # ------------------------------------------------------------------
 
     async def snmp_reachable(self) -> ServiceStatusCode:
-        """
-        Perform SNMP reachability check (sysDescr GET).
-        When PYPNM_USE_AGENT_SNMP is set, the SNMP query is routed through
-        the remote agent.
-        
-        Results are cached for 30 seconds to avoid redundant checks when
-        multiple endpoints are called for the same modem.
+        """Validate agent SNMP readiness without adding a queue task."""
+        # Revalidate the currently selected/pinned agent before consulting the
+        # reachability cache. _snmp_via_agent intentionally performs no probe.
+        status = await self._snmp_via_agent()
+        if status != ServiceStatusCode.SUCCESS:
+            return status
 
-        Returns:
-            SUCCESS if SNMP response received, else UNREACHABLE_SNMP.
-        """
-        # Check cache first
         cache_entry = _REACHABILITY_CACHE.get(self._ip_address)
         if cache_entry:
-            timestamp, ping_status, snmp_status = cache_entry
+            timestamp, _, snmp_status = cache_entry
             if snmp_status and time.time() - timestamp < _CACHE_TTL:
-                self.logger.debug(f"SNMP check result from cache: {snmp_status}")
+                self.logger.debug(f"SNMP readiness result from cache: {snmp_status}")
                 return snmp_status
-        
-        if _USE_AGENT:
-            status = await self._snmp_via_agent()
-        else:
-            status = await self._snmp_local()
-        
+
         # Update cache (preserve ping_status if present)
         ping_status = cache_entry[1] if cache_entry else None
         _REACHABILITY_CACHE[self._ip_address] = (time.time(), ping_status, status)
         return status
 
-    async def _snmp_local(self) -> ServiceStatusCode:
-        """Direct SNMP sysDescr check."""
-        try:
-            if await self.cm.is_snmp_reachable():
-                self.logger.debug("SNMP check passed (local)")
-                return ServiceStatusCode.SUCCESS
-            self.logger.debug("SNMP check failed (local)")
-            return ServiceStatusCode.UNREACHABLE_SNMP
-        except Exception as e:
-            self.logger.error(f"SNMP check exception: {e}", exc_info=True)
-            return ServiceStatusCode.UNREACHABLE_SNMP
-
     async def _snmp_via_agent(self) -> ServiceStatusCode:
-        """SNMP sysDescr check via pyPNMAgent.
+        """Validate SNMP agent availability without issuing a sysDescr task."""
+        mgr, agent = self._get_snmp_agent()
+        if not mgr or not agent:
+            self.logger.error(
+                "No valid modem-capable agent available for SNMP; not falling back to local"
+            )
+            return ServiceStatusCode.UNREACHABLE_SNMP
 
-        When the agent transport is active the agent queue is typically
-        loaded with bulk_get/walk tasks for channel-stats etc.  Sending an
-        extra sysDescr GET just to pre-validate reachability adds latency
-        and frequently times out, returning a false UNREACHABLE_SNMP.
-        Since actual SNMP operations performed later will fail with their
-        own errors if the modem is genuinely unreachable, we skip the
-        redundant check here and return SUCCESS immediately.
-        """
-        self.logger.debug("SNMP precheck skipped (agent transport active — modem reachability checked implicitly)")
+        self.logger.debug(
+            "SNMP probe skipped; validated modem-capable agent availability"
+        )
         return ServiceStatusCode.SUCCESS
 
     # ------------------------------------------------------------------

@@ -38,10 +38,11 @@ def test_compose_has_expected_service_structure() -> None:
     assert build_args.get("PYTHON_VERSION") == "3.12", "Compose should pin the Python version"
 
     ports = service.get("ports") or []
-    assert any(
-        port in ("8000:8000", "${PYPNM_PORT:-8000}:8000")
-        for port in ports
-    ), "API port mapping must expose 8000"
+    if service.get("network_mode") != "host":
+        assert any(
+            port in ("8000:8000", "${PYPNM_PORT:-8000}:8000")
+            for port in ports
+        ), "Bridge networking must publish the API's port 8000"
 
     expected_volumes = {
         "pypnm_config": "/app/config",

@@ -16,6 +16,7 @@ from pypnm.api.routes.common.service.fiber_node_utils import (
     OID_MD_NODE_STATUS_MD_DS_SG_ID,
     parse_fn_name_from_oid,
 )
+from pypnm.lib.vendor_capabilities import get_vendor_from_mac
 
 
 # ── In-memory enrichment cache ──────────────────────────────────────────────
@@ -55,12 +56,13 @@ def _inventory_freshness_seconds() -> int:
 
 
 def cancel_enrichment(cmts_ip: str) -> bool:
-    """Signal a running background enrichment to stop. Returns True if one was running."""
+    """Mark a running CMTS-side enrichment as cancelled."""
     entry = _enrichment_cache.get(cmts_ip)
     if entry and entry.get('enriching'):
         entry['cancelled'] = True
         entry['enriching'] = False
-        entry['enriched'] = True   # stop polling loop on GUI side
+        entry['enriched'] = False
+        entry['enrichment_cancelled'] = True
         return True
     return False
 
@@ -84,9 +86,6 @@ OID_DS_PROFILE_LIST = '1.3.6.1.4.1.4491.2.1.28.1.3.1.2'  # docsIf31CmtsCmRegStat
 OID_US_PROFILE_LIST = '1.3.6.1.4.1.4491.2.1.28.1.3.1.3'  # docsIf31CmtsCmRegStatusUsProfileIucList
 OID_PARTIAL_SVC  = '1.3.6.1.4.1.4491.2.1.28.1.3.1.9'    # docsIf31CmtsCmRegStatusPartialSvcState
 OID_D4_ADV_CAP   = '1.3.6.1.4.1.4491.2.1.38.1.1.1.1.1'  # docsIf40CmtsCmRegStatusAdvBandPlanCapability
-# Direct cable-modem capability scalars
-OID_CM_DOCSIS_CAP = '1.3.6.1.4.1.4491.2.1.28.1.1.0'     # docsIf31DocsisBaseCapability.0
-OID_CM_DOCSIS_CAP_LEGACY = '1.3.6.1.2.1.10.127.1.1.5.0' # docsIfDocsisBaseCapability.0
 
 # Status code mapping (docsIfCmtsCmStatusValue)
 # 6 = registrationComplete → mapped to 'operational' since modem is fully online
@@ -150,36 +149,6 @@ class CMTSModemService:
             return result
         return {'success': False, 'error': 'No result from agent'}
 
-    async def _send_cm_agent_command(self, command: str, params: dict, timeout: float = 30, priority: str = 'bulk') -> dict:
-        """Send command to CM-reachable agent (for direct modem SNMP)."""
-        agent_manager = get_agent_manager()
-        if not agent_manager:
-            raise Exception("Agent manager not available")
-
-        agent_id = agent_manager.get_agent_id_for_capability('cm_reachable')
-        if not agent_id:
-            raise Exception("No cm_reachable agent available")
-
-        task_params = dict(params)
-        task_params['target_role'] = 'cm'
-        if not task_params.get('community'):
-            task_params.pop('community', None)
-        task_id = await agent_manager.send_task(
-            agent_id=agent_id,
-            command=command,
-            params=task_params,
-            timeout=timeout,
-            priority=priority,
-        )
-
-        result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
-        if result and 'result' in result:
-            return result['result']
-        # Propagate timeout/error from manager
-        if result and not result.get('success'):
-            return result
-        return {'success': False, 'error': 'No result from agent'}
-
     @staticmethod
     def _agent_scalar_value(result: dict) -> str | None:
         """Extract a scalar value from a normalized agent SNMP response."""
@@ -208,7 +177,6 @@ class CMTSModemService:
         cmts_ip: str,
         docsif3_index: int,
         community: str | None = None,
-        modem_ip: str | None = None,
     ) -> dict:
         """Resolve one modem's CMTS interface, Fiber Node, and DOCSIS version."""
         docsis_version = None
@@ -235,38 +203,6 @@ class CMTSModemService:
                 docsif3_index,
                 exc,
             )
-
-        # If the CMTS does not expose DOCS-IF40, ask this modem's capability
-        # scalar directly. The CM agent owns its SNMP community configuration.
-        if modem_ip and docsis_version != 'DOCSIS 4.0':
-            try:
-                cap_result = await self._send_cm_agent_command(
-                    'snmp_bulk_get',
-                    {
-                        'target_ip': modem_ip,
-                        'oids': [OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY],
-                        'timeout': 3,
-                        'retries': 0,
-                        'max_concurrent': 1,
-                    },
-                    timeout=20,
-                )
-                oid_results = cap_result.get('results') or {}
-                for oid in (OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY):
-                    result = oid_results.get(oid) or {}
-                    output = str(result.get('output') or '')
-                    if result.get('success') and output and 'No Such' not in output:
-                        raw_capability = output.split('=')[-1].strip() if '=' in output else output
-                        parsed_version = self._parse_docsis_cap(raw_capability)
-                        if parsed_version:
-                            docsis_version = parsed_version
-                            break
-            except Exception as exc:
-                self.logger.debug(
-                    "Direct DOCSIS capability lookup unavailable for %s: %s",
-                    modem_ip,
-                    exc,
-                )
 
         md_if_result = await self._send_agent_command(
             'snmp_get',
@@ -949,7 +885,6 @@ class CMTSModemService:
         enrich: bool = False,
         refresh: bool = False,
         collect_cpe: bool = False,
-        modem_community: str | None = None,
         cmts_hostname: str = "",
     ) -> Dict[str, Any]:
         """Discover cable modems from a CMTS.
@@ -978,6 +913,24 @@ class CMTSModemService:
                 and cache_sufficient
                 and (not collect_cpe or 'cpe_addresses' in cached)
             ):
+                if enrich and not cached.get('enriched') and not cached.get('enriching'):
+                    cached.update({
+                        'cancelled': False,
+                        'enrichment_cancelled': False,
+                        'enrichment_failed': False,
+                        'enriching': True,
+                        'enrich_progress': {
+                            'completed': 0,
+                            'total': len(cached.get('modems') or []),
+                        },
+                    })
+                    asyncio.create_task(
+                        self._background_enrich(
+                            cmts_ip,
+                            cached.get('modems') or [],
+                            cmts_hostname=cmts_hostname,
+                        )
+                    )
                 self.logger.info(
                     "Returning cached generation for %s (age=%.0fs, enrich=%s)",
                     cmts_ip, age, enrich,
@@ -1048,14 +1001,12 @@ class CMTSModemService:
                     'raw_d3_mac_count': (snapshot or {}).get('raw_d3_mac_count'),
                 }
                 sample = inv_modems[:200]
-                enriched_count = sum(
-                    1 for m in sample
-                    if (m.get('vendor') or '').strip().lower() not in ('', 'unknown')
-                    and (m.get('software_version') or m.get('model') or '').strip()
+                is_enriched = any(
+                    m.get('cable_mac') or m.get('fiber_node') for m in sample
                 )
-                is_enriched = (enriched_count / max(len(sample), 1)) >= 0.40
 
                 if not collect_cpe:
+                    enriching = bool(enrich and not is_enriched)
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, "
@@ -1064,17 +1015,29 @@ class CMTSModemService:
                     _enrichment_cache[cmts_ip] = {
                         'modems': inv_modems,
                         'enriched': is_enriched,
-                        'enriching': False,
+                        'enriching': enriching,
                         'timestamp': time.time(),
+                        'enrich_progress': {
+                            'completed': 0,
+                            'total': len(inv_modems),
+                        },
                         **inventory_meta,
                     }
+                    if enriching:
+                        asyncio.create_task(
+                            self._background_enrich(
+                                cmts_ip,
+                                inv_modems,
+                                cmts_hostname=cmts_hostname,
+                            )
+                        )
                     return {
                         'success': True,
                         'modems': inv_modems,
                         'count': len(inv_modems),
                         'cmts_ip': cmts_ip,
                         'enriched': bool(enrich and is_enriched),
-                        'enriching': False,
+                        'enriching': enriching,
                         'cached': True,
                         **inventory_meta,
                     }
@@ -1110,6 +1073,24 @@ class CMTSModemService:
                     if refresh else _LIVE_CACHE_TTL_SECONDS
                 )
                 if age < max_age:
+                    if enrich and not cached.get('enriched') and not cached.get('enriching'):
+                        cached.update({
+                            'cancelled': False,
+                            'enrichment_cancelled': False,
+                            'enrichment_failed': False,
+                            'enriching': True,
+                            'enrich_progress': {
+                                'completed': 0,
+                                'total': len(cached.get('modems') or []),
+                            },
+                        })
+                        asyncio.create_task(
+                            self._background_enrich(
+                                cmts_ip,
+                                cached.get('modems') or [],
+                                cmts_hostname=cmts_hostname,
+                            )
+                        )
                     self.logger.info(
                         "Reusing single-flight generation for %s "
                         "(age=%.0fs, refresh=%s)",
@@ -1439,7 +1420,9 @@ class CMTSModemService:
                 
                 # Fire-and-forget background enrichment
                 asyncio.create_task(
-                    self._background_enrich(cmts_ip, modems, modem_community, cmts_hostname=cmts_hostname)
+                    self._background_enrich(
+                        cmts_ip, modems, cmts_hostname=cmts_hostname
+                    )
                 )
                 
                 self.logger.info(f"Returning {len(modems)} modems immediately, enrichment started in background")
@@ -1470,40 +1453,63 @@ class CMTSModemService:
         finally:
             live_lock.release()
 
-    async def _background_enrich(self, cmts_ip: str, modems: list, modem_community: str, cmts_hostname: str = ""):
-        """Run background enrichment and update the cache in two steps."""
+    async def _background_enrich(
+        self,
+        cmts_ip: str,
+        modems: list,
+        cmts_hostname: str = "",
+    ):
+        """Run CMTS-side enrichment and update the inventory cache."""
         global _enrichment_cache
         try:
-            self.logger.info(f"Background enrichment started for {cmts_ip} ({len(modems)} modems)")
+            if _enrichment_cache.get(cmts_ip, {}).get('cancelled'):
+                return
+            self.logger.info(
+                "CMTS-side enrichment started for %s (%s modems)",
+                cmts_ip,
+                len(modems),
+            )
 
-            # Step 1: fast CMTS-level enrichment.
-            await self._enrich_cmts_interfaces(modems)
-            # Update cache immediately and preserve inventory-completion metadata.
+            interface_result = await self._enrich_cmts_interfaces(modems)
             existing_cache = _enrichment_cache.get(cmts_ip, {})
-            _enrichment_cache[cmts_ip] = {
-                **existing_cache,
-                'modems': modems,
-                'enriched': False,
-                'enriching': True,
-                'cmts_enriched': True,
-                'timestamp': time.time(),
-                'enrich_progress': {'completed': 0, 'total': len(modems)},
-            }
-            self.logger.info(f"CMTS interface enrichment done for {cmts_ip} — OFDMA/cable-mac visible")
+            if existing_cache.get('cancelled'):
+                self.logger.info("CMTS-side enrichment cancelled for %s", cmts_ip)
+                return
+            if interface_result.get('success') is not True:
+                _enrichment_cache[cmts_ip] = {
+                    **existing_cache,
+                    'modems': modems,
+                    'enriched': False,
+                    'enriching': False,
+                    'cmts_enriched': False,
+                    'enrichment_failed': True,
+                    'timestamp': time.time(),
+                    'enrich_progress': {
+                        'completed': 0,
+                        'total': len(modems),
+                    },
+                }
+                self.logger.warning(
+                    "CMTS-side enrichment failed for %s: %s",
+                    cmts_ip,
+                    interface_result.get('error') or 'no CMTS data returned',
+                )
+                return
 
-            # Step 2: slower per-modem enrichment.
-            await self._enrich_modems_direct(modems, modem_community, cmts_ip=cmts_ip)
-
-            existing_cache = _enrichment_cache.get(cmts_ip, {})
             _enrichment_cache[cmts_ip] = {
                 **existing_cache,
                 'modems': modems,
                 'enriched': True,
                 'enriching': False,
+                'cmts_enriched': True,
+                'enrichment_failed': False,
                 'timestamp': time.time(),
+                'enrich_progress': {
+                    'completed': len(modems),
+                    'total': len(modems),
+                },
             }
-            enriched_count = sum(1 for m in modems if m.get('model'))
-            self.logger.info(f"Background enrichment complete for {cmts_ip}: {enriched_count}/{len(modems)} enriched")
+            self.logger.info("CMTS-side enrichment complete for %s", cmts_ip)
 
             # Stamp cmts/cmts_ip on every modem for MySQL inventory.
             # cmts_hostname comes from the BFF (ISW API); fall back to IP.
@@ -1523,9 +1529,10 @@ class CMTSModemService:
                 self.logger.warning(f"MySQL inventory write-back failed for {cmts_ip}: {db_exc}")
         except Exception as e:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
-            # Stop retry loops and keep partial data.
             if cmts_ip in _enrichment_cache:
                 existing_cache = _enrichment_cache[cmts_ip]
+                if existing_cache.get('cancelled'):
+                    return
                 _enrichment_cache[cmts_ip] = {
                     **existing_cache,
                     'modems': existing_cache.get('modems', modems),
@@ -1533,6 +1540,10 @@ class CMTSModemService:
                     'enriching': False,
                     'enrichment_failed': True,
                     'timestamp': time.time(),
+                    'enrich_progress': {
+                        'completed': 0,
+                        'total': len(modems),
+                    },
                 }
 
     # ── correlation logic (moved from agent._async_cmts_get_modems) ─────
@@ -1713,6 +1724,9 @@ class CMTSModemService:
                 'mac_address': mac,
                 'cmts_index': index,
             }
+            vendor = get_vendor_from_mac(mac)
+            if vendor and vendor.strip().lower() not in {'unknown', 'n/a'}:
+                modem['vendor'] = vendor
             if d3_index is not None:
                 # Keep the DOCS-IF3 augmentation index distinct from the
                 # legacy/display registration index used by existing clients.
@@ -2051,300 +2065,3 @@ class CMTSModemService:
             'enriched_count': len([m for m in modems if m.get('model') or m.get('cable_mac')]),
             'total_count': len(modems)
         }
-
-    async def _enrich_modems_direct(self, modems: list, modem_community: str | None = None, cmts_ip: str = None) -> list:
-        """
-        Query each modem directly via agent SNMP to get sysDescr + DOCSIS cap.
-        Uses snmp_bulk_get (all OIDs per modem in one call) and asyncio.gather
-        to run up to BATCH_SIZE modems in parallel.
-        """
-        import asyncio
-
-        OID_SYS_DESCR = '1.3.6.1.2.1.1.1.0'
-        ALL_OIDS = [OID_SYS_DESCR, OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY]
-
-        online_statuses = {'operational', 'registrationComplete', 'ipComplete', 'online'}
-        skip_prefixes = ('10.160.', '10.254.', '10.255.')
-        online_modems = [m for m in modems
-                         if m.get('ip_address') and m.get('ip_address') != 'N/A'
-                         and m.get('ip_address') != '0.0.0.0'
-                         and not m.get('ip_address', '').startswith(skip_prefixes)
-                         and m.get('status') in online_statuses]
-
-        MAX_CONCURRENT = _int_env('CM_ENRICH_MAX_CONCURRENT', 8, minimum=1, maximum=64)
-        FLUSH_EVERY = _int_env('CM_ENRICH_FLUSH_EVERY', 40, minimum=1, maximum=1000)
-        MAX_ENRICHMENT_SECS = _int_env('CM_ENRICH_MAX_SECS', 1800, minimum=60, maximum=7200)
-        AGENT_WAIT_TIMEOUT_SECS = _int_env('CM_ENRICH_AGENT_WAIT_TIMEOUT_SECS', 20, minimum=5, maximum=120)
-        SNMP_TIMEOUT_SECS = _int_env('CM_ENRICH_SNMP_TIMEOUT_SECS', 3, minimum=1, maximum=30)
-        SNMP_MAX_CONCURRENT = _int_env('CM_ENRICH_SNMP_MAX_CONCURRENT', 2, minimum=1, maximum=10)
-
-        self.logger.info(
-            f"Direct enrichment: {len(online_modems)} modems "
-            f"(max_concurrent={MAX_CONCURRENT}, flush_every={FLUSH_EVERY}, "
-            f"max_secs={MAX_ENRICHMENT_SECS}, agent_wait_timeout={AGENT_WAIT_TIMEOUT_SECS}, "
-            f"snmp_timeout={SNMP_TIMEOUT_SECS}, snmp_max_concurrent={SNMP_MAX_CONCURRENT})"
-        )
-        if not online_modems:
-            return modems
-
-        # ── Pre-filter: ICMP ping sweep to skip unreachable modems ───
-        # Eliminates ~50% of 3s SNMP timeouts, cutting enrichment time in half.
-        all_ips = [m.get('ip_address') for m in online_modems]
-        try:
-            sweep_result = await self._send_cm_agent_command(
-                command='ping_sweep',
-                params={
-                    'targets': all_ips,
-                    'count': 1,
-                    'timeout': 1,
-                    'concurrent_tasks': 200,
-                },
-                timeout=60,
-            )
-            if sweep_result and sweep_result.get('success'):
-                reachable_set = set(sweep_result.get('reachable', []))
-                before = len(online_modems)
-                if reachable_set:
-                    online_modems = [m for m in online_modems if m.get('ip_address') in reachable_set]
-                    skipped = before - len(online_modems)
-                    self.logger.info(
-                        f"Ping sweep: {len(reachable_set)}/{before} reachable, "
-                        f"skipping {skipped} unreachable modems"
-                    )
-                else:
-                    # Some agents can return success with an empty reachable list
-                    # when ping_sweep is unsupported/misconfigured. Do not drop all
-                    # modems in that case; continue with SNMP enrichment.
-                    self.logger.warning(
-                        "Ping sweep returned success but zero reachable targets; "
-                        "proceeding with all modems"
-                    )
-            else:
-                self.logger.warning(
-                    f"Ping sweep failed ({sweep_result.get('error') if sweep_result else 'no result'}), "
-                    "proceeding with all modems"
-                )
-        except Exception as e:
-            self.logger.warning(f"Ping sweep unavailable ({e}), proceeding with all modems")
-
-        # Initialise progress in cache so polling clients can track it
-        if cmts_ip and cmts_ip in _enrichment_cache:
-            _enrichment_cache[cmts_ip]['enrich_progress'] = {'completed': 0, 'total': len(online_modems)}
-
-        enriched_count = 0
-        completed_count = 0  # modems attempted (success + failure)
-        _first_failure_logged = False
-        _first_success_logged = False
-
-        async def _enrich_one(modem: dict):
-            """Enrich a single modem using snmp_bulk_get (1 agent call for 3 OIDs)."""
-            nonlocal enriched_count, completed_count, _first_failure_logged, _first_success_logged
-            # Honour cancel signal — skip SNMP call entirely
-            if cmts_ip and _enrichment_cache.get(cmts_ip, {}).get('cancelled'):
-                return
-            ip = modem.get('ip_address')
-            try:
-                result = await self._send_cm_agent_command(
-                    command='snmp_bulk_get',
-                    params={
-                        'target_ip': ip,
-                        'oids': ALL_OIDS,
-                        # Do NOT pass community — let the CM agent use its own
-                        # configured cm_community (the API-side modem_community
-                        # is the BFF/CMTS community, not the modem community).
-                        'timeout': SNMP_TIMEOUT_SECS,
-                        'retries': 0,   # enrichment — don't retry; skip and move on
-                        'max_concurrent': SNMP_MAX_CONCURRENT,
-                    },
-                    timeout=AGENT_WAIT_TIMEOUT_SECS,
-                )
-                if not result or not result.get('success'):
-                    if not _first_failure_logged:
-                        _first_failure_logged = True
-                        self.logger.warning(
-                            f"Direct enrichment snmp_bulk_get failed for first sample modem {ip}: "
-                            f"{result.get('error') if result else 'no result/timeout'}"
-                        )
-                    return
-
-                oid_results = result.get('results', {})
-                if not oid_results:
-                    return
-
-                # ── sysDescr ──
-                sys_r = oid_results.get(OID_SYS_DESCR, {})
-                if sys_r.get('success') and sys_r.get('output'):
-                    raw = sys_r['output']
-                    sys_descr = raw.split('=', 1)[-1].strip() if '=' in raw else raw
-                    if sys_descr and 'No Such' not in sys_descr:
-                        info = self._parse_sys_descr(sys_descr)
-                        modem['model'] = info.get('model', 'Unknown')
-                        modem['software_version'] = info.get('software', '')
-                        if info.get('vendor'):
-                            modem['vendor'] = info['vendor']
-                        enriched_count += 1
-                        if not _first_success_logged:
-                            _first_success_logged = True
-                            self.logger.info(f"Enrichment sample: {ip} → model={modem['model']} vendor={modem.get('vendor')} sw={modem.get('software_version')}")
-
-                # ── DOCSIS capability (modern scalar first, legacy fallback) ──
-                docsis_version = None
-                for oid in (OID_CM_DOCSIS_CAP, OID_CM_DOCSIS_CAP_LEGACY):
-                    dr = oid_results.get(oid, {})
-                    if dr.get('success') and dr.get('output'):
-                        raw = dr['output']
-                        cap = raw.split('=')[-1].strip() if '=' in raw else raw
-                        if 'No Such' not in cap:
-                            docsis_version = self._parse_docsis_cap(cap)
-                            if docsis_version:
-                                break
-                if docsis_version:
-                    # Never let a weaker fallback capability overwrite stronger
-                    # positive evidence already learned from OFDMA/OFDM or an
-                    # earlier capability probe.
-                    version_rank = {
-                        'DOCSIS 1.0': 10,
-                        'DOCSIS 1.1': 11,
-                        'DOCSIS 2.0': 20,
-                        'DOCSIS 3.0': 30,
-                        'DOCSIS 3.1': 31,
-                        'DOCSIS 4.0': 40,
-                    }
-                    current_version = modem.get('docsis_version')
-                    if version_rank.get(docsis_version, 0) >= version_rank.get(current_version, 0):
-                        modem['docsis_version'] = docsis_version
-
-            except Exception as e:
-                if not _first_failure_logged:
-                    _first_failure_logged = True
-                    self.logger.warning(f"Direct enrichment exception for first sample modem {ip}: {e}")
-                self.logger.debug(f"Failed to enrich modem {ip}: {e}")
-            finally:
-                # Always count this modem as done so the progress bar advances
-                completed_count += 1
-                if cmts_ip and cmts_ip in _enrichment_cache:
-                    cache_entry = _enrichment_cache[cmts_ip]
-                    if not cache_entry.get('cancelled'):
-                        progress = cache_entry.setdefault(
-                            'enrich_progress',
-                            {'completed': 0, 'total': len(online_modems)}
-                        )
-                        progress['completed'] = completed_count
-                        # Flush enriched modem data every FLUSH_EVERY completions
-                        # so the GUI poll sees continuously updated vendor/model fields
-                        if completed_count % FLUSH_EVERY == 0:
-                            cache_entry['timestamp'] = time.time()
-
-        # ── Process ALL modems at once — semaphore caps concurrency ──────────
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
-
-        async def _enrich_one_sem(modem: dict):
-            async with sem:
-                await _enrich_one(modem)
-
-        # Hard time cap: cancel remaining tasks after MAX_ENRICHMENT_SECS
-        # so huge CMTSes (10k+ modems) don't block the enrichment pipeline.
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*[_enrich_one_sem(m) for m in online_modems]),
-                timeout=MAX_ENRICHMENT_SECS,
-            )
-        except asyncio.TimeoutError:
-            self.logger.warning(
-                f"Direct enrichment hit {MAX_ENRICHMENT_SECS}s time cap: "
-                f"{enriched_count}/{len(online_modems)} enriched so far, finishing with partial results"
-            )
-
-        # Final timestamp flush
-        if cmts_ip and cmts_ip in _enrichment_cache:
-            _enrichment_cache[cmts_ip]['timestamp'] = time.time()
-
-        cancelled = cmts_ip and _enrichment_cache.get(cmts_ip, {}).get('cancelled')
-        self.logger.info(
-            f"Direct enrichment {'cancelled' if cancelled else 'done'}: "
-            f"{enriched_count}/{len(online_modems)} modems enriched"
-        )
-        return modems
-
-    def _parse_sys_descr(self, sys_descr: str) -> dict:
-        """Parse sysDescr to extract vendor, model, and software version."""
-        import re
-        result = {}
-        
-        # Check for structured format: <<KEY: value; KEY: value>>
-        # Example: "FAST3896 Wireless Voice Gateway <<HW_REV: 1.2; VENDOR: SAGEMCOM; SW_REV: LG-RDK_11.10.26; MODEL: F3896LG>>"
-        structured_match = re.search(r'<<(.+?)>>', sys_descr)
-        if structured_match:
-            fields = structured_match.group(1)
-            for pair in fields.split(';'):
-                if ':' in pair:
-                    key, value = pair.split(':', 1)
-                    key = key.strip().upper()
-                    value = value.strip()
-                    if key == 'MODEL':
-                        result['model'] = value
-                    elif key == 'VENDOR':
-                        result['vendor'] = value
-                    elif key == 'SW_REV':
-                        result['software'] = value
-            if result.get('model'):
-                return result
-        
-        # Fallback: pattern matching for non-structured sysDescr
-        descr = sys_descr.lower()
-        
-        if 'arris' in descr or 'touchstone' in descr:
-            result['vendor'] = 'ARRIS Group, Inc.'
-        elif 'technicolor' in descr:
-            result['vendor'] = 'Technicolor'
-        elif 'sagemcom' in descr:
-            result['vendor'] = 'SAGEMCOM'
-        elif 'hitron' in descr:
-            result['vendor'] = 'Hitron'
-        elif 'motorola' in descr:
-            result['vendor'] = 'Motorola'
-        elif 'cisco' in descr:
-            result['vendor'] = 'Cisco'
-        elif 'ubee' in descr:
-            result['vendor'] = 'Ubee'
-        elif 'compal' in descr:
-            result['vendor'] = 'Compal Broadband Networks'
-        
-        # Model patterns
-        model_match = re.search(r'(FAST\d+|F\d{4}[A-Z]*|TG\d+|TC\d+|SB\d+|DPC\d+|EPC\d+|CM\d+|SBG\d+|CGM\d+|CH\d+[A-Z]*|UBC\d+[A-Z]*)', sys_descr, re.I)
-        if model_match:
-            result['model'] = model_match.group(1).upper()
-        
-        # Software version
-        version_match = re.search(r'(\d+\.\d+\.\d+[\.\d\-a-zA-Z]*)', sys_descr)
-        if version_match:
-            result['software'] = version_match.group(1)
-        
-        return result
-
-    def _parse_docsis_cap(self, cap_str: str) -> str:
-        """Parse DOCSIS capability value from docsIf31DocsisBaseCapability.
-        Values: docsis10(1), docsis11(2), docsis20(3), docsis30(4), docsis31(5), docsis40(6)
-        """
-        try:
-            cap_str = cap_str.strip().lower()
-            if 'docsis31' in cap_str or cap_str == '5':
-                return 'DOCSIS 3.1'
-            elif 'docsis30' in cap_str or cap_str == '4':
-                return 'DOCSIS 3.0'
-            elif 'docsis40' in cap_str or cap_str == '6':
-                return 'DOCSIS 4.0'
-            elif 'docsis20' in cap_str or cap_str == '3':
-                return 'DOCSIS 2.0'
-            elif 'docsis11' in cap_str or cap_str == '2':
-                return 'DOCSIS 1.1'
-            elif 'docsis10' in cap_str or cap_str == '1':
-                return 'DOCSIS 1.0'
-            # Try parsing as integer
-            cap = int(cap_str.split('(')[-1].rstrip(')'))
-            docsis_map = {1: 'DOCSIS 1.0', 2: 'DOCSIS 1.1', 3: 'DOCSIS 2.0', 
-                         4: 'DOCSIS 3.0', 5: 'DOCSIS 3.1', 6: 'DOCSIS 4.0'}
-            return docsis_map.get(cap)
-        except:
-            pass
-        return None

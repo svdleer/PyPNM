@@ -386,7 +386,7 @@ class ChannelStatsRouter:
                     if cached_cm_index is None:
                         cached_cm_index = _get_cached_cm_index(request.cmts_ip, request.mac_address)
                     if cached_cm_index is not None:
-                        # Fast path: direct snmpget for SG ID using known cm_index (runs in parallel with modem walk)
+                        # Fast path: agent SNMP get for SG ID using known cm_index (runs in parallel with modem walk)
                         try:
                             fiber_node_sg_task_id = await agent_manager.send_task(
                                 cmts_agent_id, "snmp_get",

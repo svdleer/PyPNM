@@ -55,11 +55,6 @@ async def main() -> None:
         write_community=str(args.community_write)
     )
 
-    # Check modem reachability
-    if not cm.is_ping_reachable():
-        logging.error(f"{cm.get_inet_address()} not reachable, exiting...")
-        exit(1)
-
     logging.info(f"Connected to: {await cm.getSysDescr()}")
 
     # Build SpectrumAnalyzerParameters from parsed args

@@ -41,6 +41,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+# This file is a standalone API regression CLI, not a pytest test module.
+__test__ = False
+
+
 # ---------------------------------------------------------------------------
 # Lab configuration
 # ---------------------------------------------------------------------------
@@ -55,7 +59,6 @@ VENDORS = {
         "community_write": "Z1gg0Sp3c1@l",
         "test_modem_mac":  "90:32:4b:c8:19:0b",
         "test_modem_ip":   "10.206.234.92",
-        "modem_community": "z1gg0m0n1t0r1ng",
     },
     "casa": {
         "label": "Casa Systems (mnd-gt0002-ccap101)",
@@ -64,7 +67,6 @@ VENDORS = {
         "community_write": "Z1gg0Sp3c1@l",
         "test_modem_mac":  "e4:57:40:0b:cf:70",
         "test_modem_ip":   "10.206.228.4",
-        "modem_community": "z1gg0m0n1t0r1ng",
     },
     "cisco": {
         "label": "Cisco cBR-8 (mnd-gt0002-ccap201)",
@@ -73,7 +75,6 @@ VENDORS = {
         "community_write": "Z1gg0Sp3c1@l",
         "test_modem_mac":  "d4:6a:6a:fd:00:b3",
         "test_modem_ip":   "10.254.70.11",
-        "modem_community": "z1gg0m0n1t0r1ng",
     },
 }
 
@@ -325,7 +326,7 @@ def test_api_health(api: str, vendor: str, cfg: Dict):
 
 def test_modem_enrichment(api: str, vendor: str, cfg: Dict):
     """
-    Regression: POST /cmts/modems/query must return enriched fields.
+    Regression: POST /cmts/modems/query must complete CMTS-side enrichment.
     Catches: wrong HTTP method (405), fields dropped in modem map,
     Redis intercepting enrichment poll.
     """
@@ -343,13 +344,12 @@ def test_modem_enrichment(api: str, vendor: str, cfg: Dict):
     record(vendor, "enrichment", "POST /cmts/modems/query (base)", passed,
            f"http_error={r.get('_http_error', 'none')}")
 
-    # 2. Enriched call — wait up to 90s for enrichment to complete
+    # 2. CMTS-enriched call — no modem credentials are accepted or required.
     enrich_payload = {
         "cmts_ip": cfg["cmts_ip"],
         "community": cfg["community_read"],
         "limit": 5,
         "enrich": True,
-        "modem_community": cfg["modem_community"],
     }
     enriched = False
     for attempt in range(6):

@@ -13,7 +13,10 @@ class PollerSettingUpsertRequest(BaseModel):
     enabled: bool = Field(default=True)
     scope_type: str = Field(default="all_cmts")
     scope_json: Optional[str] = Field(default=None)
-    collect_identity: bool = Field(default=True)
+    collect_identity: bool = Field(
+        default=False,
+        description="Deprecated no-op; direct modem identity collection is disabled",
+    )
     collect_scqam: bool = Field(default=True)
     collect_rxmer: bool = Field(default=True)
     interval_minutes: int = Field(default=360)

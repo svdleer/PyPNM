@@ -12,8 +12,6 @@ import logging
 from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
-from pypnm.snmp.compiled_oids import COMPILED_OIDS
-from pypnm.snmp.snmp_v2c import Snmp_v2c
 
 
 async def main() -> None:
@@ -25,21 +23,15 @@ async def main() -> None:
 
     cm = CableModem(mac_address=MacAddress(args.mac), inet=Inet(args.inet), write_community=str(args.community_write))
 
-    if not cm.is_ping_reachable():
-        logging.error(f"{cm.get_inet_address} not reachable, exiting...")
-        exit(1)
-
     logging.info(f"Connected to: {await cm.getSysDescr()}")
 
-    _pysnmp = Snmp_v2c(Inet(cm.get_inet_address))
+    result = await cm.getDocsIf31CmDsOfdmChannelIdIndex()
 
-    result = await _pysnmp.walk(COMPILED_OIDS['docsIf31CmDsOfdmChanChannelId'])
-
-    if result is None:
+    if not result:
         logging.error("Not able to get OFDM Indexes...")
         exit(1)
 
-    print(_pysnmp.snmp_get_result_value(result))
+    print(result)
 
 if __name__ == "__main__":
     asyncio.run(main())

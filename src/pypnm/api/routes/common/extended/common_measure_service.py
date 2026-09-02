@@ -59,7 +59,6 @@ from pypnm.lib.file_processor import FileProcessor
 from pypnm.lib.ftp.ftp_connector import FTPConnector
 from pypnm.lib.host_endpoint import HostEndpoint
 from pypnm.lib.inet import Inet
-from pypnm.lib.ping import Ping
 from pypnm.lib.ssh.ssh_connector import SSHConnector
 from pypnm.lib.tftp.tftp_connector import TFTPConnector
 from pypnm.lib.types import ChannelId, FileNameStr, InterfaceIndex, TransactionId, HostNameStr
@@ -201,12 +200,8 @@ class CommonMeasureService(CommonMessagingService):
         """
 
         ##########################################################
-        # Verify that we can connect to the CM via Ping and SNMP
+        # Verify modem readiness through agent-backed SNMP
         ##########################################################
-
-        if not self.is_ping_reachable():
-            self.logger.error(f"{self.log_prefix} - Unreachable via PING")
-            return self.build_send_msg(ServiceStatusCode.UNREACHABLE_PING)
 
         if not await self.is_snmp_ready():
             self.logger.error(f"{self.log_prefix} - Unreachable via SNMP")
@@ -335,22 +330,6 @@ class CommonMeasureService(CommonMessagingService):
             f"Unsupported interface type: {interface_type!r}. "
             "Expected docsOfdmDownstream or docsOfdmaUpstream."
         )
-
-    def is_ping_reachable(self) -> bool:
-        """
-        Check if the cable modem is reachable via ICMP ping.
-        When agent SNMP transport is active, skip the ping check since
-        the Docker container lacks L3 access to the modem network.
-        SNMP reachability (checked next) is a more reliable indicator.
-
-        Returns:
-            bool: True if the modem responds to ping, False otherwise.
-        """
-        import os
-        if os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true':
-            self.logger.debug(f"{self.log_prefix} - Skipping ping check (agent transport)")
-            return True
-        return self.cm.is_ping_reachable()
 
     async def is_snmp_ready(self) -> bool:
         """

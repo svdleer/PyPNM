@@ -40,11 +40,6 @@ async def main() -> None:
     # Initialize CableModem object
     cable_modem = CableModem(mac_address=MacAddress(args.mac), inet=Inet(args.inet), write_community=str(args.community_write))
 
-    # Check if the cable modem is reachable
-    if not cable_modem.is_ping_reachable():
-        logging.error(f"{cable_modem.get_inet_address} not reachable, exiting...")
-        exit(1)
-
     logging.info(f"Connected to: {await cable_modem.getSysDescr()}")
 
     service:CmDsOfdmFecSummaryService = CmDsOfdmFecSummaryService(cable_modem,

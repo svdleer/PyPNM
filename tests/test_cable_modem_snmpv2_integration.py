@@ -11,6 +11,8 @@ from pypnm.docsis.cable_modem import CableModem
 from pypnm.lib.inet import Inet
 from pypnm.lib.mac_address import MacAddress
 
+# CableModem SNMP requires PyPNM AgentManager and a connected agent that
+# advertises the cm_reachable capability.
 # ---- Skip all tests unless explicitly enabled (prevents CI/network flakiness) ----
 IT_ENABLED = os.getenv("PNM_CM_IT") == "1"
 pytestmark = [
@@ -28,6 +30,7 @@ def cm() -> CableModem:
     """
     Build a CableModem from SystemConfigSettings.
     Requires:
+      - PyPNM AgentManager with a connected cm_reachable agent
       - SystemConfigSettings.default_mac_address
       - SystemConfigSettings.default_ip_address
       - SystemConfigSettings.snmp_write_community (or read community if your class uses it)
@@ -36,9 +39,6 @@ def cm() -> CableModem:
     inet = Inet(SystemConfigSettings.default_ip_address)
     # The CableModem ctor takes write_community; use the configured v2 write community.
     return CableModem(mac_address=mac, inet=inet, write_community=SystemConfigSettings.snmp_write_community)
-
-def test_ping_reachable(cm: CableModem) -> None:
-    assert cm.is_ping_reachable() is True
 
 @pytest.mark.asyncio
 async def test_snmp_reachable(cm: CableModem) -> None:

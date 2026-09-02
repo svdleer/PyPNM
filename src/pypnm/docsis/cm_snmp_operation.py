@@ -11,7 +11,6 @@ from typing import Any, cast
 
 from pysnmp.proto.rfc1902 import Gauge32, Integer32, OctetString
 
-from pypnm.config.pnm_config_manager import SystemConfigSettings
 from pypnm.docsis.data_type.ClabsDocsisVersion import ClabsDocsisVersion
 from pypnm.docsis.data_type.DocsDevEventEntry import DocsDevEventEntry
 from pypnm.docsis.data_type.DocsFddCmFddCapabilities import (
@@ -84,7 +83,6 @@ from pypnm.pnm.data_type.pnm_test_types import DocsPnmCmCtlTest
 from pypnm.snmp.compiled_oids import COMPILED_OIDS
 from pypnm.snmp.modules import DocsisIfType, DocsPnmBulkUploadControl
 from pypnm.snmp.snmp_v2c import Snmp_v2c
-from pypnm.snmp.snmp_v3 import Snmp_v3
 
 
 class DocsPnmBulkFileUploadStatus(Enum):
@@ -163,7 +161,7 @@ class CmSnmpOperation:
         _inet (str): IP address of the Cable Modem.
         _community (str): SNMP community string used for authentication.
         _port (int): SNMP port (default: 161).
-        _snmp (Snmp_v2c): SNMP client instance for communication.
+        _snmp: Agent-backed SNMP transport; local modem UDP/161 is forbidden.
         logger (logging.Logger): Logger instance for this class.
     """
 
@@ -194,125 +192,48 @@ class CmSnmpOperation:
         self._priority = priority
         self._snmp = self.__load_snmp_version()
 
-    def __load_snmp_version(self) -> Snmp_v2c | Snmp_v3:
+    def __load_snmp_version(self):
+        """Create the mandatory CM-agent transport for modem SNMP.
+
+        Cable-modem SNMP is never sent from the PyPNM process. If no
+        authenticated ``cm_reachable`` agent is available, construction fails
+        closed instead of opening a local UDP/161 transport.
         """
-        Select and instantiate the appropriate SNMP client.
+        from pypnm.api.agent.manager import get_agent_manager
+        from pypnm.snmp.agent_transport import AgentSnmpTransport
 
-        Precedence:
-        0) If agent is available -> return AgentSnmpTransport
-        1) If SNMPv3 is explicitly enabled and parameters are valid -> return Snmp_v3
-        2) Else if SNMPv2c is enabled -> return Snmp_v2c
-        3) Else -> error
-        """
-        
-        # Check if agent transport is available
-        import os
-        agent_enabled = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
-        print(f"DEBUG: PYPNM_USE_AGENT_SNMP={agent_enabled}")
-        
-        if agent_enabled:
-            allow_direct_fallback = os.environ.get('PYPNM_AGENT_ALLOW_DIRECT_FALLBACK', '').lower() == 'true'
-            try:
-                from pypnm.snmp.agent_transport import AgentSnmpTransport
-                from pypnm.api.agent.manager import get_agent_manager
-                
-                agent_manager = get_agent_manager()
-                print(f"DEBUG: Agent manager: {agent_manager}")
-                
-                if agent_manager:
-                    # Modem-side SNMP must use a CM-reachable agent only.
-                    agent = agent_manager.get_agent_for_capability('cm_reachable')
-                    print(f"DEBUG: Agent for cm_reachable: {agent}")
-                    
-                    if agent:
-                        print("DEBUG: Using agent SNMP transport")
-                        return AgentSnmpTransport(
-                            host=self._inet,
-                            write_community=self._community,
-                            port=self._port,
-                            timeout=10,
-                            retries=3,
-                            agent_id=agent.agent_id,
-                            priority=self._priority,
-                            target_role='cm',
-                        )
-                    else:
-                        print("DEBUG: No agent with cm_reachable capability")
-                        if not allow_direct_fallback:
-                            raise RuntimeError(
-                                "PYPNM_USE_AGENT_SNMP=true but no agent with cm_reachable capability is connected"
-                            )
-                else:
-                    print("DEBUG: No agent manager available")
-                    if not allow_direct_fallback:
-                        raise RuntimeError(
-                            "PYPNM_USE_AGENT_SNMP=true but AgentManager is unavailable"
-                        )
-            except Exception as e:
-                print(f"DEBUG: Agent transport exception: {e}")
-                if not allow_direct_fallback:
-                    self.logger.error(f"Agent transport required but unavailable: {e}")
-                    raise
-                self.logger.warning(f"Agent transport unavailable, falling back to direct SNMP: {e}")
-
-        print("DEBUG: Using direct Snmp_v2c transport")
-
-        if SystemConfigSettings.snmp_v3_enable():
-            '''
-            self.logger.debug("SNMPv3 enabled in configuration; validating parameters...")
-            try:
-                p = PnmConfigManager.get_snmp_v3_params()
-            except Exception as e:
-                self.logger.error(f"Failed to load SNMPv3 parameters: {e}. Falling back to SNMPv2c.")
-                p = None
-
-            # Minimal required fields for a usable v3 session
-            required = ("user", "auth_key", "priv_key", "auth_protocol", "priv_protocol")
-            if p and all(p.get(k) for k in required):
-                self.logger.debug("Using SNMPv3")
-                return Snmp_v3(
-                    host=self._inet,
-                    user=p["user"],
-                    auth_key=p["auth_key"],
-                    priv_key=p["priv_key"],
-                    auth_protocol=p["auth_protocol"],
-                    priv_protocol=p["priv_protocol"],
-                    port=self._port,
-                )
-            else:
-                self.logger.warning(
-                    "SNMPv3 is enabled but parameters are incomplete or invalid; "
-                    "falling back to SNMPv2c."
-                )
-            '''
-            # Keep the implementation stubbed for now.
-            # Force an explicit failure instead of silently falling back.
-            raise NotImplementedError(
-                "SNMPv3 is enabled in configuration, but the SNMPv3 client is not implemented yet. "
-                "Disable SNMPv3 to use SNMPv2c.")
-
-        if SystemConfigSettings.snmp_enable():
-            direct_read_community = SystemConfigSettings.snmp_read_community()
-            direct_write_community = (
-                self._community or SystemConfigSettings.snmp_write_community()
+        agent_manager = get_agent_manager()
+        if not agent_manager:
+            message = (
+                "Cable-modem SNMP requires a cm_reachable agent; "
+                "AgentManager is unavailable"
             )
-            if not direct_read_community:
-                raise ValueError("SNMP read community is required for direct SNMP mode")
-            self.logger.debug("Using SNMPv2c")
-            # Keep direct-mode reads and writes independent.
-            return Snmp_v2c(
-                host=self._inet,
-                read_community=direct_read_community,
-                write_community=direct_write_community,
-                port=self._port,
-                timeout=10,
-                retries=3,
-            )
+            self.logger.error(message)
+            raise RuntimeError(message)
 
-        # Neither protocol is usable
-        msg = "No SNMP protocol enabled or properly configured (v3 disabled/invalid and v2c disabled)."
-        self.logger.error(msg)
-        raise ValueError(msg)
+        agent = agent_manager.get_agent_for_capability('cm_reachable')
+        if not agent:
+            message = (
+                "Cable-modem SNMP requires a connected cm_reachable agent; "
+                "local direct SNMP is forbidden"
+            )
+            self.logger.error(message)
+            raise RuntimeError(message)
+
+        self.logger.debug(
+            "Using cm_reachable agent %s for cable-modem SNMP",
+            agent.agent_id,
+        )
+        return AgentSnmpTransport(
+            host=self._inet,
+            write_community=self._community,
+            port=self._port,
+            timeout=10,
+            retries=3,
+            agent_id=agent.agent_id,
+            priority=self._priority,
+            target_role='cm',
+        )
 
     async def _get_value(self, oid_suffix: str, value_type: type | str = str) -> str | bytes | int | None:
         """

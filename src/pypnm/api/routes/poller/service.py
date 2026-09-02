@@ -1685,7 +1685,6 @@ class PollerService:
         fatal_error = None
         incomplete_targets = 0
         poller_id = int(poller.get("id") or 0)
-        collect_identity = bool(int(poller.get("collect_identity") or 0))
         start_offset = max(0, int(poller.get("last_target_offset") or 0))
         subtask_retries = max(
             0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
@@ -1924,107 +1923,6 @@ class PollerService:
                     except Exception as exc:
                         complete = False
                         validation_error = str(exc)
-
-                    # ── Identity enrichment via CM agents ──────────────────
-                    # When collect_identity is enabled, use the fresh CPE IPs
-                    # to populate vendor/model/software_version for each modem
-                    # via CM-agent sysDescr SNMP. Runs on a background daemon
-                    # thread so it never blocks the CPE job coordinator.
-                    if complete and collect_identity and cpe_rows:
-                        poller_service_ref = self
-                        cmts_ip_cap = cmts_ip
-                        cmts_name_cap = cmts_name
-
-                        def _run_identity_enrichment(
-                            rows: List[Dict[str, Any]],
-                            svc_ref: "PollerService",
-                            cmts_ip_val: str,
-                            cmts_name_val: str,
-                        ) -> None:
-                            import asyncio
-                            from pypnm.api.routes.cmts.service import CMTSModemService
-
-                            try:
-                                # Deduplicate by modem MAC, preferring IPv4.
-                                mac_to_ip: Dict[str, str] = {}
-                                for row in rows:
-                                    mac = str(row.get("modem_mac") or "").strip()
-                                    ip = str(row.get("ip_address") or "").strip()
-                                    if not mac or not ip:
-                                        continue
-                                    family = str(
-                                        row.get("address_family") or ""
-                                    ).lower()
-                                    if mac not in mac_to_ip or family == "ipv4":
-                                        mac_to_ip[mac] = ip
-
-                                modem_dicts = [
-                                    {
-                                        "mac_address": mac,
-                                        "ip_address": ip,
-                                        "status": "operational",
-                                    }
-                                    for mac, ip in mac_to_ip.items()
-                                ]
-                                if not modem_dicts:
-                                    return
-
-                                logger.info(
-                                    "Identity enrichment: starting for %s "
-                                    "(%d modems)",
-                                    cmts_name_val,
-                                    len(modem_dicts),
-                                )
-                                service = CMTSModemService(
-                                    agent_priority="bulk"
-                                )
-                                loop = asyncio.new_event_loop()
-                                try:
-                                    loop.run_until_complete(
-                                        service._enrich_modems_direct(
-                                            modem_dicts,
-                                            cmts_ip=cmts_ip_val,
-                                        )
-                                    )
-                                finally:
-                                    loop.close()
-
-                                enriched = [
-                                    m
-                                    for m in modem_dicts
-                                    if m.get("vendor") or m.get("model")
-                                ]
-                                if enriched:
-                                    svc_ref._upsert_inventory_rows(
-                                        enriched,
-                                        source_poller="identity-enrichment",
-                                    )
-                                logger.info(
-                                    "Identity enrichment: finished for %s "
-                                    "(%d/%d modems enriched)",
-                                    cmts_name_val,
-                                    len(enriched),
-                                    len(modem_dicts),
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "Identity enrichment failed for %s: %s",
-                                    cmts_name_val,
-                                    exc,
-                                )
-
-                        t = threading.Thread(
-                            target=_run_identity_enrichment,
-                            args=(
-                                cpe_rows,
-                                poller_service_ref,
-                                cmts_ip_cap,
-                                cmts_name_cap,
-                            ),
-                            daemon=True,
-                            name=f"identity-enrich-{cmts_ip_cap}",
-                        )
-                        t.start()
 
                 entry = {
                     "cmts": cmts_name,
@@ -3992,17 +3890,25 @@ class PollerService:
         """Fallback: do a live CMTS walk to find modem row and upsert inventory."""
         if not cmts_name:
             return None
-        # Resolve CMTS IP: look up any row for this CMTS name in inventory
-        rows = self._query(
-            "SELECT cmts_ip FROM modem_inventory_current WHERE LOWER(cmts)=LOWER(%s) AND cmts_ip IS NOT NULL LIMIT 1",
-            (cmts_name,),
-        )
-        cmts_ip = (rows[0] or {}).get("cmts_ip") if rows else None
+        try:
+            cmts_ip = str(ipaddress.ip_address(cmts_name))
+        except ValueError:
+            # Resolve a hostname or inventory identifier by either stored CMTS
+            # name or address.
+            rows = self._query(
+                "SELECT cmts_ip FROM modem_inventory_current "
+                "WHERE (LOWER(cmts)=LOWER(%s) OR LOWER(cmts_ip)=LOWER(%s)) "
+                "AND cmts_ip IS NOT NULL LIMIT 1",
+                (cmts_name, cmts_name),
+            )
+            cmts_ip = (rows[0] or {}).get("cmts_ip") if rows else None
         if not cmts_ip:
             return None
         query_payload = {
             "cmts_ip": cmts_ip,
+            "refresh": True,
             "enrich": False,
+            "agent_priority": "bulk",
             "limit": self._cm_modem_limit_default(),
         }
         try:
@@ -4014,6 +3920,10 @@ class PollerService:
             )
             r.raise_for_status()
             payload = r.json() if r.content else {}
+            if payload.get("success") is not True:
+                raise RuntimeError(
+                    payload.get("error") or f"CMTS refresh failed for {cmts_ip}"
+                )
             modems = payload.get("modems") or []
             mac_norm = mac.lower().replace(":", "").replace("-", "")
             for m in modems:
@@ -4085,7 +3995,6 @@ class PollerService:
         query_payload = {
             "cmts_ip": cmts_ip,
             "docsif3_index": docsif3_index_value,
-            "modem_ip": modem.get("ip_address") or modem.get("ip"),
         }
         response = requests.post(
             f"{base}/cmts/modem-interface/query",
@@ -4148,92 +4057,35 @@ class PollerService:
             return
         try:
             base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
-            community = (
-                os.environ.get("MODEM_COMMUNITY")
-                or os.environ.get("CM_SNMP_COMMUNITY")
-            )
-            # Look up modem IP from inventory; if missing, do a live CMTS walk fallback
             modem = self.get_inventory_modem_by_mac(mac)
-            cmts_fallback_modem = None
-            modem_ip = (modem or {}).get("ip_address")
-            if not modem_ip:
-                cmts_fallback_modem = self._resolve_modem_from_cmts(mac, cmts, base)
-                modem_ip = (cmts_fallback_modem or {}).get("ip_address")
-                if not modem_ip:
-                    raise ValueError(f"Modem {mac} not in inventory and not found via live CMTS walk")
-            # Call sysDescr endpoint
-            r = requests.post(
-                f"{base}/system/sysDescr",
-                json={
-                    "cable_modem": {
-                        "mac_address": mac,
-                        "ip_address": modem_ip,
-                        "snmp": {
-                            "snmp_v2c": {
-                                "community": community,
-                            }
-                        },
-                    }
-                },
-                timeout=30,
+            cmts_fallback_modem = (
+                self._resolve_modem_from_cmts(mac, cmts, base) if cmts else None
             )
-            r.raise_for_status()
-            data = r.json() if r.content else {}
-
-            # Extract sysDescr string and parse vendor/model/software
-            raw_descr = ""
-            results = data.get("results") or {}
-            sys_descr_obj = results.get("sysDescr")
-            if isinstance(sys_descr_obj, dict):
-                raw_descr = sys_descr_obj.get("raw") or sys_descr_obj.get("description") or str(sys_descr_obj)
-            elif isinstance(sys_descr_obj, str):
-                raw_descr = sys_descr_obj
-
-            vendor = None
-            model_name = None
-            software_ver = None
-
-            if raw_descr:
-                from pypnm.api.routes.cmts.service import CMTSModemService
-                parsed = CMTSModemService._parse_sys_descr(None, raw_descr)
-                vendor = parsed.get("vendor")
-                model_name = parsed.get("model")
-                software_ver = parsed.get("software")
-
-            # Fallback: try flat fields from response
-            if not vendor:
-                vendor = data.get("vendor") or data.get("VENDOR")
-            if not model_name:
-                model_name = data.get("model") or data.get("MODEL") or data.get("hw_rev") or data.get("HW_REV")
-            if not software_ver:
-                software_ver = data.get("software_version") or data.get("SW_REV")
-
-            # Fallback: nested sysDescr object fields from System API
-            if isinstance(sys_descr_obj, dict):
-                if not vendor:
-                    vendor = sys_descr_obj.get("vendor") or sys_descr_obj.get("VENDOR")
-                if not model_name:
-                    model_name = sys_descr_obj.get("model") or sys_descr_obj.get("MODEL") or sys_descr_obj.get("hw_rev")
-                if not software_ver:
-                    software_ver = sys_descr_obj.get("sw_rev") or sys_descr_obj.get("SW_REV") or sys_descr_obj.get("software")
-
-            # Final fallback: values from CMTS walk row (often includes firmware)
-            if (not vendor or not model_name or not software_ver) and cmts:
-                if not cmts_fallback_modem:
-                    cmts_fallback_modem = self._resolve_modem_from_cmts(mac, cmts, base)
-                if isinstance(cmts_fallback_modem, dict):
-                    if not vendor:
-                        vendor = cmts_fallback_modem.get("vendor")
-                    if not model_name:
-                        model_name = cmts_fallback_modem.get("model")
-                    if not software_ver:
-                        software_ver = cmts_fallback_modem.get("software_version") or cmts_fallback_modem.get("firmware")
+            if cmts and not cmts_fallback_modem:
+                raise ValueError(
+                    f"Forced live CMTS refresh for {cmts} did not return modem {mac}"
+                )
+            if not modem and not cmts_fallback_modem:
+                raise ValueError(
+                    f"Modem {mac} not in inventory and not found via live CMTS walk"
+                )
 
             cable_source = dict(modem or {})
             if isinstance(cmts_fallback_modem, dict):
                 for key, value in cmts_fallback_modem.items():
-                    if value is not None and not cable_source.get(key):
+                    if value is not None and (
+                        not isinstance(value, str) or value.strip()
+                    ):
                         cable_source[key] = value
+
+            # Identity values are retained only when the CMTS inventory already
+            # exposes them. A targeted refresh never probes the modem directly.
+            vendor = cable_source.get("vendor")
+            model_name = cable_source.get("model")
+            software_ver = (
+                cable_source.get("software_version")
+                or cable_source.get("firmware")
+            )
             interface_values = {
                 "cable_mac": cable_source.get("cable_mac"),
                 "fiber_node": cable_source.get("fiber_node"),
@@ -4272,8 +4124,8 @@ class PollerService:
             # snapshot generation. Advance its CMTS revision so every GUI
             # Redis entry derived from the prior revision is rejected.
             self._touch_inventory_revision(
-                cmts or (modem or {}).get("cmts"),
-                (modem or {}).get("cmts_ip"),
+                cmts or cable_source.get("cmts"),
+                cable_source.get("cmts_ip"),
             )
             self._execute(
                 "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s",

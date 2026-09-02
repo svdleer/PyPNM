@@ -89,19 +89,41 @@ class CmDocsDevService:
 
     async def ping_cable_modem(self) -> PnmResponse:
         try:
-            if not self._cm.is_ping_reachable():
+            from pypnm.api.agent.manager import get_agent_manager
+
+            agent_manager = get_agent_manager()
+            agent = (
+                agent_manager.get_agent_for_capability('cm_reachable')
+                if agent_manager else None
+            )
+            if not agent_manager or not agent:
                 return PnmResponse(
-                    mac_address =   self._mac.mac_address,
-                    status      =   ServiceStatusCode.PING_FAILED,
-                    message     =   f"Ping to {self._ip} failed."
+                    mac_address=self._mac.mac_address,
+                    status=ServiceStatusCode.PING_FAILED,
+                    message="No cm_reachable agent is available for modem ping.",
+                )
+
+            task_id = await agent_manager.send_task(
+                agent.agent_id,
+                'ping',
+                {'target': str(self._ip)},
+                timeout=5.0,
+            )
+            result = await agent_manager.wait_for_task_async(task_id, timeout=5.0)
+            payload = result.get('result', {}) if result else {}
+            if not (payload.get('reachable') or payload.get('success')):
+                return PnmResponse(
+                    mac_address=self._mac.mac_address,
+                    status=ServiceStatusCode.PING_FAILED,
+                    message=f"Agent ping to {self._ip} failed.",
                 )
 
             return PnmResponse(
-                mac_address =   self._mac.mac_address,
-                status      =   ServiceStatusCode.SUCCESS,
-                message     =   f"Ping to cable modem at {self._ip} succeeded."
+                mac_address=self._mac.mac_address,
+                status=ServiceStatusCode.SUCCESS,
+                message=f"Agent ping to cable modem at {self._ip} succeeded.",
             )
 
         except Exception as e:
-            logger.exception("Failed to send ping to cable modem")
+            logger.exception("Failed to send agent ping to cable modem")
             raise HTTPException(status_code=500, detail=str(e)) from e

@@ -20,7 +20,8 @@ from pypnm.api.routes.docs.pnm.ds.ofdm.modulation_profile.service import (
     CmDsOfdmModProfileService,
 )
 from pypnm.api.routes.docs.pnm.ds.ofdm.rxmer.service import CmDsOfdmRxMerService
-from pypnm.docsis.cable_modem import CableModem, PnmConfigManager
+from pypnm.config.pnm_config_manager import PnmConfigManager
+from pypnm.docsis.cable_modem import CableModem
 from pypnm.docsis.cm_snmp_operation import FecSummaryType
 from pypnm.lib.inet import Inet
 

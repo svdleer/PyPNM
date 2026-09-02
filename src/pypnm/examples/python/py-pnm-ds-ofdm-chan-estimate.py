@@ -46,10 +46,6 @@ async def _build_cable_modem(
         write_community = write_community,
     )
 
-    if not cm.is_ping_reachable():
-        logger.error("%s not reachable", cm.get_inet_address)
-        raise RuntimeError(f"{cm.get_inet_address} not reachable")
-
     logger.info("Connected to: %s", await cm.getSysDescr())
     return cm
 

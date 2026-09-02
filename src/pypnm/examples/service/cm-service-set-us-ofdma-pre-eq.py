@@ -38,11 +38,6 @@ async def main() -> None:
     # Initialize CableModem
     cm = CableModem(mac_address=MacAddress(args.mac), inet=Inet(args.inet), write_community=str(args.community_write))
 
-    # Check modem reachability
-    if not cm.is_ping_reachable():
-        logging.error(f"{cm.get_inet_address} not reachable, exiting...")
-        exit(1)
-
     logging.info(f"Connected to: {await cm.getSysDescr()}")
 
     service: CmUsOfdmaPreEqService = CmUsOfdmaPreEqService(cm)

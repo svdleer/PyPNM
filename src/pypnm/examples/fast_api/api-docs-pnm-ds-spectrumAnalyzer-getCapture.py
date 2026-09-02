@@ -129,12 +129,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of averages for each segment (default: 1).",
     )
 
-    # Retrieval type: file (TFTP PNM) or snmp (direct retrieval)
+    # Retrieval type: file (TFTP PNM) or agent-backed SNMP
     parser.add_argument(
         "--retrieval-type",
         choices=["file", "snmp"],
         default="file",
-        help="Spectrum retrieval type: 'file' for PNM file via TFTP, 'snmp' for direct SNMP (default: file).",
+        help="Spectrum retrieval type: 'file' for PNM file via TFTP, 'snmp' through the PyPNM agent (default: file).",
     )
 
     # HTTP timeout for the FastAPI request
@@ -153,7 +153,7 @@ def _map_retrieval_type(label: str) -> int:
     Map Human Friendly Retrieval Type To API Enumeration.
 
     'file' -> 1 (PNM file via TFTP)
-    'snmp' -> 2 (Direct SNMP retrieval)
+    'snmp' -> 2 (Agent-backed SNMP retrieval)
     """
     if label == "file":
         return 1

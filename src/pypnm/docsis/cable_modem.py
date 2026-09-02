@@ -4,21 +4,17 @@ from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Maurice Garcia
 import logging
-import os
-
-from pypnm.config.pnm_config_manager import PnmConfigManager
 from pypnm.docsis.cm_snmp_operation import CmSnmpOperation
 from pypnm.lib.inet import Inet, InetAddressStr
 from pypnm.lib.mac_address import MacAddress
-from pypnm.lib.ping import Ping
 
 
 class CableModem(CmSnmpOperation):
     """
     Represents a Cable Modem device that extends SNMP operations.
 
-    Provides access to the modem's MAC and IP addresses, and utility
-    functions such as ping-based reachability and SNMP responsiveness checks.
+    Provides access to the modem's MAC and IP addresses plus agent-backed
+    SNMP responsiveness checks.
     """
 
     inet: Inet
@@ -26,24 +22,16 @@ class CableModem(CmSnmpOperation):
     def __init__(self, mac_address: MacAddress,
                  inet: Inet,
                  write_community: str | None = None,
-                 priority: str = 'interactive',
-                 resolve_configured_community: bool = True) -> None:
+                 priority: str = 'interactive') -> None:
         """
         Initialize the CableModem instance.
 
         Args:
             mac_address (MacAddress): The MAC address of the cable modem.
             inet (Inet): The IP address of the cable modem.
-            write_community (str, optional): SNMP write community string.
+            write_community (str, optional): SNMP write community passed to the agent.
             priority (str, optional): Agent task priority ('interactive' for GUI, 'bulk' for background jobs).
-            resolve_configured_community: Resolve the PyPNM configured community for
-                direct SNMP when ``write_community`` is absent. Agent mode always
-                leaves the value absent for agent-side role resolution.
         """
-        agent_enabled = os.environ.get('PYPNM_USE_AGENT_SNMP', '').lower() == 'true'
-        if write_community is None and resolve_configured_community and not agent_enabled:
-            configured = PnmConfigManager.get_write_community()
-            write_community = str(configured) if configured else None
         super().__init__(inet=inet, write_community=write_community, priority=priority)
         self.logger = logging.getLogger(self.__class__.__name__)
         self._mac_address: MacAddress = mac_address
@@ -67,15 +55,6 @@ class CableModem(CmSnmpOperation):
             str: The cable modem's IP address.
         """
         return InetAddressStr(self._inet.__str__())
-
-    def is_ping_reachable(self) -> bool:
-        """
-        Checks whether the cable modem is reachable via ICMP ping.
-
-        Returns:
-            bool: True if the modem responds to ping, False otherwise.
-        """
-        return Ping.is_reachable(self.get_inet_address)
 
     async def is_snmp_reachable(self) -> bool:
         """

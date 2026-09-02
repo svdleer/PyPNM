@@ -174,7 +174,6 @@ class RxMerCollectionWorker:
                 mac_address=MacAddress(str(target["mac"])),
                 inet=Inet(str(target["modem_ip"])),
                 write_community=community,
-                resolve_configured_community=False,
                 priority='bulk',
             )
             cm_agent_id = getattr(getattr(modem, "_snmp", None), "_agent_id", None)

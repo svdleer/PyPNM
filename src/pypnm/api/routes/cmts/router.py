@@ -37,7 +37,6 @@ async def get_cmts_modems(
     enrich: bool = False,
     refresh: bool = False,
     collect_cpe: bool = False,
-    modem_community: str | None = None,
     cmts_hostname: str = "",
     agent_priority: str = "interactive",
 ) -> CMTSModemResponse:
@@ -58,12 +57,11 @@ async def get_cmts_modems(
     - ofdma_enabled / ofdm_enabled flags
 
     **Optional enrichment** (enrich=true):
-    - Model name from modem sysDescr
-    - Software/firmware version from modem sysDescr
+    - Cable interface and Fiber Node data collected from the CMTS
 
     **Performance:**
     - Base discovery: ~3 seconds for 1000+ modems
-    - With enrichment: ~30-60 seconds (queries each modem)
+    - CMTS-side enrichment runs asynchronously
     """
     logger.info(f"CMTS modem discovery request: {cmts_ip} (enrich={enrich})")
 
@@ -83,7 +81,6 @@ async def get_cmts_modems(
             'limit': limit,
             'enrich': enrich,
             'collect_cpe': collect_cpe,
-            'modem_community': modem_community,
             'cmts_hostname': cmts_hostname or '',
         }
         if 'refresh' in signature(service.discover_modems).parameters:
@@ -158,7 +155,6 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         enrich=payload.enrich,
         refresh=payload.refresh,
         collect_cpe=payload.collect_cpe,
-        modem_community=payload.modem_community,
         cmts_hostname=payload.cmts_hostname,
         agent_priority=payload.agent_priority,
     )
@@ -177,7 +173,6 @@ async def query_modem_interface(
             cmts_ip=payload.cmts_ip,
             docsif3_index=payload.docsif3_index,
             community=payload.community,
-            modem_ip=payload.modem_ip,
         )
         return CMTSModemInterfaceResponse(**result)
     except Exception as exc:

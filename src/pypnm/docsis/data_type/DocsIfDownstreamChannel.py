@@ -88,7 +88,7 @@ class DocsIfDownstreamChannelEntry(BaseModel):
     --------
     Basic one-off fetch:
 
-    >>> snmp = Snmp_v2c(host="192.168.0.100", community="public", timeout=2.0, retries=1)
+    >>> snmp = ...  # Supplied internally by a high-level CableModem operation
     >>> entry = await DocsIfDownstreamChannelEntry.from_snmp(index=1, snmp=snmp)
     >>> entry.channel_id
     1
@@ -130,7 +130,7 @@ class DocsIfDownstreamChannelEntry(BaseModel):
 
         Examples
         --------
-        >>> snmp = Snmp_v2c(host="192.168.0.100", community="public")
+        >>> snmp = ...  # Supplied internally by a high-level CableModem operation
         >>> result = await DocsIfDownstreamChannelEntry.from_snmp(5, snmp)
         >>> result.entry.docsIf3SignalQualityExtRxMER  # may be None if unsupported
         """
@@ -222,7 +222,7 @@ class DocsIfDownstreamChannelEntry(BaseModel):
 
         Examples
         --------
-        >>> snmp = Snmp_v2c(host="192.168.0.100", community="public")
+        >>> snmp = ...  # Supplied internally by a high-level CableModem operation
         >>> entries = await DocsIfDownstreamChannelEntry.get(snmp, [1, 2, 3])
         >>> [e.channel_id for e in entries]
         [1, 2, 3]

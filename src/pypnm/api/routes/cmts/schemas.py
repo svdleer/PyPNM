@@ -27,10 +27,9 @@ class CMTSModemRequest(BaseModel):
         le=50000,
         description="Maximum number of modems to return",
     )
-    enrich: bool = Field(default=False, description="Whether to enrich modems with firmware/model from sysDescr")
+    enrich: bool = Field(default=False, description="Whether to enrich inventory with CMTS-side interface data")
     refresh: bool = Field(default=False, description="Bypass cached inventory and perform a live CMTS walk")
     collect_cpe: bool = Field(default=False, description="Collect DOCS-SUBMGT3 CPE addresses for scheduled inventory")
-    modem_community: Optional[str] = Field(default=None, description="SNMP community for modem enrichment")
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
     agent_priority: Literal["interactive", "bulk"] = Field(
         default="interactive",
@@ -43,7 +42,6 @@ class CMTSModemInterfaceRequest(BaseModel):
     cmts_ip: str = Field(..., description="CMTS IP address")
     docsif3_index: int = Field(..., ge=1, description="DOCS-IF3 modem registration index")
     community: Optional[str] = Field(default=None, description="SNMP community for CMTS")
-    modem_ip: Optional[str] = Field(default=None, description="Optional modem IP for direct capability fallback")
 
 
 class CMTSModemInterfaceResponse(BaseModel):
@@ -124,7 +122,7 @@ class CMTSModemResponse(BaseModel):
     count: int = Field(default=0, description="Number of modems returned")
     timestamp: Optional[str] = Field(default=None, description="Timestamp of the response")
     error: Optional[str] = Field(default=None, description="Error message if failed")
-    enriched: bool = Field(default=False, description="Whether direct per-modem metadata enrichment has completed")
+    enriched: bool = Field(default=False, description="Whether CMTS-side metadata enrichment has completed")
     capability_enriched: bool = Field(default=False, description="Whether authoritative CMTS capability tables were successfully collected for this generation")
     cached: bool = Field(default=False, description="Whether result came from cache")
     enriching: bool = Field(default=False, description="Whether enrichment is in progress")
@@ -146,18 +144,3 @@ class CMTSModemResponse(BaseModel):
     cpe_truncated: bool = Field(default=False, description="Whether a CPE address column reached the walk limit")
     cpe_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from CPE address columns")
     enrichment_progress: Optional[Dict[str, int]] = Field(default=None, description="Live enrichment progress: {completed, total}")
-
-
-class EnrichModemRequest(BaseModel):
-    """Request model for modem enrichment."""
-    modems: List[Dict[str, Any]] = Field(..., description="List of modems to enrich")
-    modem_community: Optional[str] = Field(default=None, description="SNMP community for modem queries")
-
-
-class EnrichModemResponse(BaseModel):
-    """Response model for modem enrichment."""
-    success: bool = Field(..., description="Whether enrichment was successful")
-    modems: List[Dict[str, Any]] = Field(default_factory=list, description="Enriched modems")
-    enriched_count: int = Field(default=0, description="Number of modems successfully enriched")
-    total_count: int = Field(default=0, description="Total number of modems")
-    error: Optional[str] = Field(default=None, description="Error message if failed")

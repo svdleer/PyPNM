@@ -1,5 +1,6 @@
 FROM ubuntu:24.04
 
+ARG PYTHON_VERSION=3.12
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
@@ -26,14 +27,14 @@ RUN apt-get update \
       gosu \
       iputils-ping \
       wget \
-      python3.12 \
+      python${PYTHON_VERSION} \
       python3-pip \
-      python3.12-venv \
+      python${PYTHON_VERSION}-venv \
  && rm -rf /var/lib/apt/lists/*
 
 # Create virtual environment
 ENV VIRTUAL_ENV=/opt/venv
-RUN python3.12 -m venv $VIRTUAL_ENV
+RUN python${PYTHON_VERSION} -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Optional pip proxy (system-wide so it works for root and non-root users)
@@ -89,4 +90,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -q -O /dev/null http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3.12", "-m", "uvicorn", "pypnm.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "67108864"]
+CMD ["python", "-m", "uvicorn", "pypnm.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "67108864"]
