@@ -74,7 +74,7 @@ class PollerService:
         # Queue items contain only authoritative parent modem MACs, never the
         # subscriber CPE addresses collected from DOCS-SUBMGT3.
         self._identity_worker_count = self._bounded_env_int(
-            "CPE_IDENTITY_WORKERS", 1, minimum=1, maximum=4
+            "CPE_IDENTITY_WORKERS", 12, minimum=1, maximum=12
         )
         identity_queue_size = self._bounded_env_int(
             "CPE_IDENTITY_QUEUE_SIZE", 16, minimum=1, maximum=512
@@ -215,7 +215,14 @@ class PollerService:
                 for row in rows or []
                 if isinstance(row, dict)
                 for normalized in [
-                    self._normalize_mac(str(row.get("modem_mac") or ""))
+                    self._normalize_mac(
+                        str(
+                            row.get("modem_mac")
+                            or row.get("mac_address")
+                            or row.get("mac")
+                            or ""
+                        )
+                    )
                 ]
                 if normalized
             )
@@ -303,14 +310,26 @@ class PollerService:
                     )
                     continue
                 outcome["status"] = "running"
-                outcome["updated"] = self._run_identity_enrichment(
+                identity_result = self._run_identity_enrichment(
                     modem_macs,
                     cmts_ip=cmts_ip,
                     cmts_name=cmts_name,
                     job_id=job_id,
                     job_deadline=job_deadline,
                 )
-                outcome["status"] = "done"
+                outcome.update(identity_result)
+                unresolved = int(outcome.get("unresolved") or 0)
+                resolved = int(outcome.get("resolved") or 0)
+                if unresolved:
+                    outcome["status"] = (
+                        "partial" if resolved else "failed"
+                    )
+                    outcome["error"] = (
+                        f"{unresolved}/{len(modem_macs)} modem identities "
+                        "remain unresolved"
+                    )
+                else:
+                    outcome["status"] = "done"
             except Exception as exc:
                 outcome["status"] = "failed"
                 outcome["error"] = str(exc)
@@ -331,31 +350,39 @@ class PollerService:
         cmts_name: str,
         job_id: int,
         job_deadline: float,
-    ) -> int:
+    ) -> Dict[str, int]:
         import asyncio
 
         from pypnm.api.routes.cmts.service import CMTSModemService
 
+        service = CMTSModemService(agent_priority="bulk")
         inventory_modems = self.get_inventory_modems_bulk(
             list(modem_macs),
             cmts_ip=cmts_ip,
         )
-        modem_dicts = [
-            modem
-            for modem in inventory_modems
-            if str(modem.get("ip_address") or "").strip()
-        ]
-        skipped = len(modem_macs) - len(modem_dicts)
-        if skipped:
+        modem_dicts = list(inventory_modems)
+        requested = len(modem_macs)
+        missing_inventory = requested - len(modem_dicts)
+        if missing_inventory:
             logger.info(
                 "Identity enrichment: skipped %d/%d modems for %s without a "
-                "matching authoritative inventory address",
-                skipped,
-                len(modem_macs),
+                "matching authoritative inventory row",
+                missing_inventory,
+                requested,
                 cmts_name,
             )
-        if not modem_dicts:
-            return 0
+        candidate_macs = {
+            str(modem.get("mac_address") or "")
+            for modem in modem_dicts
+            if service._needs_identity_enrichment(modem)
+        }
+        if not candidate_macs:
+            return {
+                "updated": 0,
+                "requested": requested,
+                "resolved": requested - missing_inventory,
+                "unresolved": missing_inventory,
+            }
 
         identity_fields = (
             "vendor",
@@ -374,16 +401,26 @@ class PollerService:
             cmts_name,
             len(modem_dicts),
         )
-        service = CMTSModemService(agent_priority="bulk")
-        asyncio.run(
-            service._enrich_modem_identities(
-                modem_dicts,
-                cmts_ip=cmts_ip,
-                # Poller enrichment must not share GUI cache progress or
-                # cancellation state keyed by CMTS address.
-                progress_cmts_ip=None,
-            )
-        )
+        remaining_sec = job_deadline - time.monotonic()
+        if remaining_sec > 0:
+            try:
+                asyncio.run(
+                    asyncio.wait_for(
+                        service._enrich_modem_identities(
+                            modem_dicts,
+                            cmts_ip=cmts_ip,
+                            # Poller enrichment must not share GUI cache
+                            # progress or cancellation state keyed by CMTS.
+                            progress_cmts_ip=None,
+                        ),
+                        timeout=remaining_sec,
+                    )
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Identity enrichment exceeded the poller deadline for %s",
+                    cmts_name,
+                )
 
         changed = []
         for modem in modem_dicts:
@@ -403,11 +440,16 @@ class PollerService:
                 "error_text=%s WHERE id=%s AND status='running'",
                 (
                     self._now(),
-                    "CPE identity result discarded after job deadline",
+                    "Identity result discarded after poller job deadline",
                     job_id,
                 ),
             )
-            return 0
+            return {
+                "updated": 0,
+                "requested": requested,
+                "resolved": 0,
+                "unresolved": requested,
+            }
         status_rows = self._query(
             "SELECT status FROM poller_job WHERE id=%s",
             (job_id,),
@@ -421,7 +463,12 @@ class PollerService:
                 cmts_name,
                 job_id,
             )
-            return 0
+            return {
+                "updated": 0,
+                "requested": requested,
+                "resolved": 0,
+                "unresolved": requested,
+            }
         updated = self._update_inventory_identity_rows(
             changed,
             cmts_ip=cmts_ip,
@@ -433,7 +480,17 @@ class PollerService:
             updated,
             len(modem_dicts),
         )
-        return updated
+        unresolved = missing_inventory + sum(
+            str(modem.get("mac_address") or "") in candidate_macs
+            and service._needs_identity_enrichment(modem)
+            for modem in modem_dicts
+        )
+        return {
+            "updated": updated,
+            "requested": requested,
+            "resolved": requested - unresolved,
+            "unresolved": unresolved,
+        }
 
     def _rows(self, cur):
         return cur.fetchall()
@@ -2638,7 +2695,7 @@ class PollerService:
                     last_reported = completed_identity_targets
                 time.sleep(1)
             identity_failures = sum(
-                outcome.get("status") == "failed"
+                outcome.get("status") in {"failed", "partial"}
                 for _, outcome in identity_tickets
             )
 
@@ -2786,6 +2843,7 @@ class PollerService:
         modems_succeeded = 0
         modems_failed = 0
         error_text = None
+        identity_error_text = None
         self._update_running_job_progress(
             job_id,
             "Starting poller job: loading settings",
@@ -2819,9 +2877,32 @@ class PollerService:
                     self._process_cpe_job(job_id, poller, targets)
                     return
 
-                start_offset = max(
-                    0,
-                    int(poller.get("last_target_offset") or 0),
+                collect_identity = bool(
+                    int(poller.get("collect_identity") or 0)
+                )
+                identity_tickets: List[
+                    tuple[threading.Event, Dict[str, Any]]
+                ] = []
+                identity_failures = 0
+                try:
+                    max_runtime_sec = max(
+                        60,
+                        int(poller.get("max_runtime_sec") or 14400),
+                    )
+                except (TypeError, ValueError):
+                    max_runtime_sec = 14400
+                job_deadline = time.monotonic() + max_runtime_sec
+                deadline_expired = False
+                # Identity queue state is process-local. After a worker restart,
+                # replay every target so an accepted identity ticket cannot be
+                # skipped by an inventory checkpoint from the previous process.
+                start_offset = (
+                    0
+                    if collect_identity
+                    else max(
+                        0,
+                        int(poller.get("last_target_offset") or 0),
+                    )
                 )
                 raw_request_payload = job.get("request_payload")
                 try:
@@ -2933,6 +3014,24 @@ class PollerService:
                 cancelled = False
 
                 def _job_is_running() -> bool:
+                    nonlocal deadline_expired
+                    if (
+                        collect_identity
+                        and time.monotonic() >= job_deadline
+                    ):
+                        deadline_expired = True
+                        self._execute(
+                            "UPDATE poller_job SET status='timed_out', "
+                            "finished_at=%s, error_text=%s WHERE id=%s "
+                            "AND status='running'",
+                            (
+                                self._now(),
+                                "Inventory identity job exceeded max runtime "
+                                f"of {max_runtime_sec}s",
+                                job_id,
+                            ),
+                        )
+                        return False
                     status_rows = self._query(
                         "SELECT status FROM poller_job WHERE id=%s",
                         (job_id,),
@@ -2962,11 +3061,30 @@ class PollerService:
                                 "attempt_errors": attempt_errors,
                             }
                         try:
+                            bounded_subtask_timeout = subtask_timeout_sec
+                            if collect_identity:
+                                remaining_job_sec = (
+                                    job_deadline - time.monotonic()
+                                )
+                                if remaining_job_sec <= 0:
+                                    return {
+                                        "cancelled": True,
+                                        "fetch_result": None,
+                                        "last_target_error": last_target_error,
+                                        "attempt_errors": attempt_errors,
+                                    }
+                                bounded_subtask_timeout = max(
+                                    1,
+                                    min(
+                                        subtask_timeout_sec,
+                                        int(remaining_job_sec),
+                                    ),
+                                )
                             return {
                                 "cancelled": False,
                                 "fetch_result": self._fetch_cmts_modems(
                                     cmts_ip,
-                                    timeout_sec=subtask_timeout_sec,
+                                    timeout_sec=bounded_subtask_timeout,
                                 ),
                                 "last_target_error": last_target_error,
                                 "attempt_errors": attempt_errors,
@@ -3035,6 +3153,17 @@ class PollerService:
                             "critical_oid_errors": {},
                             "error": target_error,
                         }
+                        if collect_identity:
+                            breakdown_entry.update(
+                                {
+                                    "identity_status": "not_queued",
+                                    "identity_updated": 0,
+                                    "identity_requested": 0,
+                                    "identity_resolved": 0,
+                                    "identity_unresolved": 0,
+                                    "identity_error": "Inventory fetch failed",
+                                }
+                            )
                         modems_failed += 1
                         error_text = (
                             f"CMTS collection failed at {idx}/{total_targets} "
@@ -3069,6 +3198,32 @@ class PollerService:
                             row_count=written,
                             source_poller=poller.get("name"),
                         )
+                        identity_status = "disabled"
+                        identity_error = None
+                        if collect_identity:
+                            if not _job_is_running():
+                                return False
+                            ticket = self._enqueue_identity_enrichment(
+                                modems,
+                                cmts_ip=cmts_ip,
+                                cmts_name=cmts_name,
+                                job_id=job_id,
+                                job_deadline=job_deadline,
+                                should_continue=_job_is_running,
+                            )
+                            if ticket is not None:
+                                identity_tickets.append(ticket)
+                                identity_status = "queued"
+                            elif not _job_is_running():
+                                return False
+                            else:
+                                identity_status = "not_queued"
+                                identity_error = "No valid modem MACs"
+                                logger.warning(
+                                    "Identity enrichment not queued for %s: "
+                                    "no valid modem MACs",
+                                    cmts_name,
+                                )
                         breakdown_entry = {
                             "cmts": cmts_name,
                             "cmts_ip": cmts_ip,
@@ -3084,6 +3239,17 @@ class PollerService:
                                 fetch_result.get("critical_oid_errors") or {}
                             ),
                         }
+                        if collect_identity:
+                            breakdown_entry.update(
+                                {
+                                    "identity_status": identity_status,
+                                    "identity_updated": 0,
+                                    "identity_requested": len(modems),
+                                    "identity_resolved": 0,
+                                    "identity_unresolved": len(modems),
+                                    "identity_error": identity_error,
+                                }
+                            )
                         rows_collected += written
                         modems_succeeded += len(modems)
                         progress_message = (
@@ -3098,7 +3264,8 @@ class PollerService:
                         for _, value in sorted(breakdown_by_index.items())
                     ]
                     self._execute(
-                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s",
+                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s "
+                        "AND status='running'",
                         (json.dumps(ordered_breakdown), job_id),
                     )
 
@@ -3108,8 +3275,15 @@ class PollerService:
                     if checkpoint_offset > previous_checkpoint:
                         self._execute(
                             "UPDATE poller_setting SET last_target_offset=%s, "
-                            "updated_at=%s WHERE id=%s",
-                            (checkpoint_offset, self._now(), poller_id),
+                            "updated_at=%s WHERE id=%s AND EXISTS ("
+                            "SELECT 1 FROM poller_job WHERE id=%s "
+                            "AND status='running')",
+                            (
+                                checkpoint_offset,
+                                self._now(),
+                                poller_id,
+                                job_id,
+                            ),
                         )
                     self._update_running_job_progress(
                         job_id,
@@ -3193,7 +3367,10 @@ class PollerService:
                         if cancelled:
                             for future in pending:
                                 future.cancel()
-                            executor.shutdown(wait=True, cancel_futures=True)
+                            executor.shutdown(
+                                wait=not deadline_expired,
+                                cancel_futures=True,
+                            )
                         else:
                             executor.shutdown(wait=True)
 
@@ -3205,6 +3382,93 @@ class PollerService:
                     )
                     return
 
+                if identity_tickets:
+                    total_identity_targets = len(identity_tickets)
+                    last_reported = -1
+                    while True:
+                        completed_identity_targets = sum(
+                            completed.is_set()
+                            for completed, _ in identity_tickets
+                        )
+                        if completed_identity_targets >= total_identity_targets:
+                            break
+                        if not _job_is_running():
+                            cancelled = True
+                            break
+                        if completed_identity_targets != last_reported:
+                            self._update_running_job_progress(
+                                job_id,
+                                "Inventory identity enrichment: "
+                                f"{completed_identity_targets}/"
+                                f"{total_identity_targets} CMTS targets finished",
+                                rows_collected=rows_collected,
+                                modems_attempted=modems_attempted,
+                                modems_succeeded=modems_succeeded,
+                                modems_failed=modems_failed,
+                            )
+                            last_reported = completed_identity_targets
+                        time.sleep(1)
+                    if not cancelled and not _job_is_running():
+                        cancelled = True
+
+                if cancelled:
+                    self._execute(
+                        "UPDATE poller_setting SET last_target_offset=0, "
+                        "updated_at=%s WHERE id=%s",
+                        (self._now(), poller_id),
+                    )
+                    return
+
+                identity_outcomes = {
+                    str(outcome.get("cmts_ip") or "").strip(): outcome
+                    for _, outcome in identity_tickets
+                }
+                for entry in breakdown_by_index.values():
+                    outcome = identity_outcomes.get(
+                        str(entry.get("cmts_ip") or "").strip()
+                    )
+                    if outcome is None:
+                        continue
+                    entry["identity_status"] = outcome.get("status")
+                    entry["identity_updated"] = int(
+                        outcome.get("updated") or 0
+                    )
+                    entry["identity_requested"] = int(
+                        outcome.get("requested") or 0
+                    )
+                    entry["identity_resolved"] = int(
+                        outcome.get("resolved") or 0
+                    )
+                    entry["identity_unresolved"] = int(
+                        outcome.get("unresolved") or 0
+                    )
+                    entry["identity_error"] = outcome.get("error")
+                identity_failures = sum(
+                    outcome.get("status") in {"failed", "partial"}
+                    for _, outcome in identity_tickets
+                )
+                identity_not_queued = sum(
+                    int(entry.get("row_count") or 0) > 0
+                    and entry.get("identity_status") == "not_queued"
+                    for entry in breakdown_by_index.values()
+                )
+                if collect_identity:
+                    ordered_breakdown = [
+                        value
+                        for _, value in sorted(breakdown_by_index.items())
+                    ]
+                    self._execute(
+                        "UPDATE poller_job SET cmts_breakdown=%s WHERE id=%s "
+                        "AND status='running'",
+                        (json.dumps(ordered_breakdown), job_id),
+                    )
+                identity_issues = identity_failures + identity_not_queued
+                if identity_issues:
+                    identity_error_text = (
+                        "Identity enrichment incomplete or not queued for "
+                        f"{identity_issues}/{total_targets} CMTS target(s)"
+                    )
+
                 try:
                     self._purge_stale_inventory(
                         int(poller.get("retention_days") or 30)
@@ -3215,8 +3479,11 @@ class PollerService:
                 # Every target has now been finalized (including skipped failures),
                 # so the next scheduled run must start a fresh full pass.
                 self._execute(
-                    "UPDATE poller_setting SET last_target_offset=%s, updated_at=%s WHERE id=%s",
-                    (0, self._now(), poller_id),
+                    "UPDATE poller_setting SET last_target_offset=%s, "
+                    "updated_at=%s WHERE id=%s AND EXISTS ("
+                    "SELECT 1 FROM poller_job WHERE id=%s "
+                    "AND status='running')",
+                    (0, self._now(), poller_id, job_id),
                 )
 
         except Exception as exc:
@@ -3235,9 +3502,26 @@ class PollerService:
                     checkpoint_exc,
                 )
 
+        final_error_text = (
+            f"{error_text}; {identity_error_text}"
+            if error_text and identity_error_text
+            else error_text or identity_error_text
+        )
         self._execute(
-            "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
-            ("done" if not error_text else "failed", self._now(), int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), error_text, job_id),
+            "UPDATE poller_job SET status=%s, finished_at=%s, "
+            "rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, "
+            "modems_failed=%s, error_text=%s WHERE id=%s "
+            "AND status='running'",
+            (
+                "done" if not error_text else "failed",
+                self._now(),
+                int(rows_collected),
+                int(modems_attempted),
+                int(modems_succeeded),
+                int(modems_failed),
+                final_error_text,
+                job_id,
+            ),
         )
 
     def _update_running_job_progress(
