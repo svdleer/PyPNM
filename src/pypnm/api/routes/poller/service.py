@@ -494,7 +494,7 @@ class PollerService:
         if existing_cpe_task:
             self._execute(
                 "UPDATE poller_setting SET task_type=%s, system_key=%s, name=%s, "
-                "scope_type='all_cmts', scope_json=NULL, collect_identity=TRUE, "
+                "scope_type='all_cmts', scope_json=NULL, collect_identity=FALSE, "
                 "collect_scqam=FALSE, collect_rxmer=FALSE, interval_minutes=720, "
                 "max_concurrency=10, max_runtime_sec=43200, updated_at=%s WHERE id=%s",
                 (
@@ -515,7 +515,7 @@ class PollerService:
                      interval_minutes, max_concurrency, max_agent_queue_depth,
                      retention_days, heavy_max_modems, heavy_delay_ms,
                      max_runtime_sec, last_target_offset, created_at, updated_at)
-                VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,TRUE,FALSE,FALSE,
+                VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,FALSE,FALSE,FALSE,
                         720,10,20,30,300,0,43200,0,%s,%s)
                 """,
                 (_CPE_TASK_NAME, _CPE_TASK_TYPE, _CPE_TASK_SYSTEM_KEY, now, now),
@@ -2882,16 +2882,10 @@ class PollerService:
                 (int(poller_id),),
             )
             if protected and protected[0].get("system_key"):
-                allowed = {}
                 if "enabled" in payload:
-                    allowed["enabled"] = bool(payload.get("enabled"))
-                if "collect_identity" in payload:
-                    allowed["collect_identity"] = bool(payload.get("collect_identity"))
-                if allowed:
-                    set_clause = ", ".join(f"{k}=%s" for k in allowed)
                     self._execute(
-                        f"UPDATE poller_setting SET {set_clause}, updated_at=%s WHERE id=%s",
-                        (*allowed.values(), now, int(poller_id)),
+                        "UPDATE poller_setting SET enabled=%s, updated_at=%s WHERE id=%s",
+                        (bool(payload.get("enabled")), now, int(poller_id)),
                     )
                 return int(poller_id)
 
