@@ -95,10 +95,6 @@ class CMTSRemoteQueryProbeRequest(BaseModel):
     """Request a bounded, read-only CMTS remote-query capability probe."""
 
     cmts_ip: str = Field(..., description="Allowlisted CMTS IP address")
-    provider: Literal["cadant", "casa"] = Field(
-        default="cadant",
-        description="Fixed vendor MIB profile to probe",
-    )
     limit: int = Field(
         default=1000,
         ge=1,
@@ -109,7 +105,7 @@ class CMTSRemoteQueryProbeRequest(BaseModel):
         default=10,
         ge=0,
         le=20,
-        description="Maximum number of sanitized identity summaries returned",
+        description="Maximum number of sanitized fresh identity summaries returned",
     )
 
     class Config:
@@ -128,14 +124,12 @@ class CMTSRemoteQueryProbeResponse(BaseModel):
     """Non-persistent result from the fixed CMTS remote-query probe."""
 
     success: bool
-    remote_query_provider: Literal["cadant", "casa"] = "cadant"
     cmts_sys_object_id: Optional[str] = None
     cmts_sys_descr: Optional[str] = None
     remote_query_supported: bool = False
     remote_query_complete: bool = False
     remote_query_truncated: bool = False
     remote_query_row_count: int = 0
-    freshness_available: bool = True
     freshness_verified: bool = False
     fresh_row_count: int = 0
     parsed_identity_count: int = 0
