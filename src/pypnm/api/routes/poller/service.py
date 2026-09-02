@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_for_futures
@@ -4734,95 +4735,128 @@ class PollerService:
         self,
         cmts: Optional[str] = None,
         top_n: int = 25,
+        area: Optional[str] = None,
     ) -> dict:
-        """Return vendor/model/firmware/DOCSIS count breakdowns from MySQL.
+        """Return inventory breakdowns with one grouped MySQL scan.
 
-        Uses a single table scan with subqueries to avoid the overhead of five
-        separate GROUP BY queries against 3M+ rows.
+        fZiggo and fUPC filter on the modem management IPv4 address. VFZ is
+        intentionally unfiltered by modem IP and represents the full inventory
+        scope (subject only to an optional CMTS filter).
         """
-        where_base = ""
-        params_base: list = []
-        if cmts:
-            where_base = (
-                " WHERE (LOWER(COALESCE(cmts,'')) = LOWER(%s)"
-                " OR LOWER(COALESCE(cmts_ip,'')) = LOWER(%s))"
+        normalized_area = str(area or "").strip().lower()
+        valid_areas = {"fziggo", "fupc", "vfz"}
+        area_ranges = {
+            "fziggo": [(2147483648, 2149580799)],  # 128.0.0.0/11
+            "fupc": [
+                (2684354560, 2686451711),  # 160.0.0.0/11
+                (180355072, 182452223),    # 10.192.0.0/11
+            ],
+        }
+        if normalized_area and normalized_area not in valid_areas:
+            raise ValueError(f"Unsupported inventory area: {area}")
+
+        where_parts: list[str] = []
+        params: list[Any] = []
+        cmts_value = str(cmts or "").strip()
+        if cmts_value:
+            try:
+                ipaddress.ip_address(cmts_value)
+                cmts_column = "cmts_ip"
+            except ValueError:
+                cmts_column = "cmts"
+            where_parts.append(f"{cmts_column}=%s")
+            params.append(cmts_value)
+
+        if normalized_area in area_ranges:
+            ip_number = "INET_ATON(NULLIF(TRIM(ip),''))"
+            ranges = area_ranges[normalized_area]
+            where_parts.append(
+                "(" + " OR ".join(
+                    f"{ip_number} BETWEEN %s AND %s" for _ in ranges
+                ) + ")"
             )
-            params_base = [cmts, cmts]
+            for lower, upper in ranges:
+                params.extend([lower, upper])
+
+        where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        grouped_rows = self._query(
+            f"""
+            SELECT
+                TRIM(COALESCE(vendor,'')) AS vendor,
+                TRIM(COALESCE(model,'')) AS model,
+                TRIM(COALESCE(software_version,'')) AS software_version,
+                TRIM(COALESCE(docsis_version,'')) AS docsis_version,
+                COUNT(*) AS row_count,
+                MAX(updated_at) AS last_updated
+            FROM modem_inventory_current{where_sql}
+            GROUP BY 1, 2, 3, 4
+            """,
+            tuple(params),
+        )
+
+        placeholders = {"", "unknown", "n/a", "na", "none", "null", "-"}
+        enriched_placeholders = {"", "unknown", "n/a"}
+
+        def _meaningful(value: Any) -> str:
+            text = str(value or "").strip()
+            return "" if text.lower() in placeholders else text
+
+        vendor_counts: Counter[str] = Counter()
+        model_counts: Counter[str] = Counter()
+        firmware_counts: Counter[str] = Counter()
+        docsis_counts: Counter[str] = Counter()
+        total = 0
+        enriched = 0
+        last_updated = ""
+
+        for source in grouped_rows or []:
+            count = int(source.get("row_count") or 0)
+            total += count
+            vendor_text = str(source.get("vendor") or "").strip()
+            model_text = str(source.get("model") or "").strip()
+            firmware_text = str(source.get("software_version") or "").strip()
+            vendor = _meaningful(vendor_text)
+            model = _meaningful(model_text)
+            firmware = _meaningful(firmware_text)
+            docsis = _meaningful(source.get("docsis_version"))
+            if vendor:
+                vendor_counts[vendor] += count
+            if model:
+                model_counts[model] += count
+            if firmware:
+                firmware_counts[firmware] += count
+            if docsis:
+                docsis_counts[docsis] += count
+            if (
+                vendor_text.lower() not in enriched_placeholders
+                and (
+                    bool(firmware_text)
+                    or model_text.lower() not in enriched_placeholders
+                )
+            ):
+                enriched += count
+            updated = str(source.get("last_updated") or "")
+            if updated > last_updated:
+                last_updated = updated
 
         top = max(1, min(int(top_n), 100))
 
-        # Last updated + total + enriched in one pass.
-        summary_rows = self._query(
-            f"""
-            SELECT
-                COUNT(*) AS total,
-                MAX(updated_at) AS last_updated,
-                SUM(
-                    CASE WHEN
-                        LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('','unknown','n/a')
-                        AND (
-                            TRIM(COALESCE(software_version,'')) <> ''
-                            OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('','unknown','n/a')
-                        )
-                    THEN 1 ELSE 0 END
-                ) AS enriched
-            FROM modem_inventory_current{where_base}
-            """,
-            tuple(params_base),
-        )
-        row0 = (summary_rows[0] if summary_rows else {}) or {}
-        total = int(row0.get("total") or 0)
-        enriched = int(row0.get("enriched") or 0)
-        last_updated = str(row0.get("last_updated") or "")
-
-        def _top_counts(column: str) -> list:
-            # Exclude blank, null, and known placeholder values so only
-            # meaningful identity data appears in the breakdown tables.
-            placeholder_list = "('','unknown','n/a','na','none','null','-')"
-            and_clause = (
-                (" AND" if where_base else " WHERE")
-                + f" LOWER(TRIM(COALESCE({column},''))) NOT IN {placeholder_list}"
-            )
-            rows = self._query(
-                f"""
-                SELECT TRIM({column}) AS value,
-                       COUNT(*) AS count
-                FROM modem_inventory_current{where_base}{and_clause}
-                GROUP BY 1 ORDER BY 2 DESC LIMIT %s
-                """,
-                tuple(params_base + [top]),
-            )
+        def _top(counter: Counter[str]) -> list[dict[str, Any]]:
             return [
-                {"value": str(r.get("value") or ""), "count": int(r.get("count") or 0)}
-                for r in (rows or [])
-                if r.get("value")
+                {"value": value, "count": count}
+                for value, count in counter.most_common(top)
             ]
-
-        # Run the four GROUP BY breakdowns concurrently to reduce wall time.
-        # Each uses its own thread-local DB connection so there is no lock
-        # contention with the main coordinator thread.
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        columns = ["vendor", "model", "software_version", "docsis_version"]
-        results: dict = {}
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="inv-summary") as ex:
-            futures = {ex.submit(_top_counts, col): col for col in columns}
-            for fut in as_completed(futures):
-                col = futures[fut]
-                try:
-                    results[col] = fut.result()
-                except Exception:
-                    results[col] = []
 
         return {
             "total": total,
             "enriched": enriched,
             "enriched_pct": round(enriched / total * 100, 1) if total else 0.0,
             "last_updated": last_updated,
-            "vendors": results.get("vendor", []),
-            "models": results.get("model", []),
-            "firmwares": results.get("software_version", []),
-            "docsis_versions": results.get("docsis_version", []),
+            "area": normalized_area or None,
+            "vendors": _top(vendor_counts),
+            "models": _top(model_counts),
+            "firmwares": _top(firmware_counts),
+            "docsis_versions": _top(docsis_counts),
         }
 
     # ── Queue head (admin dashboard) ─────────────────────────────

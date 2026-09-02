@@ -6,20 +6,20 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
-logger = logging.getLogger(__name__)
-
 from pypnm.api.routes.poller.schema import (
     PollerJobsResponse,
     PollerRunRequest,
     PollerSchedulerPollRequest,
     PollerSchedulerStatusResponse,
     PollerSchedulerToggleRequest,
-    PollerSettingUpsertRequest,
     PollerSettingsResponse,
+    PollerSettingUpsertRequest,
     PollerSnapshotsAnalyticsResponse,
     PollerSnapshotsByDayResponse,
 )
 from pypnm.api.routes.poller.service import poller_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin", tags=["poller"])
 
@@ -195,11 +195,21 @@ def suggest_cpe_addresses(
 @router.get("/inventory/summary")
 def inventory_summary(
     cmts: str | None = None,
+    area: str | None = Query(
+        default=None,
+        pattern="^(fziggo|fupc|vfz)$",
+    ),
     top_n: int = Query(default=25, ge=1, le=100),
 ) -> dict:
     """Return vendor/model/firmware/DOCSIS count breakdowns for the inventory dashboard."""
     try:
-        data = poller_service.get_inventory_summary(cmts=cmts, top_n=top_n)
+        data = poller_service.get_inventory_summary(
+            cmts=cmts,
+            top_n=top_n,
+            area=area,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("inventory/summary DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
