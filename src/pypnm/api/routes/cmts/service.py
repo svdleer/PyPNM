@@ -85,6 +85,12 @@ OID_CAD_RQ_POLLER_START = '1.3.6.1.4.1.4998.1.1.55.1.1.3.0'
 OID_CAD_RQ_POLLER_STOP = '1.3.6.1.4.1.4998.1.1.55.1.1.4.0'
 OID_CAD_RQ_POLL_TIME = '1.3.6.1.4.1.4998.1.1.55.1.2.1.1'
 OID_CAD_RQ_SYS_DESCR = '1.3.6.1.4.1.4998.1.1.55.1.2.1.7'
+OID_CASA_RQ_SYS_DESCR = '1.3.6.1.4.1.20858.10.18.1.1.1.9'
+OID_CASA_ENTERPRISE_PREFIX = '1.3.6.1.4.1.20858.'
+OID_CADANT_ENTERPRISE_PREFIXES = (
+    '1.3.6.1.4.1.4998.',
+    '1.3.6.1.4.1.4115.',
+)
 # DOCSIS 3.1 supplementary
 OID_US_CH_ID     = '1.3.6.1.4.1.4491.2.1.20.1.4.1.3'    # docsIf3CmtsCmUsStatusChIfIndex
 OID_IF_NAME      = '1.3.6.1.2.1.31.1.1.1.1'              # IF-MIB::ifName
@@ -2253,6 +2259,219 @@ class CMTSModemService:
         self,
         *,
         cmts_ip: str,
+        provider: str = 'cadant',
+        limit: int = 1000,
+        sample_limit: int = 10,
+    ) -> dict:
+        """Probe one fixed vendor remote-query identity profile."""
+        normalized_provider = str(provider or 'cadant').strip().lower()
+        if normalized_provider == 'casa':
+            return await self._probe_casa_remote_query_identity(
+                cmts_ip=cmts_ip,
+                limit=limit,
+                sample_limit=sample_limit,
+            )
+        if normalized_provider == 'cadant':
+            return await self._probe_cadant_remote_query_identity(
+                cmts_ip=cmts_ip,
+                limit=limit,
+                sample_limit=sample_limit,
+            )
+        return {
+            'success': False,
+            'remote_query_provider': 'cadant',
+            'error_code': 'unsupported_provider',
+        }
+
+    async def _probe_casa_remote_query_identity(
+        self,
+        *,
+        cmts_ip: str,
+        limit: int = 1000,
+        sample_limit: int = 10,
+    ) -> dict:
+        """Probe Casa cmSysDesc without persistence or freshness claims."""
+        limit = max(1, min(int(limit), 1000))
+        sample_limit = max(0, min(int(sample_limit), 20))
+
+        async def _read_scalar(oid: str) -> str | None:
+            try:
+                result = await self._send_agent_command(
+                    'snmp_get',
+                    {
+                        'target_ip': cmts_ip,
+                        'oid': oid,
+                        'timeout': 5,
+                    },
+                    timeout=15,
+                )
+                return self._agent_scalar_value(result)
+            except Exception as exc:
+                self.logger.debug('Probe scalar %s unavailable on %s: %s', oid, cmts_ip, exc)
+                return None
+
+        sys_object_raw, sys_descr_raw = await asyncio.gather(
+            _read_scalar(OID_CMTS_SYS_OBJECT_ID),
+            _read_scalar(OID_CMTS_SYS_DESCR),
+        )
+        sys_object_id = self._normalize_probe_object_id(sys_object_raw)
+        base_result = {
+            'remote_query_provider': 'casa',
+            'cmts_sys_object_id': sys_object_id,
+            'cmts_sys_descr': self._sanitize_probe_text(sys_descr_raw),
+            'freshness_available': False,
+        }
+        if not sys_object_id:
+            return {
+                **base_result,
+                'success': False,
+                'error_code': 'identity_unavailable',
+            }
+        if not sys_object_id.startswith(OID_CASA_ENTERPRISE_PREFIX):
+            return {
+                **base_result,
+                'success': False,
+                'error_code': 'provider_mismatch',
+            }
+
+        try:
+            walk_result = await self._send_agent_command(
+                'snmp_parallel_walk',
+                {
+                    'ip': cmts_ip,
+                    'oids': [OID_CASA_RQ_SYS_DESCR],
+                    'timeout': 5,
+                    'limit': limit,
+                    'overall_timeout': 45,
+                },
+                timeout=60,
+            )
+        except Exception:
+            self.logger.exception('Casa remote-query probe dispatch failed for %s', cmts_ip)
+            return {
+                **base_result,
+                'success': False,
+                'error_code': 'agent_error',
+            }
+
+        errors = walk_result.get('errors') if isinstance(walk_result, dict) else None
+        completed_values = (
+            walk_result.get('completed_oids') if isinstance(walk_result, dict) else None
+        )
+        truncated_values = (
+            walk_result.get('truncated_oids') if isinstance(walk_result, dict) else None
+        )
+        raw_results = walk_result.get('results') if isinstance(walk_result, dict) else None
+        structurally_valid = bool(
+            isinstance(walk_result, dict)
+            and (errors is None or isinstance(errors, dict))
+            and isinstance(completed_values, (list, tuple, set))
+            and isinstance(truncated_values, (list, tuple, set))
+            and isinstance(raw_results, dict)
+            and isinstance(raw_results.get(OID_CASA_RQ_SYS_DESCR), list)
+        )
+        errors = errors or {} if isinstance(errors, dict) or errors is None else {}
+        completed_oids = set(completed_values or []) if structurally_valid else set()
+        truncated_oids = set(truncated_values or []) if structurally_valid else set()
+        table_success = bool(
+            structurally_valid
+            and walk_result.get('success') is True
+            and OID_CASA_RQ_SYS_DESCR not in errors
+        )
+        remote_query_complete = bool(
+            table_success
+            and OID_CASA_RQ_SYS_DESCR in completed_oids
+            and OID_CASA_RQ_SYS_DESCR not in truncated_oids
+        )
+        remote_query_truncated = OID_CASA_RQ_SYS_DESCR in truncated_oids
+
+        descriptions: list[str] = []
+        malformed_rows = False
+        if structurally_valid:
+            for item in raw_results.get(OID_CASA_RQ_SYS_DESCR, []):
+                if not isinstance(item, dict):
+                    malformed_rows = True
+                    continue
+                if not self._remote_query_mac_from_oid(
+                    item.get('oid'), OID_CASA_RQ_SYS_DESCR
+                ):
+                    malformed_rows = True
+                    continue
+                value = str(item.get('value') or '').strip()
+                if value.startswith('STRING:'):
+                    value = value[len('STRING:'):].strip()
+                value = value.strip('"')
+                if value and 'No Such' not in value:
+                    descriptions.append(value)
+        if malformed_rows:
+            structurally_valid = False
+            table_success = False
+            remote_query_complete = False
+
+        identity_samples: list[dict[str, str]] = []
+        seen_samples: set[tuple[str, str, str]] = set()
+        parsed_identity_count = 0
+        for description in descriptions:
+            parsed = self._parse_sys_descr(description)
+            sample = {
+                'vendor': self._sanitize_probe_text(parsed.get('vendor'), max_length=128),
+                'model': self._sanitize_probe_text(parsed.get('model'), max_length=128),
+                'software_version': self._sanitize_probe_text(
+                    parsed.get('software'), max_length=128
+                ),
+            }
+            sample = {key: value for key, value in sample.items() if value}
+            if not sample or not any(
+                value != '[redacted]' and self._meaningful_identity_value(value)
+                for value in sample.values()
+            ):
+                continue
+            parsed_identity_count += 1
+            if sample_limit == 0:
+                continue
+            sample_key = (
+                sample.get('vendor', ''),
+                sample.get('model', ''),
+                sample.get('software_version', ''),
+            )
+            if sample_key in seen_samples or len(identity_samples) >= sample_limit:
+                continue
+            seen_samples.add(sample_key)
+            identity_samples.append(sample)
+
+        error_code = None
+        if not structurally_valid:
+            error_code = 'malformed_response'
+        elif not table_success:
+            error_code = 'remote_query_unavailable'
+        elif not remote_query_complete:
+            error_code = 'remote_query_incomplete'
+        elif not descriptions:
+            error_code = 'no_rows'
+        elif parsed_identity_count == 0:
+            error_code = 'identity_unparseable'
+        else:
+            error_code = 'freshness_unavailable'
+
+        return {
+            **base_result,
+            'success': table_success,
+            'remote_query_supported': table_success,
+            'remote_query_complete': remote_query_complete,
+            'remote_query_truncated': remote_query_truncated,
+            'remote_query_row_count': len(descriptions),
+            'freshness_verified': False,
+            'fresh_row_count': 0,
+            'parsed_identity_count': parsed_identity_count,
+            'enrichment_usable': False,
+            'identity_samples': identity_samples,
+            'error_code': error_code,
+        }
+
+    async def _probe_cadant_remote_query_identity(
+        self,
+        *,
+        cmts_ip: str,
         limit: int = 1000,
         sample_limit: int = 10,
     ) -> dict:
@@ -2289,6 +2508,26 @@ class CMTSModemService:
             self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_STOP),
             self._read_cmts_counter(cmts_ip, OID_CAD_RQ_POLLER_INTERVAL),
         )
+        sys_object_id = self._normalize_probe_object_id(sys_object_raw)
+        if not sys_object_id:
+            return {
+                'success': False,
+                'remote_query_provider': 'cadant',
+                'cmts_sys_descr': self._sanitize_probe_text(sys_descr_raw),
+                'freshness_available': True,
+                'error_code': 'identity_unavailable',
+            }
+        if not any(
+            sys_object_id.startswith(prefix) for prefix in OID_CADANT_ENTERPRISE_PREFIXES
+        ):
+            return {
+                'success': False,
+                'remote_query_provider': 'cadant',
+                'cmts_sys_object_id': sys_object_id,
+                'cmts_sys_descr': self._sanitize_probe_text(sys_descr_raw),
+                'freshness_available': True,
+                'error_code': 'provider_mismatch',
+            }
 
         try:
             walk_result = await self._send_agent_command(

@@ -291,6 +291,7 @@ async def probe_remote_query_identity(
                 agent_priority="bulk",
             ).probe_remote_query_identity(
                 cmts_ip=str(ipaddress.ip_address(payload.cmts_ip.strip())),
+                provider=payload.provider,
                 limit=payload.limit,
                 sample_limit=payload.sample_limit,
             )
@@ -299,6 +300,8 @@ async def probe_remote_query_identity(
         logger.exception("CMTS remote-query probe failed")
         return CMTSRemoteQueryProbeResponse(
             success=False,
+            remote_query_provider=payload.provider,
+            freshness_available=payload.provider == "cadant",
             error_code="internal_error",
         )
 
