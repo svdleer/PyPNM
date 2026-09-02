@@ -4378,18 +4378,11 @@ class PollerService:
         last_updated = str(row0.get("last_updated") or "")
 
         def _top_counts(column: str) -> list:
-            # Exclude blank, null, and known placeholder values so only
-            # meaningful identity data appears in the breakdown tables.
-            placeholder_list = "('','unknown','n/a','na','none','null','-')"
-            and_clause = (
-                (" AND" if where_base else " WHERE")
-                + f" LOWER(TRIM(COALESCE({column},''))) NOT IN {placeholder_list}"
-            )
             rows = self._query(
                 f"""
-                SELECT TRIM({column}) AS value,
+                SELECT COALESCE(NULLIF(TRIM({column}),''), '(unknown)') AS value,
                        COUNT(*) AS count
-                FROM modem_inventory_current{where_base}{and_clause}
+                FROM modem_inventory_current{where_base}
                 GROUP BY 1 ORDER BY 2 DESC LIMIT %s
                 """,
                 tuple(params_base + [top]),
@@ -4397,7 +4390,6 @@ class PollerService:
             return [
                 {"value": str(r.get("value") or ""), "count": int(r.get("count") or 0)}
                 for r in (rows or [])
-                if r.get("value")
             ]
 
         # Run the four GROUP BY breakdowns concurrently to reduce wall time.
