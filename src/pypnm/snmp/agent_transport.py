@@ -327,6 +327,10 @@ class AgentSnmpTransport:
             agent = mgr.get_agent(agent_id)
             if not agent:
                 raise RuntimeError(f"Pinned agent '{agent_id}' is not connected")
+            if not agent.authenticated or not agent.is_alive():
+                raise RuntimeError(
+                    f"Pinned agent '{agent_id}' is not authenticated and alive"
+                )
             if capability not in agent.capabilities:
                 raise RuntimeError(
                     f"Pinned agent '{agent_id}' lacks '{capability}' capability"
