@@ -6,9 +6,11 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_for_futures
 from datetime import datetime, timedelta, timezone
@@ -67,6 +69,29 @@ class PollerService:
         }
         self._worker_started = False
 
+        # CPE-triggered identity work is globally bounded per API process.
+        # Queue items contain only authoritative parent modem MACs, never the
+        # subscriber CPE addresses collected from DOCS-SUBMGT3.
+        self._identity_worker_count = self._bounded_env_int(
+            "CPE_IDENTITY_WORKERS", 1, minimum=1, maximum=4
+        )
+        identity_queue_size = self._bounded_env_int(
+            "CPE_IDENTITY_QUEUE_SIZE", 16, minimum=1, maximum=512
+        )
+        self._identity_queue: queue.Queue[
+            tuple[
+                str,
+                str,
+                tuple[str, ...],
+                int,
+                float,
+                threading.Event,
+                Dict[str, Any],
+            ]
+        ] = queue.Queue(maxsize=identity_queue_size)
+        self._identity_start_lock = threading.Lock()
+        self._identity_workers_started = False
+
         self._init_db()
         self._start_worker()
 
@@ -123,6 +148,19 @@ class PollerService:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
+    def _bounded_env_int(
+        name: str,
+        default: int,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            return max(minimum, min(int(os.environ.get(name, str(default))), maximum))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _normalize_mac(mac: str) -> str:
         compact = (
             (mac or "").strip().lower()
@@ -134,6 +172,266 @@ class PollerService:
         if len(compact) != 12 or any(ch not in "0123456789abcdef" for ch in compact):
             return ""
         return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
+
+    def _start_identity_workers(self) -> None:
+        with self._identity_start_lock:
+            if self._identity_workers_started:
+                return
+            workers = [
+                threading.Thread(
+                    target=self._identity_worker_loop,
+                    name=f"pypnm-identity-worker-{index + 1}",
+                    daemon=True,
+                )
+                for index in range(self._identity_worker_count)
+            ]
+            self._identity_workers_started = True
+        for worker in workers:
+            worker.start()
+        logger.info(
+            "Started %d bounded CPE identity worker(s); queue capacity=%d",
+            self._identity_worker_count,
+            self._identity_queue.maxsize,
+        )
+
+    def _enqueue_identity_enrichment(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        cmts_ip: str,
+        cmts_name: str,
+        job_id: int,
+        job_deadline: float,
+        should_continue: Optional[Callable[[], bool]] = None,
+    ) -> Optional[tuple[threading.Event, Dict[str, Any]]]:
+        """Queue parent modem MACs with backpressure; never queue CPE IPs."""
+        target_cmts_ip = str(cmts_ip or "").strip()
+        if not target_cmts_ip:
+            return None
+        modem_macs = tuple(
+            dict.fromkeys(
+                normalized
+                for row in rows or []
+                if isinstance(row, dict)
+                for normalized in [
+                    self._normalize_mac(str(row.get("modem_mac") or ""))
+                ]
+                if normalized
+            )
+        )
+        if not modem_macs:
+            return None
+
+        self._start_identity_workers()
+        completed = threading.Event()
+        outcome: Dict[str, Any] = {
+            "cmts": str(cmts_name or target_cmts_ip),
+            "cmts_ip": target_cmts_ip,
+            "status": "queued",
+            "updated": 0,
+            "error": None,
+        }
+        item = (
+            str(cmts_name or target_cmts_ip),
+            target_cmts_ip,
+            modem_macs,
+            int(job_id),
+            float(job_deadline),
+            completed,
+            outcome,
+        )
+        if self._identity_queue.full():
+            logger.info(
+                "Identity enrichment queue full; applying backpressure for %s",
+                cmts_name,
+            )
+        while True:
+            try:
+                self._identity_queue.put(item, timeout=1.0)
+                return completed, outcome
+            except queue.Full:
+                if should_continue is None:
+                    continue
+                try:
+                    keep_waiting = should_continue()
+                except Exception as exc:
+                    logger.warning(
+                        "Identity enrichment queue status check failed for %s: %s",
+                        cmts_name,
+                        exc,
+                    )
+                    return None
+                if not keep_waiting:
+                    logger.info(
+                        "Identity enrichment queue cancelled for %s",
+                        cmts_name,
+                    )
+                    return None
+
+    def _identity_worker_loop(self) -> None:
+        while True:
+            (
+                cmts_name,
+                cmts_ip,
+                modem_macs,
+                job_id,
+                job_deadline,
+                completed,
+                outcome,
+            ) = self._identity_queue.get()
+            try:
+                status_rows = self._query(
+                    "SELECT status FROM poller_job WHERE id=%s",
+                    (job_id,),
+                )
+                if (
+                    time.monotonic() >= job_deadline
+                    or not status_rows
+                    or str((status_rows[0] or {}).get("status") or "").lower()
+                    != "running"
+                ):
+                    outcome["status"] = "skipped"
+                    outcome["error"] = (
+                        f"Poller job {job_id} is no longer running"
+                    )
+                    logger.info(
+                        "Identity enrichment skipped for %s: poller job %d is no "
+                        "longer running",
+                        cmts_name,
+                        job_id,
+                    )
+                    continue
+                outcome["status"] = "running"
+                outcome["updated"] = self._run_identity_enrichment(
+                    modem_macs,
+                    cmts_ip=cmts_ip,
+                    cmts_name=cmts_name,
+                    job_id=job_id,
+                    job_deadline=job_deadline,
+                )
+                outcome["status"] = "done"
+            except Exception as exc:
+                outcome["status"] = "failed"
+                outcome["error"] = str(exc)
+                logger.warning(
+                    "Identity enrichment failed for %s: %s",
+                    cmts_name,
+                    exc,
+                )
+            finally:
+                completed.set()
+                self._identity_queue.task_done()
+
+    def _run_identity_enrichment(
+        self,
+        modem_macs: tuple[str, ...],
+        *,
+        cmts_ip: str,
+        cmts_name: str,
+        job_id: int,
+        job_deadline: float,
+    ) -> int:
+        import asyncio
+
+        from pypnm.api.routes.cmts.service import CMTSModemService
+
+        inventory_modems = self.get_inventory_modems_bulk(
+            list(modem_macs),
+            cmts_ip=cmts_ip,
+        )
+        modem_dicts = [
+            modem
+            for modem in inventory_modems
+            if str(modem.get("ip_address") or "").strip()
+        ]
+        skipped = len(modem_macs) - len(modem_dicts)
+        if skipped:
+            logger.info(
+                "Identity enrichment: skipped %d/%d modems for %s without a "
+                "matching authoritative inventory address",
+                skipped,
+                len(modem_macs),
+                cmts_name,
+            )
+        if not modem_dicts:
+            return 0
+
+        identity_fields = (
+            "vendor",
+            "model",
+            "software_version",
+            "docsis_version",
+        )
+        before = {
+            str(modem.get("mac_address") or ""): tuple(
+                modem.get(field) for field in identity_fields
+            )
+            for modem in modem_dicts
+        }
+        logger.info(
+            "Identity enrichment: starting for %s (%d modems from inventory)",
+            cmts_name,
+            len(modem_dicts),
+        )
+        service = CMTSModemService(agent_priority="bulk")
+        asyncio.run(
+            service._enrich_modems_direct(
+                modem_dicts,
+                # Poller enrichment must not share GUI cache progress or
+                # cancellation state keyed by CMTS address.
+                cmts_ip=None,
+            )
+        )
+
+        changed = []
+        for modem in modem_dicts:
+            mac = str(modem.get("mac_address") or "")
+            original = before.get(mac)
+            if original is None:
+                continue
+            delta: Dict[str, Any] = {"mac_address": mac}
+            for index, field in enumerate(identity_fields):
+                if modem.get(field) != original[index]:
+                    delta[field] = modem.get(field)
+            if len(delta) > 1:
+                changed.append(delta)
+        if time.monotonic() >= job_deadline:
+            self._execute(
+                "UPDATE poller_job SET status='timed_out', finished_at=%s, "
+                "error_text=%s WHERE id=%s AND status='running'",
+                (
+                    self._now(),
+                    "CPE identity result discarded after job deadline",
+                    job_id,
+                ),
+            )
+            return 0
+        status_rows = self._query(
+            "SELECT status FROM poller_job WHERE id=%s",
+            (job_id,),
+        )
+        if not status_rows or str(
+            (status_rows[0] or {}).get("status") or ""
+        ).lower() != "running":
+            logger.info(
+                "Identity enrichment result discarded for %s: poller job %d "
+                "is no longer running",
+                cmts_name,
+                job_id,
+            )
+            return 0
+        updated = self._update_inventory_identity_rows(
+            changed,
+            cmts_ip=cmts_ip,
+            job_id=job_id,
+        )
+        logger.info(
+            "Identity enrichment: finished for %s (%d/%d modem identities updated)",
+            cmts_name,
+            updated,
+            len(modem_dicts),
+        )
+        return updated
 
     def _rows(self, cur):
         return cur.fetchall()
@@ -249,6 +547,7 @@ class PollerService:
                 scope_type VARCHAR(16) NOT NULL DEFAULT 'all_cmts',
                 scope_json JSON NULL,
                 collect_identity BOOLEAN NOT NULL DEFAULT TRUE,
+                identity_rollout_version SMALLINT UNSIGNED NOT NULL DEFAULT 1,
                 collect_scqam BOOLEAN NOT NULL DEFAULT FALSE,
                 collect_rxmer BOOLEAN NOT NULL DEFAULT FALSE,
                 interval_minutes INT NOT NULL DEFAULT 360,
@@ -405,6 +704,13 @@ class PollerService:
             )
         if "system_key" not in setting_columns:
             missing_setting_columns.append("ADD COLUMN `system_key` VARCHAR(64) NULL")
+        if "identity_rollout_version" not in setting_columns:
+            # Existing installations receive version 0 so the protected CPE
+            # task is disabled exactly once during the safe rollout below.
+            missing_setting_columns.append(
+                "ADD COLUMN `identity_rollout_version` SMALLINT UNSIGNED "
+                "NOT NULL DEFAULT 0"
+            )
         if "last_scheduled_slot_utc" not in setting_columns:
             missing_setting_columns.append(
                 "ADD COLUMN `last_scheduled_slot_utc` DATETIME NULL"
@@ -475,11 +781,13 @@ class PollerService:
                 )
 
         cpe_by_key = self._query(
-            "SELECT id FROM poller_setting WHERE system_key=%s LIMIT 1",
+            "SELECT id, identity_rollout_version FROM poller_setting "
+            "WHERE system_key=%s LIMIT 1",
             (_CPE_TASK_SYSTEM_KEY,),
         )
         cpe_by_name = self._query(
-            "SELECT id FROM poller_setting WHERE name=%s LIMIT 1",
+            "SELECT id, identity_rollout_version FROM poller_setting "
+            "WHERE name=%s LIMIT 1",
             (_CPE_TASK_NAME,),
         )
         if (
@@ -494,7 +802,9 @@ class PollerService:
         if existing_cpe_task:
             self._execute(
                 "UPDATE poller_setting SET task_type=%s, system_key=%s, name=%s, "
-                "scope_type='all_cmts', scope_json=NULL, collect_identity=TRUE, "
+                "scope_type='all_cmts', scope_json=NULL, "
+                "collect_identity=CASE WHEN identity_rollout_version < 1 "
+                "THEN FALSE ELSE collect_identity END, identity_rollout_version=1, "
                 "collect_scqam=FALSE, collect_rxmer=FALSE, interval_minutes=720, "
                 "max_concurrency=10, max_runtime_sec=43200, updated_at=%s WHERE id=%s",
                 (
@@ -511,11 +821,12 @@ class PollerService:
                 """
                 INSERT INTO poller_setting
                     (name, task_type, system_key, enabled, scope_type, scope_json,
-                     collect_identity, collect_scqam, collect_rxmer,
+                     collect_identity, identity_rollout_version,
+                     collect_scqam, collect_rxmer,
                      interval_minutes, max_concurrency, max_agent_queue_depth,
                      retention_days, heavy_max_modems, heavy_delay_ms,
                      max_runtime_sec, last_target_offset, created_at, updated_at)
-                VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,TRUE,FALSE,FALSE,
+                VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,FALSE,1,FALSE,FALSE,
                         720,10,20,30,300,0,43200,0,%s,%s)
                 """,
                 (_CPE_TASK_NAME, _CPE_TASK_TYPE, _CPE_TASK_SYSTEM_KEY, now, now),
@@ -1174,6 +1485,7 @@ class PollerService:
         agent_command_timeout_sec: int = 300,
         min_remaining_tree_reserve_sec: float = 0,
         http_timeout_sec: int = 330,
+        request_timeout_cap_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fetch one fresh CPE-only generation from a CMTS."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
@@ -1190,6 +1502,11 @@ class PollerService:
             int(agent_command_timeout_sec) + 30,
             int(http_timeout_sec),
         )
+        if request_timeout_cap_sec is not None:
+            request_timeout = min(
+                request_timeout,
+                max(1.0, float(request_timeout_cap_sec)),
+            )
         response = requests.post(
             f"{base}/cmts/cpe/query",
             json=payload,
@@ -1361,6 +1678,64 @@ class PollerService:
             inserted += len(batch)
 
         return inserted
+
+    def _update_inventory_identity_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        cmts_ip: str,
+        job_id: int,
+    ) -> int:
+        """Update identity fields only while the owning poller job is running."""
+        target_cmts_ip = str(cmts_ip or "").strip()
+        if not rows or not target_cmts_ip:
+            return 0
+
+        def _meaningful(value: Any) -> Optional[str]:
+            text = str(value or "").strip()
+            if text.lower() in {"", "unknown", "n/a", "none"}:
+                return None
+            return text
+
+        values = []
+        for row in rows:
+            mac = self._normalize_mac(
+                str(row.get("mac_address") or row.get("mac") or "")
+            )
+            if not mac:
+                continue
+            identity = (
+                _meaningful(row.get("vendor")),
+                _meaningful(row.get("model")),
+                _meaningful(row.get("software_version")),
+                _meaningful(row.get("docsis_version")),
+            )
+            if not any(identity):
+                continue
+            values.append((*identity, mac, target_cmts_ip, int(job_id)))
+        if not values:
+            return 0
+
+        sql = """
+            UPDATE modem_inventory_current
+            SET vendor=COALESCE(%s, vendor),
+                model=COALESCE(%s, model),
+                software_version=COALESCE(%s, software_version),
+                docsis_version=COALESCE(%s, docsis_version)
+            WHERE mac=%s AND cmts_ip=%s
+              AND EXISTS (
+                  SELECT 1 FROM poller_job
+                  WHERE id=%s AND status='running'
+              )
+        """
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.executemany(sql, values)
+                return int(cur.rowcount or 0)
+            finally:
+                conn.close()
 
     def _persist_cpe_generation(
         self,
@@ -1686,7 +2061,24 @@ class PollerService:
         incomplete_targets = 0
         poller_id = int(poller.get("id") or 0)
         collect_identity = bool(int(poller.get("collect_identity") or 0))
-        start_offset = max(0, int(poller.get("last_target_offset") or 0))
+        identity_tickets: List[
+            tuple[threading.Event, Dict[str, Any]]
+        ] = []
+        identity_failures = 0
+        try:
+            max_runtime_sec = max(60, int(poller.get("max_runtime_sec") or 43200))
+        except (TypeError, ValueError):
+            max_runtime_sec = 43200
+        job_deadline = time.monotonic() + max_runtime_sec
+        deadline_expired = False
+        # Identity queue state is in memory. If a process restarts while an
+        # identity-enabled job is running, replay every CMTS so no accepted
+        # enrichment item can be skipped by the CPE fetch checkpoint.
+        start_offset = (
+            0
+            if collect_identity
+            else max(0, int(poller.get("last_target_offset") or 0))
+        )
         subtask_retries = max(
             0, int(os.environ.get("DATA_STORE_SUBTASK_RETRIES", "1"))
         )
@@ -1746,6 +2138,19 @@ class PollerService:
         cancelled = False
 
         def _job_is_running() -> bool:
+            nonlocal deadline_expired
+            if time.monotonic() >= job_deadline:
+                deadline_expired = True
+                self._execute(
+                    "UPDATE poller_job SET status='timed_out', finished_at=%s, "
+                    "error_text=%s WHERE id=%s AND status='running'",
+                    (
+                        self._now(),
+                        f"CPE job exceeded max runtime of {max_runtime_sec}s",
+                        job_id,
+                    ),
+                )
+                return False
             status_rows = self._query(
                 "SELECT status FROM poller_job WHERE id=%s", (job_id,)
             )
@@ -1790,19 +2195,35 @@ class PollerService:
                         last_target_error,
                         attempt_errors,
                     )
+                remaining_job_sec = max(1.0, job_deadline - time.monotonic())
+                bounded_overall_timeout = max(
+                    1,
+                    min(
+                        int(envelope["overall_timeout_sec"]),
+                        int(remaining_job_sec),
+                    ),
+                )
+                bounded_agent_timeout = max(
+                    1,
+                    min(
+                        int(envelope["agent_command_timeout_sec"]),
+                        int(remaining_job_sec),
+                    ),
+                )
+                bounded_tree_reserve = min(
+                    float(envelope["min_remaining_tree_reserve_sec"]),
+                    max(0.0, float(bounded_overall_timeout - 1)),
+                )
                 try:
                     return {
                         "cancelled": False,
                         "fetch_result": self._fetch_cmts_cpe(
                             cmts_ip,
-                            overall_timeout_sec=envelope["overall_timeout_sec"],
-                            agent_command_timeout_sec=envelope[
-                                "agent_command_timeout_sec"
-                            ],
-                            min_remaining_tree_reserve_sec=envelope[
-                                "min_remaining_tree_reserve_sec"
-                            ],
+                            overall_timeout_sec=bounded_overall_timeout,
+                            agent_command_timeout_sec=bounded_agent_timeout,
+                            min_remaining_tree_reserve_sec=bounded_tree_reserve,
                             http_timeout_sec=envelope["http_timeout_sec"],
+                            request_timeout_cap_sec=remaining_job_sec,
                         ),
                         "last_target_error": last_target_error,
                         "attempt_errors": attempt_errors,
@@ -1925,106 +2346,26 @@ class PollerService:
                         complete = False
                         validation_error = str(exc)
 
-                    # ── Identity enrichment via CM agents ──────────────────
-                    # When collect_identity is enabled, use the fresh CPE IPs
-                    # to populate vendor/model/software_version for each modem
-                    # via CM-agent sysDescr SNMP. Runs on a background daemon
-                    # thread so it never blocks the CPE job coordinator.
+                    # Queue only parent modem MACs. The bounded worker resolves
+                    # authoritative management IPs from modem_inventory_current;
+                    # DOCS-SUBMGT3 CPE addresses must never be SNMP targets.
                     if complete and collect_identity and cpe_rows:
-                        poller_service_ref = self
-                        cmts_ip_cap = cmts_ip
-                        cmts_name_cap = cmts_name
-
-                        def _run_identity_enrichment(
-                            rows: List[Dict[str, Any]],
-                            svc_ref: "PollerService",
-                            cmts_ip_val: str,
-                            cmts_name_val: str,
-                        ) -> None:
-                            import asyncio
-                            from pypnm.api.routes.cmts.service import CMTSModemService
-
-                            try:
-                                # Deduplicate by modem MAC, preferring IPv4.
-                                mac_to_ip: Dict[str, str] = {}
-                                for row in rows:
-                                    mac = str(row.get("modem_mac") or "").strip()
-                                    ip = str(row.get("ip_address") or "").strip()
-                                    if not mac or not ip:
-                                        continue
-                                    family = str(
-                                        row.get("address_family") or ""
-                                    ).lower()
-                                    if mac not in mac_to_ip or family == "ipv4":
-                                        mac_to_ip[mac] = ip
-
-                                modem_dicts = [
-                                    {
-                                        "mac_address": mac,
-                                        "ip_address": ip,
-                                        "status": "operational",
-                                    }
-                                    for mac, ip in mac_to_ip.items()
-                                ]
-                                if not modem_dicts:
-                                    return
-
-                                logger.info(
-                                    "Identity enrichment: starting for %s "
-                                    "(%d modems)",
-                                    cmts_name_val,
-                                    len(modem_dicts),
-                                )
-                                service = CMTSModemService(
-                                    agent_priority="bulk"
-                                )
-                                loop = asyncio.new_event_loop()
-                                try:
-                                    loop.run_until_complete(
-                                        service._enrich_modems_direct(
-                                            modem_dicts,
-                                            cmts_ip=cmts_ip_val,
-                                        )
-                                    )
-                                finally:
-                                    loop.close()
-
-                                enriched = [
-                                    m
-                                    for m in modem_dicts
-                                    if m.get("vendor") or m.get("model")
-                                ]
-                                if enriched:
-                                    svc_ref._upsert_inventory_rows(
-                                        enriched,
-                                        source_poller="identity-enrichment",
-                                    )
-                                logger.info(
-                                    "Identity enrichment: finished for %s "
-                                    "(%d/%d modems enriched)",
-                                    cmts_name_val,
-                                    len(enriched),
-                                    len(modem_dicts),
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "Identity enrichment failed for %s: %s",
-                                    cmts_name_val,
-                                    exc,
-                                )
-
-                        t = threading.Thread(
-                            target=_run_identity_enrichment,
-                            args=(
-                                cpe_rows,
-                                poller_service_ref,
-                                cmts_ip_cap,
-                                cmts_name_cap,
-                            ),
-                            daemon=True,
-                            name=f"identity-enrich-{cmts_ip_cap}",
+                        ticket = self._enqueue_identity_enrichment(
+                            cpe_rows,
+                            cmts_ip=cmts_ip,
+                            cmts_name=cmts_name,
+                            job_id=job_id,
+                            job_deadline=job_deadline,
+                            should_continue=_job_is_running,
                         )
-                        t.start()
+                        if ticket is not None:
+                            identity_tickets.append(ticket)
+                        elif _job_is_running():
+                            logger.warning(
+                                "Identity enrichment not queued for %s: no valid "
+                                "parent modem MACs",
+                                cmts_name,
+                            )
 
                 entry = {
                     "cmts": cmts_name,
@@ -2219,7 +2560,10 @@ class PollerService:
                     if cancelled:
                         for _, _, _, future in pending:
                             future.cancel()
-                        executor.shutdown(wait=True, cancel_futures=True)
+                        executor.shutdown(
+                            wait=not deadline_expired,
+                            cancel_futures=True,
+                        )
                     else:
                         executor.shutdown(wait=True)
 
@@ -2266,6 +2610,36 @@ class PollerService:
                     retry_attempted=True,
                 )
 
+        if not cancelled and identity_tickets:
+            total_identity_targets = len(identity_tickets)
+            last_reported = -1
+            while True:
+                completed_identity_targets = sum(
+                    completed.is_set() for completed, _ in identity_tickets
+                )
+                if completed_identity_targets >= total_identity_targets:
+                    break
+                if not _job_is_running():
+                    cancelled = True
+                    break
+                if completed_identity_targets != last_reported:
+                    self._update_running_job_progress(
+                        job_id,
+                        "CPE identity enrichment: "
+                        f"{completed_identity_targets}/{total_identity_targets} "
+                        "CMTS targets finished",
+                        rows_collected=rows_collected,
+                        modems_attempted=targets_attempted,
+                        modems_succeeded=targets_succeeded,
+                        modems_failed=targets_failed,
+                    )
+                    last_reported = completed_identity_targets
+                time.sleep(1)
+            identity_failures = sum(
+                outcome.get("status") == "failed"
+                for _, outcome in identity_tickets
+            )
+
         if cancelled:
             self._execute(
                 "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
@@ -2297,6 +2671,16 @@ class PollerService:
                 f"CPE refresh completed with {targets_succeeded} successful and "
                 f"{incomplete_targets} skipped/incomplete CMTS target(s); "
                 "previous stored rows were preserved for failed targets"
+            )
+        if identity_failures:
+            identity_message = (
+                f"identity enrichment failed for {identity_failures}/"
+                f"{len(identity_tickets)} queued CMTS target(s)"
+            )
+            result_message = (
+                f"{result_message}; {identity_message}"
+                if result_message
+                else identity_message
             )
         self._execute(
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, "
@@ -3817,35 +4201,43 @@ class PollerService:
         )
         return [str(row.get('ip_address')) for row in rows if row.get('ip_address')]
 
-    def get_inventory_modems_bulk(self, mac_addresses: list[str]) -> list[Dict[str, Any]]:
-        """Look up multiple modems by MAC address using a single indexed query."""
-        if not mac_addresses:
-            return []
-        # Normalize to colon-separated lowercase (matches PRIMARY KEY format)
-        def _norm(mac: str) -> str:
-            raw = (mac or "").strip().lower().replace("-", "").replace(".", "").replace(":", "")
-            if len(raw) == 12:
-                return ":".join(raw[i:i+2] for i in range(0, 12, 2))
-            return raw
-        normalized = [_norm(m) for m in mac_addresses if m]
+    def get_inventory_modems_bulk(
+        self,
+        mac_addresses: list[str],
+        cmts_ip: Optional[str] = None,
+    ) -> list[Dict[str, Any]]:
+        """Look up modems by primary-key MAC, optionally scoped to one CMTS."""
+        normalized = list(
+            dict.fromkeys(
+                mac
+                for value in mac_addresses or []
+                for mac in [self._normalize_mac(str(value or ""))]
+                if mac
+            )
+        )
         if not normalized:
             return []
-        # Batch into chunks of 500 to avoid overly long IN clauses
+        target_cmts_ip = str(cmts_ip or "").strip()
+
         results: list[Dict[str, Any]] = []
         for i in range(0, len(normalized), 500):
-            batch = normalized[i:i+500]
+            batch = normalized[i:i + 500]
             placeholders = ",".join(["%s"] * len(batch))
-            rows = self._query(
+            sql = (
                 "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
                 "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
                 "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
                 "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
                 "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
                 "partial_service_upstream, partial_service_state, software_version, updated_at "
-                f"FROM modem_inventory_current WHERE mac IN ({placeholders})",
-                tuple(batch),
+                f"FROM modem_inventory_current WHERE mac IN ({placeholders})"
             )
-            results.extend(self._map_inventory_row(r) for r in rows)
+            params: list[Any] = list(batch)
+            if target_cmts_ip:
+                sql += " AND cmts_ip=%s"
+                params.append(target_cmts_ip)
+            rows = self._query(sql, tuple(params))
+            results.extend(self._map_inventory_row(row) for row in rows)
         return results
 
     def clear_inventory_modems(self, cmts: Optional[str] = None, cmts_ip: Optional[str] = None) -> int:
