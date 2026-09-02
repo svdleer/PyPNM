@@ -2088,6 +2088,14 @@ class CMTSModemService:
         )
 
     @classmethod
+    def _needs_remote_identity_enrichment(cls, modem: dict) -> bool:
+        """Return True while a remote-query identity field is missing."""
+        return any(
+            not cls._meaningful_identity_value(modem.get(field))
+            for field in ('vendor', 'model', 'software_version')
+        )
+
+    @classmethod
     def _merge_parsed_identity(cls, modem: dict, parsed: dict) -> bool:
         """Fill missing identity fields without replacing meaningful values."""
         changed = False
@@ -2868,6 +2876,196 @@ class CMTSModemService:
         )
         return enriched
 
+    async def _enrich_modems_casa_remote_query(
+        self,
+        modems: list,
+        *,
+        cmts_ip: str,
+        cancel_cmts_ip: str | None = None,
+    ) -> int:
+        """Fill missing identity from a complete Casa/EVO cmSysDesc table."""
+        candidates = [
+            modem for modem in modems
+            if self._needs_remote_identity_enrichment(modem)
+        ]
+        if (
+            not candidates
+            or not cmts_ip
+            or self._enrichment_cancelled(cancel_cmts_ip)
+        ):
+            return 0
+
+        walk_limit = min(50000, max(1000, len(modems) + 100))
+        try:
+            walk_result = await self._send_agent_command(
+                'snmp_parallel_walk',
+                {
+                    'ip': cmts_ip,
+                    'oids': [OID_CASA_RQ_SYS_DESCR],
+                    'community': self.community,
+                    'timeout': 5,
+                    'limit': walk_limit,
+                    'overall_timeout': 270,
+                },
+                timeout=300,
+            )
+        except Exception as exc:
+            self.logger.debug(
+                'Casa/EVO remote-query table unavailable on %s: %s',
+                cmts_ip,
+                exc,
+            )
+            return 0
+
+        if self._enrichment_cancelled(cancel_cmts_ip):
+            return 0
+        if not isinstance(walk_result, dict):
+            self.logger.debug(
+                'Casa/EVO remote-query response malformed on %s; using fallback',
+                cmts_ip,
+            )
+            return 0
+
+        errors = walk_result.get('errors')
+        completed_values = walk_result.get('completed_oids')
+        truncated_values = walk_result.get('truncated_oids')
+        raw_results = walk_result.get('results')
+        if (
+            not (errors is None or isinstance(errors, dict))
+            or not isinstance(completed_values, (list, tuple, set))
+            or not isinstance(truncated_values, (list, tuple, set))
+            or not isinstance(raw_results, dict)
+            or not isinstance(raw_results.get(OID_CASA_RQ_SYS_DESCR), list)
+        ):
+            self.logger.debug(
+                'Casa/EVO remote-query response malformed on %s; using fallback',
+                cmts_ip,
+            )
+            return 0
+
+        errors = errors or {}
+        completed_oids = set(completed_values)
+        truncated_oids = set(truncated_values)
+        if (
+            walk_result.get('success') is not True
+            or OID_CASA_RQ_SYS_DESCR in errors
+            or OID_CASA_RQ_SYS_DESCR not in completed_oids
+            or OID_CASA_RQ_SYS_DESCR in truncated_oids
+        ):
+            self.logger.debug(
+                'Casa/EVO remote-query table incomplete on %s; using fallback',
+                cmts_ip,
+            )
+            return 0
+
+        descriptions: dict[str, str] = {}
+        malformed_rows = False
+        for item in raw_results.get(OID_CASA_RQ_SYS_DESCR, []):
+            if not isinstance(item, dict):
+                malformed_rows = True
+                break
+            mac = self._remote_query_mac_from_oid(
+                item.get('oid'),
+                OID_CASA_RQ_SYS_DESCR,
+            )
+            value = str(item.get('value') or '').strip()
+            if value.startswith('STRING:'):
+                value = value[len('STRING:'):].strip()
+            value = value.strip('"')
+            if (
+                not mac
+                or mac in descriptions
+                or not value
+                or 'No Such' in value
+            ):
+                malformed_rows = True
+                break
+            descriptions[mac] = value
+
+        if malformed_rows:
+            self.logger.debug(
+                'Casa/EVO remote-query rows malformed on %s; using fallback',
+                cmts_ip,
+            )
+            return 0
+        if self._enrichment_cancelled(cancel_cmts_ip):
+            return 0
+
+        enriched = 0
+        for modem in candidates:
+            normalized_mac = ''.join(
+                char for char in str(modem.get('mac_address') or '').lower()
+                if char in '0123456789abcdef'
+            )
+            if len(normalized_mac) != 12:
+                continue
+            mac = ':'.join(
+                normalized_mac[index:index + 2]
+                for index in range(0, 12, 2)
+            )
+            description = descriptions.get(mac)
+            if not description:
+                continue
+            parsed = self._parse_sys_descr(description)
+            if self._merge_parsed_identity(modem, parsed):
+                enriched += 1
+
+        self.logger.info(
+            'Casa/EVO remote-query identity: %s/%s candidate modems enriched on %s '
+            '(freshness unavailable)',
+            enriched,
+            len(candidates),
+            cmts_ip,
+        )
+        return enriched
+
+    async def _detect_identity_enrichment_provider(self, cmts_ip: str) -> str:
+        """Classify identity routing from standard CMTS identity scalars."""
+
+        async def _read_scalar(oid: str) -> str | None:
+            try:
+                result = await self._send_agent_command(
+                    'snmp_get',
+                    {
+                        'target_ip': cmts_ip,
+                        'oid': oid,
+                        'timeout': 5,
+                    },
+                    timeout=15,
+                )
+                return self._agent_scalar_value(result)
+            except Exception as exc:
+                self.logger.debug(
+                    'CMTS identity scalar %s unavailable on %s: %s',
+                    oid,
+                    cmts_ip,
+                    exc,
+                )
+                return None
+
+        sys_object_raw, sys_descr_raw = await asyncio.gather(
+            _read_scalar(OID_CMTS_SYS_OBJECT_ID),
+            _read_scalar(OID_CMTS_SYS_DESCR),
+        )
+        sys_object_id = self._normalize_probe_object_id(sys_object_raw)
+        sys_descr = str(sys_descr_raw or '').strip().upper()
+
+        if sys_object_id and sys_object_id.startswith('1.3.6.1.4.1.9.'):
+            return 'cisco'
+        if sys_object_id and sys_object_id.startswith(OID_CASA_ENTERPRISE_PREFIX):
+            return 'casa'
+        if any(
+            marker in sys_descr
+            for marker in ('DCTS VCCAP', 'VCCAP', 'VCMTS', 'EVO')
+        ):
+            return 'casa'
+        if any(
+            sys_object_id and sys_object_id.startswith(prefix)
+            for prefix in OID_CADANT_ENTERPRISE_PREFIXES
+        ):
+            return 'cadant'
+        return 'direct'
+
     async def _enrich_modem_identities(
         self,
         modems: list,
@@ -2876,7 +3074,7 @@ class CMTSModemService:
         modem_community: str | None = None,
         progress_cmts_ip: str | None = None,
     ) -> list:
-        """Run existing identity enrichment: CMTS remote query, then direct fallback."""
+        """Route Casa/EVO and Cadant remotely; query Cisco/unknown directly."""
         if self._enrichment_cancelled(progress_cmts_ip):
             return modems
         if progress_cmts_ip and progress_cmts_ip in _enrichment_cache:
@@ -2884,14 +3082,38 @@ class CMTSModemService:
                 'completed': 0,
                 'total': len(modems),
             }
-        await self._enrich_modems_cadant_remote_query(
-            modems,
-            cmts_ip=cmts_ip,
-            cancel_cmts_ip=progress_cmts_ip,
-        )
-        if self._enrichment_cancelled(progress_cmts_ip):
-            return modems
+
         fallback = [modem for modem in modems if self._needs_identity_enrichment(modem)]
+        if fallback:
+            provider = await self._detect_identity_enrichment_provider(cmts_ip)
+            if self._enrichment_cancelled(progress_cmts_ip):
+                return modems
+            if provider == 'cadant':
+                await self._enrich_modems_cadant_remote_query(
+                    modems,
+                    cmts_ip=cmts_ip,
+                    cancel_cmts_ip=progress_cmts_ip,
+                )
+            elif provider == 'casa':
+                await self._enrich_modems_casa_remote_query(
+                    modems,
+                    cmts_ip=cmts_ip,
+                    cancel_cmts_ip=progress_cmts_ip,
+                )
+            else:
+                self.logger.info(
+                    'Identity enrichment on %s uses direct modem queries (provider=%s)',
+                    cmts_ip,
+                    provider,
+                )
+            if self._enrichment_cancelled(progress_cmts_ip):
+                return modems
+            if provider in {'cadant', 'casa'}:
+                fallback = [
+                    modem for modem in modems
+                    if self._needs_remote_identity_enrichment(modem)
+                ]
+
         if fallback:
             await self._enrich_modems_direct(
                 fallback,
