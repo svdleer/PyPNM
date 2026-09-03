@@ -759,16 +759,18 @@ class PollerService:
                     ) from exc
 
         # Repair interrupted area migrations without rescanning already-classified
-        # CMTSes. The correlated aggregate classifies each unknown CMTS solely from
-        # its modems' management IPs; legitimately unknown CMTSes may be rechecked.
+        # CMTSes. Aggregate modem management IPs once by CMTS, then join those
+        # results to unknown summaries; a correlated subquery here can rescan the
+        # multi-million-row modem table once per CMTS and exceed startup timeout.
         area_sql = self._inventory_area_aggregate_sql("m")
         self._execute(
-            "UPDATE inventory_summary_status target SET target.area=("
-            f"SELECT {area_sql} FROM modem_inventory_current m "
+            "UPDATE inventory_summary_status target JOIN ("
+            "SELECT m.cmts_ip, "
+            f"{area_sql} AS area FROM modem_inventory_current m "
             "WHERE m.inventory_state<>'retired' "
-            "AND COALESCE(m.cmts_ip,'')<>'' "
-            "AND m.cmts_ip=target.cmts_ip"
-            ") WHERE target.area='unknown'"
+            "AND COALESCE(m.cmts_ip,'')<>'' GROUP BY m.cmts_ip"
+            ") classified ON classified.cmts_ip=target.cmts_ip "
+            "SET target.area=classified.area WHERE target.area='unknown'"
         )
         self._execute(
             "UPDATE cmts_inventory_snapshot snap "
