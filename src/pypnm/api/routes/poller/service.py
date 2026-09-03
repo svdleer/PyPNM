@@ -3188,7 +3188,7 @@ class PollerService:
                 try:
                     max_concurrency = max(
                         1,
-                        min(int(poller.get("max_concurrency") or 1), 4),
+                        min(int(poller.get("max_concurrency") or 1), 6),
                     )
                 except (TypeError, ValueError):
                     max_concurrency = 1
