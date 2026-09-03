@@ -156,6 +156,7 @@ def list_inventory_modems(
                 "quarantine_candidate_count"
             ),
             "collection_mode": snapshot.get("collection_mode") or "full",
+            "area": snapshot.get("area") or "unknown",
         })
     return response
 
@@ -202,13 +203,47 @@ def suggest_cpe_addresses(
 @router.get("/inventory/summary")
 def inventory_summary(
     cmts: str | None = None,
+    area: str = "all",
     top_n: int = Query(default=25, ge=1, le=100),
 ) -> dict:
     """Return vendor/model/firmware/DOCSIS count breakdowns for the inventory dashboard."""
     try:
-        data = poller_service.get_inventory_summary(cmts=cmts, top_n=top_n)
+        data = poller_service.get_inventory_summary(
+            cmts=cmts,
+            area=area,
+            top_n=top_n,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("inventory/summary DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "source": "mysql", **data}
+
+
+@router.get("/inventory/history")
+def inventory_history(
+    dimension: str,
+    start: str | None = None,
+    end: str | None = None,
+    cmts: str | None = None,
+    area: str = "all",
+    top_n: int = Query(default=10, ge=1, le=100),
+) -> dict:
+    """Return stable Top-N daily inventory history from stored aggregates."""
+    try:
+        data = poller_service.get_inventory_history(
+            dimension=dimension,
+            start=start,
+            end=end,
+            cmts=cmts,
+            area=area,
+            top_n=top_n,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/history DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "source": "mysql", **data}
 

@@ -313,6 +313,7 @@ class PollerService:
             CREATE TABLE IF NOT EXISTS cmts_inventory_snapshot (
                 cmts_ip VARCHAR(45) NOT NULL,
                 cmts VARCHAR(128) NOT NULL,
+                area VARCHAR(16) NOT NULL DEFAULT 'unknown',
                 snapshot_id CHAR(36) NOT NULL,
                 complete BOOLEAN NOT NULL DEFAULT FALSE,
                 truncated BOOLEAN NOT NULL DEFAULT FALSE,
@@ -334,6 +335,7 @@ class PollerService:
                 revision_at DATETIME NOT NULL,
                 PRIMARY KEY (cmts_ip),
                 INDEX idx_inventory_snapshot_cmts (cmts),
+                INDEX idx_inventory_snapshot_area (area, cmts_ip),
                 INDEX idx_inventory_snapshot_collected (collected_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
@@ -343,12 +345,14 @@ class PollerService:
             CREATE TABLE IF NOT EXISTS inventory_summary_status (
                 cmts_ip VARCHAR(45) NOT NULL,
                 cmts VARCHAR(128) NOT NULL,
+                area VARCHAR(16) NOT NULL DEFAULT 'unknown',
                 active_total BIGINT NOT NULL DEFAULT 0,
                 enriched_count BIGINT NOT NULL DEFAULT 0,
                 last_updated DATETIME NULL,
                 refreshed_at DATETIME NOT NULL,
                 PRIMARY KEY (cmts_ip),
-                INDEX idx_summary_status_cmts (cmts)
+                INDEX idx_summary_status_cmts (cmts),
+                INDEX idx_summary_status_area (area, cmts_ip)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -362,6 +366,25 @@ class PollerService:
                 PRIMARY KEY (cmts_ip, dimension, value),
                 INDEX idx_summary_dimension_value (dimension, value),
                 INDEX idx_summary_value_dimension (value, dimension)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_summary_daily (
+                snapshot_date DATE NOT NULL,
+                cmts_ip VARCHAR(45) NOT NULL,
+                cmts VARCHAR(128) NOT NULL,
+                area VARCHAR(16) NOT NULL DEFAULT 'unknown',
+                dimension VARCHAR(32) NOT NULL,
+                value VARCHAR(255) NOT NULL,
+                row_count BIGINT NOT NULL DEFAULT 0,
+                collected_at DATETIME NOT NULL,
+                refreshed_at DATETIME NOT NULL,
+                PRIMARY KEY (snapshot_date, cmts_ip, dimension, value),
+                INDEX idx_daily_dimension_date (dimension, snapshot_date),
+                INDEX idx_daily_area_date (area, snapshot_date, dimension),
+                INDEX idx_daily_cmts_date (cmts_ip, snapshot_date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -663,6 +686,7 @@ class PollerService:
 
         snapshot_columns = {
             "revision_at": "DATETIME NULL",
+            "area": "VARCHAR(16) NOT NULL DEFAULT 'unknown'",
             "capability_enriched": "BOOLEAN NOT NULL DEFAULT FALSE",
             "authoritative": "BOOLEAN NOT NULL DEFAULT FALSE",
             "quarantined": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -701,6 +725,80 @@ class PollerService:
         self._execute(
             "UPDATE cmts_inventory_snapshot "
             "SET revision_at=collected_at WHERE revision_at IS NULL"
+        )
+
+        summary_status_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM inventory_summary_status")
+        }
+        summary_area_needs_backfill = "area" not in summary_status_columns
+        if summary_area_needs_backfill:
+            try:
+                self._execute(
+                    "ALTER TABLE inventory_summary_status "
+                    "ADD COLUMN `area` VARCHAR(16) NOT NULL DEFAULT 'unknown'"
+                )
+            except Exception as exc:
+                remaining = {
+                    str(row.get("Field"))
+                    for row in self._query(
+                        "SHOW COLUMNS FROM inventory_summary_status"
+                    )
+                }
+                if "area" not in remaining:
+                    raise RuntimeError(
+                        "Failed to add required inventory summary area column"
+                    ) from exc
+
+        # Repair interrupted area migrations without rescanning already-classified
+        # CMTSes. The correlated aggregate classifies each unknown CMTS solely from
+        # its modems' management IPs; legitimately unknown CMTSes may be rechecked.
+        area_sql = self._inventory_area_aggregate_sql("m")
+        self._execute(
+            "UPDATE inventory_summary_status target SET target.area=("
+            f"SELECT {area_sql} FROM modem_inventory_current m "
+            "WHERE m.inventory_state<>'retired' "
+            "AND COALESCE(m.cmts_ip,'')<>'' "
+            "AND m.cmts_ip=target.cmts_ip"
+            ") WHERE target.area='unknown'"
+        )
+        self._execute(
+            "UPDATE cmts_inventory_snapshot snap "
+            "JOIN inventory_summary_status s ON s.cmts_ip=snap.cmts_ip "
+            "SET snap.area=s.area WHERE snap.area='unknown' "
+            "AND s.area<>'unknown'"
+        )
+
+        for idx_ddl in [
+            "CREATE INDEX idx_inventory_snapshot_area "
+            "ON cmts_inventory_snapshot (area, cmts_ip)",
+            "CREATE INDEX idx_summary_status_area "
+            "ON inventory_summary_status (area, cmts_ip)",
+        ]:
+            try:
+                self._execute(idx_ddl)
+            except Exception:
+                pass
+
+        # Repair only today's rows before seeding. Historical area assignments are
+        # unknowable, and INSERT IGNORE cannot correct an already-seeded unknown.
+        self._execute(
+            "UPDATE inventory_summary_daily d "
+            "JOIN inventory_summary_status s ON s.cmts_ip=d.cmts_ip "
+            "SET d.area=s.area WHERE d.snapshot_date=UTC_DATE() "
+            "AND d.area='unknown' AND s.area<>'unknown'"
+        )
+
+        # Current distributions are the only safe source for startup history.
+        # Seed only absent rows for today's UTC date; older dates are unknowable.
+        self._execute(
+            "INSERT IGNORE INTO inventory_summary_daily "
+            "(snapshot_date, cmts_ip, cmts, area, dimension, value, row_count, "
+            "collected_at, refreshed_at) "
+            "SELECT UTC_DATE(), c.cmts_ip, s.cmts, s.area, c.dimension, c.value, "
+            "c.row_count, COALESCE(s.last_updated, s.refreshed_at, UTC_TIMESTAMP()), "
+            "s.refreshed_at FROM inventory_summary_count c "
+            "JOIN inventory_summary_status s ON s.cmts_ip=c.cmts_ip"
         )
 
         # Indexes for listing/filtering (duplicate-index errors are harmless).
@@ -1576,6 +1674,48 @@ class PollerService:
             f"LOWER(TRIM(COALESCE({prefix}model,''))) NOT IN ('','unknown','n/a'))"
         )
 
+    @staticmethod
+    def _inventory_area_aggregate_sql(alias: str = "") -> str:
+        """Classify one CMTS from recognized modem management IPv4 addresses."""
+        prefix = f"{alias}." if alias else ""
+        management_ip = f"TRIM({prefix}ip)"
+        address = f"INET_ATON({management_ip})"
+        dotted_ipv4 = (
+            f"LENGTH({management_ip})-"
+            f"LENGTH(REPLACE({management_ip},'.',''))=3"
+        )
+        fziggo = (
+            f"({dotted_ipv4} AND "
+            f"{address} BETWEEN 2147483648 AND 2149580799)"
+        )
+        fupc = (
+            f"({dotted_ipv4} AND ("
+            f"{address} BETWEEN 2684354560 AND 2686451711 OR "
+            f"{address} BETWEEN 180355072 AND 182452223))"
+        )
+        fziggo_count = f"SUM(CASE WHEN {fziggo} THEN 1 ELSE 0 END)"
+        fupc_count = f"SUM(CASE WHEN {fupc} THEN 1 ELSE 0 END)"
+        return (
+            f"CASE WHEN {fziggo_count}>0 AND {fupc_count}=0 THEN 'fziggo' "
+            f"WHEN {fupc_count}>0 AND {fziggo_count}=0 THEN 'fupc' "
+            "ELSE 'unknown' END"
+        )
+
+    @staticmethod
+    def _normalize_inventory_area(area: Optional[str]) -> str:
+        normalized = "all" if area is None else str(area).strip().lower()
+        if normalized not in {"all", "vfz", "fziggo", "fupc"}:
+            raise ValueError("area must be one of: all, vfz, fziggo, fupc")
+        return normalized
+
+    @staticmethod
+    def _area_sql_predicate(column: str, area: str) -> tuple[str, List[str]]:
+        if area == "all":
+            return "", []
+        if area == "vfz":
+            return f"{column} IN (%s,%s)", ["fziggo", "fupc"]
+        return f"{column}=%s", [area]
+
     def _refresh_summary_for_cmts_cursor(
         self,
         cur,
@@ -1583,7 +1723,7 @@ class PollerService:
         cmts_ip: str,
         cmts: str,
         refreshed_at: str,
-    ) -> None:
+    ) -> str:
         cur.execute(
             "DELETE FROM inventory_summary_count WHERE cmts_ip=%s",
             (cmts_ip,),
@@ -1606,25 +1746,62 @@ class PollerService:
         cur.execute(
             "SELECT COUNT(*) AS total, MAX(updated_at) AS last_updated, "
             f"SUM(CASE WHEN {self._inventory_enriched_sql()} THEN 1 ELSE 0 END) "
-            "AS enriched FROM modem_inventory_current "
+            "AS enriched, "
+            f"{self._inventory_area_aggregate_sql()} AS area "
+            "FROM modem_inventory_current "
             "WHERE cmts_ip=%s AND inventory_state<>'retired'",
             (cmts_ip,),
         )
         status = cur.fetchone() or {}
+        area = str(status.get("area") or "unknown")
         cur.execute(
             "INSERT INTO inventory_summary_status "
-            "(cmts_ip, cmts, active_total, enriched_count, last_updated, refreshed_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
-            "cmts=VALUES(cmts), active_total=VALUES(active_total), "
-            "enriched_count=VALUES(enriched_count), "
+            "(cmts_ip, cmts, area, active_total, enriched_count, last_updated, "
+            "refreshed_at) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE cmts=VALUES(cmts), area=VALUES(area), "
+            "active_total=VALUES(active_total), enriched_count=VALUES(enriched_count), "
             "last_updated=VALUES(last_updated), refreshed_at=VALUES(refreshed_at)",
             (
                 cmts_ip,
                 cmts or cmts_ip,
+                area,
                 int(status.get("total") or 0),
                 int(status.get("enriched") or 0),
                 status.get("last_updated"),
                 refreshed_at,
+            ),
+        )
+        return area
+
+    @staticmethod
+    def _replace_daily_inventory_summary_cursor(
+        cur,
+        *,
+        snapshot_date: str,
+        cmts_ip: str,
+        cmts: str,
+        area: str,
+        collected_at: str,
+        refreshed_at: str,
+    ) -> None:
+        cur.execute(
+            "DELETE FROM inventory_summary_daily "
+            "WHERE snapshot_date=%s AND cmts_ip=%s",
+            (snapshot_date, cmts_ip),
+        )
+        cur.execute(
+            "INSERT INTO inventory_summary_daily "
+            "(snapshot_date, cmts_ip, cmts, area, dimension, value, row_count, "
+            "collected_at, refreshed_at) "
+            "SELECT %s, c.cmts_ip, %s, %s, c.dimension, c.value, c.row_count, "
+            "%s, %s FROM inventory_summary_count c WHERE c.cmts_ip=%s",
+            (
+                snapshot_date,
+                cmts or cmts_ip,
+                area,
+                collected_at,
+                refreshed_at,
+                cmts_ip,
             ),
         )
 
@@ -1913,12 +2090,27 @@ class PollerService:
                             [(mac, cmts_name, now) for mac in new_candidates],
                         )
 
+                derived_area = None
                 if authoritative:
-                    self._refresh_summary_for_cmts_cursor(
+                    derived_area = self._refresh_summary_for_cmts_cursor(
                         cur,
                         cmts_ip=cmts_address,
                         cmts=cmts_name,
                         refreshed_at=now,
+                    )
+                    self._replace_daily_inventory_summary_cursor(
+                        cur,
+                        snapshot_date=collected_at[:10],
+                        cmts_ip=cmts_address,
+                        cmts=cmts_name,
+                        area=derived_area,
+                        collected_at=collected_at,
+                        refreshed_at=now,
+                    )
+                    cur.execute(
+                        "UPDATE cmts_inventory_snapshot SET area=%s "
+                        "WHERE cmts_ip=%s",
+                        (derived_area, cmts_address),
                     )
                 cur.execute(
                     """
@@ -1994,6 +2186,7 @@ class PollerService:
             "quarantine_reason": quarantine_reason,
             "quarantine_candidate_count": quarantine_candidate_count,
             "collection_mode": collection_mode,
+            "area": derived_area,
         }
 
     def persist_enrichment_rows(
@@ -2310,7 +2503,7 @@ class PollerService:
     def list_inventory_snapshots(self) -> List[Dict[str, Any]]:
         """Return lightweight revision metadata for all current CMTS inventories."""
         rows = self._query(
-            "SELECT cmts_ip, cmts, snapshot_id, complete, truncated, "
+            "SELECT cmts_ip, cmts, area, snapshot_id, complete, truncated, "
             "capability_enriched, authoritative, quarantined, quarantine_reason, "
             "quarantine_candidate_count, collection_mode, requested_limit, "
             "row_count, collected_at, revision_at "
@@ -5133,21 +5326,38 @@ class PollerService:
         self,
         cmts: Optional[str] = None,
         top_n: int = 25,
+        area: Optional[str] = "all",
     ) -> dict:
         """Read normalized materialized inventory summaries only."""
         top = max(1, min(int(top_n), 100))
-        status_where = ""
-        status_params: List[Any] = []
-        if cmts:
-            status_where = " WHERE (cmts=%s OR cmts_ip=%s)"
-            status_params = [str(cmts), str(cmts)]
+        normalized_area = self._normalize_inventory_area(area)
+        cmts_value = str(cmts).strip() if cmts else None
 
+        def _scope(alias: str) -> tuple[str, List[Any]]:
+            predicates: List[str] = []
+            params: List[Any] = []
+            if cmts_value:
+                predicates.append(f"({alias}.cmts=%s OR {alias}.cmts_ip=%s)")
+                params.extend([cmts_value, cmts_value])
+            area_predicate, area_params = self._area_sql_predicate(
+                f"{alias}.area", normalized_area
+            )
+            if area_predicate:
+                predicates.append(area_predicate)
+                params.extend(area_params)
+            return (
+                (" WHERE " + " AND ".join(predicates)) if predicates else "",
+                params,
+            )
+
+        status_where, status_params = _scope("s")
         status_rows = self._query(
             "SELECT COUNT(*) AS covered_cmts, "
-            "COALESCE(SUM(active_total),0) AS total, "
-            "COALESCE(SUM(enriched_count),0) AS enriched, "
-            "MAX(last_updated) AS last_updated, MAX(refreshed_at) AS refreshed_at "
-            f"FROM inventory_summary_status{status_where}",
+            "COALESCE(SUM(s.active_total),0) AS total, "
+            "COALESCE(SUM(s.enriched_count),0) AS enriched, "
+            "MAX(s.last_updated) AS last_updated, "
+            "MAX(s.refreshed_at) AS refreshed_at "
+            f"FROM inventory_summary_status s{status_where}",
             tuple(status_params),
         )
         status = (status_rows[0] if status_rows else {}) or {}
@@ -5155,35 +5365,29 @@ class PollerService:
         total = int(status.get("total") or 0)
         enriched = int(status.get("enriched") or 0)
 
-        snapshot_where = ""
-        snapshot_params: List[Any] = []
-        if cmts:
-            snapshot_where = " WHERE (cmts=%s OR cmts_ip=%s)"
-            snapshot_params = [str(cmts), str(cmts)]
+        snapshot_where, snapshot_params = _scope("snap")
         snapshot_rows = self._query(
-            f"SELECT COUNT(*) AS c FROM cmts_inventory_snapshot{snapshot_where}",
+            "SELECT COUNT(*) AS c FROM cmts_inventory_snapshot snap"
+            f"{snapshot_where}",
             tuple(snapshot_params),
         )
-        snapshot_count = int((snapshot_rows[0] or {}).get("c") or 0) if snapshot_rows else 0
+        snapshot_count = (
+            int((snapshot_rows[0] or {}).get("c") or 0) if snapshot_rows else 0
+        )
 
-        count_where = ""
-        count_params: List[Any] = []
-        if cmts:
-            count_where = "WHERE s.cmts=%s OR s.cmts_ip=%s"
-            count_params = [str(cmts), str(cmts)]
-
+        count_where, count_params = _scope("s")
         results: Dict[str, List[Dict[str, Any]]] = {}
         for dimension in ("vendor", "model", "software_version", "docsis_version"):
-            predicate = (
+            dimension_predicate = (
                 f"{count_where} AND c.dimension=%s"
                 if count_where
-                else "WHERE c.dimension=%s"
+                else " WHERE c.dimension=%s"
             )
             rows = self._query(
                 "SELECT c.value, SUM(c.row_count) AS count "
                 "FROM inventory_summary_count c "
                 "JOIN inventory_summary_status s ON s.cmts_ip=c.cmts_ip "
-                f"{predicate} GROUP BY c.value "
+                f"{dimension_predicate} GROUP BY c.value "
                 "ORDER BY count DESC, c.value ASC LIMIT %s",
                 tuple(count_params + [dimension, top]),
             )
@@ -5205,12 +5409,161 @@ class PollerService:
             "firmwares": results.get("software_version", []),
             "docsis_versions": results.get("docsis_version", []),
             "materialized": True,
+            "area": normalized_area,
             "coverage": {
                 "covered_cmts": covered_cmts,
                 "snapshot_cmts": snapshot_count,
                 "complete": covered_cmts == snapshot_count,
             },
             "refreshed_at": str(status.get("refreshed_at") or ""),
+        }
+
+    def get_inventory_history(
+        self,
+        *,
+        dimension: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        cmts: Optional[str] = None,
+        area: Optional[str] = "all",
+        top_n: int = 10,
+    ) -> Dict[str, Any]:
+        """Read stable interval-wide Top N series from daily inventory history."""
+        dimensions = {
+            "model": "model",
+            "vendor": "vendor",
+            "firmware": "software_version",
+        }
+        normalized_dimension = str(dimension or "").strip().lower()
+        if normalized_dimension not in dimensions:
+            raise ValueError("dimension must be one of: model, vendor, firmware")
+        storage_dimension = dimensions[normalized_dimension]
+        normalized_area = self._normalize_inventory_area(area)
+        try:
+            requested_top_n = int(top_n)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("top_n must be between 1 and 100") from exc
+        if not 1 <= requested_top_n <= 100:
+            raise ValueError("top_n must be between 1 and 100")
+
+        today = datetime.now(timezone.utc).date()
+
+        def _parse_date(value: Optional[str], default) -> Any:
+            if value is None:
+                return default
+            text = str(value).strip()
+            try:
+                parsed = datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise ValueError(
+                    "start and end must be ISO dates (YYYY-MM-DD)"
+                ) from exc
+            if len(text) != 10 or parsed.isoformat() != text:
+                raise ValueError("start and end must be ISO dates (YYYY-MM-DD)")
+            return parsed
+
+        start_date = _parse_date(start, today - timedelta(days=29))
+        end_date = _parse_date(end, today)
+        if start_date > end_date:
+            raise ValueError("start date must be on or before end date")
+
+        predicates = [
+            "d.dimension=%s",
+            "d.snapshot_date BETWEEN %s AND %s",
+        ]
+        params: List[Any] = [storage_dimension, start_date, end_date]
+        cmts_value = str(cmts).strip() if cmts else None
+        if cmts_value:
+            predicates.append("(d.cmts=%s OR d.cmts_ip=%s)")
+            params.extend([cmts_value, cmts_value])
+        area_predicate, area_params = self._area_sql_predicate(
+            "d.area", normalized_area
+        )
+        if area_predicate:
+            predicates.append(area_predicate)
+            params.extend(area_params)
+        where_sql = " WHERE " + " AND ".join(predicates)
+
+        top_rows = self._query(
+            "SELECT d.value, SUM(d.row_count) AS total "
+            f"FROM inventory_summary_daily d{where_sql} "
+            "GROUP BY d.value ORDER BY total DESC, d.value ASC LIMIT %s",
+            tuple(params + [requested_top_n]),
+        )
+        selected = [str(row.get("value") or "") for row in top_rows]
+        totals = {
+            str(row.get("value") or ""): int(row.get("total") or 0)
+            for row in top_rows
+        }
+
+        coverage_rows = self._query(
+            "SELECT d.snapshot_date, COUNT(DISTINCT d.cmts_ip) AS cmts_count "
+            f"FROM inventory_summary_daily d{where_sql} "
+            "GROUP BY d.snapshot_date ORDER BY d.snapshot_date ASC",
+            tuple(params),
+        )
+        labels = [str(row.get("snapshot_date")) for row in coverage_rows]
+        coverage = [
+            {
+                "date": str(row.get("snapshot_date")),
+                "cmts_count": int(row.get("cmts_count") or 0),
+            }
+            for row in coverage_rows
+        ]
+
+        point_rows = self._query(
+            "SELECT d.snapshot_date, d.value, SUM(d.row_count) AS row_count "
+            f"FROM inventory_summary_daily d{where_sql} "
+            "GROUP BY d.snapshot_date, d.value "
+            "ORDER BY d.snapshot_date ASC, d.value ASC",
+            tuple(params),
+        )
+        selected_points: Dict[str, Dict[str, int]] = {
+            value: {} for value in selected
+        }
+        other_points: Dict[str, int] = {label: 0 for label in labels}
+        selected_set = set(selected)
+        for row in point_rows:
+            label = str(row.get("snapshot_date"))
+            value = str(row.get("value") or "")
+            count = int(row.get("row_count") or 0)
+            if value in selected_set:
+                selected_points[value][label] = count
+            elif label in other_points:
+                other_points[label] += count
+
+        ordered_selected = sorted(selected, key=lambda value: (-totals[value], value))
+        series = [
+            {
+                "value": value,
+                "data": [selected_points[value].get(label, 0) for label in labels],
+                "total": totals[value],
+            }
+            for value in ordered_selected
+        ]
+        other_total = sum(other_points.values())
+        if other_total > 0:
+            series.append(
+                {
+                    "value": "Other (remaining)",
+                    "data": [other_points[label] for label in labels],
+                    "total": other_total,
+                    "is_other": True,
+                }
+            )
+
+        return {
+            "dimension": normalized_dimension,
+            "storage_dimension": storage_dimension,
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "area": normalized_area,
+            "cmts": cmts_value,
+            "top_n": requested_top_n,
+            "labels": labels,
+            "series": series,
+            "coverage": coverage,
+            "has_data": bool(point_rows),
         }
 
     def rebuild_inventory_summaries(self) -> Dict[str, Any]:
@@ -5226,8 +5579,10 @@ class PollerService:
                 cur.execute("DELETE FROM inventory_summary_status")
                 cur.execute(
                     "INSERT INTO inventory_summary_status "
-                    "(cmts_ip, cmts, active_total, enriched_count, last_updated, refreshed_at) "
-                    "SELECT cmts_ip, COALESCE(NULLIF(MAX(cmts),''), cmts_ip), COUNT(*), "
+                    "(cmts_ip, cmts, area, active_total, enriched_count, "
+                    "last_updated, refreshed_at) "
+                    "SELECT cmts_ip, COALESCE(NULLIF(MAX(cmts),''), cmts_ip), "
+                    f"{self._inventory_area_aggregate_sql()}, COUNT(*), "
                     f"SUM(CASE WHEN {self._inventory_enriched_sql()} THEN 1 ELSE 0 END), "
                     "MAX(updated_at), %s FROM modem_inventory_current "
                     "WHERE inventory_state<>'retired' AND COALESCE(cmts_ip,'')<>'' "
@@ -5252,6 +5607,11 @@ class PollerService:
                         (dimension,),
                     )
                     count_rows += int(cur.rowcount or 0)
+                cur.execute(
+                    "UPDATE cmts_inventory_snapshot snap "
+                    "LEFT JOIN inventory_summary_status s ON s.cmts_ip=snap.cmts_ip "
+                    "SET snap.area=COALESCE(s.area,'unknown')"
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
