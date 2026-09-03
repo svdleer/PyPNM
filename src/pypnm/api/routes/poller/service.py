@@ -1514,10 +1514,10 @@ class PollerService:
               mac_domain=COALESCE(NULLIF(VALUES(mac_domain), ''), mac_domain),
               status=COALESCE(NULLIF(VALUES(status), ''), status),
               docsis_version=CASE
-                WHEN docsis_version LIKE '%4.0%' THEN docsis_version
-                WHEN VALUES(docsis_version) LIKE '%4.0%' THEN VALUES(docsis_version)
-                WHEN docsis_version LIKE '%3.1%' THEN docsis_version
-                WHEN VALUES(docsis_version) LIKE '%3.1%' THEN VALUES(docsis_version)
+                WHEN docsis_version LIKE '%%4.0%%' THEN docsis_version
+                WHEN VALUES(docsis_version) LIKE '%%4.0%%' THEN VALUES(docsis_version)
+                WHEN docsis_version LIKE '%%3.1%%' THEN docsis_version
+                WHEN VALUES(docsis_version) LIKE '%%3.1%%' THEN VALUES(docsis_version)
                 ELSE COALESCE(NULLIF(VALUES(docsis_version), ''), docsis_version)
               END,
               vendor=COALESCE(NULLIF(VALUES(vendor), ''), vendor),
@@ -2049,10 +2049,10 @@ class PollerService:
                         "fiber_node=COALESCE(NULLIF(%s,''),fiber_node), "
                         "cable_mac=COALESCE(NULLIF(%s,''),cable_mac), "
                         "docsis_version=CASE "
-                        "WHEN docsis_version LIKE '%4.0%' THEN docsis_version "
-                        "WHEN %s LIKE '%4.0%' THEN %s "
-                        "WHEN docsis_version LIKE '%3.1%' THEN docsis_version "
-                        "WHEN %s LIKE '%3.1%' THEN %s "
+                        "WHEN docsis_version LIKE '%%4.0%%' THEN docsis_version "
+                        "WHEN %s LIKE '%%4.0%%' THEN %s "
+                        "WHEN docsis_version LIKE '%%3.1%%' THEN docsis_version "
+                        "WHEN %s LIKE '%%3.1%%' THEN %s "
                         "ELSE COALESCE(NULLIF(%s,''),docsis_version) END, "
                         "updated_at=%s, source_poller=%s "
                         "WHERE mac=%s AND cmts_ip=%s "
