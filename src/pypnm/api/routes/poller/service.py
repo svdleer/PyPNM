@@ -34,6 +34,14 @@ _INVENTORY_FULL_TASK_TYPE = "inventory_full"
 _INVENTORY_FULL_SYSTEM_KEY = "inventory-daily-full"
 _INVENTORY_FULL_NAME = "Inventory daily full refresh"
 _INVENTORY_FULL_SCHEDULE = datetime_time(hour=1)
+_INVENTORY_TASK_TYPES = frozenset(
+    {
+        "inventory",
+        _INVENTORY_RECONCILE_TASK_TYPE,
+        _INVENTORY_FULL_TASK_TYPE,
+    }
+)
+_INVENTORY_TARGET_MANIFEST_VERSION = 2
 
 
 class _PollerJobNotRunning(RuntimeError):
@@ -1274,6 +1282,11 @@ class PollerService:
                     if ip:
                         _push(str(name or ip), str(ip))
         return out
+
+    @staticmethod
+    def _is_inventory_ccap_hostname(value: Any) -> bool:
+        """Return True only for CMTS hostnames containing the CCAP role marker."""
+        return "ccap" in str(value or "").strip().casefold()
 
     def _cmts_targets_for_poller(self, poller: Dict[str, Any]) -> List[Dict[str, str]]:
         def _norm(s: Any) -> str:
@@ -3284,6 +3297,7 @@ class PollerService:
                     self._process_cpe_job(job_id, poller, targets)
                     return
 
+                is_inventory_task = task_type in _INVENTORY_TASK_TYPES
                 collection_mode = (
                     "light"
                     if task_type == _INVENTORY_RECONCILE_TASK_TYPE
@@ -3310,11 +3324,14 @@ class PollerService:
                     raw_targets: Any,
                     *,
                     reject_duplicates: bool,
-                ) -> List[Dict[str, str]]:
+                    filter_non_ccap: bool,
+                    reject_non_ccap: bool,
+                ) -> tuple[List[Dict[str, str]], int]:
                     if not isinstance(raw_targets, list):
                         raise RuntimeError("Inventory target manifest is not a list")
                     normalized_targets = []
                     seen_ips = set()
+                    excluded_non_ccap_count = 0
                     for target in raw_targets:
                         if not isinstance(target, dict):
                             raise RuntimeError(
@@ -3325,6 +3342,18 @@ class PollerService:
                             raise RuntimeError(
                                 "Inventory target manifest contains a blank CMTS IP"
                             )
+                        cmts_name = str(
+                            target.get("name") or cmts_ip
+                        ).strip()
+                        if not self._is_inventory_ccap_hostname(cmts_name):
+                            if reject_non_ccap:
+                                raise RuntimeError(
+                                    "Inventory target manifest contains a non-CCAP "
+                                    f"hostname: {cmts_name or '[blank]'}"
+                                )
+                            if filter_non_ccap:
+                                excluded_non_ccap_count += 1
+                                continue
                         ip_key = cmts_ip.lower()
                         if ip_key in seen_ips:
                             if reject_duplicates:
@@ -3335,40 +3364,85 @@ class PollerService:
                         seen_ips.add(ip_key)
                         normalized_targets.append(
                             {
-                                "name": str(
-                                    target.get("name") or cmts_ip
-                                ).strip(),
+                                "name": cmts_name,
                                 "ip": cmts_ip,
                             }
                         )
-                    return normalized_targets
+                    return normalized_targets, excluded_non_ccap_count
 
                 if "inventory_targets" in request_payload:
-                    if request_payload.get(
+                    manifest_version = request_payload.get(
                         "inventory_target_manifest_version"
-                    ) != 1:
+                    )
+                    supported_manifest_versions = (
+                        {1, _INVENTORY_TARGET_MANIFEST_VERSION}
+                        if is_inventory_task
+                        else {1}
+                    )
+                    if manifest_version not in supported_manifest_versions:
                         raise RuntimeError(
                             "Unsupported inventory target manifest version"
                         )
-                    targets = _normalize_inventory_targets(
-                        request_payload.get("inventory_targets"),
-                        reject_duplicates=True,
+                    targets, excluded_non_ccap_count = (
+                        _normalize_inventory_targets(
+                            request_payload.get("inventory_targets"),
+                            reject_duplicates=True,
+                            filter_non_ccap=(
+                                is_inventory_task and manifest_version == 1
+                            ),
+                            reject_non_ccap=(
+                                is_inventory_task
+                                and manifest_version
+                                == _INVENTORY_TARGET_MANIFEST_VERSION
+                            ),
+                        )
                     )
+                    if is_inventory_task and manifest_version == 1:
+                        if start_offset and excluded_non_ccap_count:
+                            raise RuntimeError(
+                                "Cannot safely resume a legacy inventory target "
+                                "manifest containing non-CCAP hostnames"
+                            )
+                        request_payload["inventory_targets"] = targets
+                        request_payload[
+                            "inventory_target_manifest_version"
+                        ] = _INVENTORY_TARGET_MANIFEST_VERSION
+                        self._execute(
+                            "UPDATE poller_job SET request_payload=%s "
+                            "WHERE id=%s AND status='running'",
+                            (json.dumps(request_payload), job_id),
+                        )
                 else:
                     if start_offset:
                         raise RuntimeError(
                             "Cannot safely resume inventory without a target manifest"
                         )
-                    targets = _normalize_inventory_targets(
-                        self._cmts_targets_for_poller(poller),
-                        reject_duplicates=False,
+                    targets, excluded_non_ccap_count = (
+                        _normalize_inventory_targets(
+                            self._cmts_targets_for_poller(poller),
+                            reject_duplicates=False,
+                            filter_non_ccap=is_inventory_task,
+                            reject_non_ccap=False,
+                        )
                     )
                     request_payload["inventory_targets"] = targets
-                    request_payload["inventory_target_manifest_version"] = 1
+                    request_payload[
+                        "inventory_target_manifest_version"
+                    ] = (
+                        _INVENTORY_TARGET_MANIFEST_VERSION
+                        if is_inventory_task
+                        else 1
+                    )
                     self._execute(
                         "UPDATE poller_job SET request_payload=%s "
                         "WHERE id=%s AND status='running'",
                         (json.dumps(request_payload), job_id),
+                    )
+                if excluded_non_ccap_count:
+                    logger.info(
+                        "Filtered %s non-CCAP hostname(s) from inventory job %s",
+                        excluded_non_ccap_count,
+                        job_id,
                     )
                 total_targets = len(targets)
                 subtask_timeout_sec = max(
