@@ -758,20 +758,36 @@ class PollerService:
                         "Failed to add required inventory summary area column"
                     ) from exc
 
-        # Repair interrupted area migrations without rescanning already-classified
-        # CMTSes. Aggregate modem management IPs once by CMTS, then join those
-        # results to unknown summaries; a correlated subquery here can rescan the
-        # multi-million-row modem table once per CMTS and exceed startup timeout.
+        # Repair interrupted area migrations one unknown CMTS at a time. The
+        # existing cmts_ip index bounds each aggregate and each autocommitted
+        # update makes the migration restart-safe without one long DB query that
+        # can time out and prevent the poller router from loading.
         area_sql = self._inventory_area_aggregate_sql("m")
-        self._execute(
-            "UPDATE inventory_summary_status target JOIN ("
-            "SELECT m.cmts_ip, "
-            f"{area_sql} AS area FROM modem_inventory_current m "
-            "WHERE m.inventory_state<>'retired' "
-            "AND COALESCE(m.cmts_ip,'')<>'' GROUP BY m.cmts_ip"
-            ") classified ON classified.cmts_ip=target.cmts_ip "
-            "SET target.area=classified.area WHERE target.area='unknown'"
+        pending_area_rows = self._query(
+            "SELECT cmts_ip FROM inventory_summary_status "
+            "WHERE area='unknown' AND COALESCE(cmts_ip,'')<>'' "
+            "ORDER BY cmts_ip"
         )
+        for pending_area_row in pending_area_rows:
+            cmts_ip = str(pending_area_row.get("cmts_ip") or "").strip()
+            if not cmts_ip:
+                continue
+            classified_rows = self._query(
+                f"SELECT {area_sql} AS area FROM modem_inventory_current m "
+                "WHERE m.inventory_state<>'retired' AND m.cmts_ip=%s",
+                (cmts_ip,),
+            )
+            classified_area = str(
+                (classified_rows[0] if classified_rows else {}).get("area")
+                or "unknown"
+            ).strip().lower()
+            if classified_area not in {"fziggo", "fupc"}:
+                continue
+            self._execute(
+                "UPDATE inventory_summary_status SET area=%s "
+                "WHERE cmts_ip=%s AND area='unknown'",
+                (classified_area, cmts_ip),
+            )
         self._execute(
             "UPDATE cmts_inventory_snapshot snap "
             "JOIN inventory_summary_status s ON s.cmts_ip=snap.cmts_ip "
