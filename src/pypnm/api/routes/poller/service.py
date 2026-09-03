@@ -3057,6 +3057,7 @@ class PollerService:
         modems_succeeded = 0
         modems_failed = 0
         error_text = None
+        nonfatal_rejection_text = None
         self._update_running_job_progress(
             job_id,
             "Starting poller job: loading settings",
@@ -3277,6 +3278,7 @@ class PollerService:
                 ) -> bool:
                     nonlocal checkpoint_offset
                     nonlocal error_text
+                    nonlocal nonfatal_rejection_text
                     nonlocal modems_attempted
                     nonlocal modems_failed
                     nonlocal modems_succeeded
@@ -3386,7 +3388,7 @@ class PollerService:
                                 or "non-authoritative generation"
                             )
                             modems_failed += max(1, len(modems))
-                            error_text = (
+                            nonfatal_rejection_text = (
                                 f"CMTS collection rejected at {idx}/{total_targets} "
                                 f"({cmts_name}): {rejected_reason}"
                             )
@@ -3509,7 +3511,11 @@ class PollerService:
                     )
                     return
 
-                if task_type == _INVENTORY_FULL_TASK_TYPE and not error_text:
+                if (
+                    task_type == _INVENTORY_FULL_TASK_TYPE
+                    and not error_text
+                    and not nonfatal_rejection_text
+                ):
                     try:
                         self._purge_retired_inventory(7)
                     except Exception as purge_exc:
@@ -3542,9 +3548,24 @@ class PollerService:
                     checkpoint_exc,
                 )
 
+        result_status = "failed" if error_text else "done"
+        result_message = error_text
+        if not error_text and nonfatal_rejection_text:
+            if modems_succeeded <= 0:
+                result_status = "failed"
+                result_message = (
+                    "Inventory collection produced no authoritative modem rows; "
+                    f"last rejection: {nonfatal_rejection_text}"
+                )
+            else:
+                result_message = (
+                    "Inventory completed with quarantined generation(s); "
+                    f"last rejection: {nonfatal_rejection_text}"
+                )
+
         self._execute(
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
-            ("done" if not error_text else "failed", self._now(), int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), error_text, job_id),
+            (result_status, self._now(), int(rows_collected), int(modems_attempted), int(modems_succeeded), int(modems_failed), result_message, job_id),
         )
 
     def _update_running_job_progress(
