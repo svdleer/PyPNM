@@ -29,6 +29,14 @@ class CMTSModemRequest(BaseModel):
     )
     enrich: bool = Field(default=False, description="Whether to enrich inventory with CMTS-side interface data")
     refresh: bool = Field(default=False, description="Bypass cached inventory and perform a live CMTS walk")
+    collection_mode: Literal["light", "full"] = Field(
+        default="full",
+        description="Light reconciliation or full capability collection",
+    )
+    wait_for_enrichment: bool = Field(
+        default=False,
+        description="Wait for CMTS-side bulk interface enrichment before returning",
+    )
     collect_cpe: bool = Field(default=False, description="Collect DOCS-SUBMGT3 CPE addresses for scheduled inventory")
     cmts_hostname: str = Field(default="", description="Optional CMTS hostname stored with inventory")
     agent_priority: Literal["interactive", "bulk"] = Field(
@@ -144,3 +152,8 @@ class CMTSModemResponse(BaseModel):
     cpe_truncated: bool = Field(default=False, description="Whether a CPE address column reached the walk limit")
     cpe_oid_errors: Dict[str, str] = Field(default_factory=dict, description="Errors from CPE address columns")
     enrichment_progress: Optional[Dict[str, int]] = Field(default=None, description="Live enrichment progress: {completed, total}")
+    collection_mode: Literal["light", "full"] = Field(default="full")
+    authoritative: bool = Field(default=False)
+    quarantined: bool = Field(default=False)
+    quarantine_reason: Optional[str] = Field(default=None)
+    quarantine_candidate_count: Optional[int] = Field(default=None)

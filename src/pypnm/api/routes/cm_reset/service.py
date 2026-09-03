@@ -254,7 +254,8 @@ class CmResetService:
             # Look up in inventory for IP/CMTS info
             rows = self._query(
                 "SELECT mac, ip, cmts, cmts_ip, fiber_node "
-                "FROM modem_inventory_current WHERE mac=%s LIMIT 1",
+                "FROM modem_inventory_current "
+                "WHERE inventory_state<>'retired' AND mac=%s LIMIT 1",
                 (mac,),
             )
             if rows:
@@ -271,7 +272,9 @@ class CmResetService:
             placeholders = ",".join(["%s"] * len(cmts_names))
             rows = self._query(
                 f"SELECT mac, ip, cmts, cmts_ip, fiber_node "
-                f"FROM modem_inventory_current WHERE cmts IN ({placeholders}) "
+                f"FROM modem_inventory_current "
+                f"WHERE inventory_state<>'retired' "
+                f"AND cmts IN ({placeholders}) "
                 f"AND status IN ('operational','registrationComplete','ipComplete','online')",
                 cmts_names,
             )
@@ -296,7 +299,8 @@ class CmResetService:
                       LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
                       USING ascii
                   ) COLLATE ascii_bin
-                WHERE m.cmts = %s
+                WHERE m.inventory_state<>'retired'
+                  AND m.cmts = %s
                   AND t.fiber_node IN ({fn_placeholders})
                   AND t.snapshot_id = (
                       SELECT s.id FROM topology_snapshots s
@@ -320,7 +324,9 @@ class CmResetService:
             placeholders = ",".join(["%s"] * len(mac_list))
             rows = self._query(
                 f"SELECT mac, ip, cmts, cmts_ip, fiber_node "
-                f"FROM modem_inventory_current WHERE mac IN ({placeholders})",
+                f"FROM modem_inventory_current "
+                f"WHERE inventory_state<>'retired' "
+                f"AND mac IN ({placeholders})",
                 mac_list,
             )
             found = {r["mac"].lower(): r for r in rows}
@@ -515,7 +521,8 @@ class CmResetService:
         """Return distinct CMTS names from inventory for the scope selector (CCAP only)."""
         rows = self._query(
             "SELECT DISTINCT cmts FROM modem_inventory_current "
-            "WHERE cmts IS NOT NULL AND TRIM(cmts)<>'' "
+            "WHERE inventory_state<>'retired' "
+            "AND cmts IS NOT NULL AND TRIM(cmts)<>'' "
             "AND LOWER(cmts) LIKE %s ORDER BY cmts",
             ("%ccap%",),
         )
@@ -543,7 +550,7 @@ class CmResetService:
                     USING ascii
                 ) COLLATE ascii_bin
                 FROM modem_inventory_current m
-                WHERE m.cmts = %s
+                WHERE m.inventory_state<>'retired' AND m.cmts = %s
             )
             AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
             ORDER BY t.fiber_node

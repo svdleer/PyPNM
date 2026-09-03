@@ -149,6 +149,13 @@ def list_inventory_modems(
             "critical_oid_errors": snapshot.get("critical_oid_errors") or {},
             "raw_legacy_mac_count": snapshot.get("raw_legacy_mac_count"),
             "raw_d3_mac_count": snapshot.get("raw_d3_mac_count"),
+            "authoritative": snapshot.get("authoritative") is True,
+            "quarantined": snapshot.get("quarantined") is True,
+            "quarantine_reason": snapshot.get("quarantine_reason"),
+            "quarantine_candidate_count": snapshot.get(
+                "quarantine_candidate_count"
+            ),
+            "collection_mode": snapshot.get("collection_mode") or "full",
         })
     return response
 
@@ -204,6 +211,17 @@ def inventory_summary(
         logger.error("inventory/summary DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "source": "mysql", **data}
+
+
+@router.post("/inventory/summary/rebuild")
+def rebuild_inventory_summary() -> dict:
+    """Recompute materialized inventory summaries from current non-retired rows."""
+    try:
+        result = poller_service.rebuild_inventory_summaries()
+    except Exception as exc:
+        logger.error("inventory/summary/rebuild DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "materialized": True, **result}
 
 
 @router.get("/inventory/modems/{mac_address}")

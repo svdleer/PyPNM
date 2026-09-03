@@ -219,7 +219,8 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
     if cmts:
         modems = cm_snmp_query_service._query(
             "SELECT ip FROM modem_inventory_current "
-            "WHERE cmts=%s AND ip IS NOT NULL AND TRIM(ip)<>'' "
+            "WHERE inventory_state<>'retired' AND cmts=%s "
+            "AND ip IS NOT NULL AND TRIM(ip)<>'' "
             "AND status IN ('operational','registrationComplete','ipComplete','online') "
             "ORDER BY RAND() LIMIT 1",
             (cmts,),
@@ -227,7 +228,8 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
     else:
         modems = cm_snmp_query_service._query(
             "SELECT ip FROM modem_inventory_current "
-            "WHERE ip IS NOT NULL AND TRIM(ip)<>'' "
+            "WHERE inventory_state<>'retired' "
+            "AND ip IS NOT NULL AND TRIM(ip)<>'' "
             "AND status IN ('operational','registrationComplete','ipComplete','online') "
             "ORDER BY RAND() LIMIT 1",
         )

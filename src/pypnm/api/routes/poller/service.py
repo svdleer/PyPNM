@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -26,6 +27,13 @@ _CPE_TASK_TYPE = "cpe_address_refresh"
 _CPE_TASK_SYSTEM_KEY = "cpe-address-refresh"
 _CPE_TASK_NAME = "CPE address refresh"
 _CPE_TASK_SCHEDULE = (datetime_time(hour=0), datetime_time(hour=12))
+_INVENTORY_RECONCILE_TASK_TYPE = "inventory_reconcile"
+_INVENTORY_RECONCILE_SYSTEM_KEY = "inventory-light-reconcile"
+_INVENTORY_RECONCILE_NAME = "Inventory light reconciliation"
+_INVENTORY_FULL_TASK_TYPE = "inventory_full"
+_INVENTORY_FULL_SYSTEM_KEY = "inventory-daily-full"
+_INVENTORY_FULL_NAME = "Inventory daily full refresh"
+_INVENTORY_FULL_SCHEDULE = datetime_time(hour=1)
 
 
 class _PollerJobNotRunning(RuntimeError):
@@ -214,6 +222,10 @@ class PollerService:
                 updated_at DATETIME NOT NULL,
                 source_poller VARCHAR(64) NULL,
                 snapshot_id CHAR(36) NULL,
+                inventory_state VARCHAR(24) NOT NULL DEFAULT 'active',
+                missing_since DATETIME NULL,
+                consecutive_full_misses INT NOT NULL DEFAULT 0,
+                retired_at DATETIME NULL,
                 PRIMARY KEY (mac)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
@@ -313,10 +325,43 @@ class PollerService:
                 critical_oid_errors JSON NULL,
                 raw_legacy_mac_count INT NULL,
                 raw_d3_mac_count INT NULL,
+                authoritative BOOLEAN NOT NULL DEFAULT FALSE,
+                quarantined BOOLEAN NOT NULL DEFAULT FALSE,
+                quarantine_reason VARCHAR(255) NULL,
+                quarantine_candidate_count INT NULL,
+                quarantine_candidate_fingerprint CHAR(64) NULL,
+                collection_mode VARCHAR(16) NOT NULL DEFAULT 'full',
                 revision_at DATETIME NOT NULL,
                 PRIMARY KEY (cmts_ip),
                 INDEX idx_inventory_snapshot_cmts (cmts),
                 INDEX idx_inventory_snapshot_collected (collected_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_summary_status (
+                cmts_ip VARCHAR(45) NOT NULL,
+                cmts VARCHAR(128) NOT NULL,
+                active_total BIGINT NOT NULL DEFAULT 0,
+                enriched_count BIGINT NOT NULL DEFAULT 0,
+                last_updated DATETIME NULL,
+                refreshed_at DATETIME NOT NULL,
+                PRIMARY KEY (cmts_ip),
+                INDEX idx_summary_status_cmts (cmts)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_summary_count (
+                cmts_ip VARCHAR(45) NOT NULL,
+                dimension VARCHAR(32) NOT NULL,
+                value VARCHAR(255) NOT NULL,
+                row_count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (cmts_ip, dimension, value),
+                INDEX idx_summary_dimension_value (dimension, value),
+                INDEX idx_summary_value_dimension (value, dimension)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -351,6 +396,10 @@ class PollerService:
             "ofdm_channel_count": "INT NULL",
             "ofdma_channel_count": "INT NULL",
             "snapshot_id": "CHAR(36) NULL",
+            "inventory_state": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+            "missing_since": "DATETIME NULL",
+            "consecutive_full_misses": "INT NOT NULL DEFAULT 0",
+            "retired_at": "DATETIME NULL",
         }
         existing_inventory_columns = {
             str(row.get("Field"))
@@ -521,9 +570,106 @@ class PollerService:
                 (_CPE_TASK_NAME, _CPE_TASK_TYPE, _CPE_TASK_SYSTEM_KEY, now, now),
             )
 
+        def _ensure_inventory_system_task(
+            *,
+            name: str,
+            task_type: str,
+            system_key: str,
+            interval_minutes: int,
+            max_runtime_sec: int,
+        ) -> None:
+            now = self._now()
+            self._execute(
+                """
+                INSERT INTO poller_setting
+                    (name, task_type, system_key, enabled, scope_type, scope_json,
+                     collect_identity, collect_scqam, collect_rxmer,
+                     interval_minutes, max_concurrency, max_agent_queue_depth,
+                     retention_days, heavy_max_modems, heavy_delay_ms,
+                     max_runtime_sec, last_target_offset, created_at, updated_at)
+                VALUES (%s,%s,%s,TRUE,'all_cmts',NULL,FALSE,FALSE,FALSE,
+                        %s,4,20,30,300,0,%s,0,%s,%s)
+                ON DUPLICATE KEY UPDATE id=id
+                """,
+                (
+                    name,
+                    task_type,
+                    system_key,
+                    interval_minutes,
+                    max_runtime_sec,
+                    now,
+                    now,
+                ),
+            )
+            by_key = self._query(
+                "SELECT id, system_key FROM poller_setting "
+                "WHERE system_key=%s LIMIT 1",
+                (system_key,),
+            )
+            by_name = self._query(
+                "SELECT id, system_key FROM poller_setting WHERE name=%s LIMIT 1",
+                (name,),
+            )
+            if (
+                by_key
+                and by_name
+                and int(by_key[0]["id"]) != int(by_name[0]["id"])
+            ):
+                raise RuntimeError(
+                    f"Conflicting {name} system task rows exist; refusing unsafe adoption"
+                )
+            if (
+                by_name
+                and by_name[0].get("system_key")
+                and str(by_name[0]["system_key"]) != system_key
+            ):
+                raise RuntimeError(
+                    f"{name} is already assigned to another protected system task"
+                )
+            existing = by_key or by_name
+            if not existing:
+                raise RuntimeError(f"Failed to create or adopt {name} system task")
+            self._execute(
+                "UPDATE poller_setting SET task_type=%s, system_key=%s, name=%s, "
+                "scope_type='all_cmts', scope_json=NULL, collect_identity=FALSE, "
+                "collect_scqam=FALSE, collect_rxmer=FALSE, interval_minutes=%s, "
+                "run_window_start=NULL, run_window_end=NULL, "
+                "max_concurrency=4, max_runtime_sec=%s, updated_at=%s WHERE id=%s",
+                (
+                    task_type,
+                    system_key,
+                    name,
+                    interval_minutes,
+                    max_runtime_sec,
+                    now,
+                    int(existing[0]["id"]),
+                ),
+            )
+
+        _ensure_inventory_system_task(
+            name=_INVENTORY_RECONCILE_NAME,
+            task_type=_INVENTORY_RECONCILE_TASK_TYPE,
+            system_key=_INVENTORY_RECONCILE_SYSTEM_KEY,
+            interval_minutes=60,
+            max_runtime_sec=14400,
+        )
+        _ensure_inventory_system_task(
+            name=_INVENTORY_FULL_NAME,
+            task_type=_INVENTORY_FULL_TASK_TYPE,
+            system_key=_INVENTORY_FULL_SYSTEM_KEY,
+            interval_minutes=1440,
+            max_runtime_sec=43200,
+        )
+
         snapshot_columns = {
             "revision_at": "DATETIME NULL",
             "capability_enriched": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "authoritative": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "quarantined": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "quarantine_reason": "VARCHAR(255) NULL",
+            "quarantine_candidate_count": "INT NULL",
+            "quarantine_candidate_fingerprint": "CHAR(64) NULL",
+            "collection_mode": "VARCHAR(16) NOT NULL DEFAULT 'full'",
         }
         existing_snapshot_columns = {
             str(row.get("Field"))
@@ -562,6 +708,8 @@ class PollerService:
             "CREATE INDEX idx_inv_cmts ON modem_inventory_current (cmts, mac)",
             "CREATE INDEX idx_inv_cmts_ip ON modem_inventory_current (cmts_ip)",
             "CREATE INDEX idx_inv_fiber_node ON modem_inventory_current (fiber_node)",
+            "CREATE INDEX idx_inv_cmts_state ON modem_inventory_current (cmts_ip, inventory_state, mac)",
+            "CREATE INDEX idx_inv_retired ON modem_inventory_current (inventory_state, retired_at)",
         ]:
             try:
                 self._execute(idx_ddl)
@@ -594,11 +742,44 @@ class PollerService:
                 started_at DATETIME NULL,
                 finished_at DATETIME NULL,
                 error_text TEXT NULL,
+                active_key VARCHAR(17) GENERATED ALWAYS AS (
+                    CASE WHEN status IN ('queued','running') THEN mac ELSE NULL END
+                ) STORED,
                 INDEX idx_refresh_status (status, created_at),
-                INDEX idx_refresh_mac (mac, created_at)
+                INDEX idx_refresh_mac (mac, created_at),
+                UNIQUE KEY uk_refresh_active_mac (active_key)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        refresh_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM modem_refresh_request")
+        }
+        if "active_key" not in refresh_columns:
+            self._execute(
+                "ALTER TABLE modem_refresh_request ADD COLUMN active_key VARCHAR(17) "
+                "GENERATED ALWAYS AS (CASE WHEN status IN ('queued','running') "
+                "THEN mac ELSE NULL END) STORED"
+            )
+        self._execute(
+            "UPDATE modem_refresh_request older "
+            "JOIN modem_refresh_request newer ON newer.mac=older.mac "
+            "AND newer.id>older.id "
+            "AND newer.status IN ('queued','running') "
+            "SET older.status='cancelled', older.finished_at=COALESCE(older.finished_at,%s), "
+            "older.error_text=COALESCE(older.error_text,'Deduplicated during schema upgrade') "
+            "WHERE older.status IN ('queued','running')",
+            (self._now(),),
+        )
+        refresh_indexes = {
+            str(row.get("Key_name"))
+            for row in self._query("SHOW INDEX FROM modem_refresh_request")
+        }
+        if "uk_refresh_active_mac" not in refresh_indexes:
+            self._execute(
+                "CREATE UNIQUE INDEX uk_refresh_active_mac "
+                "ON modem_refresh_request (active_key)"
+            )
 
     def _start_worker(self) -> None:
         if self._worker_started:
@@ -940,7 +1121,8 @@ class PollerService:
         try:
             rows = self._query(
                 "SELECT DISTINCT cmts, cmts_ip FROM modem_inventory_current "
-                "WHERE COALESCE(cmts_ip, '') <> '' LIMIT 2000"
+                "WHERE inventory_state<>'retired' "
+                "AND COALESCE(cmts_ip, '') <> '' LIMIT 2000"
             )
             out: List[Dict[str, Any]] = []
             for r in rows or []:
@@ -1127,7 +1309,14 @@ class PollerService:
         # Final fallback: use all appdb targets if scope parse failed/empty.
         return all_from_appdb
 
-    def _fetch_cmts_modems(self, cmts_ip: str, timeout_sec: int = 300) -> Dict[str, Any]:
+    def _fetch_cmts_modems(
+        self,
+        cmts_ip: str,
+        timeout_sec: int = 300,
+        *,
+        collection_mode: str = "full",
+        wait_for_enrichment: bool = False,
+    ) -> Dict[str, Any]:
         """Fetch a fresh base CMTS inventory and its completeness metadata."""
         base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
         requested_limit = self._cm_modem_limit_default()
@@ -1135,7 +1324,9 @@ class PollerService:
             "cmts_ip": cmts_ip,
             "agent_priority": "bulk",
             "limit": requested_limit,
-            "enrich": False,
+            "enrich": collection_mode == "full" and wait_for_enrichment,
+            "wait_for_enrichment": wait_for_enrichment,
+            "collection_mode": collection_mode,
             "refresh": True,
             "collect_cpe": False,
         }
@@ -1163,6 +1354,11 @@ class PollerService:
                 "critical_oid_errors": response_payload.get("critical_oid_errors") or {},
                 "raw_legacy_mac_count": response_payload.get("raw_legacy_mac_count"),
                 "raw_d3_mac_count": response_payload.get("raw_d3_mac_count"),
+                "collection_mode": response_payload.get("collection_mode") or collection_mode,
+                "authoritative": response_payload.get(
+                    "authoritative", response_payload.get("complete") is True
+                ) is True,
+                "enriched": response_payload.get("enriched") is True,
             }
         raise RuntimeError(f"CMTS fetch failed for {cmts_ip}: {response_payload}")
 
@@ -1224,6 +1420,7 @@ class PollerService:
         rows: List[Dict[str, Any]],
         source_poller: Optional[str],
         snapshot_id: Optional[str] = None,
+        connection=None,
     ) -> int:
         if not rows:
             return 0
@@ -1301,9 +1498,11 @@ class PollerService:
                  ofdm_enabled, ofdma_enabled, partial_service,
                  partial_service_downstream, partial_service_upstream, partial_service_state,
                  software_version, first_seen_at, last_seen_at, updated_at,
-                 source_poller, snapshot_id)
+                 source_poller, snapshot_id,
+                inventory_state, missing_since, consecutive_full_misses, retired_at)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    'active',NULL,0,NULL)
             ON DUPLICATE KEY UPDATE
               ip=COALESCE(VALUES(ip), ip),
               cmts=COALESCE(NULLIF(VALUES(cmts), ''), cmts),
@@ -1347,20 +1546,540 @@ class PollerService:
               software_version=COALESCE(NULLIF(VALUES(software_version), ''), software_version),
               last_seen_at=VALUES(last_seen_at),
               updated_at=VALUES(updated_at), source_poller=VALUES(source_poller),
-              snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id)
+              snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id),
+              inventory_state='active', missing_since=NULL,
+              consecutive_full_misses=0, retired_at=NULL
         """
 
         batch_size = 500
         for i in range(0, len(all_values), batch_size):
             batch = all_values[i:i + batch_size]
-            with self._db_lock:
-                conn = self._connect()
-                cur = conn.cursor()
+            if connection is not None:
+                cur = connection.cursor()
                 cur.executemany(sql, batch)
-                conn.close()
+            else:
+                with self._db_lock:
+                    conn = self._connect()
+                    cur = conn.cursor()
+                    cur.executemany(sql, batch)
+                    conn.close()
             inserted += len(batch)
 
         return inserted
+
+    @staticmethod
+    def _inventory_enriched_sql(alias: str = "") -> str:
+        prefix = f"{alias}." if alias else ""
+        return (
+            f"LOWER(TRIM(COALESCE({prefix}vendor,''))) NOT IN ('','unknown','n/a') "
+            f"AND (TRIM(COALESCE({prefix}software_version,'')) <> '' OR "
+            f"LOWER(TRIM(COALESCE({prefix}model,''))) NOT IN ('','unknown','n/a'))"
+        )
+
+    def _refresh_summary_for_cmts_cursor(
+        self,
+        cur,
+        *,
+        cmts_ip: str,
+        cmts: str,
+        refreshed_at: str,
+    ) -> None:
+        cur.execute(
+            "DELETE FROM inventory_summary_count WHERE cmts_ip=%s",
+            (cmts_ip,),
+        )
+        dimensions = (
+            ("vendor", "vendor"),
+            ("model", "model"),
+            ("software_version", "software_version"),
+            ("docsis_version", "docsis_version"),
+        )
+        for dimension, column in dimensions:
+            cur.execute(
+                "INSERT INTO inventory_summary_count "
+                "(cmts_ip, dimension, value, row_count) "
+                f"SELECT %s, %s, COALESCE(NULLIF(TRIM({column}),''), '(unknown)'), "
+                "COUNT(*) FROM modem_inventory_current "
+                "WHERE cmts_ip=%s AND inventory_state<>'retired' GROUP BY 3",
+                (cmts_ip, dimension, cmts_ip),
+            )
+        cur.execute(
+            "SELECT COUNT(*) AS total, MAX(updated_at) AS last_updated, "
+            f"SUM(CASE WHEN {self._inventory_enriched_sql()} THEN 1 ELSE 0 END) "
+            "AS enriched FROM modem_inventory_current "
+            "WHERE cmts_ip=%s AND inventory_state<>'retired'",
+            (cmts_ip,),
+        )
+        status = cur.fetchone() or {}
+        cur.execute(
+            "INSERT INTO inventory_summary_status "
+            "(cmts_ip, cmts, active_total, enriched_count, last_updated, refreshed_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
+            "cmts=VALUES(cmts), active_total=VALUES(active_total), "
+            "enriched_count=VALUES(enriched_count), "
+            "last_updated=VALUES(last_updated), refreshed_at=VALUES(refreshed_at)",
+            (
+                cmts_ip,
+                cmts or cmts_ip,
+                int(status.get("total") or 0),
+                int(status.get("enriched") or 0),
+                status.get("last_updated"),
+                refreshed_at,
+            ),
+        )
+
+    def _lock_inventory_snapshot_cursor(
+        self,
+        cur,
+        *,
+        cmts_ip: str,
+        cmts: str,
+        locked_at: str,
+    ) -> Dict[str, Any]:
+        """Ensure and lock one CMTS snapshot row within the caller transaction."""
+        cur.execute(
+            "INSERT INTO cmts_inventory_snapshot "
+            "(cmts_ip, cmts, snapshot_id, complete, requested_limit, row_count, "
+            "collected_at, source, authoritative, quarantined, quarantine_reason, "
+            "revision_at) VALUES (%s,%s,%s,FALSE,%s,0,%s,%s,FALSE,TRUE,%s,%s) "
+            "ON DUPLICATE KEY UPDATE cmts_ip=VALUES(cmts_ip)",
+            (
+                cmts_ip,
+                cmts or cmts_ip,
+                str(uuid.uuid4()),
+                self._cm_modem_limit_default(),
+                locked_at,
+                "lock-bootstrap",
+                "snapshot row created for transaction lock bootstrap",
+                locked_at,
+            ),
+        )
+        cur.execute(
+            "SELECT quarantined, quarantine_candidate_count, "
+            "quarantine_candidate_fingerprint, collection_mode "
+            "FROM cmts_inventory_snapshot WHERE cmts_ip=%s FOR UPDATE",
+            (cmts_ip,),
+        )
+        return cur.fetchone() or {}
+
+    @staticmethod
+    def _coerce_collected_at(value: Any, fallback: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return fallback
+
+    def persist_scheduled_inventory_generation(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        cmts_hostname: str,
+        cmts_ip: str,
+        metadata: Dict[str, Any],
+        source_poller: Optional[str],
+        task_type: str,
+        job_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically merge one CMTS generation, lifecycle, snapshot, and summary."""
+        cmts_name = str(cmts_hostname or "").strip()
+        cmts_address = str(cmts_ip or "").strip()
+        if not cmts_name or not cmts_address:
+            raise ValueError("cmts_hostname and cmts_ip are required")
+
+        snapshot_id = str(uuid.uuid4())
+        stamped_rows: List[Dict[str, Any]] = []
+        observed_macs: List[str] = []
+        incomplete_new_candidates: set[str] = set()
+        for source in rows or []:
+            if not isinstance(source, dict):
+                continue
+            mac = self._normalize_mac(source.get("mac_address") or source.get("mac") or "")
+            if not mac:
+                continue
+            row = dict(source)
+            row["mac_address"] = mac
+            row["cmts"] = cmts_name
+            row["cmts_ip"] = cmts_address
+            stamped_rows.append(row)
+            observed_macs.append(mac)
+            if not row.get("cable_mac") or not row.get("fiber_node"):
+                incomplete_new_candidates.add(mac)
+
+        observed_macs = list(dict.fromkeys(observed_macs))
+        row_count = len(observed_macs)
+        population_fingerprint = (
+            hashlib.sha256(
+                "\n".join(sorted(observed_macs)).encode("ascii")
+            ).hexdigest()
+            if observed_macs
+            else None
+        )
+        complete_input = metadata.get("complete") is True
+        truncated = metadata.get("truncated") is True
+        if task_type == _INVENTORY_RECONCILE_TASK_TYPE:
+            collection_mode = "light"
+        elif task_type == _INVENTORY_FULL_TASK_TYPE:
+            collection_mode = "full"
+        else:
+            collection_mode = str(metadata.get("collection_mode") or "full")
+        now = self._now()
+        collected_at = self._coerce_collected_at(metadata.get("collected_at"), now)
+        lifecycle_task = task_type in {
+            _INVENTORY_RECONCILE_TASK_TYPE,
+            _INVENTORY_FULL_TASK_TYPE,
+        }
+
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                if job_id is not None:
+                    cur.execute(
+                        "SELECT status FROM poller_job WHERE id=%s FOR UPDATE",
+                        (int(job_id),),
+                    )
+                    job = cur.fetchone()
+                    if not job or str(job.get("status") or "").lower() != "running":
+                        raise _PollerJobNotRunning(
+                            f"Poller job {job_id} is no longer running"
+                        )
+
+                previous_snapshot = self._lock_inventory_snapshot_cursor(
+                    cur,
+                    cmts_ip=cmts_address,
+                    cmts=cmts_name,
+                    locked_at=now,
+                )
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM modem_inventory_current "
+                    "WHERE cmts_ip=%s AND inventory_state<>'retired'",
+                    (cmts_address,),
+                )
+                previous_count = int((cur.fetchone() or {}).get("c") or 0)
+
+                existing_macs: set[str] = set()
+                for offset in range(0, len(observed_macs), 500):
+                    batch = observed_macs[offset:offset + 500]
+                    placeholders = ",".join(["%s"] * len(batch))
+                    cur.execute(
+                        f"SELECT mac FROM modem_inventory_current WHERE mac IN ({placeholders})",
+                        tuple(batch),
+                    )
+                    existing_macs.update(str(row.get("mac")) for row in cur.fetchall())
+
+                producer_authoritative = metadata.get("authoritative")
+                full_enrichment_complete = bool(
+                    metadata.get("enriched") is True
+                    and metadata.get("capability_enriched") is True
+                )
+                authoritative = bool(
+                    complete_input
+                    and not truncated
+                    and row_count > 0
+                    and producer_authoritative is not False
+                    and (
+                        task_type != _INVENTORY_FULL_TASK_TYPE
+                        or full_enrichment_complete
+                    )
+                )
+                quarantined = False
+                quarantine_reason = None
+                quarantine_candidate_count = None
+                quarantine_candidate_fingerprint = None
+                if not complete_input:
+                    authoritative = False
+                    quarantined = True
+                    quarantine_reason = "incomplete generation"
+                elif truncated:
+                    authoritative = False
+                    quarantined = True
+                    quarantine_reason = "truncated generation"
+                elif row_count == 0:
+                    authoritative = False
+                    quarantined = True
+                    quarantine_reason = "zero-row complete generation"
+                    quarantine_candidate_count = 0
+                elif producer_authoritative is False:
+                    authoritative = False
+                    quarantined = True
+                    quarantine_reason = "source marked generation non-authoritative"
+                elif (
+                    task_type == _INVENTORY_FULL_TASK_TYPE
+                    and not full_enrichment_complete
+                ):
+                    authoritative = False
+                    quarantined = True
+                    missing_parts = []
+                    if metadata.get("capability_enriched") is not True:
+                        missing_parts.append("capability tables")
+                    if metadata.get("enriched") is not True:
+                        missing_parts.append("CMTS interface enrichment")
+                    quarantine_reason = (
+                        "daily full enrichment incomplete: "
+                        + ", ".join(missing_parts)
+                    )
+                elif lifecycle_task and previous_count > 0:
+                    shrink = previous_count - row_count
+                    shrink_limit = max(100.0, previous_count * 0.10)
+                    if shrink > shrink_limit:
+                        candidate_matches = bool(
+                            int(
+                                previous_snapshot.get("quarantine_candidate_count")
+                                if previous_snapshot.get("quarantine_candidate_count")
+                                is not None
+                                else -1
+                            )
+                            == row_count
+                            and previous_snapshot.get(
+                                "quarantine_candidate_fingerprint"
+                            )
+                            == population_fingerprint
+                            and str(
+                                previous_snapshot.get("collection_mode") or ""
+                            )
+                            == collection_mode
+                        )
+                        quarantine_candidate_count = row_count
+                        quarantine_candidate_fingerprint = population_fingerprint
+                        if not candidate_matches:
+                            authoritative = False
+                            quarantined = True
+                            quarantine_reason = (
+                                f"anomalous shrink from {previous_count} to "
+                                f"{row_count} rows"
+                            )
+
+                written = 0
+                if authoritative:
+                    written = self._upsert_inventory_rows(
+                        stamped_rows,
+                        source_poller=source_poller,
+                        snapshot_id=snapshot_id,
+                        connection=conn,
+                    )
+
+                if authoritative and task_type == _INVENTORY_RECONCILE_TASK_TYPE:
+                    cur.execute(
+                        "UPDATE modem_inventory_current SET "
+                        "inventory_state='suspect_missing', "
+                        "missing_since=COALESCE(missing_since,%s), updated_at=%s "
+                        "WHERE cmts_ip=%s AND inventory_state='active' "
+                        "AND (snapshot_id IS NULL OR snapshot_id<>%s)",
+                        (now, now, cmts_address, snapshot_id),
+                    )
+                elif authoritative and task_type == _INVENTORY_FULL_TASK_TYPE:
+                    cur.execute(
+                        "UPDATE modem_inventory_current SET "
+                        "inventory_state=CASE WHEN consecutive_full_misses+1>=2 "
+                        "THEN 'retired' ELSE 'suspect_missing' END, "
+                        "retired_at=CASE WHEN consecutive_full_misses+1>=2 "
+                        "THEN COALESCE(retired_at,%s) ELSE retired_at END, "
+                        "missing_since=COALESCE(missing_since,%s), "
+                        "consecutive_full_misses=consecutive_full_misses+1, "
+                        "updated_at=%s WHERE cmts_ip=%s "
+                        "AND inventory_state<>'retired' "
+                        "AND (snapshot_id IS NULL OR snapshot_id<>%s)",
+                        (now, now, now, cmts_address, snapshot_id),
+                    )
+
+                if (
+                    authoritative
+                    and task_type == _INVENTORY_RECONCILE_TASK_TYPE
+                    and written
+                ):
+                    try:
+                        auto_limit = max(
+                            1,
+                            min(
+                                int(os.environ.get("DATA_STORE_NEW_MODEM_ENRICH_LIMIT", "100")),
+                                1000,
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        auto_limit = 100
+                    new_candidates = [
+                        mac for mac in observed_macs
+                        if mac not in existing_macs and mac in incomplete_new_candidates
+                    ][:auto_limit]
+                    if new_candidates:
+                        cur.executemany(
+                            "INSERT IGNORE INTO modem_refresh_request "
+                            "(mac, cmts, status, requested_by, created_at) "
+                            "VALUES (%s,%s,'queued','inventory-light',%s)",
+                            [(mac, cmts_name, now) for mac in new_candidates],
+                        )
+
+                if authoritative:
+                    self._refresh_summary_for_cmts_cursor(
+                        cur,
+                        cmts_ip=cmts_address,
+                        cmts=cmts_name,
+                        refreshed_at=now,
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO cmts_inventory_snapshot
+                        (cmts_ip, cmts, snapshot_id, complete, truncated,
+                         capability_enriched, requested_limit, row_count,
+                         collected_at, source, source_poller, critical_oid_errors,
+                         raw_legacy_mac_count, raw_d3_mac_count, authoritative,
+                         quarantined, quarantine_reason, quarantine_candidate_count,
+                         quarantine_candidate_fingerprint, collection_mode, revision_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                        cmts=VALUES(cmts), snapshot_id=VALUES(snapshot_id),
+                        complete=VALUES(complete), truncated=VALUES(truncated),
+                        capability_enriched=VALUES(capability_enriched),
+                        requested_limit=VALUES(requested_limit), row_count=VALUES(row_count),
+                        collected_at=VALUES(collected_at), source=VALUES(source),
+                        source_poller=VALUES(source_poller),
+                        critical_oid_errors=VALUES(critical_oid_errors),
+                        raw_legacy_mac_count=VALUES(raw_legacy_mac_count),
+                        raw_d3_mac_count=VALUES(raw_d3_mac_count),
+                        authoritative=VALUES(authoritative),
+                        quarantined=VALUES(quarantined),
+                        quarantine_reason=VALUES(quarantine_reason),
+                        quarantine_candidate_count=VALUES(quarantine_candidate_count),
+                        quarantine_candidate_fingerprint=VALUES(
+                            quarantine_candidate_fingerprint
+                        ),
+                        collection_mode=VALUES(collection_mode),
+                        revision_at=GREATEST(
+                            VALUES(revision_at),
+                            DATE_ADD(COALESCE(revision_at, collected_at,
+                            '1970-01-01 00:00:00'), INTERVAL 1 SECOND))
+                    """,
+                    (
+                        cmts_address,
+                        cmts_name,
+                        snapshot_id,
+                        1 if complete_input and not truncated else 0,
+                        1 if truncated else 0,
+                        1 if collection_mode == "full" and metadata.get("capability_enriched") is True else 0,
+                        int(metadata.get("requested_limit") or self._cm_modem_limit_default()),
+                        row_count,
+                        collected_at,
+                        metadata.get("source") or "snmp-live",
+                        source_poller,
+                        json.dumps(metadata.get("critical_oid_errors") or {}),
+                        metadata.get("raw_legacy_mac_count"),
+                        metadata.get("raw_d3_mac_count"),
+                        1 if authoritative else 0,
+                        1 if quarantined else 0,
+                        quarantine_reason,
+                        quarantine_candidate_count,
+                        quarantine_candidate_fingerprint,
+                        collection_mode,
+                        now,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+        return {
+            "snapshot_id": snapshot_id,
+            "row_count": written,
+            "observed_row_count": row_count,
+            "authoritative": authoritative,
+            "complete": bool(complete_input and not truncated),
+            "quarantined": quarantined,
+            "quarantine_reason": quarantine_reason,
+            "quarantine_candidate_count": quarantine_candidate_count,
+            "collection_mode": collection_mode,
+        }
+
+    def persist_enrichment_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        cmts: str,
+        cmts_ip: str,
+        source_poller: str,
+    ) -> int:
+        """Persist enrichment, refresh its summary, and advance revision atomically."""
+        values = []
+        now = self._now()
+        for source in rows or []:
+            if not isinstance(source, dict):
+                continue
+            mac = self._normalize_mac(
+                source.get("mac_address") or source.get("mac") or ""
+            )
+            if len(mac) != 17:
+                continue
+            docsis_version = source.get("docsis_version")
+            values.append(
+                (
+                    source.get("fiber_node"),
+                    source.get("cable_mac"),
+                    docsis_version,
+                    docsis_version,
+                    docsis_version,
+                    docsis_version,
+                    docsis_version,
+                    now,
+                    source_poller,
+                    mac,
+                    cmts_ip,
+                )
+            )
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                self._lock_inventory_snapshot_cursor(
+                    cur,
+                    cmts_ip=cmts_ip,
+                    cmts=cmts,
+                    locked_at=now,
+                )
+                written = 0
+                if values:
+                    cur.executemany(
+                        "UPDATE modem_inventory_current SET "
+                        "fiber_node=COALESCE(NULLIF(%s,''),fiber_node), "
+                        "cable_mac=COALESCE(NULLIF(%s,''),cable_mac), "
+                        "docsis_version=CASE "
+                        "WHEN docsis_version LIKE '%4.0%' THEN docsis_version "
+                        "WHEN %s LIKE '%4.0%' THEN %s "
+                        "WHEN docsis_version LIKE '%3.1%' THEN docsis_version "
+                        "WHEN %s LIKE '%3.1%' THEN %s "
+                        "ELSE COALESCE(NULLIF(%s,''),docsis_version) END, "
+                        "updated_at=%s, source_poller=%s "
+                        "WHERE mac=%s AND cmts_ip=%s "
+                        "AND inventory_state<>'retired'",
+                        values,
+                    )
+                    written = int(cur.rowcount or 0)
+                self._refresh_summary_for_cmts_cursor(
+                    cur,
+                    cmts_ip=cmts_ip,
+                    cmts=cmts,
+                    refreshed_at=now,
+                )
+                cur.execute(
+                    "UPDATE cmts_inventory_snapshot SET revision_at="
+                    "GREATEST(UTC_TIMESTAMP(), DATE_ADD(COALESCE(revision_at, "
+                    "collected_at, '1970-01-01 00:00:00'), INTERVAL 1 SECOND)) "
+                    "WHERE cmts_ip=%s",
+                    (cmts_ip,),
+                )
+                conn.commit()
+                return written
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def _persist_cpe_generation(
         self,
@@ -1463,39 +2182,23 @@ class PollerService:
         if not cmts_name or not cmts_address:
             raise ValueError("cmts_hostname and cmts_ip are required")
 
-        snapshot_id = str(uuid.uuid4())
-        stamped_rows: List[Dict[str, Any]] = []
-        for source in rows or []:
-            if not isinstance(source, dict):
-                continue
-            row = dict(source)
-            row["cmts"] = cmts_name
-            row["cmts_ip"] = cmts_address
-            stamped_rows.append(row)
-
-        written = self._upsert_inventory_rows(
-            stamped_rows,
+        result = self.persist_scheduled_inventory_generation(
+            rows,
+            cmts_hostname=cmts_name,
+            cmts_ip=cmts_address,
+            metadata=metadata,
             source_poller=source_poller,
-            snapshot_id=snapshot_id,
+            task_type="inventory",
         )
         cpe_written = self._persist_cpe_generation(
             metadata.get('cpe_addresses') or [],
             cmts_ip=cmts_address,
-            snapshot_id=snapshot_id,
+            snapshot_id=result["snapshot_id"],
             complete=metadata.get('cpe_complete') is True,
             truncated=metadata.get('cpe_truncated') is True,
         )
-        self._record_inventory_snapshot(
-            cmts=cmts_name,
-            cmts_ip=cmts_address,
-            snapshot_id=snapshot_id,
-            metadata=metadata,
-            row_count=written,
-            source_poller=source_poller,
-        )
         return {
-            "snapshot_id": snapshot_id,
-            "row_count": written,
+            **result,
             "cpe_row_count": cpe_written,
         }
 
@@ -1518,15 +2221,8 @@ class PollerService:
         except Exception:
             collected_at = self._now()
 
-        # A complete generation is authoritative. Prune stale rows before
-        # publishing its metadata; readers do not filter by generation, so a
-        # failed batch or metadata write cannot hide the previous inventory.
-        if metadata.get("complete") is True and metadata.get("truncated") is not True:
-            self._execute(
-                "DELETE FROM modem_inventory_current "
-                "WHERE cmts_ip=%s AND (snapshot_id IS NULL OR snapshot_id<>%s)",
-                (cmts_ip, snapshot_id),
-            )
+        # Legacy callers publish observation metadata only. Lifecycle transitions
+        # are exclusively handled by persist_scheduled_inventory_generation.
 
         revision_at = self._now()
         self._execute(
@@ -1594,6 +2290,8 @@ class PollerService:
         row["complete"] = bool(row.get("complete"))
         row["truncated"] = bool(row.get("truncated"))
         row["capability_enriched"] = bool(row.get("capability_enriched"))
+        row["authoritative"] = bool(row.get("authoritative"))
+        row["quarantined"] = bool(row.get("quarantined"))
         errors = row.get("critical_oid_errors")
         if isinstance(errors, str):
             try:
@@ -1613,7 +2311,9 @@ class PollerService:
         """Return lightweight revision metadata for all current CMTS inventories."""
         rows = self._query(
             "SELECT cmts_ip, cmts, snapshot_id, complete, truncated, "
-            "capability_enriched, requested_limit, row_count, collected_at, revision_at "
+            "capability_enriched, authoritative, quarantined, quarantine_reason, "
+            "quarantine_candidate_count, collection_mode, requested_limit, "
+            "row_count, collected_at, revision_at "
             "FROM cmts_inventory_snapshot"
         )
         snapshots: List[Dict[str, Any]] = []
@@ -1622,6 +2322,8 @@ class PollerService:
             row["complete"] = bool(row.get("complete"))
             row["truncated"] = bool(row.get("truncated"))
             row["capability_enriched"] = bool(row.get("capability_enriched"))
+            row["authoritative"] = bool(row.get("authoritative"))
+            row["quarantined"] = bool(row.get("quarantined"))
             for field in ("collected_at", "revision_at"):
                 value = row.get(field)
                 if isinstance(value, datetime):
@@ -1649,26 +2351,82 @@ class PollerService:
                 tuple(params),
             )
 
-    def _purge_stale_inventory(self, retention_days: int) -> int:
-        days = max(1, int(retention_days or 30))
-        before = self._query("SELECT COUNT(*) AS c FROM modem_inventory_current")
-        count_before = int((before[0] or {}).get("c") or 0) if before else 0
+    def _refresh_summary_and_revision(
+        self,
+        *,
+        cmts: str | None,
+        cmts_ip: str | None,
+    ) -> None:
+        address = str(cmts_ip or "").strip()
+        name = str(cmts or "").strip()
+        if not address and name:
+            rows = self._query(
+                "SELECT cmts_ip, cmts FROM modem_inventory_current "
+                "WHERE inventory_state<>'retired' AND "
+                "(cmts=%s OR cmts_ip=%s) LIMIT 1",
+                (name, name),
+            )
+            if rows:
+                address = str(rows[0].get("cmts_ip") or "")
+                name = str(rows[0].get("cmts") or name)
+        if not address:
+            return
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                self._lock_inventory_snapshot_cursor(
+                    cur,
+                    cmts_ip=address,
+                    cmts=name or address,
+                    locked_at=now,
+                )
+                self._refresh_summary_for_cmts_cursor(
+                    cur,
+                    cmts_ip=address,
+                    cmts=name or address,
+                    refreshed_at=now,
+                )
+                cur.execute(
+                    "UPDATE cmts_inventory_snapshot SET revision_at="
+                    "GREATEST(UTC_TIMESTAMP(), DATE_ADD(COALESCE(revision_at, "
+                    "collected_at, '1970-01-01 00:00:00'), INTERVAL 1 SECOND)) "
+                    "WHERE cmts_ip=%s",
+                    (address,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
-        self._execute(
-            "DELETE FROM modem_inventory_current WHERE last_seen_at < (UTC_TIMESTAMP() - INTERVAL %s DAY)",
+    def _purge_retired_inventory(self, retention_days: int = 7) -> int:
+        """Hard-delete only retired rows whose audit window has elapsed."""
+        days = max(7, int(retention_days or 7))
+        before = self._query(
+            "SELECT COUNT(*) AS c FROM modem_inventory_current "
+            "WHERE inventory_state='retired' AND retired_at < "
+            "(UTC_TIMESTAMP() - INTERVAL %s DAY)",
             (days,),
         )
+        count_before = int((before[0] or {}).get("c") or 0) if before else 0
+        if count_before:
+            self._execute(
+                "DELETE FROM modem_inventory_current "
+                "WHERE inventory_state='retired' AND retired_at < "
+                "(UTC_TIMESTAMP() - INTERVAL %s DAY)",
+                (days,),
+            )
         self._execute(
-            "DELETE FROM modem_cpe_ip_current "
-            "WHERE last_seen_at < (UTC_TIMESTAMP() - INTERVAL %s DAY) "
-            "OR NOT EXISTS (SELECT 1 FROM modem_inventory_current m "
+            "DELETE FROM modem_cpe_ip_current WHERE NOT EXISTS "
+            "(SELECT 1 FROM modem_inventory_current m "
             "WHERE m.mac=modem_cpe_ip_current.modem_mac "
-            "AND m.cmts_ip=modem_cpe_ip_current.cmts_ip)",
-            (days,),
+            "AND m.cmts_ip=modem_cpe_ip_current.cmts_ip)"
         )
-        after = self._query("SELECT COUNT(*) AS c FROM modem_inventory_current")
-        count_after = int((after[0] or {}).get("c") or 0) if after else 0
-        return max(0, count_before - count_after)
+        return count_before
 
     def _process_cpe_job(
         self,
@@ -2227,14 +2985,15 @@ class PollerService:
         for candidate in queued:
             setting_missing = candidate.get("setting_id") is None
             disabled = int(candidate.get("enabled") or 0) != 1
-            is_cpe_task = (
-                str(candidate.get("task_type") or "inventory") == _CPE_TASK_TYPE
-            )
+            is_fixed_task = str(candidate.get("task_type") or "inventory") in {
+                _CPE_TASK_TYPE,
+                _INVENTORY_FULL_TASK_TYPE,
+            }
             inside_window = self._inside_run_window(
                 candidate.get("run_window_start"),
                 candidate.get("run_window_end"),
             )
-            if setting_missing or disabled or is_cpe_task or inside_window:
+            if setting_missing or disabled or is_fixed_task or inside_window:
                 job = candidate
                 break
 
@@ -2266,7 +3025,7 @@ class PollerService:
             is_enabled_inventory = (
                 int(current_setting.get("enabled") or 0) == 1
                 and str(current_setting.get("task_type") or "inventory")
-                != _CPE_TASK_TYPE
+                not in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}
             )
             if is_enabled_inventory and not self._inside_run_window(
                 current_setting.get("run_window_start"),
@@ -2331,6 +3090,12 @@ class PollerService:
                     self._process_cpe_job(job_id, poller, targets)
                     return
 
+                collection_mode = (
+                    "light"
+                    if task_type == _INVENTORY_RECONCILE_TASK_TYPE
+                    else "full"
+                )
+                wait_for_enrichment = task_type == _INVENTORY_FULL_TASK_TYPE
                 start_offset = max(
                     0,
                     int(poller.get("last_target_offset") or 0),
@@ -2479,6 +3244,8 @@ class PollerService:
                                 "fetch_result": self._fetch_cmts_modems(
                                     cmts_ip,
                                     timeout_sec=subtask_timeout_sec,
+                                    collection_mode=collection_mode,
+                                    wait_for_enrichment=wait_for_enrichment,
                                 ),
                                 "last_target_error": last_target_error,
                                 "attempt_errors": attempt_errors,
@@ -2567,25 +3334,35 @@ class PollerService:
                             modem["cmts"] = cmts_name
                             modem["cmts_ip"] = cmts_ip
 
-                        snapshot_id = str(uuid.uuid4())
-                        written = self._upsert_inventory_rows(
+                        persistence = self.persist_scheduled_inventory_generation(
                             modems,
-                            source_poller=poller.get("name"),
-                            snapshot_id=snapshot_id,
-                        )
-                        self._record_inventory_snapshot(
-                            cmts=cmts_name,
+                            cmts_hostname=cmts_name,
                             cmts_ip=cmts_ip,
-                            snapshot_id=snapshot_id,
                             metadata=fetch_result,
-                            row_count=written,
                             source_poller=poller.get("name"),
+                            task_type=task_type,
+                            job_id=job_id,
+                        )
+                        written = int(persistence.get("row_count") or 0)
+                        observed_count = int(
+                            persistence.get("observed_row_count") or 0
+                        )
+                        persistence_authoritative = (
+                            persistence.get("authoritative") is True
                         )
                         breakdown_entry = {
                             "cmts": cmts_name,
                             "cmts_ip": cmts_ip,
                             "row_count": written,
-                            "complete": fetch_result.get("complete") is True,
+                            "observed_row_count": observed_count,
+                            "complete": persistence.get("complete") is True,
+                            "authoritative": persistence_authoritative,
+                            "quarantined": persistence.get("quarantined") is True,
+                            "quarantine_reason": persistence.get("quarantine_reason"),
+                            "quarantine_candidate_count": persistence.get(
+                                "quarantine_candidate_count"
+                            ),
+                            "collection_mode": persistence.get("collection_mode"),
                             "truncated": fetch_result.get("truncated") is True,
                             "capability_enriched": (
                                 fetch_result.get("capability_enriched") is True
@@ -2597,11 +3374,26 @@ class PollerService:
                             ),
                         }
                         rows_collected += written
-                        modems_succeeded += len(modems)
-                        progress_message = (
-                            f"CMTS {idx}/{total_targets}: {cmts_name} done "
-                            f"({len(modems)} modems)"
-                        )
+                        if persistence_authoritative:
+                            modems_succeeded += len(modems)
+                            progress_message = (
+                                f"CMTS {idx}/{total_targets}: {cmts_name} done "
+                                f"({len(modems)} modems)"
+                            )
+                        else:
+                            rejected_reason = str(
+                                persistence.get("quarantine_reason")
+                                or "non-authoritative generation"
+                            )
+                            modems_failed += max(1, len(modems))
+                            error_text = (
+                                f"CMTS collection rejected at {idx}/{total_targets} "
+                                f"({cmts_name}): {rejected_reason}"
+                            )
+                            progress_message = (
+                                f"CMTS {idx}/{total_targets}: {cmts_name} "
+                                f"rejected ({rejected_reason})"
+                            )
 
                     breakdown_by_index[idx] = breakdown_entry
                     finalized_indices.add(idx)
@@ -2717,12 +3509,15 @@ class PollerService:
                     )
                     return
 
-                try:
-                    self._purge_stale_inventory(
-                        int(poller.get("retention_days") or 30)
-                    )
-                except Exception:
-                    pass
+                if task_type == _INVENTORY_FULL_TASK_TYPE and not error_text:
+                    try:
+                        self._purge_retired_inventory(7)
+                    except Exception as purge_exc:
+                        logger.warning(
+                            "Retired inventory purge after full job %s failed: %s",
+                            job_id,
+                            purge_exc,
+                        )
 
                 # Every target has now been finalized (including skipped failures),
                 # so the next scheduled run must start a fresh full pass.
@@ -2878,7 +3673,8 @@ class PollerService:
             }
 
         if (
-            str(poller.get("task_type") or "inventory") != _CPE_TASK_TYPE
+            str(poller.get("task_type") or "inventory")
+            not in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}
             and not self._inside_run_window(
                 poller.get("run_window_start"),
                 poller.get("run_window_end"),
@@ -2943,7 +3739,8 @@ class PollerService:
             if enforce_interval_due:
                 if (
                     int(setting.get("enabled") or 0) != 1
-                    or str(setting.get("task_type") or "inventory") != "inventory"
+                    or str(setting.get("task_type") or "inventory")
+                    not in {"inventory", _INVENTORY_RECONCILE_TASK_TYPE}
                     or not self._inside_run_window(
                         setting.get("run_window_start"),
                         setting.get("run_window_end"),
@@ -2982,7 +3779,7 @@ class PollerService:
             if (
                 explicit_request
                 and str(setting.get("task_type") or "inventory")
-                != _CPE_TASK_TYPE
+                not in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}
                 and not self._inside_run_window(
                     setting.get("run_window_start"),
                     setting.get("run_window_end"),
@@ -3008,7 +3805,10 @@ class PollerService:
                 ),
             )
             job_id = int(cur.lastrowid or 0)
-            if job_id and str(setting.get("task_type") or "inventory") == "inventory":
+            if job_id and str(setting.get("task_type") or "inventory") in {
+                "inventory",
+                _INVENTORY_RECONCILE_TASK_TYPE,
+            }:
                 cur.execute(
                     "UPDATE poller_setting SET "
                     "last_interval_enqueue_utc="
@@ -3218,6 +4018,25 @@ class PollerService:
             "%Y-%m-%d %H:%M:%S"
         )
 
+    def _latest_daily_slot_utc(
+        self,
+        slot: datetime_time,
+        now_utc: datetime | None = None,
+    ) -> str:
+        current_utc = now_utc or datetime.now(timezone.utc)
+        local_now = current_utc.astimezone(self._schedule_zone())
+        local_slot = local_now.replace(
+            hour=slot.hour,
+            minute=slot.minute,
+            second=slot.second,
+            microsecond=0,
+        )
+        if local_now < local_slot:
+            local_slot -= timedelta(days=1)
+        return local_slot.astimezone(timezone.utc).replace(tzinfo=None).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
     def run_scheduler_once(self) -> int:
         scheduler_lock_conn = self._try_acquire_scheduler_lock()
         if scheduler_lock_conn is None:
@@ -3233,7 +4052,13 @@ class PollerService:
         queued = 0
         decisions = []
         try:
-            max_global_active = max(1, int(os.environ.get("DATA_STORE_MAX_ACTIVE_JOBS", "10")))
+            try:
+                max_global_active = max(
+                    1,
+                    int(os.environ.get("DATA_STORE_MAX_ACTIVE_JOBS", "10")),
+                )
+            except (TypeError, ValueError):
+                max_global_active = 10
             active_job_rows = self._query(
                 "SELECT j.status, p.id AS setting_id, p.enabled, p.task_type, "
                 "p.run_window_start, p.run_window_end "
@@ -3245,10 +4070,10 @@ class PollerService:
                 status = str(active_job.get("status") or "").lower()
                 setting_missing = active_job.get("setting_id") is None
                 disabled = int(active_job.get("enabled") or 0) != 1
-                is_cpe_task = (
-                    str(active_job.get("task_type") or "inventory")
-                    == _CPE_TASK_TYPE
-                )
+                is_fixed_task = str(active_job.get("task_type") or "inventory") in {
+                    _CPE_TASK_TYPE,
+                    _INVENTORY_FULL_TASK_TYPE,
+                }
                 inside_window = self._inside_run_window(
                     active_job.get("run_window_start"),
                     active_job.get("run_window_end"),
@@ -3257,7 +4082,7 @@ class PollerService:
                     status == "running"
                     or setting_missing
                     or disabled
-                    or is_cpe_task
+                    or is_fixed_task
                     or inside_window
                 ):
                     global_active += 1
@@ -3290,8 +4115,16 @@ class PollerService:
                     decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "active_job_exists"})
                     continue
 
-                if str(p.get("task_type") or "inventory") == _CPE_TASK_TYPE:
-                    scheduled_slot = self._latest_cpe_slot_utc()
+                task_type = str(p.get("task_type") or "inventory")
+                if task_type in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}:
+                    if task_type == _CPE_TASK_TYPE:
+                        scheduled_slot = self._latest_cpe_slot_utc()
+                        fixed_reason = "fixed_schedule_due"
+                    else:
+                        scheduled_slot = self._latest_daily_slot_utc(
+                            _INVENTORY_FULL_SCHEDULE
+                        )
+                        fixed_reason = "daily_full_schedule_due"
                     recorded_slot = p.get("last_scheduled_slot_utc")
                     if isinstance(recorded_slot, datetime):
                         recorded_slot = recorded_slot.strftime("%Y-%m-%d %H:%M:%S")
@@ -3341,7 +4174,7 @@ class PollerService:
                             "poller_id": pid,
                             "poller_name": pname,
                             "decision": "queued",
-                            "reason": "fixed_schedule_due",
+                            "reason": fixed_reason,
                         })
                     else:
                         decisions.append({
@@ -3553,7 +4386,7 @@ class PollerService:
         if limit is None:
             limit = self._cm_modem_limit_default()
         limit = max(1, min(int(limit or self._cm_modem_limit_default()), 50000))
-        where = []
+        where = ["inventory_state<>'retired'"]
         params: List[Any] = []
 
         if cmts:
@@ -3637,7 +4470,8 @@ class PollerService:
             "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
             "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
             "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-            "partial_service_upstream, partial_service_state, software_version, updated_at "
+            "partial_service_upstream, partial_service_state, software_version, "
+            "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
             f"FROM modem_inventory_current{where_sql} ORDER BY cmts ASC, mac ASC LIMIT {marker}",
             tuple(params + [limit]),
         )
@@ -3656,8 +4490,10 @@ class PollerService:
             "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
             "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
             "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-            "partial_service_upstream, partial_service_state, software_version, updated_at "
-            f"FROM modem_inventory_current WHERE mac IN ({marker}, {marker}, {marker}) "
+            "partial_service_upstream, partial_service_state, software_version, "
+            "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
+            f"FROM modem_inventory_current WHERE inventory_state<>'retired' "
+            f"AND mac IN ({marker}, {marker}, {marker}) "
             f"ORDER BY FIELD(mac, {marker}, {marker}, {marker}) LIMIT 1",
             (formatted, compact, dotted, formatted, compact, dotted),
         )
@@ -3686,8 +4522,10 @@ class PollerService:
     def list_cpe_index(self, limit: int = 500000) -> Dict[str, Any]:
         capped = max(1, min(int(limit or 500000), 500000))
         rows = self._query(
-            "SELECT ip_address, address_family, modem_mac "
-            "FROM modem_cpe_ip_current LIMIT %s",
+            "SELECT c.ip_address, c.address_family, c.modem_mac "
+            "FROM modem_cpe_ip_current c JOIN modem_inventory_current m "
+            "ON m.mac=c.modem_mac AND m.cmts_ip=c.cmts_ip "
+            "WHERE m.inventory_state<>'retired' LIMIT %s",
             (capped + 1,),
         )
         return {
@@ -3702,9 +4540,12 @@ class PollerService:
         comparator = 'LIKE %s' if normalized['prefix'] else '= %s'
         value = normalized['value'] + '%' if normalized['prefix'] else normalized['value']
         rows = self._query(
-            "SELECT DISTINCT ip_address FROM modem_cpe_ip_current "
-            f"WHERE address_family=%s AND ip_address {comparator} "
-            "ORDER BY ip_address LIMIT %s",
+            "SELECT DISTINCT c.ip_address FROM modem_cpe_ip_current c "
+            "JOIN modem_inventory_current m ON m.mac=c.modem_mac "
+            "AND m.cmts_ip=c.cmts_ip "
+            f"WHERE m.inventory_state<>'retired' AND c.address_family=%s "
+            f"AND c.ip_address {comparator} "
+            "ORDER BY c.ip_address LIMIT %s",
             (normalized['family'], value, capped),
         )
         return [str(row.get('ip_address')) for row in rows if row.get('ip_address')]
@@ -3733,8 +4574,10 @@ class PollerService:
                 "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
                 "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
                 "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-                "partial_service_upstream, partial_service_state, software_version, updated_at "
-                f"FROM modem_inventory_current WHERE mac IN ({placeholders})",
+                "partial_service_upstream, partial_service_state, software_version, "
+            "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
+                f"FROM modem_inventory_current WHERE inventory_state<>'retired' "
+                f"AND mac IN ({placeholders})",
                 tuple(batch),
             )
             results.extend(self._map_inventory_row(r) for r in rows)
@@ -3785,6 +4628,28 @@ class PollerService:
                 f"DELETE FROM modem_inventory_current WHERE {where_sql}",
                 tuple(params),
             )
+        summary_rows = self._query(
+            f"SELECT cmts_ip FROM inventory_summary_status WHERE {where_sql}",
+            tuple(params),
+        )
+        summary_cmts_ips = {
+            str(row.get("cmts_ip") or "").strip()
+            for row in summary_rows
+            if str(row.get("cmts_ip") or "").strip()
+        }
+        if cmts_addr:
+            summary_cmts_ips.add(cmts_addr)
+        if summary_cmts_ips:
+            placeholders = ",".join(["%s"] * len(summary_cmts_ips))
+            self._execute(
+                f"DELETE FROM inventory_summary_count "
+                f"WHERE cmts_ip IN ({placeholders})",
+                tuple(sorted(summary_cmts_ips)),
+            )
+        self._execute(
+            f"DELETE FROM inventory_summary_status WHERE {where_sql}",
+            tuple(params),
+        )
         self._execute(
             f"DELETE FROM cmts_inventory_snapshot WHERE {where_sql}",
             tuple(params),
@@ -3834,6 +4699,10 @@ class PollerService:
             "partial_service_upstream": _to_bool(row.get("partial_service_upstream")),
             "partial_service_state": row.get("partial_service_state"),
             "software_version": row.get("software_version"),
+            "inventory_state": row.get("inventory_state") or "active",
+            "missing_since": row.get("missing_since"),
+            "consecutive_full_misses": int(row.get("consecutive_full_misses") or 0),
+            "retired_at": row.get("retired_at"),
             "updated_at": row.get("updated_at"),
         }
 
@@ -3852,12 +4721,21 @@ class PollerService:
             return int((existing[0] or {}).get("id") or 0)
 
         now = self._now()
-        return int(
+        inserted = int(
             self._execute(
-                "INSERT INTO modem_refresh_request (mac, cmts, status, requested_by, created_at) VALUES (%s,%s,%s,%s,%s)",
+                "INSERT IGNORE INTO modem_refresh_request "
+                "(mac, cmts, status, requested_by, created_at) "
+                "VALUES (%s,%s,%s,%s,%s)",
                 (normalized_mac, cmts, "queued", requested_by or "api", now),
             ) or 0
         )
+        if inserted:
+            return inserted
+        existing = self._query(
+            "SELECT id FROM modem_refresh_request WHERE active_key=%s LIMIT 1",
+            (normalized_mac,),
+        )
+        return int((existing[0] or {}).get("id") or 0) if existing else 0
 
     def get_refresh_status(self, mac: str) -> dict | None:
         mac_norm = self._normalize_mac(mac).replace(":", "").replace("-", "")
@@ -3887,7 +4765,7 @@ class PollerService:
         return True
 
     def _resolve_modem_from_cmts(self, mac: str, cmts_name: str | None, base: str) -> Dict[str, Any] | None:
-        """Fallback: do a live CMTS walk to find modem row and upsert inventory."""
+        """Fallback live lookup that never mutates authoritative inventory."""
         if not cmts_name:
             return None
         try:
@@ -3897,7 +4775,8 @@ class PollerService:
             # name or address.
             rows = self._query(
                 "SELECT cmts_ip FROM modem_inventory_current "
-                "WHERE (LOWER(cmts)=LOWER(%s) OR LOWER(cmts_ip)=LOWER(%s)) "
+                "WHERE inventory_state<>'retired' AND "
+                "(LOWER(cmts)=LOWER(%s) OR LOWER(cmts_ip)=LOWER(%s)) "
                 "AND cmts_ip IS NOT NULL LIMIT 1",
                 (cmts_name, cmts_name),
             )
@@ -3929,26 +4808,6 @@ class PollerService:
             for m in modems:
                 m_mac = str(m.get("mac_address") or "").lower().replace(":", "").replace("-", "")
                 if m_mac == mac_norm:
-                    found_ip = m.get("ip_address")
-                    if found_ip:
-                        # Upsert into inventory so the UPDATE later succeeds
-                        self._upsert_inventory_rows([{
-                            "mac_address": mac,
-                            "ip_address": found_ip,
-                            "cmts": cmts_name,
-                            "cmts_ip": cmts_ip,
-                            **{k: m.get(k) for k in (
-                                "cmts_index", "docsif3_index", "fiber_node",
-                                "cable_mac", "mac_domain", "status",
-                                "docsis_version", "upstream_interface", "upstream_ifindex",
-                                "ofdm_ifindex", "ofdma_ifindex",
-                                "ofdm_channel_count", "ofdma_channel_count",
-                                "ofdma_rf_port_ifindex", "ofdm_enabled", "ofdma_enabled",
-                                "partial_service", "partial_service_downstream",
-                                "partial_service_upstream", "partial_service_state",
-                                "firmware", "software_version", "vendor", "model",
-                            )},
-                        }], source_poller="refresh-fallback")
                     out = dict(m)
                     out["cmts_ip"] = cmts_ip
                     out["cmts"] = cmts_name
@@ -4058,25 +4917,13 @@ class PollerService:
         try:
             base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
             modem = self.get_inventory_modem_by_mac(mac)
-            cmts_fallback_modem = (
-                self._resolve_modem_from_cmts(mac, cmts, base) if cmts else None
-            )
-            if cmts and not cmts_fallback_modem:
+            if not modem:
                 raise ValueError(
-                    f"Forced live CMTS refresh for {cmts} did not return modem {mac}"
-                )
-            if not modem and not cmts_fallback_modem:
-                raise ValueError(
-                    f"Modem {mac} not in inventory and not found via live CMTS walk"
+                    f"Modem {mac} is not in active inventory; "
+                    "targeted refresh cannot discover or reactivate inventory rows"
                 )
 
-            cable_source = dict(modem or {})
-            if isinstance(cmts_fallback_modem, dict):
-                for key, value in cmts_fallback_modem.items():
-                    if value is not None and (
-                        not isinstance(value, str) or value.strip()
-                    ):
-                        cable_source[key] = value
+            cable_source = dict(modem)
 
             # Identity values are retained only when the CMTS inventory already
             # exposes them. A targeted refresh never probes the modem directly.
@@ -4099,41 +4946,113 @@ class PollerService:
             fiber_node = interface_values.get("fiber_node")
             docsis_version = interface_values.get("docsis_version")
 
-            if vendor or model_name or software_ver or cable_mac or fiber_node or docsis_version:
-                self._execute(
-                    "UPDATE modem_inventory_current SET "
-                    "vendor=COALESCE(NULLIF(%s,''), vendor), "
-                    "model=COALESCE(NULLIF(%s,''), model), "
-                    "software_version=COALESCE(NULLIF(%s,''), software_version), "
-                    "cable_mac=COALESCE(NULLIF(%s,''), cable_mac), "
-                    "fiber_node=COALESCE(NULLIF(%s,''), fiber_node), "
-                    "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
-                    "updated_at=%s WHERE mac=%s",
-                    (
-                        vendor,
-                        model_name,
-                        software_ver,
-                        cable_mac,
-                        fiber_node,
-                        docsis_version,
-                        self._now(),
-                        mac,
-                    ),
-                )
-            # A completed single-modem refresh changes data outside the full
-            # snapshot generation. Advance its CMTS revision so every GUI
-            # Redis entry derived from the prior revision is rejected.
-            self._touch_inventory_revision(
-                cmts or cable_source.get("cmts"),
-                cable_source.get("cmts_ip"),
+            cmts_address = str(cable_source.get("cmts_ip") or "").strip()
+            cmts_label = str(
+                cmts or cable_source.get("cmts") or cmts_address
+            ).strip()
+            inventory_mac = str(
+                cable_source.get("mac_address") or cable_source.get("mac") or mac
             )
-            self._execute(
-                "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s",
-                ("completed", self._now(), req_id),
-            )
+            if not cmts_address:
+                raise ValueError(f"Modem {mac} has no CMTS address in inventory")
+
+            now = self._now()
+            with self._db_lock:
+                conn = self._connect()
+                try:
+                    conn.begin()
+                    cur = conn.cursor()
+                    self._lock_inventory_snapshot_cursor(
+                        cur,
+                        cmts_ip=cmts_address,
+                        cmts=cmts_label or cmts_address,
+                        locked_at=now,
+                    )
+                    cur.execute(
+                        "SELECT inventory_state FROM modem_inventory_current "
+                        "WHERE mac=%s AND cmts_ip=%s FOR UPDATE",
+                        (inventory_mac, cmts_address),
+                    )
+                    inventory_row = cur.fetchone()
+                    if not inventory_row or str(
+                        inventory_row.get("inventory_state") or "active"
+                    ) == "retired":
+                        raise ValueError(
+                            f"Modem {mac} is no longer active inventory"
+                        )
+                    cur.execute(
+                        "SELECT status FROM modem_refresh_request "
+                        "WHERE id=%s FOR UPDATE",
+                        (req_id,),
+                    )
+                    request_row = cur.fetchone() or {}
+                    if str(request_row.get("status") or "") != "running":
+                        raise RuntimeError(
+                            f"Refresh request {req_id} is no longer running"
+                        )
+
+                    if (
+                        vendor
+                        or model_name
+                        or software_ver
+                        or cable_mac
+                        or fiber_node
+                        or docsis_version
+                    ):
+                        cur.execute(
+                            "UPDATE modem_inventory_current SET "
+                            "vendor=COALESCE(NULLIF(%s,''), vendor), "
+                            "model=COALESCE(NULLIF(%s,''), model), "
+                            "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                            "cable_mac=COALESCE(NULLIF(%s,''), cable_mac), "
+                            "fiber_node=COALESCE(NULLIF(%s,''), fiber_node), "
+                            "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
+                            "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
+                            "AND inventory_state<>'retired'",
+                            (
+                                vendor,
+                                model_name,
+                                software_ver,
+                                cable_mac,
+                                fiber_node,
+                                docsis_version,
+                                now,
+                                inventory_mac,
+                                cmts_address,
+                            ),
+                        )
+                    self._refresh_summary_for_cmts_cursor(
+                        cur,
+                        cmts_ip=cmts_address,
+                        cmts=cmts_label or cmts_address,
+                        refreshed_at=now,
+                    )
+                    cur.execute(
+                        "UPDATE cmts_inventory_snapshot SET revision_at="
+                        "GREATEST(UTC_TIMESTAMP(), DATE_ADD(COALESCE(revision_at, "
+                        "collected_at, '1970-01-01 00:00:00'), INTERVAL 1 SECOND)) "
+                        "WHERE cmts_ip=%s",
+                        (cmts_address,),
+                    )
+                    cur.execute(
+                        "UPDATE modem_refresh_request SET status=%s, "
+                        "finished_at=%s WHERE id=%s AND status='running'",
+                        ("completed", now, req_id),
+                    )
+                    if int(cur.rowcount or 0) != 1:
+                        raise RuntimeError(
+                            f"Refresh request {req_id} completion lost a race"
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
         except Exception as exc:
             self._execute(
-                "UPDATE modem_refresh_request SET status=%s, finished_at=%s, error_text=%s WHERE id=%s",
+                "UPDATE modem_refresh_request SET status=%s, finished_at=%s, "
+                "error_text=%s WHERE id=%s AND status='running'",
                 ("failed", self._now(), str(exc)[:500], req_id),
             )
 
@@ -4146,12 +5065,17 @@ class PollerService:
             where = " WHERE (LOWER(COALESCE(cmts,'')) = LOWER(%s) OR LOWER(COALESCE(cmts_ip,'')) = LOWER(%s))"
             params = [cmts, cmts]
 
+        active_predicate = "inventory_state<>'retired'"
+        if where:
+            where = where + " AND " + active_predicate
+        else:
+            where = " WHERE " + active_predicate
         total_rows = self._query(f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}", tuple(params))
         total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
 
         enriched_rows = self._query(
             f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}"
-            + (" AND" if where else " WHERE")
+            + " AND"
             + " LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('', 'unknown', 'n/a')"
             + " AND ("
             + " TRIM(COALESCE(software_version,'')) <> ''"
@@ -4189,86 +5113,135 @@ class PollerService:
         cmts: Optional[str] = None,
         top_n: int = 25,
     ) -> dict:
-        """Return vendor/model/firmware/DOCSIS count breakdowns from MySQL.
-
-        Uses a single table scan with subqueries to avoid the overhead of five
-        separate GROUP BY queries against 3M+ rows.
-        """
-        where_base = ""
-        params_base: list = []
-        if cmts:
-            where_base = (
-                " WHERE (LOWER(COALESCE(cmts,'')) = LOWER(%s)"
-                " OR LOWER(COALESCE(cmts_ip,'')) = LOWER(%s))"
-            )
-            params_base = [cmts, cmts]
-
+        """Read normalized materialized inventory summaries only."""
         top = max(1, min(int(top_n), 100))
+        status_where = ""
+        status_params: List[Any] = []
+        if cmts:
+            status_where = " WHERE (cmts=%s OR cmts_ip=%s)"
+            status_params = [str(cmts), str(cmts)]
 
-        # Last updated + total + enriched in one pass.
-        summary_rows = self._query(
-            f"""
-            SELECT
-                COUNT(*) AS total,
-                MAX(updated_at) AS last_updated,
-                SUM(
-                    CASE WHEN
-                        LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('','unknown','n/a')
-                        AND (
-                            TRIM(COALESCE(software_version,'')) <> ''
-                            OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('','unknown','n/a')
-                        )
-                    THEN 1 ELSE 0 END
-                ) AS enriched
-            FROM modem_inventory_current{where_base}
-            """,
-            tuple(params_base),
+        status_rows = self._query(
+            "SELECT COUNT(*) AS covered_cmts, "
+            "COALESCE(SUM(active_total),0) AS total, "
+            "COALESCE(SUM(enriched_count),0) AS enriched, "
+            "MAX(last_updated) AS last_updated, MAX(refreshed_at) AS refreshed_at "
+            f"FROM inventory_summary_status{status_where}",
+            tuple(status_params),
         )
-        row0 = (summary_rows[0] if summary_rows else {}) or {}
-        total = int(row0.get("total") or 0)
-        enriched = int(row0.get("enriched") or 0)
-        last_updated = str(row0.get("last_updated") or "")
+        status = (status_rows[0] if status_rows else {}) or {}
+        covered_cmts = int(status.get("covered_cmts") or 0)
+        total = int(status.get("total") or 0)
+        enriched = int(status.get("enriched") or 0)
 
-        def _top_counts(column: str) -> list:
-            rows = self._query(
-                f"""
-                SELECT COALESCE(NULLIF(TRIM({column}),''), '(unknown)') AS value,
-                       COUNT(*) AS count
-                FROM modem_inventory_current{where_base}
-                GROUP BY 1 ORDER BY 2 DESC LIMIT %s
-                """,
-                tuple(params_base + [top]),
+        snapshot_where = ""
+        snapshot_params: List[Any] = []
+        if cmts:
+            snapshot_where = " WHERE (cmts=%s OR cmts_ip=%s)"
+            snapshot_params = [str(cmts), str(cmts)]
+        snapshot_rows = self._query(
+            f"SELECT COUNT(*) AS c FROM cmts_inventory_snapshot{snapshot_where}",
+            tuple(snapshot_params),
+        )
+        snapshot_count = int((snapshot_rows[0] or {}).get("c") or 0) if snapshot_rows else 0
+
+        count_where = ""
+        count_params: List[Any] = []
+        if cmts:
+            count_where = "WHERE s.cmts=%s OR s.cmts_ip=%s"
+            count_params = [str(cmts), str(cmts)]
+
+        results: Dict[str, List[Dict[str, Any]]] = {}
+        for dimension in ("vendor", "model", "software_version", "docsis_version"):
+            predicate = (
+                f"{count_where} AND c.dimension=%s"
+                if count_where
+                else "WHERE c.dimension=%s"
             )
-            return [
-                {"value": str(r.get("value") or ""), "count": int(r.get("count") or 0)}
-                for r in (rows or [])
+            rows = self._query(
+                "SELECT c.value, SUM(c.row_count) AS count "
+                "FROM inventory_summary_count c "
+                "JOIN inventory_summary_status s ON s.cmts_ip=c.cmts_ip "
+                f"{predicate} GROUP BY c.value "
+                "ORDER BY count DESC, c.value ASC LIMIT %s",
+                tuple(count_params + [dimension, top]),
+            )
+            results[dimension] = [
+                {
+                    "value": str(row.get("value") or ""),
+                    "count": int(row.get("count") or 0),
+                }
+                for row in rows
             ]
-
-        # Run the four GROUP BY breakdowns concurrently to reduce wall time.
-        # Each uses its own thread-local DB connection so there is no lock
-        # contention with the main coordinator thread.
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        columns = ["vendor", "model", "software_version", "docsis_version"]
-        results: dict = {}
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="inv-summary") as ex:
-            futures = {ex.submit(_top_counts, col): col for col in columns}
-            for fut in as_completed(futures):
-                col = futures[fut]
-                try:
-                    results[col] = fut.result()
-                except Exception:
-                    results[col] = []
 
         return {
             "total": total,
             "enriched": enriched,
             "enriched_pct": round(enriched / total * 100, 1) if total else 0.0,
-            "last_updated": last_updated,
+            "last_updated": str(status.get("last_updated") or ""),
             "vendors": results.get("vendor", []),
             "models": results.get("model", []),
             "firmwares": results.get("software_version", []),
             "docsis_versions": results.get("docsis_version", []),
+            "materialized": True,
+            "coverage": {
+                "covered_cmts": covered_cmts,
+                "snapshot_cmts": snapshot_count,
+                "complete": covered_cmts == snapshot_count,
+            },
+            "refreshed_at": str(status.get("refreshed_at") or ""),
+        }
+
+    def rebuild_inventory_summaries(self) -> Dict[str, Any]:
+        """Recompute normalized summaries without performing source discovery."""
+        started = time.perf_counter()
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute("DELETE FROM inventory_summary_count")
+                cur.execute("DELETE FROM inventory_summary_status")
+                cur.execute(
+                    "INSERT INTO inventory_summary_status "
+                    "(cmts_ip, cmts, active_total, enriched_count, last_updated, refreshed_at) "
+                    "SELECT cmts_ip, COALESCE(NULLIF(MAX(cmts),''), cmts_ip), COUNT(*), "
+                    f"SUM(CASE WHEN {self._inventory_enriched_sql()} THEN 1 ELSE 0 END), "
+                    "MAX(updated_at), %s FROM modem_inventory_current "
+                    "WHERE inventory_state<>'retired' AND COALESCE(cmts_ip,'')<>'' "
+                    "GROUP BY cmts_ip",
+                    (now,),
+                )
+                status_rows = int(cur.rowcount or 0)
+                count_rows = 0
+                for dimension, column in (
+                    ("vendor", "vendor"),
+                    ("model", "model"),
+                    ("software_version", "software_version"),
+                    ("docsis_version", "docsis_version"),
+                ):
+                    cur.execute(
+                        "INSERT INTO inventory_summary_count "
+                        "(cmts_ip, dimension, value, row_count) "
+                        f"SELECT cmts_ip, %s, COALESCE(NULLIF(TRIM({column}),''), "
+                        "'(unknown)'), COUNT(*) FROM modem_inventory_current "
+                        "WHERE inventory_state<>'retired' AND COALESCE(cmts_ip,'')<>'' "
+                        "GROUP BY cmts_ip, 3",
+                        (dimension,),
+                    )
+                    count_rows += int(cur.rowcount or 0)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return {
+            "status_rows": status_rows,
+            "count_rows": count_rows,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            "refreshed_at": now,
         }
 
     # ── Queue head (admin dashboard) ─────────────────────────────

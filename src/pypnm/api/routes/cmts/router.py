@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 from inspect import signature
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -36,6 +37,8 @@ async def get_cmts_modems(
     limit: int | None = Query(default=None, ge=1, le=50000),
     enrich: bool = False,
     refresh: bool = False,
+    collection_mode: Literal["light", "full"] = "full",
+    wait_for_enrichment: bool = False,
     collect_cpe: bool = False,
     cmts_hostname: str = "",
     agent_priority: str = "interactive",
@@ -83,23 +86,40 @@ async def get_cmts_modems(
             'collect_cpe': collect_cpe,
             'cmts_hostname': cmts_hostname or '',
         }
-        if 'refresh' in signature(service.discover_modems).parameters:
-            discovery_kwargs['refresh'] = refresh
-        elif refresh:
-            return CMTSModemResponse(
-                success=False,
-                modems=[],
-                count=0,
-                error='This PyPNM service version does not support forced inventory refresh',
-            )
+        discovery_parameters = signature(service.discover_modems).parameters
+        optional_arguments = (
+            ('refresh', refresh, False, 'forced inventory refresh'),
+            ('collection_mode', collection_mode, 'full', 'collection modes'),
+            (
+                'wait_for_enrichment',
+                wait_for_enrichment,
+                False,
+                'synchronous enrichment',
+            ),
+        )
+        for name, value, default, feature in optional_arguments:
+            if name in discovery_parameters:
+                discovery_kwargs[name] = value
+            elif value != default:
+                return CMTSModemResponse(
+                    success=False,
+                    modems=[],
+                    count=0,
+                    collection_mode=collection_mode,
+                    error=(
+                        'This PyPNM service version does not support '
+                        f'{feature}'
+                    ),
+                )
         result = await service.discover_modems(**discovery_kwargs)
-        
+
         if not result.get('success'):
             return CMTSModemResponse(
                 success=False,
                 modems=[],
                 count=0,
-                error=result.get('error', 'Discovery failed')
+                collection_mode=collection_mode,
+                error=result.get('error', 'Discovery failed'),
             )
         
         modems = result.get('modems', [])
@@ -133,6 +153,13 @@ async def get_cmts_modems(
             cpe_truncated=result.get('cpe_truncated') is True,
             cpe_oid_errors=result.get('cpe_oid_errors') or {},
             enrichment_progress=result.get('enrich_progress'),
+            collection_mode=result.get('collection_mode') or collection_mode,
+            authoritative=result.get(
+                'authoritative', result.get('complete') is True
+            ) is True,
+            quarantined=result.get('quarantined') is True,
+            quarantine_reason=result.get('quarantine_reason'),
+            quarantine_candidate_count=result.get('quarantine_candidate_count'),
         )
         
     except Exception as e:
@@ -141,7 +168,8 @@ async def get_cmts_modems(
             success=False,
             modems=[],
             count=0,
-            error=str(e)
+            collection_mode=collection_mode,
+            error=str(e),
         )
 
 
@@ -154,6 +182,8 @@ async def query_cmts_modems(payload: CMTSModemRequest) -> CMTSModemResponse:
         limit=payload.limit,
         enrich=payload.enrich,
         refresh=payload.refresh,
+        collection_mode=payload.collection_mode,
+        wait_for_enrichment=payload.wait_for_enrichment,
         collect_cpe=payload.collect_cpe,
         cmts_hostname=payload.cmts_hostname,
         agent_priority=payload.agent_priority,

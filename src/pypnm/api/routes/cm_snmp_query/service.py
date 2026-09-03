@@ -314,7 +314,8 @@ class CmSnmpQueryService:
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
-                f"WHERE 1=1 {online_filter} ORDER BY RAND() {limit_clause}"
+                f"WHERE m.inventory_state<>'retired' {online_filter} "
+                f"ORDER BY RAND() {limit_clause}"
             )
         elif scope_type == "cmts":
             cmts_names = [str(c).strip() for c in (scope.get("cmts") or []) if str(c).strip()]
@@ -324,7 +325,8 @@ class CmSnmpQueryService:
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
-                f"WHERE m.cmts IN ({placeholders}) {online_filter} "
+                f"WHERE m.inventory_state<>'retired' "
+                f"AND m.cmts IN ({placeholders}) {online_filter} "
                 f"ORDER BY RAND() {limit_clause}",
                 cmts_names,
             )
@@ -347,7 +349,8 @@ class CmSnmpQueryService:
                       LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))
                       USING ascii
                   ) COLLATE ascii_bin
-                WHERE m.cmts = %s
+                WHERE m.inventory_state<>'retired'
+                  AND m.cmts = %s
                   AND t.fiber_node IN ({fn_placeholders})
                   AND t.snapshot_id = (
                       SELECT s.id FROM topology_snapshots s
@@ -641,7 +644,8 @@ class CmSnmpQueryService:
     def get_cmts_options(self) -> list[str]:
         rows = self._query(
             "SELECT DISTINCT cmts FROM modem_inventory_current "
-            "WHERE cmts IS NOT NULL AND TRIM(cmts)<>'' "
+            "WHERE inventory_state<>'retired' "
+            "AND cmts IS NOT NULL AND TRIM(cmts)<>'' "
             "AND LOWER(cmts) LIKE %s ORDER BY cmts",
             ("%ccap%",),
         )
@@ -664,7 +668,7 @@ class CmSnmpQueryService:
                     USING ascii
                 ) COLLATE ascii_bin
                 FROM modem_inventory_current m
-                WHERE m.cmts = %s
+                WHERE m.inventory_state<>'retired' AND m.cmts = %s
             )
             AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
             ORDER BY t.fiber_node

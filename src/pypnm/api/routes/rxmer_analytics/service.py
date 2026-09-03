@@ -512,6 +512,7 @@ class RxMerAnalyticsService:
                         return job, True
 
                 where_parts = [
+                    "i.inventory_state<>'retired'",
                     "i.ip IS NOT NULL",
                     "TRIM(i.ip) NOT IN ('', 'N/A', '0.0.0.0', '::')",
                     "(i.ofdm_enabled=TRUE OR COALESCE(i.ofdm_channel_count, 0)>0 "
@@ -852,7 +853,10 @@ class RxMerAnalyticsService:
         safe_limit = max(1, min(int(limit), 5000))
         query_value = str(query or "").strip()
         params: list[Any] = ["%ccap%"]
-        where = "TRIM(cmts)<>'' AND LOWER(TRIM(cmts)) LIKE %s"
+        where = (
+            "inventory_state<>'retired' AND TRIM(cmts)<>'' "
+            "AND LOWER(TRIM(cmts)) LIKE %s"
+        )
         if query_value:
             where += " AND cmts LIKE %s"
             params.append(f"%{query_value}%")
@@ -925,7 +929,8 @@ class RxMerAnalyticsService:
                          USING ascii
                      ) COLLATE ascii_bin
                  )
-                WHERE i.cmts IN ({placeholders})
+                WHERE i.inventory_state<>'retired'
+                  AND i.cmts IN ({placeholders})
             """
         else:
             source_sql = f"""
@@ -936,7 +941,8 @@ class RxMerAnalyticsService:
                     USING utf8mb4
                 ) COLLATE utf8mb4_bin AS fiber_node
                 FROM modem_inventory_current AS i
-                WHERE i.cmts IN ({placeholders})
+                WHERE i.inventory_state<>'retired'
+                  AND i.cmts IN ({placeholders})
             """
 
         params: list[Any] = list(cmts_names)

@@ -667,12 +667,21 @@ class CMTSModemService:
         )
 
     @staticmethod
+    def _collection_mode_compatible(
+        entry: dict[str, Any], requested_mode: str
+    ) -> bool:
+        """Allow full generations to serve light requests, never the reverse."""
+        cached_mode = entry.get('collection_mode') or 'full'
+        return requested_mode == 'light' or cached_mode == 'full'
+
+    @staticmethod
     def _cache_response(
         cmts_ip: str,
         entry: dict[str, Any],
         *,
         enrich: bool,
         limit: int,
+        collection_mode: str,
         collect_cpe: bool = False,
     ) -> Dict[str, Any]:
         modems = entry.get('modems') or []
@@ -685,12 +694,15 @@ class CMTSModemService:
             'enriched': bool(enrich and entry.get('enriched') is True),
             'enriching': bool(enrich and entry.get('enriching') is True),
             'cached': True,
+            'collection_mode': collection_mode,
         }
         for key in (
             'capability_enriched', 'source', 'complete', 'truncated',
             'requested_limit', 'collected_at', 'revision_at', 'snapshot_id',
             'critical_oid_errors', 'raw_legacy_mac_count',
             'raw_d3_mac_count', 'cmts_enriched', 'enrich_progress',
+            'authoritative', 'quarantined',
+            'quarantine_reason', 'quarantine_candidate_count',
         ):
             if key in entry:
                 response[key] = entry[key]
@@ -698,12 +710,39 @@ class CMTSModemService:
             for key in ('cpe_addresses', 'cpe_complete', 'cpe_truncated', 'cpe_oid_errors'):
                 if key in entry:
                     response[key] = entry[key]
-        response['capability_enriched'] = entry.get('capability_enriched') is True
+        response['capability_enriched'] = bool(
+            collection_mode == 'full'
+            and entry.get('capability_enriched') is True
+        )
         response['inventory_stale'] = entry.get('inventory_stale') is True
         response['inventory_complete'] = entry.get(
             'inventory_complete', entry.get('complete')
         ) is True
         return response
+
+    @staticmethod
+    def _persist_enrichment_rows(
+        modems: list[dict[str, Any]],
+        *,
+        cmts: str,
+        cmts_ip: str,
+        source_poller: str,
+    ) -> tuple[int, str | None]:
+        """Persist enrichment and propagate the resulting cache revision."""
+        from pypnm.api.routes.poller.service import poller_service
+
+        written = poller_service.persist_enrichment_rows(
+            modems,
+            cmts=cmts,
+            cmts_ip=cmts_ip,
+            source_poller=source_poller,
+        )
+        snapshot = poller_service.get_inventory_snapshot(cmts_ip)
+        revision_at = (snapshot or {}).get('revision_at')
+        cached = _enrichment_cache.get(cmts_ip)
+        if revision_at and cached is not None:
+            cached['revision_at'] = revision_at
+        return written, revision_at
 
     # ── dedicated CPE collection ────────────────────────────────────────────
 
@@ -884,6 +923,8 @@ class CMTSModemService:
         limit: int = 50000,
         enrich: bool = False,
         refresh: bool = False,
+        collection_mode: str = "full",
+        wait_for_enrichment: bool = False,
         collect_cpe: bool = False,
         cmts_hostname: str = "",
     ) -> Dict[str, Any]:
@@ -902,6 +943,11 @@ class CMTSModemService:
         self.cmts_ip = cmts_ip
         self.community = community
         limit = max(1, min(int(limit or 1), 50000))
+        if collection_mode not in {"light", "full"}:
+            raise ValueError("collection_mode must be 'light' or 'full'")
+        if collection_mode == "light":
+            wait_for_enrichment = False
+            enrich = False
 
         # ── Tier 1: In-memory cache (Redis-like speed) ─────────────────
         if not refresh and cmts_ip in _enrichment_cache:
@@ -911,6 +957,10 @@ class CMTSModemService:
             if (
                 age < _LIVE_CACHE_TTL_SECONDS
                 and cache_sufficient
+                and self._collection_mode_compatible(cached, collection_mode)
+                and not (
+                    wait_for_enrichment and enrich and not cached.get('enriched')
+                )
                 and (not collect_cpe or 'cpe_addresses' in cached)
             ):
                 if enrich and not cached.get('enriched') and not cached.get('enriching'):
@@ -937,6 +987,7 @@ class CMTSModemService:
                 )
                 return self._cache_response(
                     cmts_ip, cached, enrich=enrich, limit=limit,
+                    collection_mode=collection_mode,
                     collect_cpe=collect_cpe,
                 )
 
@@ -947,7 +998,18 @@ class CMTSModemService:
             inv_modems = [] if refresh else poller_service.list_inventory_modems(
                 cmts=cmts_ip, limit=limit,
             )
-            if inv_modems:
+            snapshot_mode = (snapshot or {}).get('collection_mode') or 'full'
+            persisted_full_compatible = bool(
+                snapshot_mode == 'full'
+                or (
+                    (snapshot or {}).get('capability_enriched') is True
+                    and (snapshot or {}).get('complete') is True
+                    and (snapshot or {}).get('truncated') is not True
+                )
+            )
+            if inv_modems and (
+                collection_mode == 'light' or persisted_full_compatible
+            ):
                 # Prefer the generation timestamp persisted with the inventory.
                 # Legacy rows without snapshot metadata remain usable for the
                 # 200-row preview but cannot prove a complete full inventory.
@@ -999,6 +1061,15 @@ class CMTSModemService:
                     'critical_oid_errors': (snapshot or {}).get('critical_oid_errors') or {},
                     'raw_legacy_mac_count': (snapshot or {}).get('raw_legacy_mac_count'),
                     'raw_d3_mac_count': (snapshot or {}).get('raw_d3_mac_count'),
+                    'collection_mode': snapshot_mode,
+                    'authoritative': (snapshot or {}).get(
+                        'authoritative', snapshot_complete
+                    ) is True,
+                    'quarantined': (snapshot or {}).get('quarantined') is True,
+                    'quarantine_reason': (snapshot or {}).get('quarantine_reason'),
+                    'quarantine_candidate_count': (snapshot or {}).get(
+                        'quarantine_candidate_count'
+                    ),
                 }
                 sample = inv_modems[:200]
                 is_enriched = any(
@@ -1006,7 +1077,50 @@ class CMTSModemService:
                 )
 
                 if not collect_cpe:
-                    enriching = bool(enrich and not is_enriched)
+                    enrichment_error = None
+                    if enrich and wait_for_enrichment and not is_enriched:
+                        interface_result = await self._enrich_cmts_interfaces(
+                            inv_modems
+                        )
+                        is_enriched = interface_result.get('success') is True
+                        enrichment_error = (
+                            None
+                            if is_enriched
+                            else interface_result.get('error')
+                        )
+                        if is_enriched:
+                            cmts_label = (
+                                str(cmts_hostname or '').strip()
+                                or next(
+                                    (
+                                        str(modem.get('cmts') or '').strip()
+                                        for modem in inv_modems
+                                        if str(modem.get('cmts') or '').strip()
+                                        and str(modem.get('cmts')).strip().lower()
+                                        != 'unknown'
+                                    ),
+                                    cmts_ip,
+                                )
+                            )
+                            try:
+                                _, revision_at = self._persist_enrichment_rows(
+                                    inv_modems,
+                                    cmts=cmts_label,
+                                    cmts_ip=cmts_ip,
+                                    source_poller='live-enrich',
+                                )
+                                if revision_at:
+                                    inventory_meta['revision_at'] = revision_at
+                            except Exception as db_exc:
+                                self.logger.warning(
+                                    "Synchronous inventory enrichment write-back "
+                                    "failed for %s: %s",
+                                    cmts_ip,
+                                    db_exc,
+                                )
+                    enriching = bool(
+                        enrich and not wait_for_enrichment and not is_enriched
+                    )
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, "
@@ -1016,9 +1130,12 @@ class CMTSModemService:
                         'modems': inv_modems,
                         'enriched': is_enriched,
                         'enriching': enriching,
+                        'enrichment_failed': bool(
+                            enrich and wait_for_enrichment and not is_enriched
+                        ),
                         'timestamp': time.time(),
                         'enrich_progress': {
-                            'completed': 0,
+                            'completed': len(inv_modems) if is_enriched else 0,
                             'total': len(inv_modems),
                         },
                         **inventory_meta,
@@ -1038,8 +1155,14 @@ class CMTSModemService:
                         'cmts_ip': cmts_ip,
                         'enriched': bool(enrich and is_enriched),
                         'enriching': enriching,
+                        'enrichment_error': enrichment_error,
                         'cached': True,
                         **inventory_meta,
+                        'collection_mode': collection_mode,
+                        'capability_enriched': bool(
+                            collection_mode == 'full'
+                            and inventory_meta.get('capability_enriched') is True
+                        ),
                     }
         except Exception as exc:
             self.logger.warning(f"MySQL inventory lookup skipped for {cmts_ip}: {exc}")
@@ -1047,12 +1170,22 @@ class CMTSModemService:
         # An agent is required only for Tier 3 live collection.
         agent_manager = get_agent_manager()
         if not agent_manager:
-            return {'success': False, 'error': 'Agent manager not available',
-                    'modems': [], 'count': 0}
+            return {
+                'success': False,
+                'error': 'Agent manager not available',
+                'modems': [],
+                'count': 0,
+                'collection_mode': collection_mode,
+            }
         agents = agent_manager.get_available_agents()
         if not agents:
-            return {'success': False, 'error': 'No agents available',
-                    'modems': [], 'count': 0}
+            return {
+                'success': False,
+                'error': 'No agents available',
+                'modems': [],
+                'count': 0,
+                'collection_mode': collection_mode,
+            }
 
         # ── Tier 3: Live SNMP walk (slow, last resort) ───────────────
         live_lock = await _get_live_walk_lock(cmts_ip)
@@ -1064,7 +1197,11 @@ class CMTSModemService:
             cached = _enrichment_cache.get(cmts_ip)
             if (
                 cached
+                and self._collection_mode_compatible(cached, collection_mode)
                 and self._cache_sufficient(cached, limit)
+                and not (
+                    wait_for_enrichment and enrich and not cached.get('enriched')
+                )
                 and (not collect_cpe or 'cpe_addresses' in cached)
             ):
                 age = time.time() - cached.get('timestamp', 0)
@@ -1098,17 +1235,25 @@ class CMTSModemService:
                     )
                     return self._cache_response(
                         cmts_ip, cached, enrich=enrich, limit=limit,
+                        collection_mode=collection_mode,
                         collect_cpe=collect_cpe,
                     )
 
             # ── Step 1: Parallel SNMP walks via agent ────────────────────
-            walk_oids = [
+            full_walk_oids = [
                 OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
                 OID_OLD_US_CH_IF, OID_SW_REV,
                 OID_US_CH_ID, OID_IF_NAME,
                 OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
                 OID_D4_ADV_CAP,
             ]
+            light_walk_oids = [
+                OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
+                OID_OLD_US_CH_IF, OID_SW_REV,
+            ]
+            walk_oids = (
+                light_walk_oids if collection_mode == "light" else full_walk_oids
+            )
             walk_limit = int(limit or 0)
             if collect_cpe:
                 walk_oids.extend((OID_CPE_ADDR_TYPE, OID_CPE_ADDR, OID_CPE_PREFIX))
@@ -1130,7 +1275,9 @@ class CMTSModemService:
                 'timeout': 5,
                 'limit': walk_limit,
                 'overall_timeout': 270,
-                'raw_octet_oids': [OID_D4_ADV_CAP],
+                'raw_octet_oids': (
+                    [OID_D4_ADV_CAP] if collection_mode == "full" else []
+                ),
             }
             walk_started = time.perf_counter()
             if walk_group_count == 1:
@@ -1244,21 +1391,22 @@ class CMTSModemService:
                 oid for oid in capability_oids if oid not in completed_oids
             ]
             capability_enriched = bool(
-                has_completion_metadata
+                collection_mode == "full"
+                and has_completion_metadata
                 and not capability_oid_errors
                 and not missing_capability_completions
             )
-            if not has_completion_metadata:
+            if collection_mode == "full" and not has_completion_metadata:
                 self.logger.warning(
                     "%s capability collection lacks per-OID completion metadata",
                     cmts_ip,
                 )
-            if capability_oid_errors:
+            if collection_mode == "full" and capability_oid_errors:
                 self.logger.warning(
                     "%s capability OID collection errors: %s",
                     cmts_ip, capability_oid_errors,
                 )
-            if missing_capability_completions:
+            if collection_mode == "full" and missing_capability_completions:
                 self.logger.warning(
                     "%s capability OIDs missing completion: %s",
                     cmts_ip, missing_capability_completions,
@@ -1287,6 +1435,9 @@ class CMTSModemService:
                 'critical_oid_errors': critical_oid_errors,
                 'raw_legacy_mac_count': legacy_mac_rows,
                 'raw_d3_mac_count': d3_mac_rows,
+                'collection_mode': collection_mode,
+                'authoritative': inventory_complete,
+                'quarantined': False,
             }
             if not has_completion_metadata:
                 self.logger.warning(
@@ -1380,6 +1531,56 @@ class CMTSModemService:
                     )
 
             # ── Step 3: Enrichment ───────────────────────────────────────
+            if (
+                collection_mode == "full"
+                and enrich
+                and wait_for_enrichment
+                and modems
+            ):
+                interface_result = await self._enrich_cmts_interfaces(modems)
+                enrichment_succeeded = interface_result.get('success') is True
+                _enrichment_cache[cmts_ip] = {
+                    **_enrichment_cache.get(cmts_ip, {}),
+                    'modems': modems,
+                    'enriched': enrichment_succeeded,
+                    'enriching': False,
+                    'cmts_enriched': enrichment_succeeded,
+                    'enrichment_failed': not enrichment_succeeded,
+                    'timestamp': time.time(),
+                    'enrich_progress': {
+                        'completed': len(modems) if enrichment_succeeded else 0,
+                        'total': len(modems),
+                    },
+                }
+                if enrichment_succeeded and str(cmts_hostname or '').strip():
+                    try:
+                        _, revision_at = self._persist_enrichment_rows(
+                            modems,
+                            cmts=cmts_hostname,
+                            cmts_ip=cmts_ip,
+                            source_poller='live-enrich',
+                        )
+                        if revision_at:
+                            inventory_meta['revision_at'] = revision_at
+                    except Exception as db_exc:
+                        self.logger.warning(
+                            "Synchronous inventory enrichment write-back failed for %s: %s",
+                            cmts_ip,
+                            db_exc,
+                        )
+                return {
+                    'success': True,
+                    'modems': modems,
+                    'count': len(modems),
+                    'cmts_ip': cmts_ip,
+                    'enriched': enrichment_succeeded,
+                    'enriching': False,
+                    'enrichment_error': (
+                        None if enrichment_succeeded else interface_result.get('error')
+                    ),
+                    **inventory_meta,
+                }
+
             if enrich and modems:
                 # Guard: don't start a second enrichment if one is already running
                 existing = _enrichment_cache.get(cmts_ip, {})
@@ -1520,13 +1721,25 @@ class CMTSModemService:
                 if not m.get('cmts_ip'):
                     m['cmts_ip'] = cmts_ip
 
-            # Persist to MySQL so Tier 2 survives container restarts
+            # Persist to MySQL so Tier 2 survives container restarts.
             try:
-                from pypnm.api.routes.poller.service import poller_service
-                written = poller_service._upsert_inventory_rows(modems, source_poller='live-enrich')
-                self.logger.info(f"Wrote {written} enriched modems to MySQL inventory for {cmts_ip}")
+                written, _ = self._persist_enrichment_rows(
+                    modems,
+                    cmts=cmts_label,
+                    cmts_ip=cmts_ip,
+                    source_poller='live-enrich',
+                )
+                self.logger.info(
+                    "Wrote %s enriched modems to MySQL inventory for %s",
+                    written,
+                    cmts_ip,
+                )
             except Exception as db_exc:
-                self.logger.warning(f"MySQL inventory write-back failed for {cmts_ip}: {db_exc}")
+                self.logger.warning(
+                    "MySQL inventory write-back failed for %s: %s",
+                    cmts_ip,
+                    db_exc,
+                )
         except Exception as e:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
             if cmts_ip in _enrichment_cache:
