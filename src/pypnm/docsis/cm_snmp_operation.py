@@ -2098,10 +2098,12 @@ class CmSnmpOperation:
             oid_file_name = f'{"docsPnmCmDsOfdmRxMerFileName"}.{ofdm_idx}'
             self.logger.debug(f'Setting RxMER file name [{oid_file_name}] = "{rxmer_file_name}"')
             
-            # Wrap SNMP SET with timeout to prevent hanging
-            set_response = await asyncio.wait_for(
-                self._snmp.set(oid_file_name, rxmer_file_name, OctetString),
-                timeout=5.0
+            # AgentSnmpTransport owns the timeout budget based on the configured
+            # SNMP timeout and retries. Do not impose a shorter caller deadline:
+            # cancelling here leaves the agent operation running and discards its
+            # eventual response as an expired task.
+            set_response = await self._snmp.set(
+                oid_file_name, rxmer_file_name, OctetString,
             )
 
             result = Snmp_v2c.snmp_set_result_value(set_response)
@@ -2112,11 +2114,9 @@ class CmSnmpOperation:
             if set_and_go:
                 oid_file_enable = f'{"docsPnmCmDsOfdmRxMerFileEnable"}.{ofdm_idx}'
                 self.logger.debug(f'Enabling RxMER capture [{oid_file_enable}] = 1')
-                
-                # Wrap SNMP SET with timeout to prevent hanging
-                set_response = await asyncio.wait_for(
-                    self._snmp.set(oid_file_enable, 1, Integer32),
-                    timeout=5.0
+
+                set_response = await self._snmp.set(
+                    oid_file_enable, 1, Integer32,
                 )
 
                 result = Snmp_v2c.snmp_set_result_value(set_response)
