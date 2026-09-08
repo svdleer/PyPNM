@@ -1842,9 +1842,9 @@ class PollerService:
             f"{normalized} NOT IN "
             "('','unknown','n/a','(unknown)','none','null','not available','0') "
             f"AND {normalized} NOT REGEXP '^0+([.]0+)*$' "
-            f"AND {normalized} NOT LIKE '%no such%' "
-            f"AND {normalized} NOT LIKE '%timeout%' "
-            f"AND {normalized} NOT LIKE '%unknown object%'"
+            f"AND {normalized} NOT LIKE '%%no such%%' "
+            f"AND {normalized} NOT LIKE '%%timeout%%' "
+            f"AND {normalized} NOT LIKE '%%unknown object%%'"
         )
 
     @classmethod
