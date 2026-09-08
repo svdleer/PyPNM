@@ -2918,35 +2918,50 @@ class RxMerAnalyticsService:
                     np.maximum(maximum_view, values, out=maximum_view)
                     last_attempt_id = int(row["capture_attempt_id"])
                     processed_channels += 1
-                with connection.cursor() as cursor:
-                    cursor.executemany(
-                        """
-                        INSERT INTO rxmer_channel_extreme
-                        (capture_attempt_id, job_id, target_id, worst_qdb,
-                         worst_subcarrier_index, worst_frequency_hz, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE worst_qdb=VALUES(worst_qdb),
-                            worst_subcarrier_index=VALUES(worst_subcarrier_index),
-                            worst_frequency_hz=VALUES(worst_frequency_hz)
-                        """,
-                        extreme_rows,
-                    )
-                    cursor.execute(
-                        "UPDATE rxmer_spectrum_build SET lease_until="
-                        "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE), updated_at=%s "
-                        "WHERE job_id=%s AND source_revision=%s AND lease_owner=%s "
-                        "AND state='building'",
-                        (self._now(), job_id, source_revision, lease_owner),
-                    )
-                    if cursor.rowcount == 0:
+                batch_connection = self._connect(autocommit=False)
+                try:
+                    with batch_connection.cursor() as cursor:
+                        # Serialize with cleanup using the same job -> build lock order.
+                        # A stale worker must not recreate analytics rows after deletion.
+                        cursor.execute(
+                            "SELECT id FROM rxmer_job WHERE id=%s FOR UPDATE",
+                            (job_id,),
+                        )
+                        if not cursor.fetchone():
+                            raise RuntimeError("RxMER spectrum build lease was lost")
                         cursor.execute(
                             "SELECT 1 FROM rxmer_spectrum_build WHERE job_id=%s "
                             "AND source_revision=%s AND lease_owner=%s "
-                            "AND state='building' LIMIT 1",
+                            "AND state='building' FOR UPDATE",
                             (job_id, source_revision, lease_owner),
                         )
                         if not cursor.fetchone():
                             raise RuntimeError("RxMER spectrum build lease was lost")
+                        cursor.executemany(
+                            """
+                            INSERT INTO rxmer_channel_extreme
+                            (capture_attempt_id, job_id, target_id, worst_qdb,
+                             worst_subcarrier_index, worst_frequency_hz, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE worst_qdb=VALUES(worst_qdb),
+                                worst_subcarrier_index=VALUES(worst_subcarrier_index),
+                                worst_frequency_hz=VALUES(worst_frequency_hz)
+                            """,
+                            extreme_rows,
+                        )
+                        cursor.execute(
+                            "UPDATE rxmer_spectrum_build SET lease_until="
+                            "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE), updated_at=%s "
+                            "WHERE job_id=%s AND source_revision=%s AND lease_owner=%s "
+                            "AND state='building'",
+                            (self._now(), job_id, source_revision, lease_owner),
+                        )
+                    batch_connection.commit()
+                except Exception:
+                    batch_connection.rollback()
+                    raise
+                finally:
+                    batch_connection.close()
 
             if processed_channels != source_channels:
                 raise ValueError("one or more successful RxMER vectors are missing")
