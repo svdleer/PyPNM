@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import asyncio
 import ipaddress
 import json
 import logging
@@ -5513,7 +5512,7 @@ class PollerService:
                 parsed["software_version"] = version_match.group(0)
         return parsed
 
-    async def query_modem_identity(self, mac: str) -> Dict[str, Any]:
+    def query_modem_identity(self, mac: str) -> Dict[str, Any]:
         """Query identity only for a modem and target in active Inventory."""
         normalized_mac = self._normalize_mac(mac)
         if not normalized_mac:
@@ -5563,14 +5562,13 @@ class PollerService:
             "retries": 1,
             "max_concurrent": 1,
         }
-        task_id = await agent_manager.send_task(
+        result = agent_manager.send_task_and_wait(
             agent.agent_id,
             "snmp_bulk_get",
             params,
             timeout=30,
             priority="bulk",
         )
-        result = await agent_manager.wait_for_task_async(task_id, timeout=30)
         if not result or result.get("type") != "response":
             error = str((result or {}).get("error") or "Agent identity task timed out")
             if "timeout" in error.lower():
@@ -5743,7 +5741,7 @@ class PollerService:
                 conn.close()
 
     def _fetch_modem_identity(self, *, mac: str) -> Dict[str, Any]:
-        payload = asyncio.run(self.query_modem_identity(mac))
+        payload = self.query_modem_identity(mac)
         if payload.get("success") is not True:
             raise RuntimeError(payload.get("error") or "Identity query failed")
         return {

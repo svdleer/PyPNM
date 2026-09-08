@@ -11,6 +11,7 @@ import time
 import uuid
 from collections import deque
 from queue import Queue, Empty
+from threading import Lock
 from typing import Optional
 from fastapi import WebSocket
 
@@ -29,6 +30,7 @@ class AgentManager:
         self.auth_token = auth_token
         self._task_queues: dict[str, Queue] = {}
         self._async_task_queues: dict[str, asyncio.Queue] = {}
+        self._task_lock = Lock()
         self._rr_counters: dict[str, int] = {}  # round-robin index per capability
         self._agent_timeouts: dict[str, int] = {}  # consecutive timeout count per agent
         self._agent_quarantine: dict[str, float] = {}  # agent_id → quarantine-until timestamp
@@ -46,10 +48,13 @@ class AgentManager:
         # Per-agent log ring buffers — populated by agents streaming type=log messages
         self.AGENT_LOG_BUFFER_SIZE: int = 1000
         self._agent_logs: dict[str, deque[dict]] = {}
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _describe_task(self, task_id: str) -> str:
         """Build a concise task description for timeout/error diagnostics."""
-        task = self.pending_tasks.get(task_id)
+        with self._task_lock:
+            task = self.pending_tasks.get(task_id)
+            agent_id = self._task_agent_ids.get(task_id, '-')
         if not task:
             return "unknown task"
 
@@ -63,7 +68,6 @@ class AgentManager:
         else:
             oid_desc = "oid=-"
 
-        agent_id = self._task_agent_ids.get(task_id, '-')
         return f"agent={agent_id} command={task.command} target={target_ip} {oid_desc}"
 
     def _record_agent_success(self, agent_id: str):
@@ -98,17 +102,15 @@ class AgentManager:
 
     def _cleanup_task(self, task_id: str):
         """Cleanup all task bookkeeping structures."""
-        if task_id in self._task_queues:
-            del self._task_queues[task_id]
-        if task_id in self._async_task_queues:
-            del self._async_task_queues[task_id]
-        if task_id in self.pending_tasks:
-            del self.pending_tasks[task_id]
-        if task_id in self._task_agent_ids:
-            del self._task_agent_ids[task_id]
+        with self._task_lock:
+            self._task_queues.pop(task_id, None)
+            self._async_task_queues.pop(task_id, None)
+            self.pending_tasks.pop(task_id, None)
+            self._task_agent_ids.pop(task_id, None)
     
     async def handle_websocket(self, websocket: WebSocket):
         """Handle WebSocket connection from agent."""
+        self._event_loop = asyncio.get_running_loop()
         await websocket.accept()
         agent_id = None
         
@@ -227,28 +229,28 @@ class AgentManager:
     def _handle_response(self, data: dict):
         """Handle task response from agent."""
         request_id = data.get('request_id')
+        with self._task_lock:
+            task = self.pending_tasks.get(request_id)
+            sync_queue = self._task_queues.get(request_id)
+            async_queue = self._async_task_queues.get(request_id)
+            if task:
+                task.completed = True
+                task.result = data.get('result')
+                task.error = data.get('error')
 
-        if request_id not in self.pending_tasks:
+        if not task:
             self.logger.warning(f"Response for unknown/expired task: {request_id} — task may have timed out before agent responded")
             return
 
-        task = self.pending_tasks[request_id]
-        task.completed = True
-        task.result = data.get('result')
-        task.error = data.get('error')
-
-        in_sync  = request_id in self._task_queues
-        in_async = request_id in self._async_task_queues
+        in_sync = sync_queue is not None
+        in_async = async_queue is not None
         self.logger.debug(f"Task {request_id} response received — sync_waiter={in_sync} async_waiter={in_async}")
 
-        # Put in queue if waiting
-        if in_sync:
-            self._task_queues[request_id].put(data)
-
-        # Put in async queue if waiting
-        if in_async:
+        if sync_queue is not None:
+            sync_queue.put(data)
+        if async_queue is not None:
             try:
-                self._async_task_queues[request_id].put_nowait(data)
+                async_queue.put_nowait(data)
             except asyncio.QueueFull:
                 self.logger.error(f"Async queue full for task: {request_id}")
 
@@ -268,19 +270,21 @@ class AgentManager:
         """Handle error from agent."""
         request_id = data.get('request_id')
         error = data.get('error')
-        
-        if request_id in self.pending_tasks:
-            task = self.pending_tasks[request_id]
-            task.completed = True
-            task.error = error
-            
-            if request_id in self._task_queues:
-                self._task_queues[request_id].put(data)
-            if request_id in self._async_task_queues:
-                try:
-                    self._async_task_queues[request_id].put_nowait(data)
-                except asyncio.QueueFull:
-                    self.logger.error(f"Async queue full for errored task: {request_id}")
+        with self._task_lock:
+            task = self.pending_tasks.get(request_id)
+            sync_queue = self._task_queues.get(request_id)
+            async_queue = self._async_task_queues.get(request_id)
+            if task:
+                task.completed = True
+                task.error = error
+
+        if sync_queue is not None:
+            sync_queue.put(data)
+        if async_queue is not None:
+            try:
+                async_queue.put_nowait(data)
+            except asyncio.QueueFull:
+                self.logger.error(f"Async queue full for errored task: {request_id}")
 
     def _handle_log(self, data: dict) -> None:
         """Store a streamed log entry from an agent in its ring buffer."""
@@ -430,10 +434,11 @@ class AgentManager:
             params=params,
             timeout=timeout
         )
-        self.pending_tasks[task_id] = task
-        self._task_agent_ids[task_id] = agent_id
-        self._task_queues[task_id] = Queue()
-        self._async_task_queues[task_id] = asyncio.Queue(maxsize=1)
+        with self._task_lock:
+            self.pending_tasks[task_id] = task
+            self._task_agent_ids[task_id] = agent_id
+            self._task_queues[task_id] = Queue()
+            self._async_task_queues[task_id] = asyncio.Queue(maxsize=1)
         
         # Send command to agent
         msg = json.dumps({
@@ -447,47 +452,88 @@ class AgentManager:
         try:
             await agent.websocket.send_text(msg)
             self.logger.info(f"Sent task {task_id} ({command}) to agent '{agent_id}'")
-        except Exception as e:
+        except BaseException as e:
             self.logger.error(f"Failed to send task {task_id} to '{agent_id}': {e}")
             self._cleanup_task(task_id)
             raise
         
         return task_id
-    
+
+    def send_task_and_wait(
+        self,
+        agent_id: str,
+        command: str,
+        params: dict,
+        *,
+        timeout: float = 30.0,
+        priority: str = "interactive",
+    ) -> Optional[dict]:
+        """Send on the API event loop and block a worker thread for the result."""
+        loop = self._event_loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError("Agent manager event loop is unavailable")
+        future = asyncio.run_coroutine_threadsafe(
+            self.send_task(
+                agent_id,
+                command,
+                params,
+                timeout=timeout,
+                priority=priority,
+            ),
+            loop,
+        )
+        try:
+            task_id = future.result(timeout=10)
+        except Exception:
+            future.cancel()
+            raise
+        return self.wait_for_task(task_id, timeout=timeout)
+
     def wait_for_task(self, task_id: str, timeout: float = 30.0) -> Optional[dict]:
         """Wait for task result (blocking - for sync code only)."""
-        if task_id not in self._task_queues:
+        with self._task_lock:
+            task_queue = self._task_queues.get(task_id)
+            agent_id = self._task_agent_ids.get(task_id)
+        if task_queue is None:
             return None
-        
+
         try:
-            result = self._task_queues[task_id].get(timeout=timeout)
+            result = task_queue.get(timeout=timeout)
+            if agent_id:
+                self._record_agent_success(agent_id)
             return result
         except Empty:
             task_desc = self._describe_task(task_id)
-            self.logger.error(f"Timeout ({timeout}s) waiting (sync) for task {task_id} — {task_desc}")
+            if agent_id:
+                self._record_agent_timeout(agent_id)
+            self.logger.error(
+                f"Timeout ({timeout}s) waiting (sync) for task {task_id} — "
+                f"{task_desc}; agent is still running"
+            )
             return None
         finally:
             self._cleanup_task(task_id)
     
     async def wait_for_task_async(self, task_id: str, timeout: float = 30.0) -> Optional[dict]:
         """Wait for task result (async - for async code)."""
-        if task_id not in self._async_task_queues:
+        with self._task_lock:
+            task_queue = self._async_task_queues.get(task_id)
+            agent_id = self._task_agent_ids.get(task_id)
+        if task_queue is None:
             return None
-        
+
         try:
             result = await asyncio.wait_for(
-                self._async_task_queues[task_id].get(),
+                task_queue.get(),
                 timeout=timeout
             )
             # Success — reset timeout counter for this agent
-            agent_id = self._task_agent_ids.get(task_id)
             if agent_id:
                 self._record_agent_success(agent_id)
             return result
         except asyncio.TimeoutError:
             task_desc = self._describe_task(task_id)
             # Record timeout for quarantine tracking
-            agent_id = self._task_agent_ids.get(task_id)
             if agent_id:
                 self._record_agent_timeout(agent_id)
             self.logger.error(
