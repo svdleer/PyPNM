@@ -45,6 +45,7 @@ _INVENTORY_TASK_TYPES = frozenset(
 _INVENTORY_TARGET_MANIFEST_VERSION = 2
 _IDENTITY_SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
 _IDENTITY_FIRMWARE_OID = "1.3.6.1.2.1.69.1.3.2.0"
+_IDENTITY_DOCSIS_CAPABILITY_OID = "1.3.6.1.4.1.4491.2.1.28.1.1.0"
 _IDENTITY_REQUEST_SOURCE = "inventory-identity"
 
 
@@ -5373,6 +5374,23 @@ class PollerService:
                 payload.get("error"),
             )
 
+        discovered_version = payload.get("docsis_version")
+        docsis_version = self._stronger_docsis_version(
+            existing["docsis_version"],
+            discovered_version,
+        )
+        return {
+            "cable_mac": payload.get("cable_mac") or existing["cable_mac"],
+            "fiber_node": payload.get("fiber_node") or existing["fiber_node"],
+            "docsis_version": docsis_version,
+        }
+
+    @staticmethod
+    def _stronger_docsis_version(
+        current: Any,
+        discovered: Any,
+    ) -> str | None:
+        """Return the strongest normalized DOCSIS version without downgrading."""
         version_rank = {
             "DOCSIS 1.0": 10,
             "DOCSIS 1.1": 11,
@@ -5381,18 +5399,27 @@ class PollerService:
             "DOCSIS 3.1": 31,
             "DOCSIS 4.0": 40,
         }
-        discovered_version = payload.get("docsis_version")
-        docsis_version = (
-            discovered_version
-            if version_rank.get(discovered_version, 0)
-            >= version_rank.get(existing["docsis_version"], 0)
-            else existing["docsis_version"]
-        )
+        current_value = str(current or "").strip() or None
+        discovered_value = str(discovered or "").strip() or None
+        if version_rank.get(discovered_value, 0) > version_rank.get(current_value, 0):
+            return discovered_value
+        return current_value
+
+    @staticmethod
+    def _parse_docsis_capability(value: Any) -> str | None:
+        """Parse a ClabsDocsisVersion scalar returned by a modem SNMP agent."""
+        text = str(value or "").strip()
+        match = re.search(r"(?:^|\D)([0-6])\D*$", text)
+        if not match:
+            return None
         return {
-            "cable_mac": payload.get("cable_mac") or existing["cable_mac"],
-            "fiber_node": payload.get("fiber_node") or existing["fiber_node"],
-            "docsis_version": docsis_version,
-        }
+            1: "DOCSIS 1.0",
+            2: "DOCSIS 1.1",
+            3: "DOCSIS 2.0",
+            4: "DOCSIS 3.0",
+            5: "DOCSIS 3.1",
+            6: "DOCSIS 4.0",
+        }.get(int(match.group(1)))
 
     @staticmethod
     def _clean_identity_value(value: Any) -> str | None:
@@ -5556,7 +5583,11 @@ class PollerService:
 
         params = {
             "target_ip": normalized_ip,
-            "oids": [_IDENTITY_SYSDESCR_OID, _IDENTITY_FIRMWARE_OID],
+            "oids": [
+                _IDENTITY_SYSDESCR_OID,
+                _IDENTITY_FIRMWARE_OID,
+                _IDENTITY_DOCSIS_CAPABILITY_OID,
+            ],
             "target_role": "cm",
             "timeout": 5,
             "retries": 1,
@@ -5586,9 +5617,14 @@ class PollerService:
             oid_results,
             _IDENTITY_FIRMWARE_OID,
         )
+        docsis_capability = self._extract_agent_oid_value(
+            oid_results,
+            _IDENTITY_DOCSIS_CAPABILITY_OID,
+        )
         identity = self._parse_modem_identity(sys_descr, firmware)
-        if not any(identity.values()):
-            raise RuntimeError("Modem returned no usable identity values")
+        docsis_version = self._parse_docsis_capability(docsis_capability)
+        if not any(identity.values()) and not docsis_version:
+            raise RuntimeError("Modem returned no usable identity or capability values")
         return {
             "success": True,
             "mac": normalized_mac,
@@ -5596,6 +5632,7 @@ class PollerService:
             "cmts_ip": str(modem.get("cmts_ip") or "").strip(),
             "inventory_updated_at": modem.get("updated_at"),
             "sys_descr": sys_descr,
+            "docsis_version": docsis_version,
             **identity,
         }
 
@@ -5750,6 +5787,10 @@ class PollerService:
             "software_version": self._clean_identity_value(
                 payload.get("software_version")
             ),
+            "docsis_version": self._stronger_docsis_version(
+                None,
+                payload.get("docsis_version"),
+            ),
             "queried_ip": str(payload.get("modem_ip") or "").strip(),
             "queried_cmts_ip": str(payload.get("cmts_ip") or "").strip(),
             "inventory_updated_at": payload.get("inventory_updated_at"),
@@ -5888,6 +5929,10 @@ class PollerService:
             discovered_software = self._clean_identity_value(
                 identity.get("software_version")
             )
+            discovered_docsis_version = self._stronger_docsis_version(
+                cable_source.get("docsis_version"),
+                identity.get("docsis_version"),
+            )
             queried_ip = str(identity.get("queried_ip") or "").strip()
             queried_cmts_ip = str(identity.get("queried_cmts_ip") or "").strip()
             queried_updated_at = identity.get("inventory_updated_at")
@@ -5898,7 +5943,7 @@ class PollerService:
                 interface_values = {
                     "cable_mac": None,
                     "fiber_node": None,
-                    "docsis_version": None,
+                    "docsis_version": discovered_docsis_version,
                 }
             else:
                 vendor = discovered_vendor or cable_source.get("vendor")
@@ -5911,12 +5956,16 @@ class PollerService:
                 interface_values = {
                     "cable_mac": cable_source.get("cable_mac"),
                     "fiber_node": cable_source.get("fiber_node"),
-                    "docsis_version": cable_source.get("docsis_version"),
+                    "docsis_version": discovered_docsis_version,
                 }
                 try:
                     interface_values = self._resolve_cmts_interface_from_cmts(
                         cable_source,
                         base,
+                    )
+                    interface_values["docsis_version"] = self._stronger_docsis_version(
+                        interface_values.get("docsis_version"),
+                        discovered_docsis_version,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -6032,12 +6081,14 @@ class PollerService:
                             "vendor=COALESCE(NULLIF(%s,''), vendor), "
                             "model=COALESCE(NULLIF(%s,''), model), "
                             "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                            "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                             "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
                             "AND inventory_state<>'retired'",
                             (
                                 vendor,
                                 model_name,
                                 software_ver,
+                                docsis_version,
                                 now,
                                 inventory_mac,
                                 cmts_address,
