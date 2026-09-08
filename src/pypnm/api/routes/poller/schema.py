@@ -44,6 +44,11 @@ class PollerSchedulerPollRequest(BaseModel):
     poll_sec: int = Field(default=60)
 
 
+class ModemRefreshRequest(BaseModel):
+    mac: str
+    cmts: Optional[str] = Field(default=None)
+
+
 class PollerSettingsResponse(BaseModel):
     status: str = Field(default="success")
     pollers: List[Dict[str, Any]] = Field(default_factory=list)

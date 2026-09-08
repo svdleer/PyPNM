@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query
 logger = logging.getLogger(__name__)
 
 from pypnm.api.routes.poller.schema import (
+    ModemRefreshRequest,
     PollerJobsResponse,
     PollerRunRequest,
     PollerSchedulerPollRequest,
@@ -357,14 +358,14 @@ def poller_snapshots_analytics(
 
 
 @router.post("/modem-refresh")
-def enqueue_modem_refresh(payload: dict) -> dict:
-    mac = payload.get("mac", "")
-    cmts = payload.get("cmts")
-    if not mac:
-        return {"status": "error", "message": "mac is required"}
+def enqueue_modem_refresh(payload: ModemRefreshRequest) -> dict:
     req_id = poller_service.enqueue_modem_refresh(
-        mac=mac, cmts=cmts, requested_by=payload.get("requested_by"),
+        mac=payload.mac,
+        cmts=payload.cmts,
+        requested_by="api",
     )
+    if not req_id:
+        raise HTTPException(status_code=400, detail="A valid modem MAC is required")
     return {"status": "success", "request_id": req_id}
 
 
@@ -378,7 +379,12 @@ def get_modem_refresh_status(mac: str) -> dict:
 
 @router.post("/modem-refresh/{req_id}/cancel")
 def cancel_modem_refresh(req_id: int) -> dict:
-    poller_service.cancel_refresh_request(req_id)
+    cancelled = poller_service.cancel_refresh_request(req_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=409,
+            detail="Refresh request is missing or no longer cancellable",
+        )
     return {"status": "success", "cancelled": True}
 
 

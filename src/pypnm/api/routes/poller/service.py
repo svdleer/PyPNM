@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import ipaddress
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -42,6 +44,13 @@ _INVENTORY_TASK_TYPES = frozenset(
     }
 )
 _INVENTORY_TARGET_MANIFEST_VERSION = 2
+_IDENTITY_SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
+_IDENTITY_FIRMWARE_OID = "1.3.6.1.2.1.69.1.3.2.0"
+_IDENTITY_REQUEST_SOURCE = "inventory-identity"
+
+
+class _IdentityDispatchBlocked(RuntimeError):
+    """Identity dispatch is paused until a timed-out agent reconnects."""
 
 
 class _PollerJobNotRunning(RuntimeError):
@@ -82,6 +91,7 @@ class PollerService:
             "decisions": [],
         }
         self._worker_started = False
+        self._identity_blocked_agents: set[tuple[str, int]] = set()
 
         self._init_db()
         self._start_worker()
@@ -866,19 +876,52 @@ class PollerService:
                 started_at DATETIME NULL,
                 finished_at DATETIME NULL,
                 error_text TEXT NULL,
+                attempt_count INT NOT NULL DEFAULT 0,
+                next_attempt_at DATETIME NULL,
+                last_attempt_at DATETIME NULL,
                 active_key VARCHAR(17) GENERATED ALWAYS AS (
                     CASE WHEN status IN ('queued','running') THEN mac ELSE NULL END
                 ) STORED,
-                INDEX idx_refresh_status (status, created_at),
+                INDEX idx_refresh_status (status, next_attempt_at, created_at),
                 INDEX idx_refresh_mac (mac, created_at),
                 UNIQUE KEY uk_refresh_active_mac (active_key)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_identity_cursor (
+                id TINYINT PRIMARY KEY,
+                cursor_mac VARCHAR(17) NOT NULL DEFAULT '',
+                cycle_started_at DATETIME NOT NULL,
+                next_scan_at DATETIME NULL,
+                queued_count BIGINT NOT NULL DEFAULT 0,
+                completed_count BIGINT NOT NULL DEFAULT 0,
+                failed_count BIGINT NOT NULL DEFAULT 0,
+                last_error VARCHAR(500) NULL,
+                updated_at DATETIME NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        now = self._now()
+        self._execute(
+            "INSERT IGNORE INTO inventory_identity_cursor "
+            "(id, cursor_mac, cycle_started_at, updated_at) VALUES (1,'',%s,%s)",
+            (now, now),
+        )
         refresh_columns = {
             str(row.get("Field"))
             for row in self._query("SHOW COLUMNS FROM modem_refresh_request")
         }
+        for column, ddl in (
+            ("attempt_count", "INT NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "DATETIME NULL"),
+            ("last_attempt_at", "DATETIME NULL"),
+        ):
+            if column not in refresh_columns:
+                self._execute(
+                    f"ALTER TABLE modem_refresh_request ADD COLUMN {column} {ddl}"
+                )
         if "active_key" not in refresh_columns:
             self._execute(
                 "ALTER TABLE modem_refresh_request ADD COLUMN active_key VARCHAR(17) "
@@ -895,10 +938,36 @@ class PollerService:
             "WHERE older.status IN ('queued','running')",
             (self._now(),),
         )
+        refresh_index_rows = self._query("SHOW INDEX FROM modem_refresh_request")
         refresh_indexes = {
             str(row.get("Key_name"))
-            for row in self._query("SHOW INDEX FROM modem_refresh_request")
+            for row in refresh_index_rows
         }
+        status_index_columns = [
+            str(row.get("Column_name"))
+            for row in sorted(
+                (
+                    row
+                    for row in refresh_index_rows
+                    if str(row.get("Key_name")) == "idx_refresh_status"
+                ),
+                key=lambda row: int(row.get("Seq_in_index") or 0),
+            )
+        ]
+        expected_status_index = ["status", "next_attempt_at", "created_at"]
+        if status_index_columns != expected_status_index:
+            if "idx_refresh_status" in refresh_indexes:
+                self._execute(
+                    "ALTER TABLE modem_refresh_request "
+                    "DROP INDEX idx_refresh_status, "
+                    "ADD INDEX idx_refresh_status "
+                    "(status, next_attempt_at, created_at)"
+                )
+            else:
+                self._execute(
+                    "CREATE INDEX idx_refresh_status ON modem_refresh_request "
+                    "(status, next_attempt_at, created_at)"
+                )
         if "uk_refresh_active_mac" not in refresh_indexes:
             self._execute(
                 "CREATE UNIQUE INDEX uk_refresh_active_mac "
@@ -975,15 +1044,65 @@ class PollerService:
         )
 
     def _recover_interrupted_refresh_work(self) -> None:
-        """Requeue refresh work orphaned when the refresh lock owner stopped."""
-        self._execute(
-            """
-            UPDATE modem_refresh_request
-            SET status='queued', started_at=NULL, finished_at=NULL,
-                error_text='Recovered after refresh worker restart'
-            WHERE status='running'
-            """
-        )
+        """Recover orphaned refresh work without bypassing identity backoff."""
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, attempt_count FROM modem_refresh_request "
+                    "WHERE status='running' AND requested_by=%s FOR UPDATE",
+                    (_IDENTITY_REQUEST_SOURCE,),
+                )
+                identity_rows = cur.fetchall()
+                terminal_failures = 0
+                for row in identity_rows:
+                    req_id = int(row["id"])
+                    attempt_count = int(row.get("attempt_count") or 0)
+                    if attempt_count >= self._identity_max_attempts():
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='failed', "
+                            "finished_at=%s, next_attempt_at=NULL, "
+                            "error_text='Identity retry limit reached during recovery' "
+                            "WHERE id=%s AND status='running'",
+                            (now, req_id),
+                        )
+                        terminal_failures += int(cur.rowcount or 0)
+                        continue
+                    next_attempt_at = (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=self._identity_retry_delay(attempt_count))
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    cur.execute(
+                        "UPDATE modem_refresh_request SET status='queued', "
+                        "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
+                        "error_text='Recovered after refresh worker restart' "
+                        "WHERE id=%s AND status='running'",
+                        (next_attempt_at, req_id),
+                    )
+                if terminal_failures:
+                    cur.execute(
+                        "UPDATE inventory_identity_cursor SET "
+                        "failed_count=failed_count+%s, "
+                        "last_error='Identity retry limit reached during recovery', "
+                        "updated_at=%s WHERE id=1",
+                        (terminal_failures, now),
+                    )
+                cur.execute(
+                    "UPDATE modem_refresh_request SET status='queued', "
+                    "started_at=NULL, finished_at=NULL, "
+                    "error_text='Recovered after refresh worker restart' "
+                    "WHERE status='running' AND COALESCE(requested_by,'')<>%s",
+                    (_IDENTITY_REQUEST_SOURCE,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def _worker_loop(self) -> None:
         lock_conn = None
@@ -1074,6 +1193,7 @@ class PollerService:
                 logger.warning("Refresh timeout sweep failed: %s", exc)
 
             try:
+                self._seed_identity_refresh_queue()
                 self._process_refresh_queue()
             except Exception as exc:
                 logger.warning("Refresh queue worker failed: %s", exc)
@@ -1119,9 +1239,16 @@ class PollerService:
                 finished_at=%s,
                 error_text=CONCAT('Timed out after ', %s, 's')
             WHERE status='running' AND started_at IS NOT NULL
+              AND COALESCE(requested_by,'')<>%s
               AND TIMESTAMPDIFF(SECOND, started_at, UTC_TIMESTAMP()) > %s
             """,
-            ("timed_out", self._now(), max_runtime, max_runtime),
+            (
+                "timed_out",
+                self._now(),
+                max_runtime,
+                _IDENTITY_REQUEST_SOURCE,
+                max_runtime,
+            ),
         )
         self._execute(
             """
@@ -1130,9 +1257,21 @@ class PollerService:
                 finished_at=%s,
                 error_text=CONCAT('Expired in queue after ', %s, 's')
             WHERE status='queued' AND created_at IS NOT NULL
-              AND TIMESTAMPDIFF(SECOND, created_at, UTC_TIMESTAMP()) > %s
+              AND COALESCE(requested_by,'')<>%s
+              AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())
+              AND TIMESTAMPDIFF(
+                    SECOND,
+                    COALESCE(last_attempt_at, created_at),
+                    UTC_TIMESTAMP()
+                  ) > %s
             """,
-            ("timed_out", self._now(), max_queue_age, max_queue_age),
+            (
+                "timed_out",
+                self._now(),
+                max_queue_age,
+                _IDENTITY_REQUEST_SOURCE,
+                max_queue_age,
+            ),
         )
     def _log_scheduler_decisions(self, tick_at: str, decisions: List[Dict[str, Any]]) -> None:
         persisted_decisions = [
@@ -1697,12 +1836,37 @@ class PollerService:
         return inserted
 
     @staticmethod
-    def _inventory_enriched_sql(alias: str = "") -> str:
+    def _identity_value_sql(column: str) -> str:
+        normalized = f"LOWER(TRIM(COALESCE({column},'')))"
+        return (
+            f"{normalized} NOT IN "
+            "('','unknown','n/a','(unknown)','none','null','not available','0') "
+            f"AND {normalized} NOT REGEXP '^0+([.]0+)*$' "
+            f"AND {normalized} NOT LIKE '%no such%' "
+            f"AND {normalized} NOT LIKE '%timeout%' "
+            f"AND {normalized} NOT LIKE '%unknown object%'"
+        )
+
+    @classmethod
+    def _inventory_enriched_sql(cls, alias: str = "") -> str:
+        prefix = f"{alias}." if alias else ""
+        vendor = cls._identity_value_sql(f"{prefix}vendor")
+        software = cls._identity_value_sql(f"{prefix}software_version")
+        model = cls._identity_value_sql(f"{prefix}model")
+        return f"{vendor} AND ({software} OR {model})"
+
+    @staticmethod
+    def _identity_eligible_sql(alias: str = "") -> str:
         prefix = f"{alias}." if alias else ""
         return (
-            f"LOWER(TRIM(COALESCE({prefix}vendor,''))) NOT IN ('','unknown','n/a') "
-            f"AND (TRIM(COALESCE({prefix}software_version,'')) <> '' OR "
-            f"LOWER(TRIM(COALESCE({prefix}model,''))) NOT IN ('','unknown','n/a'))"
+            f"{prefix}inventory_state<>'retired' "
+            f"AND {prefix}cmts_ip IS NOT NULL "
+            f"AND TRIM({prefix}cmts_ip)<>'' "
+            f"AND {prefix}ip IS NOT NULL "
+            f"AND TRIM({prefix}ip) NOT IN ('','0.0.0.0','::') "
+            f"AND INET6_ATON(TRIM({prefix}ip)) IS NOT NULL "
+            f"AND LOWER(TRIM(COALESCE({prefix}status,''))) IN "
+            "('operational','registrationcomplete','ipcomplete','online')"
         )
 
     @staticmethod
@@ -1766,11 +1930,18 @@ class PollerService:
             ("docsis_version", "docsis_version"),
         )
         for dimension, column in dimensions:
+            if dimension in {"vendor", "model", "software_version"}:
+                value_sql = (
+                    f"CASE WHEN {self._identity_value_sql(column)} "
+                    f"THEN TRIM({column}) ELSE '(unknown)' END"
+                )
+            else:
+                value_sql = f"COALESCE(NULLIF(TRIM({column}),''), '(unknown)')"
             cur.execute(
                 "INSERT INTO inventory_summary_count "
                 "(cmts_ip, dimension, value, row_count) "
-                f"SELECT %s, %s, COALESCE(NULLIF(TRIM({column}),''), '(unknown)'), "
-                "COUNT(*) FROM modem_inventory_current "
+                f"SELECT %s, %s, {value_sql}, COUNT(*) "
+                "FROM modem_inventory_current "
                 "WHERE cmts_ip=%s AND inventory_state<>'retired' GROUP BY 3",
                 (cmts_ip, dimension, cmts_ip),
             )
@@ -5016,6 +5187,8 @@ class PollerService:
 
     def enqueue_modem_refresh(self, mac: str, cmts: str | None = None, requested_by: str | None = None) -> int:
         normalized_mac = self._normalize_mac(mac)
+        if not normalized_mac:
+            return 0
         # Dedupe: if there's already a queued/running refresh for this modem, reuse it.
         existing = self._query(
             "SELECT id FROM modem_refresh_request "
@@ -5046,7 +5219,8 @@ class PollerService:
     def get_refresh_status(self, mac: str) -> dict | None:
         mac_norm = self._normalize_mac(mac).replace(":", "").replace("-", "")
         rows = self._query(
-            "SELECT id, mac, cmts, status, error_text, created_at, started_at, finished_at "
+            "SELECT id, mac, cmts, status, error_text, attempt_count, "
+            "next_attempt_at, last_attempt_at, created_at, started_at, finished_at "
             "FROM modem_refresh_request "
             "WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = LOWER(%s) "
             "ORDER BY id DESC LIMIT 1",
@@ -5055,20 +5229,45 @@ class PollerService:
         return rows[0] if rows else None
 
     def cancel_refresh_request(self, req_id: int) -> bool:
-        before = self._query(
-            "SELECT status FROM modem_refresh_request WHERE id=%s LIMIT 1",
-            (int(req_id),),
-        )
-        if not before:
-            return False
-        current_status = str((before[0] or {}).get("status") or "").lower()
-        if current_status not in {"queued", "running"}:
-            return False
-        self._execute(
-            "UPDATE modem_refresh_request SET status=%s, finished_at=%s WHERE id=%s AND status IN ('queued','running')",
-            ("cancelled", self._now(), int(req_id)),
-        )
-        return True
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status, requested_by FROM modem_refresh_request "
+                    "WHERE id=%s FOR UPDATE",
+                    (int(req_id),),
+                )
+                request = cur.fetchone() or {}
+                if str(request.get("status") or "").lower() not in {
+                    "queued",
+                    "running",
+                }:
+                    conn.rollback()
+                    return False
+                cur.execute(
+                    "UPDATE modem_refresh_request SET status='cancelled', "
+                    "finished_at=%s WHERE id=%s AND status IN ('queued','running')",
+                    (now, int(req_id)),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return False
+                if request.get("requested_by") == _IDENTITY_REQUEST_SOURCE:
+                    cur.execute(
+                        "DELETE FROM modem_refresh_request WHERE id=%s "
+                        "AND requested_by=%s AND status='cancelled'",
+                        (int(req_id), _IDENTITY_REQUEST_SOURCE),
+                    )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def _resolve_modem_from_cmts(self, mac: str, cmts_name: str | None, base: str) -> Dict[str, Any] | None:
         """Fallback live lookup that never mutates authoritative inventory."""
@@ -5196,10 +5395,453 @@ class PollerService:
             "docsis_version": docsis_version,
         }
 
+    @staticmethod
+    def _clean_identity_value(value: Any) -> str | None:
+        text = str(value or "").strip()
+        text = re.sub(
+            r"^(?:STRING|INTEGER|Gauge32|Counter32|Counter64|OID|Hex-STRING|IpAddress):\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip().strip('"').strip()
+        lowered = text.lower()
+        missing = {
+            "",
+            "unknown",
+            "n/a",
+            "(unknown)",
+            "none",
+            "null",
+            "not available",
+        }
+        if (
+            lowered in missing
+            or re.fullmatch(r"0+(?:\.0+)*", lowered) is not None
+            or any(marker in lowered for marker in ("no such", "timeout", "unknown object"))
+        ):
+            return None
+        return text
+
+    @staticmethod
+    def _stored_identity_value(value: Any) -> str | None:
+        text = str(value or "").strip()
+        lowered = text.lower()
+        if (
+            lowered
+            in {
+                "",
+                "unknown",
+                "n/a",
+                "(unknown)",
+                "none",
+                "null",
+                "not available",
+                "0",
+            }
+            or re.fullmatch(r"0+(?:\.0+)*", lowered) is not None
+            or any(marker in lowered for marker in ("no such", "timeout", "unknown object"))
+        ):
+            return None
+        return text
+
+    @classmethod
+    def _summary_identity_value(cls, value: Any) -> str:
+        return cls._stored_identity_value(value) or "(unknown)"
+
+    @classmethod
+    def _extract_agent_oid_value(cls, oid_results: Dict[str, Any], oid: str) -> str | None:
+        result = oid_results.get(oid) or oid_results.get(oid.lstrip("."))
+        if not isinstance(result, dict) or result.get("success") is not True:
+            return None
+        value = result.get("value")
+        if value is None and isinstance(result.get("results"), list) and result["results"]:
+            value = result["results"][0].get("value")
+        if value is None and result.get("output") is not None:
+            output = str(result["output"])
+            value = output.split(" = ", 1)[1] if " = " in output else output
+        return cls._clean_identity_value(value)
+
+    @classmethod
+    def _parse_modem_identity(
+        cls,
+        sys_descr: str | None,
+        firmware: str | None,
+    ) -> Dict[str, str | None]:
+        description = cls._clean_identity_value(sys_descr) or ""
+        parsed: Dict[str, str | None] = {
+            "vendor": None,
+            "model": None,
+            "software_version": cls._clean_identity_value(firmware),
+        }
+        structured = re.search(r"<<(.+?)>>", description)
+        if structured:
+            fields: Dict[str, str] = {}
+            for pair in structured.group(1).split(";"):
+                if ":" not in pair:
+                    continue
+                key, value = pair.split(":", 1)
+                cleaned = cls._clean_identity_value(value)
+                if cleaned:
+                    fields[key.strip().upper()] = cleaned
+            parsed["vendor"] = fields.get("VENDOR")
+            parsed["model"] = fields.get("MODEL") or fields.get("HW_MODEL")
+            parsed["software_version"] = (
+                parsed["software_version"] or fields.get("SW_REV")
+            )
+
+        if not parsed["vendor"] and description:
+            from pypnm.lib.vendor_capabilities import get_vendor_from_sysdescr
+
+            parsed["vendor"] = cls._clean_identity_value(
+                get_vendor_from_sysdescr(description)
+            )
+        if not parsed["model"] and description:
+            model_match = re.search(
+                r"(FAST\d+|F\d{4}[A-Z]*|TG\d+[A-Z0-9-]*|TC\d+|SBG?\d+|"
+                r"DPC\d+|EPC\d+|CGM\d+|CH\d+[A-Z0-9-]*|UBC\d+[A-Z0-9-]*)",
+                description,
+                re.IGNORECASE,
+            )
+            if model_match:
+                parsed["model"] = model_match.group(1).upper()
+        if not parsed["software_version"] and description:
+            version_match = re.search(
+                r"\b\d+\.\d+(?:\.\d+)+(?:[-._][A-Za-z0-9.-]+)?\b",
+                description,
+            )
+            if version_match:
+                parsed["software_version"] = version_match.group(0)
+        return parsed
+
+    async def query_modem_identity(self, mac: str) -> Dict[str, Any]:
+        """Query identity only for a modem and target in active Inventory."""
+        normalized_mac = self._normalize_mac(mac)
+        if not normalized_mac:
+            raise ValueError("A valid modem MAC address is required")
+        modem = self.get_inventory_modem_by_mac(normalized_mac)
+        if not modem:
+            raise ValueError(f"Modem {normalized_mac} is not in active inventory")
+        modem_ip = str(modem.get("ip_address") or modem.get("ip") or "").strip()
+        try:
+            normalized_ip = str(ipaddress.ip_address(modem_ip))
+        except ValueError as exc:
+            raise ValueError(
+                f"Modem {normalized_mac} has no valid Inventory management IP"
+            ) from exc
+
+        from pypnm.api.agent.manager import get_agent_manager
+
+        agent_manager = get_agent_manager()
+        if not agent_manager:
+            raise RuntimeError("Agent manager is unavailable")
+        agent = None
+        agent_token: tuple[str, int] | None = None
+        for agent_id in agent_manager.get_all_agent_ids_for_capability("cm_reachable"):
+            candidate = agent_manager.get_agent(agent_id)
+            if not candidate:
+                continue
+            token = (candidate.agent_id, id(candidate.websocket))
+            self._identity_blocked_agents = {
+                blocked
+                for blocked in self._identity_blocked_agents
+                if blocked[0] != candidate.agent_id or blocked == token
+            }
+            if token not in self._identity_blocked_agents:
+                agent = candidate
+                agent_token = token
+                break
+        if not agent or not agent_token:
+            raise _IdentityDispatchBlocked(
+                "Identity dispatch is paused until a timed-out agent reconnects"
+            )
+
+        params = {
+            "target_ip": normalized_ip,
+            "oids": [_IDENTITY_SYSDESCR_OID, _IDENTITY_FIRMWARE_OID],
+            "target_role": "cm",
+            "timeout": 5,
+            "retries": 1,
+            "max_concurrent": 1,
+        }
+        task_id = await agent_manager.send_task(
+            agent.agent_id,
+            "snmp_bulk_get",
+            params,
+            timeout=30,
+            priority="bulk",
+        )
+        result = await agent_manager.wait_for_task_async(task_id, timeout=30)
+        if not result or result.get("type") != "response":
+            error = str((result or {}).get("error") or "Agent identity task timed out")
+            if "timeout" in error.lower():
+                self._identity_blocked_agents.add(agent_token)
+            raise RuntimeError(error)
+        response = result.get("result") or {}
+        if response.get("success") is not True:
+            raise RuntimeError(response.get("error") or "Agent identity task failed")
+        oid_results = response.get("results") or {}
+        sys_descr = self._extract_agent_oid_value(
+            oid_results,
+            _IDENTITY_SYSDESCR_OID,
+        )
+        firmware = self._extract_agent_oid_value(
+            oid_results,
+            _IDENTITY_FIRMWARE_OID,
+        )
+        identity = self._parse_modem_identity(sys_descr, firmware)
+        if not any(identity.values()):
+            raise RuntimeError("Modem returned no usable identity values")
+        return {
+            "success": True,
+            "mac": normalized_mac,
+            "modem_ip": normalized_ip,
+            "cmts_ip": str(modem.get("cmts_ip") or "").strip(),
+            "inventory_updated_at": modem.get("updated_at"),
+            "sys_descr": sys_descr,
+            **identity,
+        }
+
+    def _identity_queue_depth(self) -> int:
+        try:
+            return max(
+                1,
+                min(int(os.environ.get("DATA_STORE_IDENTITY_QUEUE_DEPTH", "4")), 20),
+            )
+        except (TypeError, ValueError):
+            return 4
+
+    @staticmethod
+    def _identity_max_attempts() -> int:
+        try:
+            return max(
+                1,
+                min(int(os.environ.get("DATA_STORE_IDENTITY_MAX_ATTEMPTS", "4")), 10),
+            )
+        except (TypeError, ValueError):
+            return 4
+
+    @staticmethod
+    def _identity_retry_delay(attempt_count: int) -> int:
+        try:
+            base = max(
+                30,
+                min(int(os.environ.get("DATA_STORE_IDENTITY_RETRY_BASE_SEC", "60")), 3600),
+            )
+        except (TypeError, ValueError):
+            base = 60
+        return min(base * (2 ** max(0, attempt_count - 1)), 21600)
+
+    def _seed_identity_refresh_queue(self) -> int:
+        """Keep a tiny durable queue fed by a persisted primary-key cursor."""
+        enabled = os.environ.get(
+            "DATA_STORE_IDENTITY_ENRICHMENT_ENABLED",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return 0
+
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM modem_refresh_request "
+                    "WHERE status IN ('queued','running')"
+                )
+                active = int((cur.fetchone() or {}).get("c") or 0)
+                available = self._identity_queue_depth() - active
+                if available <= 0:
+                    conn.rollback()
+                    return 0
+
+                cur.execute(
+                    "SELECT cursor_mac, next_scan_at FROM inventory_identity_cursor "
+                    "WHERE id=1 FOR UPDATE"
+                )
+                state = cur.fetchone() or {}
+                next_scan_at = state.get("next_scan_at")
+                if next_scan_at and next_scan_at > datetime.now():
+                    conn.rollback()
+                    return 0
+                cursor_mac = str(state.get("cursor_mac") or "")
+                eligible = self._identity_eligible_sql()
+                enriched = self._inventory_enriched_sql()
+                cur.execute(
+                    "SELECT mac, cmts FROM modem_inventory_current "
+                    f"WHERE mac>%s AND {eligible} AND NOT ({enriched}) "
+                    "ORDER BY mac LIMIT %s",
+                    (cursor_mac, available),
+                )
+                candidates = cur.fetchall()
+                if not candidates:
+                    try:
+                        rescan_seconds = max(
+                            300,
+                            min(
+                                int(
+                                    os.environ.get(
+                                        "DATA_STORE_IDENTITY_RESCAN_SEC",
+                                        "86400",
+                                    )
+                                ),
+                                604800,
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        rescan_seconds = 86400
+                    next_scan = (
+                        datetime.now() + timedelta(seconds=rescan_seconds)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    cur.execute(
+                        "UPDATE inventory_identity_cursor SET cursor_mac='', "
+                        "cycle_started_at=%s, next_scan_at=%s, updated_at=%s "
+                        "WHERE id=1",
+                        (now, next_scan, now),
+                    )
+                    conn.commit()
+                    return 0
+
+                queued = 0
+                owned_cursor = cursor_mac
+                for row in candidates:
+                    cur.execute(
+                        "INSERT IGNORE INTO modem_refresh_request "
+                        "(mac, cmts, status, requested_by, created_at) "
+                        "VALUES (%s,%s,'queued',%s,%s)",
+                        (row["mac"], row.get("cmts"), _IDENTITY_REQUEST_SOURCE, now),
+                    )
+                    if int(cur.rowcount or 0) == 1:
+                        queued += 1
+                        owned_cursor = row["mac"]
+                        continue
+                    cur.execute(
+                        "SELECT id FROM modem_refresh_request WHERE active_key=%s "
+                        "AND requested_by=%s AND status IN ('queued','running') "
+                        "LIMIT 1 FOR UPDATE",
+                        (row["mac"], _IDENTITY_REQUEST_SOURCE),
+                    )
+                    if cur.fetchone():
+                        owned_cursor = row["mac"]
+                        continue
+                    break
+
+                if owned_cursor != cursor_mac:
+                    cur.execute(
+                        "UPDATE inventory_identity_cursor SET cursor_mac=%s, "
+                        "next_scan_at=NULL, queued_count=queued_count+%s, updated_at=%s "
+                        "WHERE id=1",
+                        (owned_cursor, queued, now),
+                    )
+                conn.commit()
+                return queued
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _fetch_modem_identity(self, *, mac: str) -> Dict[str, Any]:
+        payload = asyncio.run(self.query_modem_identity(mac))
+        if payload.get("success") is not True:
+            raise RuntimeError(payload.get("error") or "Identity query failed")
+        return {
+            "vendor": self._clean_identity_value(payload.get("vendor")),
+            "model": self._clean_identity_value(payload.get("model")),
+            "software_version": self._clean_identity_value(
+                payload.get("software_version")
+            ),
+            "queried_ip": str(payload.get("modem_ip") or "").strip(),
+            "queried_cmts_ip": str(payload.get("cmts_ip") or "").strip(),
+            "inventory_updated_at": payload.get("inventory_updated_at"),
+        }
+
+    @classmethod
+    def _identity_row_is_enriched(cls, row: Dict[str, Any]) -> bool:
+        vendor = cls._stored_identity_value(row.get("vendor"))
+        model = cls._stored_identity_value(row.get("model"))
+        software = cls._stored_identity_value(row.get("software_version"))
+        return vendor is not None and (software is not None or model is not None)
+
+    def _apply_refresh_summary_delta_cursor(
+        self,
+        cur,
+        *,
+        cmts_ip: str,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        refreshed_at: str,
+    ) -> None:
+        cur.execute(
+            "SELECT cmts_ip FROM inventory_summary_status "
+            "WHERE cmts_ip=%s FOR UPDATE",
+            (cmts_ip,),
+        )
+        if not cur.fetchone():
+            raise RuntimeError(
+                f"Identity summary status is missing for CMTS {cmts_ip}"
+            )
+
+        for dimension in ("vendor", "model", "software_version", "docsis_version"):
+            if dimension in {"vendor", "model", "software_version"}:
+                old_value = self._summary_identity_value(before.get(dimension))
+                new_value = self._summary_identity_value(after.get(dimension))
+            else:
+                old_value = str(before.get(dimension) or "").strip() or "(unknown)"
+                new_value = str(after.get(dimension) or "").strip() or "(unknown)"
+            if old_value == new_value:
+                continue
+            cur.execute(
+                "SELECT row_count FROM inventory_summary_count "
+                "WHERE cmts_ip=%s AND dimension=%s AND value=%s FOR UPDATE",
+                (cmts_ip, dimension, old_value),
+            )
+            old_bucket = cur.fetchone() or {}
+            if int(old_bucket.get("row_count") or 0) <= 0:
+                raise RuntimeError(
+                    "Identity summary bucket is missing for "
+                    f"{cmts_ip}/{dimension}/{old_value}"
+                )
+            cur.execute(
+                "UPDATE inventory_summary_count SET row_count=row_count-1 "
+                "WHERE cmts_ip=%s AND dimension=%s AND value=%s AND row_count>0",
+                (cmts_ip, dimension, old_value),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError(
+                    "Identity summary bucket update lost a race for "
+                    f"{cmts_ip}/{dimension}/{old_value}"
+                )
+            cur.execute(
+                "DELETE FROM inventory_summary_count WHERE cmts_ip=%s "
+                "AND dimension=%s AND value=%s AND row_count=0",
+                (cmts_ip, dimension, old_value),
+            )
+            cur.execute(
+                "INSERT INTO inventory_summary_count "
+                "(cmts_ip, dimension, value, row_count) VALUES (%s,%s,%s,1) "
+                "ON DUPLICATE KEY UPDATE row_count=row_count+1",
+                (cmts_ip, dimension, new_value),
+            )
+
+        enriched_delta = int(self._identity_row_is_enriched(after)) - int(
+            self._identity_row_is_enriched(before)
+        )
+        cur.execute(
+            "UPDATE inventory_summary_status SET "
+            "enriched_count=GREATEST(enriched_count+%s,0), "
+            "last_updated=%s, refreshed_at=%s WHERE cmts_ip=%s",
+            (enriched_delta, refreshed_at, refreshed_at, cmts_ip),
+        )
+
     def _process_refresh_queue(self) -> None:
         """Process one queued modem refresh request."""
         rows = self._query(
-            "SELECT id, mac, cmts FROM modem_refresh_request WHERE status='queued' ORDER BY id ASC LIMIT 1"
+            "SELECT id, mac, cmts, requested_by FROM modem_refresh_request "
+            "WHERE status='queued' "
+            "AND (next_attempt_at IS NULL OR next_attempt_at<=UTC_TIMESTAMP()) "
+            "ORDER BY COALESCE(next_attempt_at, created_at), id ASC LIMIT 1"
         )
         if not rows:
             return
@@ -5207,13 +5849,19 @@ class PollerService:
         req_id = int(req["id"])
         mac = req["mac"]
         cmts = req.get("cmts")
+        requested_by = str(req.get("requested_by") or "api")
+        identity_only = requested_by == _IDENTITY_REQUEST_SOURCE
 
         # Claim only if still queued; never resurrect a request cancelled
         # between the SELECT and UPDATE.
+        claim_at = self._now()
         self._execute(
-            "UPDATE modem_refresh_request SET status=%s, started_at=%s "
-            "WHERE id=%s AND status='queued'",
-            ("running", self._now(), req_id),
+            "UPDATE modem_refresh_request SET status=%s, started_at=%s, "
+            "finished_at=NULL, next_attempt_at=NULL, last_attempt_at=%s, "
+            "attempt_count=attempt_count+1, error_text=NULL "
+            "WHERE id=%s AND status='queued' "
+            "AND (next_attempt_at IS NULL OR next_attempt_at<=UTC_TIMESTAMP())",
+            ("running", claim_at, claim_at, req_id),
         )
         claimed = self._query(
             "SELECT status FROM modem_refresh_request WHERE id=%s", (req_id,)
@@ -5230,32 +5878,65 @@ class PollerService:
                 )
 
             cable_source = dict(modem)
+            modem_ip = str(
+                cable_source.get("ip_address") or cable_source.get("ip") or ""
+            ).strip()
+            if not modem_ip:
+                raise ValueError(f"Modem {mac} has no management IP in inventory")
 
-            # Identity values are retained only when the CMTS inventory already
-            # exposes them. A targeted refresh never probes the modem directly.
-            vendor = cable_source.get("vendor")
-            model_name = cable_source.get("model")
-            software_ver = (
-                cable_source.get("software_version")
-                or cable_source.get("firmware")
+            identity = self._fetch_modem_identity(mac=mac)
+            discovered_vendor = self._clean_identity_value(identity.get("vendor"))
+            discovered_model = self._clean_identity_value(identity.get("model"))
+            discovered_software = self._clean_identity_value(
+                identity.get("software_version")
             )
-            interface_values = {
-                "cable_mac": cable_source.get("cable_mac"),
-                "fiber_node": cable_source.get("fiber_node"),
-                "docsis_version": cable_source.get("docsis_version"),
-            }
-            try:
-                interface_values = self._resolve_cmts_interface_from_cmts(cable_source, base)
-            except Exception as exc:
-                logger.warning("Targeted CMTS interface lookup for %s failed: %s", mac, exc)
+            queried_ip = str(identity.get("queried_ip") or "").strip()
+            queried_cmts_ip = str(identity.get("queried_cmts_ip") or "").strip()
+            queried_updated_at = identity.get("inventory_updated_at")
+            if identity_only:
+                vendor = discovered_vendor
+                model_name = discovered_model
+                software_ver = discovered_software
+                interface_values = {
+                    "cable_mac": None,
+                    "fiber_node": None,
+                    "docsis_version": None,
+                }
+            else:
+                vendor = discovered_vendor or cable_source.get("vendor")
+                model_name = discovered_model or cable_source.get("model")
+                software_ver = (
+                    discovered_software
+                    or cable_source.get("software_version")
+                    or cable_source.get("firmware")
+                )
+                interface_values = {
+                    "cable_mac": cable_source.get("cable_mac"),
+                    "fiber_node": cable_source.get("fiber_node"),
+                    "docsis_version": cable_source.get("docsis_version"),
+                }
+                try:
+                    interface_values = self._resolve_cmts_interface_from_cmts(
+                        cable_source,
+                        base,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Targeted CMTS interface lookup for %s failed: %s",
+                        mac,
+                        exc,
+                    )
             cable_mac = interface_values.get("cable_mac")
             fiber_node = interface_values.get("fiber_node")
             docsis_version = interface_values.get("docsis_version")
 
             cmts_address = str(cable_source.get("cmts_ip") or "").strip()
-            cmts_label = str(
-                cmts or cable_source.get("cmts") or cmts_address
-            ).strip()
+            if identity_only:
+                cmts_label = str(cable_source.get("cmts") or cmts_address).strip()
+            else:
+                cmts_label = str(
+                    cmts or cable_source.get("cmts") or cmts_address
+                ).strip()
             inventory_mac = str(
                 cable_source.get("mac_address") or cable_source.get("mac") or mac
             )
@@ -5275,7 +5956,9 @@ class PollerService:
                         locked_at=now,
                     )
                     cur.execute(
-                        "SELECT inventory_state FROM modem_inventory_current "
+                        "SELECT inventory_state, ip, cmts, cmts_ip, status, updated_at, "
+                        "vendor, model, software_version, docsis_version "
+                        "FROM modem_inventory_current "
                         "WHERE mac=%s AND cmts_ip=%s FOR UPDATE",
                         (inventory_mac, cmts_address),
                     )
@@ -5286,6 +5969,37 @@ class PollerService:
                         raise ValueError(
                             f"Modem {mac} is no longer active inventory"
                         )
+                    if identity_only:
+                        try:
+                            locked_ip = str(
+                                ipaddress.ip_address(
+                                    str(inventory_row.get("ip") or "").strip()
+                                )
+                            )
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                f"Modem {mac} Inventory target became invalid"
+                            ) from exc
+                        locked_status = str(
+                            inventory_row.get("status") or ""
+                        ).strip().lower()
+                        target_changed = (
+                            locked_ip != queried_ip
+                            or str(inventory_row.get("cmts_ip") or "").strip()
+                            != queried_cmts_ip
+                            or inventory_row.get("updated_at") != queried_updated_at
+                            or locked_status
+                            not in {
+                                "operational",
+                                "registrationcomplete",
+                                "ipcomplete",
+                                "online",
+                            }
+                        )
+                        if target_changed:
+                            raise RuntimeError(
+                                f"Modem {mac} Inventory changed during identity query"
+                            )
                     cur.execute(
                         "SELECT status FROM modem_refresh_request "
                         "WHERE id=%s FOR UPDATE",
@@ -5297,7 +6011,41 @@ class PollerService:
                             f"Refresh request {req_id} is no longer running"
                         )
 
-                    if (
+                    identity_before = {
+                        "vendor": inventory_row.get("vendor"),
+                        "model": inventory_row.get("model"),
+                        "software_version": inventory_row.get("software_version"),
+                        "docsis_version": inventory_row.get("docsis_version"),
+                    }
+                    identity_after = {
+                        "vendor": vendor or identity_before["vendor"],
+                        "model": model_name or identity_before["model"],
+                        "software_version": (
+                            software_ver or identity_before["software_version"]
+                        ),
+                        "docsis_version": (
+                            docsis_version or identity_before["docsis_version"]
+                        ),
+                    }
+
+                    if identity_only:
+                        cur.execute(
+                            "UPDATE modem_inventory_current SET "
+                            "vendor=COALESCE(NULLIF(%s,''), vendor), "
+                            "model=COALESCE(NULLIF(%s,''), model), "
+                            "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                            "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
+                            "AND inventory_state<>'retired'",
+                            (
+                                vendor,
+                                model_name,
+                                software_ver,
+                                now,
+                                inventory_mac,
+                                cmts_address,
+                            ),
+                        )
+                    elif (
                         vendor
                         or model_name
                         or software_ver
@@ -5327,10 +6075,11 @@ class PollerService:
                                 cmts_address,
                             ),
                         )
-                    self._refresh_summary_for_cmts_cursor(
+                    self._apply_refresh_summary_delta_cursor(
                         cur,
                         cmts_ip=cmts_address,
-                        cmts=cmts_label or cmts_address,
+                        before=identity_before,
+                        after=identity_after,
                         refreshed_at=now,
                     )
                     cur.execute(
@@ -5349,6 +6098,18 @@ class PollerService:
                         raise RuntimeError(
                             f"Refresh request {req_id} completion lost a race"
                         )
+                    if identity_only:
+                        cur.execute(
+                            "UPDATE inventory_identity_cursor SET "
+                            "completed_count=completed_count+1, last_error=NULL, "
+                            "updated_at=%s WHERE id=1",
+                            (now,),
+                        )
+                        cur.execute(
+                            "DELETE FROM modem_refresh_request WHERE id=%s "
+                            "AND requested_by=%s AND status='completed'",
+                            (req_id, _IDENTITY_REQUEST_SOURCE),
+                        )
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -5356,58 +6117,128 @@ class PollerService:
                 finally:
                     conn.close()
         except Exception as exc:
-            self._execute(
-                "UPDATE modem_refresh_request SET status=%s, finished_at=%s, "
-                "error_text=%s WHERE id=%s AND status='running'",
-                ("failed", self._now(), str(exc)[:500], req_id),
-            )
+            error_text = str(exc)[:500]
+            failed_at = self._now()
+            with self._db_lock:
+                conn = self._connect()
+                try:
+                    conn.begin()
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT status, attempt_count FROM modem_refresh_request "
+                        "WHERE id=%s FOR UPDATE",
+                        (req_id,),
+                    )
+                    request = cur.fetchone() or {}
+                    if str(request.get("status") or "") != "running":
+                        conn.rollback()
+                        return
+                    attempt_count = int(request.get("attempt_count") or 0)
+                    if identity_only and isinstance(exc, _IdentityDispatchBlocked):
+                        next_attempt_at = (
+                            datetime.now(timezone.utc) + timedelta(seconds=60)
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='queued', "
+                            "attempt_count=GREATEST(attempt_count-1,0), "
+                            "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
+                            "error_text=%s WHERE id=%s AND status='running'",
+                            (next_attempt_at, error_text, req_id),
+                        )
+                    elif identity_only and attempt_count < self._identity_max_attempts():
+                        delay = self._identity_retry_delay(attempt_count)
+                        next_attempt_at = (
+                            datetime.now(timezone.utc) + timedelta(seconds=delay)
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='queued', "
+                            "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
+                            "error_text=%s WHERE id=%s AND status='running'",
+                            (next_attempt_at, error_text, req_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='failed', "
+                            "finished_at=%s, next_attempt_at=NULL, error_text=%s "
+                            "WHERE id=%s AND status='running'",
+                            (failed_at, error_text, req_id),
+                        )
+                        if identity_only and int(cur.rowcount or 0) == 1:
+                            cur.execute(
+                                "UPDATE inventory_identity_cursor SET "
+                                "failed_count=failed_count+1, last_error=%s, "
+                                "updated_at=%s WHERE id=1",
+                                (error_text, failed_at),
+                            )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
 
     # ── Enrichment progress ──────────────────────────────────────
 
     def get_enrichment_progress(self, cmts: str | None = None) -> dict:
-        where = ""
-        params: list = []
+        scope_sql = ""
+        scope_params: list = []
         if cmts:
-            where = " WHERE (LOWER(COALESCE(cmts,'')) = LOWER(%s) OR LOWER(COALESCE(cmts_ip,'')) = LOWER(%s))"
-            params = [cmts, cmts]
+            scope_sql = (
+                " AND (LOWER(COALESCE(cmts,''))=LOWER(%s) "
+                "OR LOWER(COALESCE(cmts_ip,''))=LOWER(%s))"
+            )
+            scope_params = [cmts, cmts]
 
-        active_predicate = "inventory_state<>'retired'"
-        if where:
-            where = where + " AND " + active_predicate
-        else:
-            where = " WHERE " + active_predicate
-        total_rows = self._query(f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}", tuple(params))
-        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
-
-        enriched_rows = self._query(
-            f"SELECT COUNT(*) AS c FROM modem_inventory_current{where}"
-            + " AND"
-            + " LOWER(TRIM(COALESCE(vendor,''))) NOT IN ('', 'unknown', 'n/a')"
-            + " AND ("
-            + " TRIM(COALESCE(software_version,'')) <> ''"
-            + " OR LOWER(TRIM(COALESCE(model,''))) NOT IN ('', 'unknown', 'n/a')"
-            + " )",
-            tuple(params),
+        inventory_rows = self._query(
+            "SELECT COUNT(*) AS c FROM modem_inventory_current "
+            "WHERE inventory_state<>'retired'" + scope_sql,
+            tuple(scope_params),
         )
-        enriched = int((enriched_rows[0] or {}).get("c") or 0) if enriched_rows else 0
+        inventory_total = (
+            int((inventory_rows[0] or {}).get("c") or 0) if inventory_rows else 0
+        )
+        eligible = self._identity_eligible_sql()
+        enriched_predicate = self._inventory_enriched_sql()
+        total_rows = self._query(
+            "SELECT COUNT(*) AS c FROM modem_inventory_current "
+            f"WHERE {eligible}" + scope_sql,
+            tuple(scope_params),
+        )
+        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+        enriched_rows = self._query(
+            "SELECT COUNT(*) AS c FROM modem_inventory_current "
+            f"WHERE {eligible} AND ({enriched_predicate})" + scope_sql,
+            tuple(scope_params),
+        )
+        enriched = (
+            int((enriched_rows[0] or {}).get("c") or 0) if enriched_rows else 0
+        )
 
-        # Check if any refresh requests are in progress (scoped to CMTS when provided)
         if cmts:
             pending_rows = self._query(
-                "SELECT COUNT(*) AS c FROM modem_refresh_request "
-                "WHERE status IN ('queued','running') AND LOWER(COALESCE(cmts,'')) = LOWER(%s)",
-                (cmts,),
+                "SELECT COUNT(*) AS c FROM modem_refresh_request r "
+                "JOIN modem_inventory_current i ON i.mac=r.mac "
+                "WHERE r.status IN ('queued','running') AND r.requested_by=%s "
+                "AND i.inventory_state<>'retired' "
+                "AND (LOWER(COALESCE(i.cmts,''))=LOWER(%s) "
+                "OR LOWER(COALESCE(i.cmts_ip,''))=LOWER(%s))",
+                (_IDENTITY_REQUEST_SOURCE, cmts, cmts),
             )
         else:
             pending_rows = self._query(
-                "SELECT COUNT(*) AS c FROM modem_refresh_request WHERE status IN ('queued','running')"
+                "SELECT COUNT(*) AS c FROM modem_refresh_request "
+                "WHERE status IN ('queued','running') AND requested_by=%s",
+                (_IDENTITY_REQUEST_SOURCE,),
             )
         pending = int((pending_rows[0] or {}).get("c") or 0) if pending_rows else 0
 
         return {
+            "inventory_total": inventory_total,
             "total": total,
+            "eligible_total": total,
             "enriched": enriched,
             "pending_refresh": pending,
+            "pending_identity": pending,
             "enriching": pending > 0,
             "percentage": round(enriched / total * 100, 1) if total > 0 else 0.0,
         }
@@ -5689,11 +6520,20 @@ class PollerService:
                     ("software_version", "software_version"),
                     ("docsis_version", "docsis_version"),
                 ):
+                    if dimension in {"vendor", "model", "software_version"}:
+                        value_sql = (
+                            f"CASE WHEN {self._identity_value_sql(column)} "
+                            f"THEN TRIM({column}) ELSE '(unknown)' END"
+                        )
+                    else:
+                        value_sql = (
+                            f"COALESCE(NULLIF(TRIM({column}),''), '(unknown)')"
+                        )
                     cur.execute(
                         "INSERT INTO inventory_summary_count "
                         "(cmts_ip, dimension, value, row_count) "
-                        f"SELECT cmts_ip, %s, COALESCE(NULLIF(TRIM({column}),''), "
-                        "'(unknown)'), COUNT(*) FROM modem_inventory_current "
+                        f"SELECT cmts_ip, %s, {value_sql}, COUNT(*) "
+                        "FROM modem_inventory_current "
                         "WHERE inventory_state<>'retired' AND COALESCE(cmts_ip,'')<>'' "
                         "GROUP BY cmts_ip, 3",
                         (dimension,),

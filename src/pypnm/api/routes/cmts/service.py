@@ -78,7 +78,6 @@ OID_OLD_MAC      = '1.3.6.1.2.1.10.127.1.3.3.1.2'       # docsIfCmtsCmStatusMacA
 OID_OLD_IP       = '1.3.6.1.2.1.10.127.1.3.3.1.3'       # docsIfCmtsCmStatusIpAddress
 OID_OLD_STATUS   = '1.3.6.1.2.1.10.127.1.3.3.1.9'       # docsIfCmtsCmStatusValue
 OID_OLD_US_CH_IF = '1.3.6.1.2.1.10.127.1.3.3.1.5'       # docsIfCmtsCmStatusUpChannelIfIndex
-OID_SW_REV       = '1.3.6.1.2.1.10.127.1.2.2.1.3'       # docsIfCmtsCmStatusSoftwareRev (firmware)
 # DOCSIS 3.1 supplementary
 OID_US_CH_ID     = '1.3.6.1.4.1.4491.2.1.20.1.4.1.3'    # docsIf3CmtsCmUsStatusChIfIndex
 OID_IF_NAME      = '1.3.6.1.2.1.31.1.1.1.1'              # IF-MIB::ifName
@@ -1242,14 +1241,14 @@ class CMTSModemService:
             # ── Step 1: Parallel SNMP walks via agent ────────────────────
             full_walk_oids = [
                 OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
-                OID_OLD_US_CH_IF, OID_SW_REV,
+                OID_OLD_US_CH_IF,
                 OID_US_CH_ID, OID_IF_NAME,
                 OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
                 OID_D4_ADV_CAP,
             ]
             light_walk_oids = [
                 OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
-                OID_OLD_US_CH_IF, OID_SW_REV,
+                OID_OLD_US_CH_IF,
             ]
             walk_oids = (
                 light_walk_oids if collection_mode == "light" else full_walk_oids
@@ -1803,12 +1802,6 @@ class CMTSModemService:
             except (ValueError, TypeError):
                 pass
 
-        sw_rev_map: dict[str, str] = {}
-        for item in raw.get(OID_SW_REV, []):
-            fw = str(item['value'])
-            if fw and 'No Such' not in fw and fw != '0':
-                sw_rev_map[self._extract_index(item['oid'], OID_SW_REV)] = fw
-
         # ---- IF-MIB::ifName ----
         if_name_map: dict[int, str] = {}
         for item in raw.get(OID_IF_NAME, []):
@@ -1887,22 +1880,18 @@ class CMTSModemService:
         # ---- correlate old table → MAC-keyed lookups ----
         mac_to_ip: dict[str, str] = {}
         mac_to_status: dict[str, int] = {}
-        mac_to_firmware: dict[str, str] = {}
         mac_to_us_ch_if: dict[str, int] = {}
         for old_index, mac in old_mac_map.items():
             if old_index in old_ip_map:
                 mac_to_ip[mac] = old_ip_map[old_index]
             if old_index in old_status_map:
                 mac_to_status[mac] = old_status_map[old_index]
-            if old_index in sw_rev_map:
-                mac_to_firmware[mac] = sw_rev_map[old_index]
             if old_index in old_us_ch_if_map:
                 mac_to_us_ch_if[mac] = old_us_ch_if_map[old_index]
 
         self.logger.info(
             f"Correlated: {len(mac_to_ip)} IPs, {len(mac_to_status)} statuses, "
-            f"{len(mac_to_firmware)} firmware, {len(mac_to_us_ch_if)} D3.0 US-CH, "
-            f"{len(us_ch_map)} D3.1 US-CH"
+            f"{len(mac_to_us_ch_if)} D3.0 US-CH, {len(us_ch_map)} D3.1 US-CH"
         )
 
         # ---- build modem list from the union of both registration tables ----
@@ -1952,9 +1941,6 @@ class CMTSModemService:
                 sc = mac_to_status[mac]
                 modem['status_code'] = sc
                 modem['status'] = STATUS_MAP.get(sc, 'unknown')
-
-            if mac in mac_to_firmware:
-                modem['firmware'] = mac_to_firmware[mac]
 
             # Positive DOCS-IF31 per-modem state proves DOCSIS 3.1 capability,
             # including state=none (healthy, not partial service). Operational
