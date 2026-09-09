@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_for_futures
 from datetime import datetime, timedelta, timezone
 from datetime import time as datetime_time
+from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -91,7 +92,9 @@ class PollerService:
             "decisions": [],
         }
         self._worker_started = False
+        self._identity_agent_lock = threading.Lock()
         self._identity_blocked_agents: set[tuple[str, int]] = set()
+        self._identity_events: Queue = Queue()
 
         self._init_db()
         self._start_worker()
@@ -879,6 +882,15 @@ class PollerService:
                 attempt_count INT NOT NULL DEFAULT 0,
                 next_attempt_at DATETIME NULL,
                 last_attempt_at DATETIME NULL,
+                claim_token CHAR(36) NULL,
+                agent_task_id CHAR(36) NULL,
+                agent_id VARCHAR(128) NULL,
+                dispatched_at DATETIME NULL,
+                dispatch_deadline_at DATETIME NULL,
+                response_received_at DATETIME NULL,
+                target_ip VARCHAR(45) NULL,
+                target_cmts_ip VARCHAR(45) NULL,
+                target_inventory_updated_at DATETIME NULL,
                 active_key VARCHAR(17) GENERATED ALWAYS AS (
                     CASE WHEN status IN ('queued','running') THEN mac ELSE NULL END
                 ) STORED,
@@ -917,6 +929,15 @@ class PollerService:
             ("attempt_count", "INT NOT NULL DEFAULT 0"),
             ("next_attempt_at", "DATETIME NULL"),
             ("last_attempt_at", "DATETIME NULL"),
+            ("claim_token", "CHAR(36) NULL"),
+            ("agent_task_id", "CHAR(36) NULL"),
+            ("agent_id", "VARCHAR(128) NULL"),
+            ("dispatched_at", "DATETIME NULL"),
+            ("dispatch_deadline_at", "DATETIME NULL"),
+            ("response_received_at", "DATETIME NULL"),
+            ("target_ip", "VARCHAR(45) NULL"),
+            ("target_cmts_ip", "VARCHAR(45) NULL"),
+            ("target_inventory_updated_at", "DATETIME NULL"),
         ):
             if column not in refresh_columns:
                 self._execute(
@@ -972,6 +993,16 @@ class PollerService:
             self._execute(
                 "CREATE UNIQUE INDEX uk_refresh_active_mac "
                 "ON modem_refresh_request (active_key)"
+            )
+        if "uk_refresh_agent_task" not in refresh_indexes:
+            self._execute(
+                "CREATE UNIQUE INDEX uk_refresh_agent_task "
+                "ON modem_refresh_request (agent_task_id)"
+            )
+        if "idx_refresh_dispatch" not in refresh_indexes:
+            self._execute(
+                "CREATE INDEX idx_refresh_dispatch ON modem_refresh_request "
+                "(status, dispatch_deadline_at)"
             )
 
     def _start_worker(self) -> None:
@@ -1052,8 +1083,11 @@ class PollerService:
                 conn.begin()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id, attempt_count FROM modem_refresh_request "
-                    "WHERE status='running' AND requested_by=%s FOR UPDATE",
+                    "SELECT id, attempt_count, dispatched_at "
+                    "FROM modem_refresh_request "
+                    "WHERE status='running' AND requested_by=%s "
+                    "AND (dispatch_deadline_at IS NULL "
+                    "OR dispatch_deadline_at<=UTC_TIMESTAMP()) FOR UPDATE",
                     (_IDENTITY_REQUEST_SOURCE,),
                 )
                 identity_rows = cur.fetchall()
@@ -1061,10 +1095,28 @@ class PollerService:
                 for row in identity_rows:
                     req_id = int(row["id"])
                     attempt_count = int(row.get("attempt_count") or 0)
+                    if not row.get("dispatched_at"):
+                        next_attempt_at = (
+                            datetime.now(timezone.utc) + timedelta(seconds=2)
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='queued', "
+                            "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
+                            "claim_token=NULL, agent_task_id=NULL, agent_id=NULL, "
+                            "dispatched_at=NULL, dispatch_deadline_at=NULL, "
+                            "response_received_at=NULL, "
+                            "error_text='Recovered unacknowledged identity claim' "
+                            "WHERE id=%s AND status='running' "
+                            "AND dispatched_at IS NULL",
+                            (next_attempt_at, req_id),
+                        )
+                        continue
                     if attempt_count >= self._identity_max_attempts():
                         cur.execute(
                             "UPDATE modem_refresh_request SET status='failed', "
-                            "finished_at=%s, next_attempt_at=NULL, "
+                            "finished_at=%s, next_attempt_at=NULL, claim_token=NULL, "
+                            "agent_task_id=NULL, agent_id=NULL, dispatched_at=NULL, "
+                            "dispatch_deadline_at=NULL, "
                             "error_text='Identity retry limit reached during recovery' "
                             "WHERE id=%s AND status='running'",
                             (now, req_id),
@@ -1078,7 +1130,10 @@ class PollerService:
                     cur.execute(
                         "UPDATE modem_refresh_request SET status='queued', "
                         "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
-                        "error_text='Recovered after refresh worker restart' "
+                        "claim_token=NULL, agent_task_id=NULL, agent_id=NULL, "
+                        "dispatched_at=NULL, dispatch_deadline_at=NULL, "
+                        "response_received_at=NULL, "
+                        "error_text='Recovered expired identity dispatch' "
                         "WHERE id=%s AND status='running'",
                         (next_attempt_at, req_id),
                     )
@@ -1092,7 +1147,7 @@ class PollerService:
                     )
                 cur.execute(
                     "UPDATE modem_refresh_request SET status='queued', "
-                    "started_at=NULL, finished_at=NULL, "
+                    "started_at=NULL, finished_at=NULL, claim_token=NULL, "
                     "error_text='Recovered after refresh worker restart' "
                     "WHERE status='running' AND COALESCE(requested_by,'')<>%s",
                     (_IDENTITY_REQUEST_SOURCE,),
@@ -1155,14 +1210,27 @@ class PollerService:
             time.sleep(2)
 
     def _refresh_worker_loop(self) -> None:
-        """Process targeted modem enrichment independently of long poller jobs."""
+        """Dispatch identity work asynchronously and keep manual refresh isolated."""
         lock_conn = None
+        manual_executor: ThreadPoolExecutor | None = None
+        manual_future = None
+        maintenance_due = 0.0
+        dispatch_due = 0.0
+        manual_due = 0.0
         while True:
             if lock_conn is None:
+                if manual_executor is not None:
+                    manual_executor.shutdown(wait=False, cancel_futures=True)
+                    manual_executor = None
+                    manual_future = None
                 try:
                     lock_conn = self._try_acquire_worker_lock("refresh")
                     if lock_conn is not None:
                         self._recover_interrupted_refresh_work()
+                        manual_executor = ThreadPoolExecutor(
+                            max_workers=1,
+                            thread_name_prefix="pypnm-manual-refresh",
+                        )
                 except Exception as exc:
                     logger.warning("Refresh worker lock/recovery failed: %s", exc)
                     if lock_conn is not None:
@@ -1176,8 +1244,6 @@ class PollerService:
                     continue
 
             try:
-                # Keep the advisory-lock connection distinct from thread-local
-                # query connections, and never reconnect it implicitly.
                 lock_conn.ping(reconnect=False)
             except Exception:
                 try:
@@ -1187,18 +1253,46 @@ class PollerService:
                 lock_conn = None
                 continue
 
-            try:
-                self._timeout_stale_refresh_requests()
-            except Exception as exc:
-                logger.warning("Refresh timeout sweep failed: %s", exc)
+            completed_events = 0
+            for _ in range(512):
+                try:
+                    event = self._identity_events.get_nowait()
+                except Empty:
+                    break
+                try:
+                    self._apply_identity_task_event(event)
+                    completed_events += 1
+                except Exception as exc:
+                    logger.warning("Identity completion processing failed: %s", exc)
 
-            try:
-                self._seed_identity_refresh_queue()
-                self._process_refresh_queue()
-            except Exception as exc:
-                logger.warning("Refresh queue worker failed: %s", exc)
+            if manual_future is not None and manual_future.done():
+                try:
+                    manual_future.result()
+                except Exception as exc:
+                    logger.warning("Manual refresh worker failed: %s", exc)
+                manual_future = None
 
-            time.sleep(2)
+            tick = time.monotonic()
+            try:
+                if tick >= maintenance_due:
+                    self._timeout_stale_refresh_requests()
+                    self._expire_identity_dispatches()
+                    self._seed_identity_refresh_queue()
+                    maintenance_due = tick + 2.0
+                if completed_events or tick >= dispatch_due:
+                    self._dispatch_identity_tasks()
+                    dispatch_due = tick + 0.25
+                if (
+                    manual_executor is not None
+                    and manual_future is None
+                    and tick >= manual_due
+                ):
+                    manual_future = manual_executor.submit(self._process_refresh_queue)
+                    manual_due = tick + 2.0
+            except Exception as exc:
+                logger.warning("Refresh queue scheduling failed: %s", exc)
+
+            time.sleep(0.1)
 
     def _scheduler_due(self) -> bool:
         last_tick = self._scheduler.get("last_tick")
@@ -1230,8 +1324,22 @@ class PollerService:
         )
 
     def _timeout_stale_refresh_requests(self) -> None:
-        max_runtime = max(30, int(os.environ.get("DATA_STORE_REFRESH_MAX_RUNTIME_SEC", "300")))
-        max_queue_age = max(30, int(os.environ.get("DATA_STORE_REFRESH_MAX_QUEUE_AGE_SEC", str(max_runtime))))
+        # Manual refreshes can consume 70 seconds for identity plus 180 seconds
+        # for CMTS interface lookup before persistence. Keep the stale floor
+        # above that complete supported path, even when configured lower.
+        max_runtime = max(
+            300,
+            int(os.environ.get("DATA_STORE_REFRESH_MAX_RUNTIME_SEC", "300")),
+        )
+        max_queue_age = max(
+            120,
+            int(
+                os.environ.get(
+                    "DATA_STORE_REFRESH_MAX_QUEUE_AGE_SEC",
+                    str(max_runtime),
+                )
+            ),
+        )
         self._execute(
             """
             UPDATE modem_refresh_request
@@ -1852,8 +1960,7 @@ class PollerService:
         prefix = f"{alias}." if alias else ""
         vendor = cls._identity_value_sql(f"{prefix}vendor")
         software = cls._identity_value_sql(f"{prefix}software_version")
-        model = cls._identity_value_sql(f"{prefix}model")
-        return f"{vendor} AND ({software} OR {model})"
+        return f"{vendor} AND {software}"
 
     @staticmethod
     def _identity_eligible_sql(alias: str = "") -> str:
@@ -5220,7 +5327,9 @@ class PollerService:
         mac_norm = self._normalize_mac(mac).replace(":", "").replace("-", "")
         rows = self._query(
             "SELECT id, mac, cmts, status, error_text, attempt_count, "
-            "next_attempt_at, last_attempt_at, created_at, started_at, finished_at "
+            "next_attempt_at, last_attempt_at, created_at, started_at, finished_at, "
+            "agent_task_id, agent_id, dispatched_at, dispatch_deadline_at, "
+            "response_received_at "
             "FROM modem_refresh_request "
             "WHERE LOWER(REPLACE(REPLACE(mac,':',''),'-','')) = LOWER(%s) "
             "ORDER BY id DESC LIMIT 1",
@@ -5562,23 +5671,30 @@ class PollerService:
             raise RuntimeError("Agent manager is unavailable")
         agent = None
         agent_token: tuple[str, int] | None = None
-        for agent_id in agent_manager.get_all_agent_ids_for_capability("cm_reachable"):
-            candidate = agent_manager.get_agent(agent_id)
-            if not candidate:
-                continue
-            token = (candidate.agent_id, id(candidate.websocket))
-            self._identity_blocked_agents = {
-                blocked
-                for blocked in self._identity_blocked_agents
-                if blocked[0] != candidate.agent_id or blocked == token
-            }
-            if token not in self._identity_blocked_agents:
-                agent = candidate
-                agent_token = token
-                break
+        with self._identity_agent_lock:
+            capable_agent_ids = agent_manager.get_all_agent_ids_for_capability(
+                "cm_reachable"
+            )
+            for _ in capable_agent_ids:
+                agent_id = agent_manager.get_agent_id_for_capability("cm_reachable")
+                if not agent_id:
+                    break
+                candidate = agent_manager.get_agent(agent_id)
+                if not candidate:
+                    continue
+                token = (candidate.agent_id, id(candidate.websocket))
+                self._identity_blocked_agents = {
+                    blocked
+                    for blocked in self._identity_blocked_agents
+                    if blocked[0] != candidate.agent_id or blocked == token
+                }
+                if token not in self._identity_blocked_agents:
+                    agent = candidate
+                    agent_token = token
+                    break
         if not agent or not agent_token:
             raise _IdentityDispatchBlocked(
-                "Identity dispatch is paused until a timed-out agent reconnects"
+                "Identity dispatch is paused until an available agent reconnects"
             )
 
         params = {
@@ -5597,13 +5713,14 @@ class PollerService:
             agent.agent_id,
             "snmp_bulk_get",
             params,
-            timeout=30,
+            timeout=70,
             priority="bulk",
         )
         if not result or result.get("type") != "response":
             error = str((result or {}).get("error") or "Agent identity task timed out")
             if "timeout" in error.lower():
-                self._identity_blocked_agents.add(agent_token)
+                with self._identity_agent_lock:
+                    self._identity_blocked_agents.add(agent_token)
             raise RuntimeError(error)
         response = result.get("result") or {}
         if response.get("success") is not True:
@@ -5639,11 +5756,33 @@ class PollerService:
     def _identity_queue_depth(self) -> int:
         try:
             return max(
-                1,
-                min(int(os.environ.get("DATA_STORE_IDENTITY_QUEUE_DEPTH", "4")), 20),
+                128,
+                min(
+                    int(os.environ.get("DATA_STORE_IDENTITY_QUEUE_DEPTH", "1024")),
+                    10000,
+                ),
             )
         except (TypeError, ValueError):
-            return 4
+            return 1024
+
+    @staticmethod
+    def _identity_max_in_flight() -> int:
+        """Global bound for asynchronous modem identity tasks."""
+        try:
+            return max(
+                16,
+                min(
+                    int(
+                        os.environ.get(
+                            "DATA_STORE_IDENTITY_MAX_IN_FLIGHT",
+                            "128",
+                        )
+                    ),
+                    512,
+                ),
+            )
+        except (TypeError, ValueError):
+            return 128
 
     @staticmethod
     def _identity_max_attempts() -> int:
@@ -5681,14 +5820,23 @@ class PollerService:
             try:
                 conn.begin()
                 cur = conn.cursor()
+                stale_eligible = self._identity_eligible_sql("i")
+                cur.execute(
+                    "DELETE r FROM modem_refresh_request r "
+                    "LEFT JOIN modem_inventory_current i ON i.mac=r.mac "
+                    "WHERE r.status='queued' AND r.requested_by=%s "
+                    f"AND (i.mac IS NULL OR NOT COALESCE(({stale_eligible}), FALSE))",
+                    (_IDENTITY_REQUEST_SOURCE,),
+                )
                 cur.execute(
                     "SELECT COUNT(*) AS c FROM modem_refresh_request "
-                    "WHERE status IN ('queued','running')"
+                    "WHERE status IN ('queued','running') AND requested_by=%s",
+                    (_IDENTITY_REQUEST_SOURCE,),
                 )
                 active = int((cur.fetchone() or {}).get("c") or 0)
                 available = self._identity_queue_depth() - active
                 if available <= 0:
-                    conn.rollback()
+                    conn.commit()
                     return 0
 
                 cur.execute(
@@ -5698,7 +5846,7 @@ class PollerService:
                 state = cur.fetchone() or {}
                 next_scan_at = state.get("next_scan_at")
                 if next_scan_at and next_scan_at > datetime.now():
-                    conn.rollback()
+                    conn.commit()
                     return 0
                 cursor_mac = str(state.get("cursor_mac") or "")
                 eligible = self._identity_eligible_sql()
@@ -5777,6 +5925,537 @@ class PollerService:
             finally:
                 conn.close()
 
+    def _identity_event_callback(self, event: dict) -> None:
+        """Keep agent-loop callbacks nonblocking; DB work stays on the worker."""
+        self._identity_events.put_nowait(dict(event))
+
+    def _claim_next_identity_request(self, agent_id: str) -> Dict[str, Any] | None:
+        """Durably claim one identity row and snapshot its dispatch target."""
+        now = self._now()
+        deadline = (
+            datetime.now(timezone.utc) + timedelta(seconds=12)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        claim_token = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
+        eligible = self._identity_eligible_sql("i")
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT r.id, r.mac, r.cmts, r.attempt_count, "
+                    "i.ip AS target_ip, "
+                    "i.cmts_ip AS target_cmts_ip, i.updated_at AS target_updated_at "
+                    "FROM modem_refresh_request r "
+                    "JOIN modem_inventory_current i ON i.mac=r.mac "
+                    "WHERE r.status='queued' AND r.requested_by=%s "
+                    "AND (r.next_attempt_at IS NULL "
+                    "OR r.next_attempt_at<=UTC_TIMESTAMP()) "
+                    f"AND {eligible} "
+                    "ORDER BY COALESCE(r.next_attempt_at, r.created_at), r.id "
+                    "LIMIT 1 FOR UPDATE",
+                    (_IDENTITY_REQUEST_SOURCE,),
+                )
+                request = cur.fetchone()
+                if not request:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "UPDATE modem_refresh_request SET status='running', "
+                    "started_at=%s, finished_at=NULL, next_attempt_at=NULL, "
+                    "claim_token=%s, agent_task_id=%s, agent_id=%s, "
+                    "dispatched_at=NULL, dispatch_deadline_at=%s, "
+                    "response_received_at=NULL, target_ip=%s, target_cmts_ip=%s, "
+                    "target_inventory_updated_at=%s, error_text=NULL "
+                    "WHERE id=%s AND status='queued' AND requested_by=%s",
+                    (
+                        now,
+                        claim_token,
+                        task_id,
+                        agent_id,
+                        deadline,
+                        request.get("target_ip"),
+                        request.get("target_cmts_ip"),
+                        request.get("target_updated_at"),
+                        int(request["id"]),
+                        _IDENTITY_REQUEST_SOURCE,
+                    ),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                claimed = dict(request)
+                claimed.update(
+                    {
+                        "claim_token": claim_token,
+                        "agent_task_id": task_id,
+                        "agent_id": agent_id,
+                    }
+                )
+                return claimed
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _dispatch_identity_tasks(self) -> int:
+        """Fill available agent slots without waiting for task responses."""
+        from pypnm.api.agent.manager import get_agent_manager
+
+        manager = get_agent_manager()
+        if not manager:
+            return 0
+        rows = self._query(
+            "SELECT COUNT(*) AS c FROM modem_refresh_request "
+            "WHERE status='running' AND requested_by=%s",
+            (_IDENTITY_REQUEST_SOURCE,),
+        )
+        running = int((rows[0] or {}).get("c") or 0) if rows else 0
+        available = self._identity_max_in_flight() - running
+        dispatched = 0
+        for _ in range(max(0, available)):
+            agent_id = manager.get_agent_id_for_capability(
+                "cm_reachable",
+                priority="identity",
+            )
+            if not agent_id:
+                break
+            request = self._claim_next_identity_request(agent_id)
+            if not request:
+                break
+            task_id = str(request["agent_task_id"])
+            params = {
+                "target_ip": str(request.get("target_ip") or "").strip(),
+                "oids": [
+                    _IDENTITY_SYSDESCR_OID,
+                    _IDENTITY_FIRMWARE_OID,
+                    _IDENTITY_DOCSIS_CAPABILITY_OID,
+                ],
+                "target_role": "cm",
+                "timeout": 2,
+                "retries": 0,
+                "max_concurrent": 3,
+                "allow_public_fallback": False,
+            }
+            try:
+                manager.send_task_fire_and_forget(
+                    agent_id,
+                    "snmp_bulk_get",
+                    params,
+                    task_id=task_id,
+                    callback=self._identity_event_callback,
+                    timeout=8,
+                    priority="identity",
+                )
+            except Exception as exc:
+                self._identity_event_callback(
+                    {
+                        "type": "error",
+                        "request_id": task_id,
+                        "error": str(exc),
+                        "terminal_reason": "send_failed",
+                    }
+                )
+            dispatched += 1
+        return dispatched
+
+    def _expire_identity_dispatches(self) -> None:
+        rows = self._query(
+            "SELECT agent_task_id FROM modem_refresh_request "
+            "WHERE status='running' AND requested_by=%s "
+            "AND dispatch_deadline_at<=UTC_TIMESTAMP() "
+            "AND agent_task_id IS NOT NULL LIMIT 512",
+            (_IDENTITY_REQUEST_SOURCE,),
+        )
+        for row in rows:
+            self._identity_event_callback(
+                {
+                    "type": "error",
+                    "request_id": row.get("agent_task_id"),
+                    "error": "Identity dispatch deadline expired",
+                    "terminal_reason": "dispatch_timeout",
+                }
+            )
+
+    def _acknowledge_identity_dispatch_cursor(
+        self,
+        cur,
+        *,
+        request: Dict[str, Any],
+        now: str,
+    ) -> bool:
+        """Durably consume one attempt after the WebSocket send succeeds."""
+        if request.get("dispatched_at"):
+            return False
+        deadline = (
+            datetime.now(timezone.utc) + timedelta(seconds=12)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute(
+            "UPDATE modem_refresh_request SET attempt_count=attempt_count+1, "
+            "last_attempt_at=%s, dispatched_at=%s, dispatch_deadline_at=%s "
+            "WHERE id=%s AND status='running' AND agent_task_id=%s "
+            "AND claim_token=%s AND agent_id=%s AND dispatched_at IS NULL",
+            (
+                now,
+                now,
+                deadline,
+                int(request["id"]),
+                str(request.get("agent_task_id") or ""),
+                str(request.get("claim_token") or ""),
+                str(request.get("agent_id") or ""),
+            ),
+        )
+        if int(cur.rowcount or 0) != 1:
+            raise RuntimeError(
+                f"Identity task {request.get('agent_task_id')} send acknowledgement "
+                "lost ownership"
+            )
+        request["attempt_count"] = int(request.get("attempt_count") or 0) + 1
+        request["dispatched_at"] = now
+        request["dispatch_deadline_at"] = deadline
+        return True
+
+    def _transition_identity_failure_cursor(
+        self,
+        cur,
+        *,
+        request: Dict[str, Any],
+        error_text: str,
+        now: str,
+    ) -> None:
+        request_id = int(request["id"])
+        task_id = str(request.get("agent_task_id") or "")
+        claim_token = str(request.get("claim_token") or "")
+        attempt_count = int(request.get("attempt_count") or 0)
+        if not request.get("dispatched_at"):
+            next_attempt_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=2)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute(
+                "UPDATE modem_refresh_request SET status='queued', "
+                "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
+                "claim_token=NULL, agent_task_id=NULL, agent_id=NULL, "
+                "dispatched_at=NULL, dispatch_deadline_at=NULL, "
+                "response_received_at=%s, error_text=%s "
+                "WHERE id=%s AND status='running' AND agent_task_id=%s "
+                "AND claim_token=%s AND dispatched_at IS NULL",
+                (
+                    next_attempt_at,
+                    now,
+                    error_text[:500],
+                    request_id,
+                    task_id,
+                    claim_token,
+                ),
+            )
+            return
+        if attempt_count < self._identity_max_attempts():
+            delay = self._identity_retry_delay(attempt_count)
+            next_attempt_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=delay)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute(
+                "UPDATE modem_refresh_request SET status='queued', "
+                "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
+                "claim_token=NULL, agent_task_id=NULL, agent_id=NULL, "
+                "dispatched_at=NULL, dispatch_deadline_at=NULL, "
+                "response_received_at=%s, error_text=%s "
+                "WHERE id=%s AND status='running' AND agent_task_id=%s "
+                "AND claim_token=%s",
+                (
+                    next_attempt_at,
+                    now,
+                    error_text[:500],
+                    request_id,
+                    task_id,
+                    claim_token,
+                ),
+            )
+        else:
+            cur.execute(
+                "UPDATE modem_refresh_request SET status='failed', "
+                "finished_at=%s, next_attempt_at=NULL, claim_token=NULL, "
+                "dispatch_deadline_at=NULL, response_received_at=%s, "
+                "error_text=%s WHERE id=%s AND status='running' "
+                "AND agent_task_id=%s AND claim_token=%s",
+                (
+                    now,
+                    now,
+                    error_text[:500],
+                    request_id,
+                    task_id,
+                    claim_token,
+                ),
+            )
+            if int(cur.rowcount or 0) == 1:
+                cur.execute(
+                    "UPDATE inventory_identity_cursor SET "
+                    "failed_count=failed_count+1, last_error=%s, updated_at=%s "
+                    "WHERE id=1",
+                    (error_text[:500], now),
+                )
+
+    def _apply_identity_task_event(self, event: dict) -> None:
+        """Persist one asynchronous identity response or terminal transport error."""
+        task_id = str(event.get("request_id") or "")
+        if not task_id:
+            return
+        now = self._now()
+        response_event = event.get("type") == "response"
+        target = None
+        if response_event:
+            rows = self._query(
+                "SELECT target_cmts_ip, cmts FROM modem_refresh_request "
+                "WHERE agent_task_id=%s AND status='running'",
+                (task_id,),
+            )
+            target = rows[0] if rows else None
+            if not target:
+                return
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                if response_event:
+                    target_cmts_ip = str(
+                        (target or {}).get("target_cmts_ip") or ""
+                    ).strip()
+                    target_cmts = str(
+                        (target or {}).get("cmts") or target_cmts_ip
+                    ).strip()
+                    self._lock_inventory_snapshot_cursor(
+                        cur,
+                        cmts_ip=target_cmts_ip,
+                        cmts=target_cmts or target_cmts_ip,
+                        locked_at=now,
+                    )
+                cur.execute(
+                    "SELECT id, mac, cmts, status, attempt_count, claim_token, "
+                    "agent_task_id, agent_id, dispatched_at, dispatch_deadline_at, "
+                    "target_ip, target_cmts_ip, target_inventory_updated_at "
+                    "FROM modem_refresh_request "
+                    "WHERE agent_task_id=%s FOR UPDATE",
+                    (task_id,),
+                )
+                request = cur.fetchone()
+                if not request or str(request.get("status") or "") != "running":
+                    conn.rollback()
+                    return
+
+                event_type = str(event.get("type") or "")
+                if event_type == "sent":
+                    event_agent_id = str(event.get("agent_id") or "")
+                    if event_agent_id != str(request.get("agent_id") or ""):
+                        conn.rollback()
+                        return
+                    self._acknowledge_identity_dispatch_cursor(
+                        cur,
+                        request=request,
+                        now=now,
+                    )
+                    conn.commit()
+                    return
+
+                if event_type != "response":
+                    # An agent-originated error also proves that send_text
+                    # completed. Manager transport failures carry a terminal
+                    # reason and intentionally remain unacknowledged.
+                    if not event.get("terminal_reason"):
+                        self._acknowledge_identity_dispatch_cursor(
+                            cur,
+                            request=request,
+                            now=now,
+                        )
+                    self._transition_identity_failure_cursor(
+                        cur,
+                        request=request,
+                        error_text=str(event.get("error") or "Identity task failed"),
+                        now=now,
+                    )
+                    conn.commit()
+                    return
+
+                # A response proves the command crossed the send boundary. This
+                # also handles a very fast response arriving before its sent event.
+                self._acknowledge_identity_dispatch_cursor(
+                    cur,
+                    request=request,
+                    now=now,
+                )
+                response = event.get("result") or {}
+                if response.get("success") is not True:
+                    self._transition_identity_failure_cursor(
+                        cur,
+                        request=request,
+                        error_text=str(response.get("error") or "Identity task failed"),
+                        now=now,
+                    )
+                    conn.commit()
+                    return
+                oid_results = response.get("results") or {}
+                sys_descr = self._extract_agent_oid_value(
+                    oid_results,
+                    _IDENTITY_SYSDESCR_OID,
+                )
+                firmware = self._extract_agent_oid_value(
+                    oid_results,
+                    _IDENTITY_FIRMWARE_OID,
+                )
+                docsis_value = self._extract_agent_oid_value(
+                    oid_results,
+                    _IDENTITY_DOCSIS_CAPABILITY_OID,
+                )
+                identity = self._parse_modem_identity(sys_descr, firmware)
+                docsis_version = self._parse_docsis_capability(docsis_value)
+                if not any(identity.values()) and not docsis_version:
+                    self._transition_identity_failure_cursor(
+                        cur,
+                        request=request,
+                        error_text="Modem returned no usable identity values",
+                        now=now,
+                    )
+                    conn.commit()
+                    return
+
+                cmts_ip = str(request.get("target_cmts_ip") or "").strip()
+                cmts = str(request.get("cmts") or cmts_ip).strip()
+                cur.execute(
+                    "SELECT inventory_state, ip, cmts, cmts_ip, status, updated_at, "
+                    "vendor, model, software_version, docsis_version "
+                    "FROM modem_inventory_current WHERE mac=%s AND cmts_ip=%s "
+                    "FOR UPDATE",
+                    (request.get("mac"), cmts_ip),
+                )
+                inventory = cur.fetchone()
+                valid_statuses = {
+                    "operational",
+                    "registrationcomplete",
+                    "ipcomplete",
+                    "online",
+                }
+                if (
+                    not inventory
+                    or str(inventory.get("inventory_state") or "active") == "retired"
+                    or str(inventory.get("ip") or "").strip()
+                    != str(request.get("target_ip") or "").strip()
+                    or inventory.get("updated_at")
+                    != request.get("target_inventory_updated_at")
+                    or str(inventory.get("status") or "").strip().lower()
+                    not in valid_statuses
+                ):
+                    self._transition_identity_failure_cursor(
+                        cur,
+                        request=request,
+                        error_text="Inventory target changed during identity query",
+                        now=now,
+                    )
+                    conn.commit()
+                    return
+
+                before = {
+                    "vendor": inventory.get("vendor"),
+                    "model": inventory.get("model"),
+                    "software_version": inventory.get("software_version"),
+                    "docsis_version": inventory.get("docsis_version"),
+                }
+                after = {
+                    "vendor": self._clean_identity_value(identity.get("vendor"))
+                    or before["vendor"],
+                    "model": self._clean_identity_value(identity.get("model"))
+                    or before["model"],
+                    "software_version": self._clean_identity_value(
+                        identity.get("software_version")
+                    )
+                    or before["software_version"],
+                    "docsis_version": self._stronger_docsis_version(
+                        before["docsis_version"],
+                        docsis_version,
+                    ),
+                }
+                cur.execute(
+                    "UPDATE modem_inventory_current SET "
+                    "vendor=COALESCE(NULLIF(%s,''), vendor), "
+                    "model=COALESCE(NULLIF(%s,''), model), "
+                    "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                    "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
+                    "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
+                    "AND inventory_state<>'retired'",
+                    (
+                        after["vendor"],
+                        after["model"],
+                        after["software_version"],
+                        after["docsis_version"],
+                        now,
+                        request.get("mac"),
+                        cmts_ip,
+                    ),
+                )
+                self._apply_refresh_summary_delta_cursor(
+                    cur,
+                    cmts_ip=cmts_ip,
+                    cmts=cmts or cmts_ip,
+                    before=before,
+                    after=after,
+                    refreshed_at=now,
+                )
+                cur.execute(
+                    "UPDATE cmts_inventory_snapshot SET revision_at="
+                    "GREATEST(UTC_TIMESTAMP(), DATE_ADD(COALESCE(revision_at, "
+                    "collected_at, '1970-01-01 00:00:00'), INTERVAL 1 SECOND)) "
+                    "WHERE cmts_ip=%s",
+                    (cmts_ip,),
+                )
+                if not self._identity_row_is_enriched(after):
+                    self._transition_identity_failure_cursor(
+                        cur,
+                        request=request,
+                        error_text=(
+                            "Identity response did not include both vendor and firmware"
+                        ),
+                        now=now,
+                    )
+                    conn.commit()
+                    return
+
+                cur.execute(
+                    "UPDATE modem_refresh_request SET status='completed', "
+                    "finished_at=%s, response_received_at=%s, claim_token=NULL, "
+                    "dispatch_deadline_at=NULL WHERE id=%s AND status='running' "
+                    "AND agent_task_id=%s AND claim_token=%s",
+                    (
+                        now,
+                        now,
+                        int(request["id"]),
+                        task_id,
+                        request.get("claim_token"),
+                    ),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise RuntimeError(
+                        f"Identity task {task_id} completion lost ownership"
+                    )
+                cur.execute(
+                    "UPDATE inventory_identity_cursor SET "
+                    "completed_count=completed_count+1, last_error=NULL, "
+                    "updated_at=%s WHERE id=1",
+                    (now,),
+                )
+                cur.execute(
+                    "DELETE FROM modem_refresh_request WHERE id=%s "
+                    "AND requested_by=%s AND status='completed'",
+                    (int(request["id"]), _IDENTITY_REQUEST_SOURCE),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def _fetch_modem_identity(self, *, mac: str) -> Dict[str, Any]:
         payload = self.query_modem_identity(mac)
         if payload.get("success") is not True:
@@ -5799,15 +6478,15 @@ class PollerService:
     @classmethod
     def _identity_row_is_enriched(cls, row: Dict[str, Any]) -> bool:
         vendor = cls._stored_identity_value(row.get("vendor"))
-        model = cls._stored_identity_value(row.get("model"))
         software = cls._stored_identity_value(row.get("software_version"))
-        return vendor is not None and (software is not None or model is not None)
+        return vendor is not None and software is not None
 
     def _apply_refresh_summary_delta_cursor(
         self,
         cur,
         *,
         cmts_ip: str,
+        cmts: str,
         before: Dict[str, Any],
         after: Dict[str, Any],
         refreshed_at: str,
@@ -5818,10 +6497,17 @@ class PollerService:
             (cmts_ip,),
         )
         if not cur.fetchone():
-            raise RuntimeError(
-                f"Identity summary status is missing for CMTS {cmts_ip}"
+            # The inventory update is already visible in this transaction, so a
+            # full rebuild is both the repair and the post-update summary state.
+            self._refresh_summary_for_cmts_cursor(
+                cur,
+                cmts_ip=cmts_ip,
+                cmts=cmts or cmts_ip,
+                refreshed_at=refreshed_at,
             )
+            return
 
+        changes: list[tuple[str, str, str]] = []
         for dimension in ("vendor", "model", "software_version", "docsis_version"):
             if dimension in {"vendor", "model", "software_version"}:
                 old_value = self._summary_identity_value(before.get(dimension))
@@ -5838,10 +6524,16 @@ class PollerService:
             )
             old_bucket = cur.fetchone() or {}
             if int(old_bucket.get("row_count") or 0) <= 0:
-                raise RuntimeError(
-                    "Identity summary bucket is missing for "
-                    f"{cmts_ip}/{dimension}/{old_value}"
+                self._refresh_summary_for_cmts_cursor(
+                    cur,
+                    cmts_ip=cmts_ip,
+                    cmts=cmts or cmts_ip,
+                    refreshed_at=refreshed_at,
                 )
+                return
+            changes.append((dimension, old_value, new_value))
+
+        for dimension, old_value, new_value in changes:
             cur.execute(
                 "UPDATE inventory_summary_count SET row_count=row_count-1 "
                 "WHERE cmts_ip=%s AND dimension=%s AND value=%s AND row_count>0",
@@ -5874,39 +6566,63 @@ class PollerService:
             (enriched_delta, refreshed_at, refreshed_at, cmts_ip),
         )
 
+    def _claim_next_refresh_request(self) -> Optional[Dict[str, Any]]:
+        """Atomically lock and claim one due request for a refresh worker."""
+        claim_at = self._now()
+        claim_token = str(uuid.uuid4())
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, mac, cmts, requested_by "
+                    "FROM modem_refresh_request WHERE status='queued' "
+                    "AND COALESCE(requested_by,'')<>%s "
+                    "AND (next_attempt_at IS NULL "
+                    "OR next_attempt_at<=UTC_TIMESTAMP()) "
+                    "ORDER BY COALESCE(next_attempt_at, created_at), id ASC "
+                    "LIMIT 1 FOR UPDATE",
+                    (_IDENTITY_REQUEST_SOURCE,),
+                )
+                req = cur.fetchone()
+                if not req:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "UPDATE modem_refresh_request SET status='running', "
+                    "started_at=%s, finished_at=NULL, next_attempt_at=NULL, "
+                    "last_attempt_at=%s, attempt_count=attempt_count+1, "
+                    "claim_token=%s, error_text=NULL WHERE id=%s "
+                    "AND status='queued' "
+                    "AND (next_attempt_at IS NULL "
+                    "OR next_attempt_at<=UTC_TIMESTAMP())",
+                    (claim_at, claim_at, claim_token, int(req["id"])),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                claimed = dict(req)
+                claimed["claim_token"] = claim_token
+                return claimed
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def _process_refresh_queue(self) -> None:
-        """Process one queued modem refresh request."""
-        rows = self._query(
-            "SELECT id, mac, cmts, requested_by FROM modem_refresh_request "
-            "WHERE status='queued' "
-            "AND (next_attempt_at IS NULL OR next_attempt_at<=UTC_TIMESTAMP()) "
-            "ORDER BY COALESCE(next_attempt_at, created_at), id ASC LIMIT 1"
-        )
-        if not rows:
+        """Atomically claim and process one queued modem refresh request."""
+        req = self._claim_next_refresh_request()
+        if not req:
             return
-        req = rows[0]
         req_id = int(req["id"])
+        claim_token = str(req["claim_token"])
         mac = req["mac"]
         cmts = req.get("cmts")
         requested_by = str(req.get("requested_by") or "api")
         identity_only = requested_by == _IDENTITY_REQUEST_SOURCE
-
-        # Claim only if still queued; never resurrect a request cancelled
-        # between the SELECT and UPDATE.
-        claim_at = self._now()
-        self._execute(
-            "UPDATE modem_refresh_request SET status=%s, started_at=%s, "
-            "finished_at=NULL, next_attempt_at=NULL, last_attempt_at=%s, "
-            "attempt_count=attempt_count+1, error_text=NULL "
-            "WHERE id=%s AND status='queued' "
-            "AND (next_attempt_at IS NULL OR next_attempt_at<=UTC_TIMESTAMP())",
-            ("running", claim_at, claim_at, req_id),
-        )
-        claimed = self._query(
-            "SELECT status FROM modem_refresh_request WHERE id=%s", (req_id,)
-        )
-        if not claimed or str((claimed[0] or {}).get("status") or "") != "running":
-            return
         try:
             base = (os.environ.get("PYPNM_API_URL") or "http://127.0.0.1:8000").rstrip("/")
             modem = self.get_inventory_modem_by_mac(mac)
@@ -6048,14 +6764,17 @@ class PollerService:
                                 f"Modem {mac} Inventory changed during identity query"
                             )
                     cur.execute(
-                        "SELECT status FROM modem_refresh_request "
-                        "WHERE id=%s FOR UPDATE",
+                        "SELECT status, attempt_count, claim_token "
+                        "FROM modem_refresh_request WHERE id=%s FOR UPDATE",
                         (req_id,),
                     )
                     request_row = cur.fetchone() or {}
-                    if str(request_row.get("status") or "") != "running":
+                    if (
+                        str(request_row.get("status") or "") != "running"
+                        or str(request_row.get("claim_token") or "") != claim_token
+                    ):
                         raise RuntimeError(
-                            f"Refresh request {req_id} is no longer running"
+                            f"Refresh request {req_id} is no longer owned by this worker"
                         )
 
                     identity_before = {
@@ -6127,6 +6846,7 @@ class PollerService:
                     self._apply_refresh_summary_delta_cursor(
                         cur,
                         cmts_ip=cmts_address,
+                        cmts=cmts_label or cmts_address,
                         before=identity_before,
                         after=identity_after,
                         refreshed_at=now,
@@ -6138,10 +6858,64 @@ class PollerService:
                         "WHERE cmts_ip=%s",
                         (cmts_address,),
                     )
+                    if identity_only and not self._identity_row_is_enriched(
+                        identity_after
+                    ):
+                        incomplete_error = (
+                            "Identity response did not include both vendor and firmware"
+                        )
+                        attempt_count = int(request_row.get("attempt_count") or 0)
+                        if attempt_count < self._identity_max_attempts():
+                            next_attempt_at = (
+                                datetime.now(timezone.utc)
+                                + timedelta(
+                                    seconds=self._identity_retry_delay(attempt_count)
+                                )
+                            ).strftime("%Y-%m-%d %H:%M:%S")
+                            cur.execute(
+                                "UPDATE modem_refresh_request SET status='queued', "
+                                "started_at=NULL, finished_at=NULL, "
+                                "next_attempt_at=%s, claim_token=NULL, error_text=%s "
+                                "WHERE id=%s AND status='running' "
+                                "AND claim_token=%s",
+                                (
+                                    next_attempt_at,
+                                    incomplete_error,
+                                    req_id,
+                                    claim_token,
+                                ),
+                            )
+                            transitioned = int(cur.rowcount or 0)
+                        else:
+                            cur.execute(
+                                "UPDATE modem_refresh_request SET status='failed', "
+                                "finished_at=%s, next_attempt_at=NULL, "
+                                "claim_token=NULL, error_text=%s "
+                                "WHERE id=%s AND status='running' "
+                                "AND claim_token=%s",
+                                (now, incomplete_error, req_id, claim_token),
+                            )
+                            transitioned = int(cur.rowcount or 0)
+                            if transitioned == 1:
+                                cur.execute(
+                                    "UPDATE inventory_identity_cursor SET "
+                                    "failed_count=failed_count+1, last_error=%s, "
+                                    "updated_at=%s WHERE id=1",
+                                    (incomplete_error, now),
+                                )
+                        if transitioned != 1:
+                            raise RuntimeError(
+                                f"Refresh request {req_id} incomplete transition "
+                                "lost a race"
+                            )
+                        conn.commit()
+                        return
+
                     cur.execute(
                         "UPDATE modem_refresh_request SET status=%s, "
-                        "finished_at=%s WHERE id=%s AND status='running'",
-                        ("completed", now, req_id),
+                        "finished_at=%s, claim_token=NULL WHERE id=%s "
+                        "AND status='running' AND claim_token=%s",
+                        ("completed", now, req_id, claim_token),
                     )
                     if int(cur.rowcount or 0) != 1:
                         raise RuntimeError(
@@ -6174,12 +6948,15 @@ class PollerService:
                     conn.begin()
                     cur = conn.cursor()
                     cur.execute(
-                        "SELECT status, attempt_count FROM modem_refresh_request "
-                        "WHERE id=%s FOR UPDATE",
+                        "SELECT status, attempt_count, claim_token "
+                        "FROM modem_refresh_request WHERE id=%s FOR UPDATE",
                         (req_id,),
                     )
                     request = cur.fetchone() or {}
-                    if str(request.get("status") or "") != "running":
+                    if (
+                        str(request.get("status") or "") != "running"
+                        or str(request.get("claim_token") or "") != claim_token
+                    ):
                         conn.rollback()
                         return
                     attempt_count = int(request.get("attempt_count") or 0)
@@ -6191,8 +6968,9 @@ class PollerService:
                             "UPDATE modem_refresh_request SET status='queued', "
                             "attempt_count=GREATEST(attempt_count-1,0), "
                             "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
-                            "error_text=%s WHERE id=%s AND status='running'",
-                            (next_attempt_at, error_text, req_id),
+                            "claim_token=NULL, error_text=%s WHERE id=%s "
+                            "AND status='running' AND claim_token=%s",
+                            (next_attempt_at, error_text, req_id, claim_token),
                         )
                     elif identity_only and attempt_count < self._identity_max_attempts():
                         delay = self._identity_retry_delay(attempt_count)
@@ -6202,15 +6980,17 @@ class PollerService:
                         cur.execute(
                             "UPDATE modem_refresh_request SET status='queued', "
                             "started_at=NULL, finished_at=NULL, next_attempt_at=%s, "
-                            "error_text=%s WHERE id=%s AND status='running'",
-                            (next_attempt_at, error_text, req_id),
+                            "claim_token=NULL, error_text=%s WHERE id=%s "
+                            "AND status='running' AND claim_token=%s",
+                            (next_attempt_at, error_text, req_id, claim_token),
                         )
                     else:
                         cur.execute(
                             "UPDATE modem_refresh_request SET status='failed', "
-                            "finished_at=%s, next_attempt_at=NULL, error_text=%s "
-                            "WHERE id=%s AND status='running'",
-                            (failed_at, error_text, req_id),
+                            "finished_at=%s, next_attempt_at=NULL, claim_token=NULL, "
+                            "error_text=%s WHERE id=%s AND status='running' "
+                            "AND claim_token=%s",
+                            (failed_at, error_text, req_id, claim_token),
                         )
                         if identity_only and int(cur.rowcount or 0) == 1:
                             cur.execute(

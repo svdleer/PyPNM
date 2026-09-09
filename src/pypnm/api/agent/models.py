@@ -8,13 +8,16 @@ import time
 
 @dataclass
 class PendingTask:
-    """Represents a task waiting for agent response."""
+    """Represents a task waiting for an agent response or callback."""
     task_id: str
     command: str
     params: dict
-    callback: Optional[Callable] = None
+    callback: Optional[Callable[[dict], None]] = None
     created_at: float = field(default_factory=time.time)
     timeout: float = 30.0
+    priority: str = "interactive"
+    agent_connection: Any = None
+    timeout_handle: Any = None
     result: Optional[dict] = None
     completed: bool = False
     error: Optional[str] = None
@@ -26,6 +29,8 @@ class ConnectedAgent:
     agent_id: str
     websocket: Any  # FastAPI WebSocket connection
     capabilities: list[str]
+    limits: dict[str, int] = field(default_factory=dict)
+    in_flight: dict[str, int] = field(default_factory=dict)
     connected_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     authenticated: bool = False
@@ -39,6 +44,8 @@ class ConnectedAgent:
         return {
             'agent_id': self.agent_id,
             'capabilities': self.capabilities,
+            'limits': dict(self.limits),
+            'in_flight': dict(self.in_flight),
             'connected_at': self.connected_at,
             'last_seen': self.last_seen,
             'authenticated': self.authenticated,
