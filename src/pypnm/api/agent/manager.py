@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import deque
 from queue import Queue, Empty
-from threading import Lock
+from threading import Lock, Timer
 from typing import Optional
 from fastapi import WebSocket
 
@@ -147,7 +147,7 @@ class AgentManager:
 
         if not task:
             return False
-        if success and agent_id:
+        if success and agent_id and task.priority != "identity":
             self._record_agent_success(agent_id)
 
         if callback is not None:
@@ -170,7 +170,7 @@ class AgentManager:
             agent_id = self._task_agent_ids.get(task_id)
         if not task or task.completed or task.callback is None:
             return
-        if agent_id:
+        if agent_id and task.priority != "identity":
             self._record_agent_timeout(agent_id)
         event = {
             'type': 'error',
@@ -537,8 +537,12 @@ class AgentManager:
         callback=None,
         sent_callback=None,
         create_waiters: bool = True,
+        send_deadline: float | None = None,
+        claim_send_outcome=None,
     ) -> str:
         """Send a task with optional sent and terminal event callbacks."""
+        if send_deadline is not None and time.monotonic() >= send_deadline:
+            raise TimeoutError(f"Agent task {task_id or '<new>'} send deadline expired")
         if command in self.LONG_COMMANDS:
             if timeout < self.LONG_TASK_TIMEOUT:
                 timeout = self.LONG_TASK_TIMEOUT
@@ -587,19 +591,29 @@ class AgentManager:
 
         try:
             await agent.websocket.send_text(msg)
+        except asyncio.CancelledError:
+            self.logger.warning("Cancelled pending send for task %s", task_id)
+            self._cleanup_task(task_id)
+            raise
         except BaseException as exc:
             self.logger.error(f"Failed to send task {task_id} to '{agent_id}': {exc}")
             if callback is not None:
-                self._deliver_task_event({
-                    'type': 'error',
-                    'request_id': task_id,
-                    'error': str(exc),
-                    'terminal_reason': 'send_failed',
-                })
+                if claim_send_outcome is None or claim_send_outcome("failed"):
+                    self._deliver_task_event({
+                        'type': 'error',
+                        'request_id': task_id,
+                        'error': str(exc),
+                        'terminal_reason': 'send_failed',
+                    })
+                else:
+                    self._cleanup_task(task_id)
             else:
                 self._cleanup_task(task_id)
                 raise
         else:
+            if claim_send_outcome is not None and not claim_send_outcome("sent"):
+                self._cleanup_task(task_id)
+                return task_id
             if sent_callback is not None:
                 try:
                     sent_callback({
@@ -644,33 +658,70 @@ class AgentManager:
         loop = self._event_loop
         if loop is None or not loop.is_running():
             raise RuntimeError("Agent manager event loop is unavailable")
+        callback_timeout = float(timeout)
+        if callback_timeout <= 0:
+            raise ValueError("Agent task timeout must be greater than zero")
+        send_timeout = min(10.0, callback_timeout)
+        send_deadline = time.monotonic() + send_timeout
+        outcome_lock = Lock()
+        send_outcome: str | None = None
+
+        def _claim_send_outcome(outcome: str) -> bool:
+            nonlocal send_outcome
+            with outcome_lock:
+                if send_outcome is not None:
+                    return False
+                send_outcome = outcome
+                return True
+
         future = asyncio.run_coroutine_threadsafe(
             self.send_task(
                 agent_id,
                 command,
                 params,
-                timeout=timeout,
+                timeout=callback_timeout,
                 priority=priority,
                 task_id=task_id,
                 callback=callback,
                 sent_callback=callback,
                 create_waiters=False,
+                send_deadline=send_deadline,
+                claim_send_outcome=_claim_send_outcome,
             ),
             loop,
         )
 
+        def _send_timed_out() -> None:
+            if not _claim_send_outcome("timeout"):
+                return
+            future.cancel()
+            callback({
+                'type': 'error',
+                'request_id': task_id,
+                'error': f'Agent task send timeout after {send_timeout}s',
+                'terminal_reason': 'send_failed',
+            })
+
+        send_timeout_handle = Timer(send_timeout, _send_timed_out)
+        send_timeout_handle.daemon = True
+
         def _send_completed(send_future) -> None:
+            send_timeout_handle.cancel()
+            if send_future.cancelled():
+                return
             try:
                 send_future.result()
             except Exception as exc:
-                callback({
-                    'type': 'error',
-                    'request_id': task_id,
-                    'error': str(exc),
-                    'terminal_reason': 'send_failed',
-                })
+                if _claim_send_outcome("failed"):
+                    callback({
+                        'type': 'error',
+                        'request_id': task_id,
+                        'error': str(exc),
+                        'terminal_reason': 'send_failed',
+                    })
 
         future.add_done_callback(_send_completed)
+        send_timeout_handle.start()
         return task_id
 
     def send_task_and_wait(
