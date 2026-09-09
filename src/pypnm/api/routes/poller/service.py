@@ -247,7 +247,18 @@ class PollerService:
                 missing_since DATETIME NULL,
                 consecutive_full_misses INT NOT NULL DEFAULT 0,
                 retired_at DATETIME NULL,
-                PRIMARY KEY (mac)
+                PRIMARY KEY (mac),
+                INDEX idx_inv_cmts (cmts, mac),
+                INDEX idx_inv_cmts_ip (cmts_ip),
+                INDEX idx_inv_fiber_node (fiber_node),
+                INDEX idx_inv_vendor (vendor),
+                INDEX idx_inv_model (model),
+                INDEX idx_inv_software_version (software_version),
+                INDEX idx_inv_docsis_version (docsis_version),
+                INDEX idx_inv_cmts_state (cmts_ip, inventory_state, mac),
+                INDEX idx_inv_retired (inventory_state, retired_at),
+                INDEX idx_inv_ip_state (ip, inventory_state, mac),
+                INDEX idx_inv_state_order (inventory_state, cmts, mac)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -854,18 +865,35 @@ class PollerService:
             "JOIN inventory_summary_status s ON s.cmts_ip=c.cmts_ip"
         )
 
-        # Indexes for listing/filtering (duplicate-index errors are harmless).
-        for idx_ddl in [
-            "CREATE INDEX idx_inv_cmts ON modem_inventory_current (cmts, mac)",
-            "CREATE INDEX idx_inv_cmts_ip ON modem_inventory_current (cmts_ip)",
-            "CREATE INDEX idx_inv_fiber_node ON modem_inventory_current (fiber_node)",
-            "CREATE INDEX idx_inv_cmts_state ON modem_inventory_current (cmts_ip, inventory_state, mac)",
-            "CREATE INDEX idx_inv_retired ON modem_inventory_current (inventory_state, retired_at)",
-        ]:
-            try:
-                self._execute(idx_ddl)
-            except Exception:
-                pass
+        # Existing deployments must apply these indexes as a serialized schema
+        # migration before starting the API. Runtime verification is deliberately
+        # read-only so module import never performs multi-million-row DDL.
+        required_inventory_indexes = {
+            "idx_inv_cmts",
+            "idx_inv_cmts_ip",
+            "idx_inv_fiber_node",
+            "idx_inv_vendor",
+            "idx_inv_model",
+            "idx_inv_software_version",
+            "idx_inv_docsis_version",
+            "idx_inv_cmts_state",
+            "idx_inv_retired",
+            "idx_inv_ip_state",
+            "idx_inv_state_order",
+        }
+        inventory_indexes = {
+            str(row.get("Key_name"))
+            for row in self._query("SHOW INDEX FROM modem_inventory_current")
+        }
+        missing_inventory_indexes = sorted(
+            required_inventory_indexes - inventory_indexes
+        )
+        if missing_inventory_indexes:
+            raise RuntimeError(
+                "Required modem inventory indexes are missing; apply the schema "
+                "migration before starting the API: "
+                + ", ".join(missing_inventory_indexes)
+            )
 
         self._execute(
             """
@@ -5052,7 +5080,7 @@ class PollerService:
         offset: int = 0,
         limit: int | None = None,
     ) -> Dict[str, Any]:
-        """Return one stable, filtered inventory page and its exact total."""
+        """Return one stable filtered page, with an exact total when inexpensive."""
         if limit is None:
             limit = self._cm_modem_limit_default()
         limit = max(1, min(int(limit or self._cm_modem_limit_default()), 50000))
@@ -5065,6 +5093,14 @@ class PollerService:
         normalized_area = self._normalize_inventory_area(area)
         where: List[str] = []
         params: List[Any] = []
+        resolved_search_type: Optional[str] = None
+        total_exact = True
+        index_hint_sql = ""
+        order_sql_override: Optional[str] = None
+
+        def literal_like_pattern(value: str, *, contains: bool = False) -> str:
+            escaped = value.replace("=", "==").replace("%", "=%").replace("_", "=_")
+            return f"%{escaped}%" if contains else escaped + "%"
         if state != "all":
             where.append("m.inventory_state=%s")
             params.append(state)
@@ -5093,8 +5129,50 @@ class PollerService:
 
         if search_value:
             search_text = str(search_value).strip()
-            sv = f"%{search_text.lower()}%"
-            normalized_search_type = str(search_type or "all").strip().lower()
+            normalized_search_type = str(search_type or "auto").strip().lower()
+            normalized_search_type = {
+                "all": "identity",
+                "firmware": "software",
+            }.get(normalized_search_type, normalized_search_type)
+            allowed_search_types = {
+                "auto",
+                "identity",
+                "mac",
+                "ip",
+                "vendor",
+                "model",
+                "software",
+                "docsis",
+                "fiber_node",
+                "name",
+                "cpe_ip",
+            }
+            if normalized_search_type not in allowed_search_types:
+                raise ValueError(
+                    "search_type must be one of: auto, mac, ip, vendor, model, "
+                    "software, docsis, fiber_node, identity, cpe_ip"
+                )
+
+            formatted_mac = self._normalize_mac(search_text)
+            try:
+                parsed_ip = ipaddress.ip_address(search_text)
+            except ValueError:
+                parsed_ip = None
+
+            if normalized_search_type == "auto":
+                if formatted_mac:
+                    normalized_search_type = "mac"
+                elif parsed_ip is not None:
+                    normalized_search_type = "ip"
+                elif cmts:
+                    normalized_search_type = "identity"
+                else:
+                    raise ValueError(
+                        "All-server text search requires a search field; select "
+                        "MAC, IP, vendor, model, software, DOCSIS, or fiber node"
+                    )
+            resolved_search_type = normalized_search_type
+
             if normalized_search_type == "cpe_ip":
                 cpe_query = self.normalize_cpe_search(search_text)
                 comparator = "c.ip_address LIKE %s" if cpe_query["prefix"] else "c.ip_address=%s"
@@ -5112,44 +5190,84 @@ class PollerService:
                     ]
                 )
             elif normalized_search_type == "ip":
-                where.append("LOWER(COALESCE(m.ip,'')) LIKE %s")
-                params.append(sv)
+                if parsed_ip is None:
+                    raise ValueError("IP search requires a complete valid IPv4 or IPv6 address")
+                canonical_ip = parsed_ip.compressed
+                where.append("(m.ip=%s OR m.cmts_ip=%s)")
+                params.extend([canonical_ip, canonical_ip])
+                if not cmts:
+                    index_hint_sql = (
+                        " USE INDEX (idx_inv_ip_state, idx_inv_cmts_state)"
+                    )
+                    order_sql_override = "m.mac ASC"
             elif normalized_search_type == "mac":
-                mac_norm = (
+                mac_compact = (
                     search_text.lower()
                     .replace(":", "")
                     .replace("-", "")
                     .replace(".", "")
                     .replace(" ", "")
                 )
-                if len(mac_norm) == 12:
-                    formatted = ":".join(
-                        mac_norm[index:index + 2] for index in range(0, 12, 2)
-                    )
+                if not 2 <= len(mac_compact) <= 12 or any(
+                    character not in "0123456789abcdef" for character in mac_compact
+                ):
+                    raise ValueError("MAC search requires 2 to 12 hexadecimal characters")
+                if len(mac_compact) == 12:
                     dotted = ".".join(
-                        mac_norm[index:index + 4] for index in range(0, 12, 4)
+                        mac_compact[index:index + 4] for index in range(0, 12, 4)
                     )
                     where.append("m.mac IN (%s,%s,%s)")
-                    params.extend([formatted, mac_norm, dotted])
+                    params.extend([formatted_mac, mac_compact, dotted])
                 else:
-                    expression = (
-                        "LOWER(REPLACE(REPLACE(REPLACE(COALESCE(m.mac,''),"
-                        "':',''),'-',''),'.',''))"
+                    mac_prefix = ":".join(
+                        mac_compact[index:index + 2]
+                        for index in range(0, len(mac_compact), 2)
                     )
-                    where.append(f"{expression} LIKE %s")
-                    params.append(f"%{mac_norm}%")
+                    where.append("m.mac LIKE %s")
+                    params.append(mac_prefix + "%")
+                    total_exact = False
+                index_hint_sql = " FORCE INDEX (PRIMARY)"
+                order_sql_override = "m.mac ASC"
+            elif normalized_search_type in {
+                "vendor",
+                "model",
+                "software",
+                "docsis",
+                "fiber_node",
+            }:
+                if len(search_text) < 2:
+                    raise ValueError("Prefix search requires at least 2 characters")
+                search_columns = {
+                    "vendor": ("vendor", "idx_inv_vendor"),
+                    "model": ("model", "idx_inv_model"),
+                    "software": ("software_version", "idx_inv_software_version"),
+                    "docsis": ("docsis_version", "idx_inv_docsis_version"),
+                    "fiber_node": ("fiber_node", "idx_inv_fiber_node"),
+                }
+                column, index_name = search_columns[normalized_search_type]
+                where.append(f"m.{column} LIKE %s ESCAPE '='")
+                params.append(literal_like_pattern(search_text))
+                total_exact = False
+                if not cmts:
+                    index_hint_sql = f" FORCE INDEX ({index_name})"
+                    order_sql_override = f"m.{column} ASC, m.mac ASC"
             elif normalized_search_type == "name":
+                if not cmts:
+                    raise ValueError("All-server name search requires a selected CCAP")
+                prefix_value = literal_like_pattern(search_text)
                 where.append(
-                    "(LOWER(COALESCE(m.vendor,'')) LIKE %s OR "
-                    "LOWER(COALESCE(m.model,'')) LIKE %s OR "
-                    "LOWER(COALESCE(m.fiber_node,'')) LIKE %s)"
+                    "(m.vendor LIKE %s ESCAPE '=' OR "
+                    "m.model LIKE %s ESCAPE '=' OR "
+                    "m.fiber_node LIKE %s ESCAPE '=')"
                 )
-                params.extend([sv, sv, sv])
-            elif normalized_search_type == "fiber_node":
-                where.append("LOWER(COALESCE(m.fiber_node,'')) LIKE %s")
-                params.append(sv)
+                params.extend([prefix_value, prefix_value, prefix_value])
             else:
-                # identity/all is intentionally broad for operator discovery.
+                if not cmts:
+                    raise ValueError(
+                        "All-server contains search requires a selected CCAP or "
+                        "an explicit structured search field"
+                    )
+                sv = literal_like_pattern(search_text.lower(), contains=True)
                 broad_columns = (
                     "m.mac",
                     "m.ip",
@@ -5165,31 +5283,39 @@ class PollerService:
                 )
                 where.append(
                     "(" + " OR ".join(
-                        f"LOWER(COALESCE({column},'')) LIKE %s"
+                        f"LOWER(COALESCE({column},'')) LIKE %s ESCAPE '='"
                         for column in broad_columns
                     ) + ")"
                 )
                 params.extend([sv] * len(broad_columns))
 
         if interface_filter:
+            if not cmts:
+                raise ValueError("Interface filtering requires a selected CCAP")
             where.append(
-                "(LOWER(COALESCE(m.upstream_interface,'')) LIKE %s OR "
-                "LOWER(COALESCE(m.cable_mac,'')) LIKE %s)"
+                "(LOWER(COALESCE(m.upstream_interface,'')) LIKE %s ESCAPE '=' OR "
+                "LOWER(COALESCE(m.cable_mac,'')) LIKE %s ESCAPE '=')"
             )
-            interface_value = f"%{str(interface_filter).lower()}%"
+            interface_value = literal_like_pattern(
+                str(interface_filter).lower(), contains=True
+            )
             params.extend([interface_value, interface_value])
 
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
-        total_rows = self._query(
-            f"SELECT COUNT(*) AS c FROM modem_inventory_current m{where_sql}",
-            tuple(params),
-        )
-        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
-        order_sql = (
+        from_sql = f"FROM modem_inventory_current m{index_hint_sql}"
+        total: Optional[int] = None
+        if total_exact:
+            total_rows = self._query(
+                f"SELECT COUNT(*) AS c {from_sql}{where_sql}",
+                tuple(params),
+            )
+            total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+        order_sql = order_sql_override or (
             "m.mac ASC"
             if cmts and cmts_column == "m.cmts_ip"
             else "m.cmts ASC, m.mac ASC"
         )
+        query_limit = limit if total_exact else limit + 1
         rows = self._query(
             "SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.cmts_index, "
             "m.docsif3_index, m.fiber_node, m.cable_mac, m.mac_domain, m.status, "
@@ -5200,16 +5326,23 @@ class PollerService:
             "m.partial_service_downstream, m.partial_service_upstream, "
             "m.partial_service_state, m.software_version, m.inventory_state, "
             "m.missing_since, m.consecutive_full_misses, m.retired_at, m.updated_at "
-            f"FROM modem_inventory_current m{where_sql} "
+            f"{from_sql}{where_sql} "
             f"ORDER BY {order_sql} LIMIT %s OFFSET %s",
-            tuple(params + [limit, offset]),
+            tuple(params + [query_limit, offset]),
         )
-        modems = [self._map_inventory_row(row) for row in rows]
+        has_more_without_total = not total_exact and len(rows) > limit
+        page_rows = rows[:limit]
+        modems = [self._map_inventory_row(row) for row in page_rows]
         count = len(modems)
-        has_more = offset + count < total
+        has_more = (
+            offset + count < int(total or 0)
+            if total_exact
+            else has_more_without_total
+        )
         return {
             "modems": modems,
             "total": total,
+            "total_exact": total_exact,
             "count": count,
             "offset": offset,
             "limit": limit,
@@ -5217,6 +5350,7 @@ class PollerService:
             "next_offset": offset + count if has_more else None,
             "lifecycle_state": state,
             "area": normalized_area,
+            "search_type": resolved_search_type,
         }
 
     def list_inventory_modems(
