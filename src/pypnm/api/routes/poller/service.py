@@ -5185,6 +5185,11 @@ class PollerService:
             tuple(params),
         )
         total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+        order_sql = (
+            "m.mac ASC"
+            if cmts and cmts_column == "m.cmts_ip"
+            else "m.cmts ASC, m.mac ASC"
+        )
         rows = self._query(
             "SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.cmts_index, "
             "m.docsif3_index, m.fiber_node, m.cable_mac, m.mac_domain, m.status, "
@@ -5196,7 +5201,7 @@ class PollerService:
             "m.partial_service_state, m.software_version, m.inventory_state, "
             "m.missing_since, m.consecutive_full_misses, m.retired_at, m.updated_at "
             f"FROM modem_inventory_current m{where_sql} "
-            "ORDER BY m.cmts ASC, m.mac ASC LIMIT %s OFFSET %s",
+            f"ORDER BY {order_sql} LIMIT %s OFFSET %s",
             tuple(params + [limit, offset]),
         )
         modems = [self._map_inventory_row(row) for row in rows]
