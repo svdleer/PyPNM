@@ -2259,6 +2259,12 @@ class PollerService:
             _INVENTORY_RECONCILE_TASK_TYPE,
             _INVENTORY_FULL_TASK_TYPE,
         }
+        interface_enrichment_warning = (
+            "Optional CMTS interface enrichment unavailable"
+            if task_type == _INVENTORY_FULL_TASK_TYPE
+            and metadata.get("enriched") is not True
+            else None
+        )
 
         with self._db_lock:
             conn = self._connect()
@@ -2308,9 +2314,8 @@ class PollerService:
                     existing_macs.update(str(row.get("mac")) for row in cur.fetchall())
 
                 producer_authoritative = metadata.get("authoritative")
-                full_enrichment_complete = bool(
-                    metadata.get("enriched") is True
-                    and metadata.get("capability_enriched") is True
+                full_enrichment_complete = (
+                    metadata.get("capability_enriched") is True
                 )
                 authoritative = bool(
                     complete_input
@@ -2349,14 +2354,8 @@ class PollerService:
                 ):
                     authoritative = False
                     quarantined = True
-                    missing_parts = []
-                    if metadata.get("capability_enriched") is not True:
-                        missing_parts.append("capability tables")
-                    if metadata.get("enriched") is not True:
-                        missing_parts.append("CMTS interface enrichment")
                     quarantine_reason = (
-                        "daily full enrichment incomplete: "
-                        + ", ".join(missing_parts)
+                        "daily full enrichment incomplete: capability tables"
                     )
                 elif lifecycle_task and previous_count > 0:
                     shrink = previous_count - row_count
@@ -2580,6 +2579,13 @@ class PollerService:
                     ),
                 )
                 conn.commit()
+                if authoritative and interface_enrichment_warning:
+                    logger.warning(
+                        "Accepted daily full inventory for %s (%s) without "
+                        "optional CMTS interface enrichment",
+                        cmts_name,
+                        cmts_address,
+                    )
             except Exception:
                 conn.rollback()
                 raise
@@ -2596,6 +2602,9 @@ class PollerService:
             "quarantine_reason": quarantine_reason,
             "quarantine_candidate_count": quarantine_candidate_count,
             "collection_mode": collection_mode,
+            "interface_enrichment_warning": (
+                interface_enrichment_warning if authoritative else None
+            ),
             "area": derived_area,
         }
 
@@ -4037,6 +4046,9 @@ class PollerService:
                             "quarantine_candidate_count": persistence.get(
                                 "quarantine_candidate_count"
                             ),
+                            "interface_enrichment_warning": persistence.get(
+                                "interface_enrichment_warning"
+                            ),
                             "collection_mode": persistence.get("collection_mode"),
                             "truncated": fetch_result.get("truncated") is True,
                             "capability_enriched": (
@@ -4055,6 +4067,10 @@ class PollerService:
                                 f"CMTS {idx}/{total_targets}: {cmts_name} done "
                                 f"({len(modems)} modems)"
                             )
+                            if persistence.get("interface_enrichment_warning"):
+                                progress_message += (
+                                    " (optional interface enrichment unavailable)"
+                                )
                         else:
                             rejected_reason = str(
                                 persistence.get("quarantine_reason")
