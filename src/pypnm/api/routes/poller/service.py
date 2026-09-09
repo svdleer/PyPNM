@@ -363,6 +363,20 @@ class PollerService:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS inventory_shrink_candidate (
+                cmts_ip VARCHAR(45) NOT NULL,
+                collection_mode VARCHAR(16) NOT NULL,
+                candidate_count INT NOT NULL,
+                candidate_fingerprint CHAR(64) NULL,
+                candidate_macs MEDIUMTEXT NOT NULL,
+                observed_at DATETIME NOT NULL,
+                PRIMARY KEY (cmts_ip, collection_mode),
+                INDEX idx_shrink_candidate_observed (observed_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS inventory_summary_status (
                 cmts_ip VARCHAR(45) NOT NULL,
                 cmts VARCHAR(128) NOT NULL,
@@ -787,7 +801,7 @@ class PollerService:
                 continue
             classified_rows = self._query(
                 f"SELECT {area_sql} AS area FROM modem_inventory_current m "
-                "WHERE m.inventory_state<>'retired' AND m.cmts_ip=%s",
+                "WHERE m.inventory_state='active' AND m.cmts_ip=%s",
                 (cmts_ip,),
             )
             classified_area = str(
@@ -1492,7 +1506,7 @@ class PollerService:
         try:
             rows = self._query(
                 "SELECT DISTINCT cmts, cmts_ip FROM modem_inventory_current "
-                "WHERE inventory_state<>'retired' "
+                "WHERE inventory_state='active' "
                 "AND COALESCE(cmts_ip, '') <> '' LIMIT 2000"
             )
             out: List[Dict[str, Any]] = []
@@ -1966,7 +1980,7 @@ class PollerService:
     def _identity_eligible_sql(alias: str = "") -> str:
         prefix = f"{alias}." if alias else ""
         return (
-            f"{prefix}inventory_state<>'retired' "
+            f"{prefix}inventory_state='active' "
             f"AND {prefix}cmts_ip IS NOT NULL "
             f"AND TRIM({prefix}cmts_ip)<>'' "
             f"AND {prefix}ip IS NOT NULL "
@@ -2049,7 +2063,7 @@ class PollerService:
                 "(cmts_ip, dimension, value, row_count) "
                 f"SELECT %s, %s, {value_sql}, COUNT(*) "
                 "FROM modem_inventory_current "
-                "WHERE cmts_ip=%s AND inventory_state<>'retired' GROUP BY 3",
+                "WHERE cmts_ip=%s AND inventory_state='active' GROUP BY 3",
                 (cmts_ip, dimension, cmts_ip),
             )
         cur.execute(
@@ -2058,7 +2072,7 @@ class PollerService:
             "AS enriched, "
             f"{self._inventory_area_aggregate_sql()} AS area "
             "FROM modem_inventory_current "
-            "WHERE cmts_ip=%s AND inventory_state<>'retired'",
+            "WHERE cmts_ip=%s AND inventory_state='active'",
             (cmts_ip,),
         )
         status = cur.fetchone() or {}
@@ -2234,7 +2248,7 @@ class PollerService:
                             f"Poller job {job_id} is no longer running"
                         )
 
-                previous_snapshot = self._lock_inventory_snapshot_cursor(
+                self._lock_inventory_snapshot_cursor(
                     cur,
                     cmts_ip=cmts_address,
                     cmts=cmts_name,
@@ -2246,6 +2260,14 @@ class PollerService:
                     (cmts_address,),
                 )
                 previous_count = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT candidate_count, candidate_fingerprint, candidate_macs, "
+                    "TIMESTAMPDIFF(SECOND, observed_at, %s) AS candidate_age_seconds "
+                    "FROM inventory_shrink_candidate "
+                    "WHERE cmts_ip=%s AND collection_mode=%s FOR UPDATE",
+                    (now, cmts_address, collection_mode),
+                )
+                shrink_candidate = cur.fetchone() or {}
 
                 existing_macs: set[str] = set()
                 for offset in range(0, len(observed_macs), 500):
@@ -2312,22 +2334,47 @@ class PollerService:
                     shrink = previous_count - row_count
                     shrink_limit = max(100.0, previous_count * 0.10)
                     if shrink > shrink_limit:
+                        prior_candidate_count = int(
+                            shrink_candidate.get("candidate_count")
+                            if shrink_candidate.get("candidate_count") is not None
+                            else -1
+                        )
+                        candidate_tolerance = max(
+                            25,
+                            (max(prior_candidate_count, 0) + 99) // 100,
+                        )
+                        try:
+                            prior_candidate_macs = set(
+                                json.loads(shrink_candidate.get("candidate_macs") or "[]")
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            prior_candidate_macs = set()
+                        current_candidate_macs = set(observed_macs)
+                        overlap_denominator = max(
+                            len(prior_candidate_macs),
+                            len(current_candidate_macs),
+                            1,
+                        )
+                        overlap_ratio = (
+                            len(prior_candidate_macs & current_candidate_macs)
+                            / overlap_denominator
+                        )
+                        candidate_age_seconds = int(
+                            shrink_candidate.get("candidate_age_seconds")
+                            if shrink_candidate.get("candidate_age_seconds") is not None
+                            else -1
+                        )
+                        candidate_max_age_seconds = (
+                            6 * 60 * 60
+                            if collection_mode == "light"
+                            else 48 * 60 * 60
+                        )
                         candidate_matches = bool(
-                            int(
-                                previous_snapshot.get("quarantine_candidate_count")
-                                if previous_snapshot.get("quarantine_candidate_count")
-                                is not None
-                                else -1
-                            )
-                            == row_count
-                            and previous_snapshot.get(
-                                "quarantine_candidate_fingerprint"
-                            )
-                            == population_fingerprint
-                            and str(
-                                previous_snapshot.get("collection_mode") or ""
-                            )
-                            == collection_mode
+                            prior_candidate_count >= 0
+                            and abs(row_count - prior_candidate_count)
+                            <= candidate_tolerance
+                            and 0 <= candidate_age_seconds <= candidate_max_age_seconds
+                            and overlap_ratio >= 0.98
                         )
                         quarantine_candidate_count = row_count
                         quarantine_candidate_fingerprint = population_fingerprint
@@ -2338,6 +2385,32 @@ class PollerService:
                                 f"anomalous shrink from {previous_count} to "
                                 f"{row_count} rows"
                             )
+                            cur.execute(
+                                "INSERT INTO inventory_shrink_candidate "
+                                "(cmts_ip, collection_mode, candidate_count, "
+                                "candidate_fingerprint, candidate_macs, observed_at) "
+                                "VALUES (%s,%s,%s,%s,%s,%s) "
+                                "ON DUPLICATE KEY UPDATE "
+                                "candidate_count=VALUES(candidate_count), "
+                                "candidate_fingerprint=VALUES(candidate_fingerprint), "
+                                "candidate_macs=VALUES(candidate_macs), "
+                                "observed_at=VALUES(observed_at)",
+                                (
+                                    cmts_address,
+                                    collection_mode,
+                                    row_count,
+                                    population_fingerprint,
+                                    json.dumps(sorted(current_candidate_macs)),
+                                    now,
+                                ),
+                            )
+
+                if authoritative:
+                    cur.execute(
+                        "DELETE FROM inventory_shrink_candidate "
+                        "WHERE cmts_ip=%s AND collection_mode=%s",
+                        (cmts_address, collection_mode),
+                    )
 
                 written = 0
                 if authoritative:
@@ -2558,7 +2631,7 @@ class PollerService:
                         "ELSE COALESCE(NULLIF(%s,''),docsis_version) END, "
                         "updated_at=%s, source_poller=%s "
                         "WHERE mac=%s AND cmts_ip=%s "
-                        "AND inventory_state<>'retired'",
+                        "AND inventory_state='active'",
                         values,
                     )
                     written = int(cur.rowcount or 0)
@@ -2864,7 +2937,7 @@ class PollerService:
         if not address and name:
             rows = self._query(
                 "SELECT cmts_ip, cmts FROM modem_inventory_current "
-                "WHERE inventory_state<>'retired' AND "
+                "WHERE inventory_state='active' AND "
                 "(cmts=%s OR cmts_ip=%s) LIMIT 1",
                 (name, name),
             )
@@ -2906,7 +2979,16 @@ class PollerService:
                 conn.close()
 
     def _purge_retired_inventory(self, retention_days: int = 7) -> int:
-        """Hard-delete only retired rows whose audit window has elapsed."""
+        """Hard-delete retired rows only when explicitly enabled."""
+        purge_enabled = os.environ.get(
+            "DATA_STORE_RETIRED_PURGE_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not purge_enabled:
+            logger.info(
+                "Retired inventory purge disabled; set "
+                "DATA_STORE_RETIRED_PURGE_ENABLED=true to enable it"
+            )
+            return 0
         days = max(7, int(retention_days or 7))
         before = self._query(
             "SELECT COUNT(*) AS c FROM modem_inventory_current "
@@ -4959,107 +5041,240 @@ class PollerService:
             raise ValueError('Enter a valid IPv6 address prefix')
         return {'family': 'ipv6', 'value': address.compressed, 'prefix': True}
 
+    def list_inventory_modems_page(
+        self,
+        cmts: Optional[str] = None,
+        search_type: Optional[str] = None,
+        search_value: Optional[str] = None,
+        interface_filter: Optional[str] = None,
+        lifecycle_state: str = "active",
+        area: Optional[str] = "all",
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> Dict[str, Any]:
+        """Return one stable, filtered inventory page and its exact total."""
+        if limit is None:
+            limit = self._cm_modem_limit_default()
+        limit = max(1, min(int(limit or self._cm_modem_limit_default()), 50000))
+        offset = max(0, int(offset or 0))
+        state = str(lifecycle_state or "active").strip().lower()
+        if state not in {"active", "suspect_missing", "retired", "all"}:
+            raise ValueError(
+                "lifecycle_state must be one of: active, suspect_missing, retired, all"
+            )
+        normalized_area = self._normalize_inventory_area(area)
+        where: List[str] = []
+        params: List[Any] = []
+        if state != "all":
+            where.append("m.inventory_state=%s")
+            params.append(state)
+
+        if cmts:
+            cmts_value = str(cmts).strip()
+            try:
+                ipaddress.ip_address(cmts_value)
+                cmts_column = "m.cmts_ip"
+            except ValueError:
+                cmts_column = "m.cmts"
+            # Both columns use a case-insensitive collation in production. Direct
+            # equality keeps the predicate sargable so the existing indexes are used.
+            where.append(f"{cmts_column}=%s")
+            params.append(cmts_value)
+
+        if normalized_area != "all":
+            area_predicate, area_params = self._area_sql_predicate(
+                "s.area", normalized_area
+            )
+            where.append(
+                "EXISTS (SELECT 1 FROM inventory_summary_status s "
+                f"WHERE s.cmts_ip=m.cmts_ip AND {area_predicate})"
+            )
+            params.extend(area_params)
+
+        if search_value:
+            search_text = str(search_value).strip()
+            sv = f"%{search_text.lower()}%"
+            normalized_search_type = str(search_type or "all").strip().lower()
+            if normalized_search_type == "cpe_ip":
+                cpe_query = self.normalize_cpe_search(search_text)
+                comparator = "c.ip_address LIKE %s" if cpe_query["prefix"] else "c.ip_address=%s"
+                where.append(
+                    "EXISTS (SELECT 1 FROM modem_cpe_ip_current c "
+                    "WHERE c.modem_mac=m.mac AND c.cmts_ip=m.cmts_ip "
+                    f"AND c.address_family=%s AND {comparator})"
+                )
+                params.extend(
+                    [
+                        cpe_query["family"],
+                        cpe_query["value"] + "%"
+                        if cpe_query["prefix"]
+                        else cpe_query["value"],
+                    ]
+                )
+            elif normalized_search_type == "ip":
+                where.append("LOWER(COALESCE(m.ip,'')) LIKE %s")
+                params.append(sv)
+            elif normalized_search_type == "mac":
+                mac_norm = (
+                    search_text.lower()
+                    .replace(":", "")
+                    .replace("-", "")
+                    .replace(".", "")
+                    .replace(" ", "")
+                )
+                if len(mac_norm) == 12:
+                    formatted = ":".join(
+                        mac_norm[index:index + 2] for index in range(0, 12, 2)
+                    )
+                    dotted = ".".join(
+                        mac_norm[index:index + 4] for index in range(0, 12, 4)
+                    )
+                    where.append("m.mac IN (%s,%s,%s)")
+                    params.extend([formatted, mac_norm, dotted])
+                else:
+                    expression = (
+                        "LOWER(REPLACE(REPLACE(REPLACE(COALESCE(m.mac,''),"
+                        "':',''),'-',''),'.',''))"
+                    )
+                    where.append(f"{expression} LIKE %s")
+                    params.append(f"%{mac_norm}%")
+            elif normalized_search_type == "name":
+                where.append(
+                    "(LOWER(COALESCE(m.vendor,'')) LIKE %s OR "
+                    "LOWER(COALESCE(m.model,'')) LIKE %s OR "
+                    "LOWER(COALESCE(m.fiber_node,'')) LIKE %s)"
+                )
+                params.extend([sv, sv, sv])
+            elif normalized_search_type == "fiber_node":
+                where.append("LOWER(COALESCE(m.fiber_node,'')) LIKE %s")
+                params.append(sv)
+            else:
+                # identity/all is intentionally broad for operator discovery.
+                broad_columns = (
+                    "m.mac",
+                    "m.ip",
+                    "m.cmts",
+                    "m.cmts_ip",
+                    "m.fiber_node",
+                    "m.vendor",
+                    "m.model",
+                    "m.software_version",
+                    "m.docsis_version",
+                    "m.upstream_interface",
+                    "m.cable_mac",
+                )
+                where.append(
+                    "(" + " OR ".join(
+                        f"LOWER(COALESCE({column},'')) LIKE %s"
+                        for column in broad_columns
+                    ) + ")"
+                )
+                params.extend([sv] * len(broad_columns))
+
+        if interface_filter:
+            where.append(
+                "(LOWER(COALESCE(m.upstream_interface,'')) LIKE %s OR "
+                "LOWER(COALESCE(m.cable_mac,'')) LIKE %s)"
+            )
+            interface_value = f"%{str(interface_filter).lower()}%"
+            params.extend([interface_value, interface_value])
+
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        total_rows = self._query(
+            f"SELECT COUNT(*) AS c FROM modem_inventory_current m{where_sql}",
+            tuple(params),
+        )
+        total = int((total_rows[0] or {}).get("c") or 0) if total_rows else 0
+        rows = self._query(
+            "SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.cmts_index, "
+            "m.docsif3_index, m.fiber_node, m.cable_mac, m.mac_domain, m.status, "
+            "m.docsis_version, m.vendor, m.model, m.upstream_interface, "
+            "m.upstream_ifindex, m.ofdm_ifindex, m.ofdma_ifindex, "
+            "m.ofdm_channel_count, m.ofdma_channel_count, m.ofdma_rf_port_ifindex, "
+            "m.ofdm_enabled, m.ofdma_enabled, m.partial_service, "
+            "m.partial_service_downstream, m.partial_service_upstream, "
+            "m.partial_service_state, m.software_version, m.inventory_state, "
+            "m.missing_since, m.consecutive_full_misses, m.retired_at, m.updated_at "
+            f"FROM modem_inventory_current m{where_sql} "
+            "ORDER BY m.cmts ASC, m.mac ASC LIMIT %s OFFSET %s",
+            tuple(params + [limit, offset]),
+        )
+        modems = [self._map_inventory_row(row) for row in rows]
+        count = len(modems)
+        has_more = offset + count < total
+        return {
+            "modems": modems,
+            "total": total,
+            "count": count,
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + count if has_more else None,
+            "lifecycle_state": state,
+            "area": normalized_area,
+        }
+
     def list_inventory_modems(
         self,
         cmts: Optional[str] = None,
         search_type: Optional[str] = None,
         search_value: Optional[str] = None,
         interface_filter: Optional[str] = None,
+        lifecycle_state: str = "active",
+        area: Optional[str] = "all",
+        offset: int = 0,
         limit: int | None = None,
     ) -> List[Dict[str, Any]]:
-        if limit is None:
-            limit = self._cm_modem_limit_default()
-        limit = max(1, min(int(limit or self._cm_modem_limit_default()), 50000))
-        where = ["inventory_state<>'retired'"]
-        params: List[Any] = []
+        """Compatibility wrapper returning only the modem rows from one page."""
+        return self.list_inventory_modems_page(
+            cmts=cmts,
+            search_type=search_type,
+            search_value=search_value,
+            interface_filter=interface_filter,
+            lifecycle_state=lifecycle_state,
+            area=area,
+            offset=offset,
+            limit=limit,
+        )["modems"]
 
-        if cmts:
-            marker = "%s"
-            cmts_value = str(cmts).strip()
-            try:
-                ipaddress.ip_address(cmts_value)
-                cmts_column = "cmts_ip"
-            except ValueError:
-                cmts_column = "cmts"
-            # Both columns use a case-insensitive collation in production. Direct
-            # equality keeps the predicate sargable so the existing indexes are used.
-            where.append(f"{cmts_column} = {marker}")
-            params.append(cmts_value)
-
-        if search_value:
-            sv = f"%{str(search_value).lower()}%"
-            marker = "%s"
-            if search_type == "cpe_ip":
-                cpe_query = self.normalize_cpe_search(str(search_value))
-                comparator = (
-                    f"c.ip_address LIKE {marker}"
-                    if cpe_query['prefix'] else f"c.ip_address = {marker}"
-                )
-                where.append(
-                    "EXISTS (SELECT 1 FROM modem_cpe_ip_current c "
-                    f"WHERE c.modem_mac=modem_inventory_current.mac "
-                    f"AND c.cmts_ip=modem_inventory_current.cmts_ip "
-                    f"AND c.address_family={marker} AND {comparator})"
-                )
-                params.extend([
-                    cpe_query['family'],
-                    cpe_query['value'] + '%' if cpe_query['prefix'] else cpe_query['value'],
-                ])
-            elif search_type == "ip":
-                where.append(f"LOWER(COALESCE(ip,'')) LIKE {marker}")
-                params.append(sv)
-            elif search_type == "mac":
-                mac_norm = (
-                    str(search_value)
-                    .lower()
-                    .replace(":", "")
-                    .replace("-", "")
-                    .replace(".", "")
-                    .replace(" ", "")
-                )
-                marker = "%s"
-                if len(mac_norm) == 12:
-                    # Full MAC — use indexed primary-key candidates. Canonical
-                    # rows are first; bare/dotted candidates preserve upgrade
-                    # compatibility without applying functions to the column.
-                    formatted = ":".join(mac_norm[i:i+2] for i in range(0, 12, 2))
-                    dotted = ".".join(mac_norm[i:i+4] for i in range(0, 12, 4))
-                    where.append(f"mac IN ({marker}, {marker}, {marker})")
-                    params.extend([formatted, mac_norm, dotted])
-                    limit = 1
-                else:
-                    # Partial MAC — fall back to normalised LIKE scan
-                    expr = "LOWER(REPLACE(REPLACE(COALESCE(mac,''),':',''),'-',''))"
-                    where.append(f"{expr} LIKE {marker}")
-                    params.append(f"%{mac_norm}%")
-            elif search_type == "name":
-                where.append(
-                    f"(LOWER(COALESCE(vendor,'')) LIKE {marker} OR LOWER(COALESCE(model,'')) LIKE {marker} OR LOWER(COALESCE(fiber_node,'')) LIKE {marker})"
-                )
-                params.extend([sv, sv, sv])
-            elif search_type == "fiber_node":
-                where.append(f"LOWER(COALESCE(fiber_node,'')) LIKE {marker}")
-                params.append(sv)
-
-        if interface_filter:
-            marker = "%s"
-            where.append(f"(LOWER(COALESCE(upstream_interface,'')) LIKE {marker} OR LOWER(COALESCE(cable_mac,'')) LIKE {marker})")
-            params.append(f"%{str(interface_filter).lower()}%")
-
-        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
-        marker = "%s"
+    def list_inventory_interface_choices(self, cmts: str) -> Dict[str, List[str]]:
+        """Return active-only distinct interface labels for one CMTS."""
+        cmts_value = str(cmts or "").strip()
+        if not cmts_value:
+            raise ValueError("cmts is required")
+        try:
+            ipaddress.ip_address(cmts_value)
+            cmts_column = "cmts_ip"
+        except ValueError:
+            cmts_column = "cmts"
         rows = self._query(
-            "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
-            "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
-            "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
-            "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
-            "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-            "partial_service_upstream, partial_service_state, software_version, "
-            "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
-            f"FROM modem_inventory_current{where_sql} ORDER BY cmts ASC, mac ASC LIMIT {marker}",
-            tuple(params + [limit]),
+            "SELECT choice_type, choice_value FROM ("
+            "SELECT 'upstream_interface' AS choice_type, "
+            "TRIM(upstream_interface) AS choice_value "
+            "FROM modem_inventory_current WHERE inventory_state='active' "
+            f"AND {cmts_column}=%s AND COALESCE(TRIM(upstream_interface),'')<>'' "
+            "GROUP BY TRIM(upstream_interface) UNION ALL "
+            "SELECT 'cable_mac' AS choice_type, TRIM(cable_mac) AS choice_value "
+            "FROM modem_inventory_current WHERE inventory_state='active' "
+            f"AND {cmts_column}=%s AND COALESCE(TRIM(cable_mac),'')<>'' "
+            "GROUP BY TRIM(cable_mac)) choices "
+            "ORDER BY choice_type, choice_value",
+            (cmts_value, cmts_value),
         )
-        return [self._map_inventory_row(row) for row in rows]
+        upstream_interfaces = [
+            str(row.get("choice_value"))
+            for row in rows
+            if row.get("choice_type") == "upstream_interface"
+        ]
+        cable_macs = [
+            str(row.get("choice_value"))
+            for row in rows
+            if row.get("choice_type") == "cable_mac"
+        ]
+        return {
+            "upstream_interfaces": upstream_interfaces,
+            "cable_macs": cable_macs,
+        }
 
     def get_inventory_modem_by_mac(self, mac_address: str) -> Optional[Dict[str, Any]]:
         marker = "%s"
@@ -5076,7 +5291,7 @@ class PollerService:
             "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
             "partial_service_upstream, partial_service_state, software_version, "
             "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
-            f"FROM modem_inventory_current WHERE inventory_state<>'retired' "
+            f"FROM modem_inventory_current WHERE inventory_state='active' "
             f"AND mac IN ({marker}, {marker}, {marker}) "
             f"ORDER BY FIELD(mac, {marker}, {marker}, {marker}) LIMIT 1",
             (formatted, compact, dotted, formatted, compact, dotted),
@@ -5109,7 +5324,7 @@ class PollerService:
             "SELECT c.ip_address, c.address_family, c.modem_mac "
             "FROM modem_cpe_ip_current c JOIN modem_inventory_current m "
             "ON m.mac=c.modem_mac AND m.cmts_ip=c.cmts_ip "
-            "WHERE m.inventory_state<>'retired' LIMIT %s",
+            "WHERE m.inventory_state='active' LIMIT %s",
             (capped + 1,),
         )
         return {
@@ -5127,7 +5342,7 @@ class PollerService:
             "SELECT DISTINCT c.ip_address FROM modem_cpe_ip_current c "
             "JOIN modem_inventory_current m ON m.mac=c.modem_mac "
             "AND m.cmts_ip=c.cmts_ip "
-            f"WHERE m.inventory_state<>'retired' AND c.address_family=%s "
+            f"WHERE m.inventory_state='active' AND c.address_family=%s "
             f"AND c.ip_address {comparator} "
             "ORDER BY c.ip_address LIMIT %s",
             (normalized['family'], value, capped),
@@ -5160,7 +5375,7 @@ class PollerService:
                 "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
                 "partial_service_upstream, partial_service_state, software_version, "
             "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
-                f"FROM modem_inventory_current WHERE inventory_state<>'retired' "
+                f"FROM modem_inventory_current WHERE inventory_state='active' "
                 f"AND mac IN ({placeholders})",
                 tuple(batch),
             )
@@ -5389,7 +5604,7 @@ class PollerService:
             # name or address.
             rows = self._query(
                 "SELECT cmts_ip FROM modem_inventory_current "
-                "WHERE inventory_state<>'retired' AND "
+                "WHERE inventory_state='active' AND "
                 "(LOWER(cmts)=LOWER(%s) OR LOWER(cmts_ip)=LOWER(%s)) "
                 "AND cmts_ip IS NOT NULL LIMIT 1",
                 (cmts_name, cmts_name),
@@ -6339,7 +6554,7 @@ class PollerService:
                 }
                 if (
                     not inventory
-                    or str(inventory.get("inventory_state") or "active") == "retired"
+                    or str(inventory.get("inventory_state") or "") != "active"
                     or str(inventory.get("ip") or "").strip()
                     != str(request.get("target_ip") or "").strip()
                     or inventory.get("updated_at")
@@ -6383,7 +6598,7 @@ class PollerService:
                     "software_version=COALESCE(NULLIF(%s,''), software_version), "
                     "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                     "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
-                    "AND inventory_state<>'retired'",
+                    "AND inventory_state='active'",
                     (
                         after["vendor"],
                         after["model"],
@@ -6727,8 +6942,8 @@ class PollerService:
                     )
                     inventory_row = cur.fetchone()
                     if not inventory_row or str(
-                        inventory_row.get("inventory_state") or "active"
-                    ) == "retired":
+                        inventory_row.get("inventory_state") or ""
+                    ) != "active":
                         raise ValueError(
                             f"Modem {mac} is no longer active inventory"
                         )
@@ -6802,7 +7017,7 @@ class PollerService:
                             "software_version=COALESCE(NULLIF(%s,''), software_version), "
                             "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                             "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
-                            "AND inventory_state<>'retired'",
+                            "AND inventory_state='active'",
                             (
                                 vendor,
                                 model_name,
@@ -6830,7 +7045,7 @@ class PollerService:
                             "fiber_node=COALESCE(NULLIF(%s,''), fiber_node), "
                             "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                             "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
-                            "AND inventory_state<>'retired'",
+                            "AND inventory_state='active'",
                             (
                                 vendor,
                                 model_name,
@@ -7020,7 +7235,7 @@ class PollerService:
 
         inventory_rows = self._query(
             "SELECT COUNT(*) AS c FROM modem_inventory_current "
-            "WHERE inventory_state<>'retired'" + scope_sql,
+            "WHERE inventory_state='active'" + scope_sql,
             tuple(scope_params),
         )
         inventory_total = (
@@ -7048,15 +7263,17 @@ class PollerService:
                 "SELECT COUNT(*) AS c FROM modem_refresh_request r "
                 "JOIN modem_inventory_current i ON i.mac=r.mac "
                 "WHERE r.status IN ('queued','running') AND r.requested_by=%s "
-                "AND i.inventory_state<>'retired' "
+                "AND i.inventory_state='active' "
                 "AND (LOWER(COALESCE(i.cmts,''))=LOWER(%s) "
                 "OR LOWER(COALESCE(i.cmts_ip,''))=LOWER(%s))",
                 (_IDENTITY_REQUEST_SOURCE, cmts, cmts),
             )
         else:
             pending_rows = self._query(
-                "SELECT COUNT(*) AS c FROM modem_refresh_request "
-                "WHERE status IN ('queued','running') AND requested_by=%s",
+                "SELECT COUNT(*) AS c FROM modem_refresh_request r "
+                "JOIN modem_inventory_current i ON i.mac=r.mac "
+                "WHERE r.status IN ('queued','running') AND r.requested_by=%s "
+                "AND i.inventory_state='active'",
                 (_IDENTITY_REQUEST_SOURCE,),
             )
         pending = int((pending_rows[0] or {}).get("c") or 0) if pending_rows else 0
@@ -7185,10 +7402,13 @@ class PollerService:
             "model": "model",
             "vendor": "vendor",
             "firmware": "software_version",
+            "docsis": "docsis_version",
         }
         normalized_dimension = str(dimension or "").strip().lower()
         if normalized_dimension not in dimensions:
-            raise ValueError("dimension must be one of: model, vendor, firmware")
+            raise ValueError(
+                "dimension must be one of: model, vendor, firmware, docsis"
+            )
         storage_dimension = dimensions[normalized_dimension]
         normalized_area = self._normalize_inventory_area(area)
         try:
@@ -7337,7 +7557,7 @@ class PollerService:
                     f"{self._inventory_area_aggregate_sql()}, COUNT(*), "
                     f"SUM(CASE WHEN {self._inventory_enriched_sql()} THEN 1 ELSE 0 END), "
                     "MAX(updated_at), %s FROM modem_inventory_current "
-                    "WHERE inventory_state<>'retired' AND COALESCE(cmts_ip,'')<>'' "
+                    "WHERE inventory_state='active' AND COALESCE(cmts_ip,'')<>'' "
                     "GROUP BY cmts_ip",
                     (now,),
                 )
@@ -7363,7 +7583,7 @@ class PollerService:
                         "(cmts_ip, dimension, value, row_count) "
                         f"SELECT cmts_ip, %s, {value_sql}, COUNT(*) "
                         "FROM modem_inventory_current "
-                        "WHERE inventory_state<>'retired' AND COALESCE(cmts_ip,'')<>'' "
+                        "WHERE inventory_state='active' AND COALESCE(cmts_ip,'')<>'' "
                         "GROUP BY cmts_ip, 3",
                         (dimension,),
                     )

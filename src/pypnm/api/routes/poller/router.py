@@ -111,30 +111,36 @@ def list_inventory_modems(
     search_type: str | None = None,
     search_value: str | None = None,
     interface: str | None = None,
+    lifecycle_state: str = "active",
+    area: str = "all",
+    offset: int = Query(default=0, ge=0),
     limit: int | None = Query(default=None, ge=1, le=50000),
 ) -> dict:
+    """Return a stable inventory page; active lifecycle rows are the default."""
     if limit is None:
         limit = poller_service._cm_modem_limit_default()
 
     try:
-        modems = poller_service.list_inventory_modems(
+        page = poller_service.list_inventory_modems_page(
             cmts=cmts,
             search_type=search_type,
             search_value=search_value,
             interface_filter=interface,
+            lifecycle_state=lifecycle_state,
+            area=area,
+            offset=offset,
             limit=limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        logger.error(f"inventory/modems DB error: {exc}")
+        logger.error("inventory/modems DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     snapshot = poller_service.get_inventory_snapshot(cmts) if cmts else None
     response = {
         "status": "success",
-        "modems": modems,
-        "count": len(modems),
         "source": "pypnm-inventory",
+        **page,
     }
     if snapshot:
         response.update({
@@ -160,6 +166,21 @@ def list_inventory_modems(
             "area": snapshot.get("area") or "unknown",
         })
     return response
+
+
+@router.get("/inventory/interfaces")
+def list_inventory_interface_choices(
+    cmts: str = Query(min_length=1, max_length=128),
+) -> dict:
+    """Return active-only distinct upstream-interface and cable-MAC choices."""
+    try:
+        choices = poller_service.list_inventory_interface_choices(cmts)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/interfaces DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "cmts": cmts, **choices}
 
 
 @router.get("/inventory/snapshots/current")
@@ -231,7 +252,7 @@ def inventory_history(
     area: str = "all",
     top_n: int = Query(default=10, ge=1, le=100),
 ) -> dict:
-    """Return stable Top-N daily inventory history from stored aggregates."""
+    """Return stable Top-N model/vendor/firmware/DOCSIS daily history."""
     try:
         data = poller_service.get_inventory_history(
             dimension=dimension,
