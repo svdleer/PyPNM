@@ -5933,7 +5933,7 @@ class PollerService:
         """Durably claim one identity row and snapshot its dispatch target."""
         now = self._now()
         deadline = (
-            datetime.now(timezone.utc) + timedelta(seconds=45)
+            datetime.now(timezone.utc) + timedelta(seconds=60)
         ).strftime("%Y-%m-%d %H:%M:%S")
         claim_token = str(uuid.uuid4())
         task_id = str(uuid.uuid4())
@@ -6047,7 +6047,7 @@ class PollerService:
                     params,
                     task_id=task_id,
                     callback=self._identity_event_callback,
-                    timeout=30,
+                    timeout=45,
                     priority="identity",
                 )
             except Exception as exc:
@@ -6091,7 +6091,7 @@ class PollerService:
         if request.get("dispatched_at"):
             return False
         deadline = (
-            datetime.now(timezone.utc) + timedelta(seconds=45)
+            datetime.now(timezone.utc) + timedelta(seconds=60)
         ).strftime("%Y-%m-%d %H:%M:%S")
         cur.execute(
             "UPDATE modem_refresh_request SET attempt_count=attempt_count+1, "
