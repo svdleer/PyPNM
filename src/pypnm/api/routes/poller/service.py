@@ -7539,71 +7539,61 @@ class PollerService:
         }
 
     def rebuild_inventory_summaries(self) -> Dict[str, Any]:
-        """Recompute normalized summaries without performing source discovery."""
+        """Recompute summaries in bounded, restart-safe per-CMTS transactions."""
         started = time.perf_counter()
         now = self._now()
-        with self._db_lock:
-            conn = self._connect()
-            try:
-                conn.begin()
-                cur = conn.cursor()
-                cur.execute("DELETE FROM inventory_summary_count")
-                cur.execute("DELETE FROM inventory_summary_status")
-                cur.execute(
-                    "INSERT INTO inventory_summary_status "
-                    "(cmts_ip, cmts, area, active_total, enriched_count, "
-                    "last_updated, refreshed_at) "
-                    "SELECT cmts_ip, COALESCE(NULLIF(MAX(cmts),''), cmts_ip), "
-                    f"{self._inventory_area_aggregate_sql()}, COUNT(*), "
-                    f"SUM(CASE WHEN {self._inventory_enriched_sql()} THEN 1 ELSE 0 END), "
-                    "MAX(updated_at), %s FROM modem_inventory_current "
-                    "WHERE inventory_state='active' AND COALESCE(cmts_ip,'')<>'' "
-                    "GROUP BY cmts_ip",
-                    (now,),
-                )
-                status_rows = int(cur.rowcount or 0)
-                count_rows = 0
-                for dimension, column in (
-                    ("vendor", "vendor"),
-                    ("model", "model"),
-                    ("software_version", "software_version"),
-                    ("docsis_version", "docsis_version"),
-                ):
-                    if dimension in {"vendor", "model", "software_version"}:
-                        value_sql = (
-                            f"CASE WHEN {self._identity_value_sql(column)} "
-                            f"THEN TRIM({column}) ELSE '(unknown)' END"
+        targets = self._query(
+            "SELECT cmts_ip, MAX(cmts) AS cmts FROM ("
+            "SELECT cmts_ip, cmts FROM cmts_inventory_snapshot "
+            "WHERE COALESCE(cmts_ip,'')<>'' UNION ALL "
+            "SELECT cmts_ip, cmts FROM inventory_summary_status "
+            "WHERE COALESCE(cmts_ip,'')<>''"
+            ") inventory_targets GROUP BY cmts_ip ORDER BY cmts_ip"
+        )
+        status_rows = 0
+        conn = self._connect()
+        try:
+            for target in targets:
+                cmts_ip = str(target.get("cmts_ip") or "").strip()
+                if not cmts_ip:
+                    continue
+                cmts = str(target.get("cmts") or cmts_ip).strip() or cmts_ip
+                with self._db_lock:
+                    try:
+                        conn.begin()
+                        cur = conn.cursor()
+                        area = self._refresh_summary_for_cmts_cursor(
+                            cur,
+                            cmts_ip=cmts_ip,
+                            cmts=cmts,
+                            refreshed_at=now,
                         )
-                    else:
-                        value_sql = (
-                            f"COALESCE(NULLIF(TRIM({column}),''), '(unknown)')"
+                        cur.execute(
+                            "UPDATE cmts_inventory_snapshot SET area=%s "
+                            "WHERE cmts_ip=%s",
+                            (area, cmts_ip),
                         )
-                    cur.execute(
-                        "INSERT INTO inventory_summary_count "
-                        "(cmts_ip, dimension, value, row_count) "
-                        f"SELECT cmts_ip, %s, {value_sql}, COUNT(*) "
-                        "FROM modem_inventory_current "
-                        "WHERE inventory_state='active' AND COALESCE(cmts_ip,'')<>'' "
-                        "GROUP BY cmts_ip, 3",
-                        (dimension,),
-                    )
-                    count_rows += int(cur.rowcount or 0)
-                cur.execute(
-                    "UPDATE cmts_inventory_snapshot snap "
-                    "LEFT JOIN inventory_summary_status s ON s.cmts_ip=snap.cmts_ip "
-                    "SET snap.area=COALESCE(s.area,'unknown')"
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
+                        conn.commit()
+                        status_rows += 1
+                    except Exception:
+                        conn.rollback()
+                        raise
+        finally:
+            conn.close()
+        count_result = self._query(
+            "SELECT COUNT(*) AS c FROM inventory_summary_count"
+        )
+        count_rows = (
+            int((count_result[0] or {}).get("c") or 0)
+            if count_result
+            else 0
+        )
         return {
             "status_rows": status_rows,
             "count_rows": count_rows,
             "duration_ms": round((time.perf_counter() - started) * 1000, 1),
             "refreshed_at": now,
+            "strategy": "per_cmts",
         }
 
     # ── Queue head (admin dashboard) ─────────────────────────────
