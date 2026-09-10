@@ -6944,7 +6944,8 @@ class PollerService:
                     "AND COALESCE(requested_by,'')<>%s "
                     "AND (next_attempt_at IS NULL "
                     "OR next_attempt_at<=UTC_TIMESTAMP()) "
-                    "ORDER BY COALESCE(next_attempt_at, created_at), id ASC "
+                    "ORDER BY CASE WHEN requested_by='api' THEN 0 ELSE 1 END, "
+                    "COALESCE(next_attempt_at, created_at), id ASC "
                     "LIMIT 1 FOR UPDATE",
                     (_IDENTITY_REQUEST_SOURCE,),
                 )
