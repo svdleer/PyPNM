@@ -142,7 +142,13 @@ def fetch_pnm_files(
     downloaded: List[str] = []
 
     for config in configs:
-        downloaded.extend(_fetch_from_ftp(prefix, config, cache_dir))
+        fetched = _fetch_from_ftp(prefix, config, cache_dir)
+        downloaded.extend(fetched)
+        # FTP configurations are alternative sources for the same capture.
+        # Once one source succeeds, do not add latency or duplicate downloads
+        # by probing every remaining endpoint.
+        if fetched:
+            break
     return downloaded
 
 

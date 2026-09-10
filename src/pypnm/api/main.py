@@ -30,9 +30,11 @@ StartUp.initialize()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Increase the asyncio default thread pool for blocking I/O (FTP, TFTP, SFTP)
-    # Tunable via PYPNM_THREADPOOL_SIZE env var (default 32)
-    pool_size = int(os.environ.get('PYPNM_THREADPOOL_SIZE', 32))
+    # Increase the asyncio default thread pool for blocking I/O (FTP, TFTP, SFTP).
+    # Keep one API process because live agent WebSockets are process-local; use
+    # this executor to provide concurrency without breaking agent ownership.
+    # Tunable via PYPNM_THREADPOOL_SIZE env var (default 64).
+    pool_size = int(os.environ.get('PYPNM_THREADPOOL_SIZE', 64))
     executor = ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix='pypnm-worker')
     loop = asyncio.get_running_loop()
     loop.set_default_executor(executor)

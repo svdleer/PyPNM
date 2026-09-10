@@ -1071,7 +1071,11 @@ class UsOfdmaRxMerRouter:
                 fetched_via_agent = await _prefetch_via_agent_if_enabled(basename)
                 if not fetched_via_agent:
                     try:
-                        _fetch_pnm_files(basename, allow_when_local=True)
+                        await asyncio.to_thread(
+                            _fetch_pnm_files,
+                            basename,
+                            allow_when_local=True,
+                        )
                     except Exception as e:
                         self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
                 filepath = cache_dir / basename
@@ -1106,9 +1110,9 @@ class UsOfdmaRxMerRouter:
             
             try:
                 # Read and parse file
-                data = filepath.read_bytes()
+                data = await asyncio.to_thread(filepath.read_bytes)
                 # Housekeeping: file in memory — delete from FTP + local cache
-                _delete_pnm_files(basename)
+                await asyncio.to_thread(_delete_pnm_files, basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
                 
@@ -1217,7 +1221,11 @@ class UsOfdmaRxMerRouter:
                 fetched_via_agent = await _prefetch_via_agent_if_enabled(basename)
                 if not fetched_via_agent:
                     try:
-                        _fetch_pnm_files(basename, allow_when_local=True)
+                        await asyncio.to_thread(
+                            _fetch_pnm_files,
+                            basename,
+                            allow_when_local=True,
+                        )
                     except Exception as e:
                         self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
                 filepath = cache_dir / basename
@@ -1243,9 +1251,9 @@ class UsOfdmaRxMerRouter:
                     )
 
             try:
-                data = filepath.read_bytes()
+                data = await asyncio.to_thread(filepath.read_bytes)
                 # Housekeeping: file in memory — delete from FTP + local cache
-                _delete_pnm_files(basename)
+                await asyncio.to_thread(_delete_pnm_files, basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
 
@@ -1316,7 +1324,11 @@ class UsOfdmaRxMerRouter:
                 fetched_via_agent = await _prefetch_via_agent_if_enabled(basename)
                 if not fetched_via_agent:
                     try:
-                        _fetch_pnm_files(basename, allow_when_local=True)
+                        await asyncio.to_thread(
+                            _fetch_pnm_files,
+                            basename,
+                            allow_when_local=True,
+                        )
                     except Exception as e:
                         self.logger.warning(f"FTP prefetch skipped for {basename}: {e}")
                 filepath = cache_dir / basename
@@ -1344,8 +1356,8 @@ class UsOfdmaRxMerRouter:
             self.logger.info(f"Loading US RxMER file (combined): {filepath}")
 
             try:
-                data = filepath.read_bytes()
-                _delete_pnm_files(basename)
+                data = await asyncio.to_thread(filepath.read_bytes)
+                await asyncio.to_thread(_delete_pnm_files, basename)
                 parser = CmtsUsOfdmaRxMer(data)
                 model = parser.to_model()
 
