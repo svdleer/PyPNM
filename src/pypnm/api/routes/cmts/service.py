@@ -124,9 +124,15 @@ class CMTSModemService:
         if not agent_manager:
             raise Exception("Agent manager not available")
 
-        agent_id = agent_manager.get_agent_id_for_capability('cmts_reachable')
+        agent_id = agent_manager.get_agent_id_for_capability(
+            'cmts_reachable',
+            priority=self.agent_priority,
+        )
         if not agent_id:
-            raise Exception("No cmts_reachable agent available")
+            raise Exception(
+                "No cmts_reachable agent with free "
+                f"{self.agent_priority} capacity"
+            )
 
         task_params = dict(params)
         task_params['target_role'] = 'cmts'
