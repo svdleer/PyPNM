@@ -354,7 +354,12 @@ class AgentSnmpTransport:
         mgr, agent = self._get_manager_and_agent(self._target_role, self._agent_id)
         task_params = dict(params)
         task_params['target_role'] = self._target_role
-        if not task_params.get('community'):
+        if self._target_role == 'cm':
+            # CM credentials are agent-owned. Never transmit API/UI-provided
+            # communities to a CM agent; it resolves its configured read or
+            # write community locally for every operation.
+            task_params.pop('community', None)
+        elif not str(task_params.get('community') or '').strip():
             task_params.pop('community', None)
         task_id = await mgr.send_task(
             agent.agent_id, command, task_params, timeout=timeout,
