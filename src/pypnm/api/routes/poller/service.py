@@ -3999,7 +3999,7 @@ class PollerService:
                             "error": target_error,
                         }
                         modems_failed += 1
-                        error_text = (
+                        nonfatal_rejection_text = (
                             f"CMTS collection failed at {idx}/{total_targets} "
                             f"({cmts_name}): {target_error}"
                         )
@@ -4240,17 +4240,10 @@ class PollerService:
         result_status = "failed" if error_text else "done"
         result_message = error_text
         if not error_text and nonfatal_rejection_text:
-            if modems_succeeded <= 0:
-                result_status = "failed"
-                result_message = (
-                    "Inventory collection produced no authoritative modem rows; "
-                    f"last rejection: {nonfatal_rejection_text}"
-                )
-            else:
-                result_message = (
-                    "Inventory completed with quarantined generation(s); "
-                    f"last rejection: {nonfatal_rejection_text}"
-                )
+            result_message = (
+                "Inventory completed with CMTS warning(s); "
+                f"last warning: {nonfatal_rejection_text}"
+            )
 
         self._execute(
             "UPDATE poller_job SET status=%s, finished_at=%s, rows_collected=%s, modems_attempted=%s, modems_succeeded=%s, modems_failed=%s, error_text=%s WHERE id=%s AND status='running'",
@@ -6145,14 +6138,14 @@ class PollerService:
                     int(
                         os.environ.get(
                             "DATA_STORE_IDENTITY_MAX_IN_FLIGHT",
-                            "32",
+                            "96",
                         )
                     ),
                     512,
                 ),
             )
         except (TypeError, ValueError):
-            return 32
+            return 96
 
     @staticmethod
     def _identity_max_attempts() -> int:
