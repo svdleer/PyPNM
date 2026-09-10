@@ -6145,14 +6145,14 @@ class PollerService:
                     int(
                         os.environ.get(
                             "DATA_STORE_IDENTITY_MAX_IN_FLIGHT",
-                            "96",
+                            "32",
                         )
                     ),
                     512,
                 ),
             )
         except (TypeError, ValueError):
-            return 96
+            return 32
 
     @staticmethod
     def _identity_max_attempts() -> int:
