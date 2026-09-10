@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Any
 
-from pypnm.api.agent.manager import get_agent_manager
+from pypnm.api.agent.manager import AgentCapacityError, get_agent_manager
 from pypnm.api.routes.common.service.fiber_node_utils import (
     OID_MD_NODE_STATUS_MD_DS_SG_ID,
     parse_fn_name_from_oid,
@@ -53,6 +53,15 @@ def _int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None =
 def _inventory_freshness_seconds() -> int:
     """Age threshold for informational stale metadata; rows remain usable."""
     return _int_env('INVENTORY_FRESHNESS_SECONDS', 172800)
+
+
+def _agent_capacity_wait_seconds() -> int:
+    """Bound bulk admission wait so a 300s walk stays inside its 330s HTTP budget."""
+    return _int_env(
+        'CMTS_AGENT_CAPACITY_WAIT_SECONDS',
+        20,
+        maximum=25,
+    )
 
 
 def cancel_enrichment(cmts_ip: str) -> bool:
@@ -124,27 +133,69 @@ class CMTSModemService:
         if not agent_manager:
             raise Exception("Agent manager not available")
 
-        agent_id = agent_manager.get_agent_id_for_capability(
-            'cmts_reachable',
-            priority=self.agent_priority,
-        )
-        if not agent_id:
-            raise Exception(
-                "No cmts_reachable agent with free "
-                f"{self.agent_priority} capacity"
-            )
-
         task_params = dict(params)
         task_params['target_role'] = 'cmts'
         if not task_params.get('community'):
             task_params.pop('community', None)
-        task_id = await agent_manager.send_task(
-            agent_id=agent_id,
-            command=command,
-            params=task_params,
-            timeout=timeout,
-            priority=self.agent_priority,
+
+        capacity_wait = (
+            float(_agent_capacity_wait_seconds())
+            if self.agent_priority == "bulk"
+            else 0.0
         )
+        capacity_deadline = time.monotonic() + capacity_wait
+        wait_started: float | None = None
+        while True:
+            agent_id = agent_manager.get_agent_id_for_capability(
+                'cmts_reachable',
+                priority=self.agent_priority,
+                warn_if_unavailable=False,
+            )
+            if agent_id:
+                try:
+                    # Selection is advisory. send_task performs the authoritative
+                    # reservation under its lock; only its pre-send capacity race
+                    # is safe to retry here.
+                    task_id = await agent_manager.send_task(
+                        agent_id=agent_id,
+                        command=command,
+                        params=task_params,
+                        timeout=timeout,
+                        priority=self.agent_priority,
+                    )
+                    break
+                except AgentCapacityError:
+                    pass
+
+            if wait_started is None:
+                wait_started = time.monotonic()
+                if capacity_wait > 0:
+                    self.logger.info(
+                        "All cmts_reachable agents are using their %s slots; "
+                        "waiting up to %.0fs before sending %s",
+                        self.agent_priority,
+                        capacity_wait,
+                        command,
+                    )
+
+            remaining = capacity_deadline - time.monotonic()
+            if remaining <= 0:
+                waited = max(0.0, time.monotonic() - wait_started)
+                raise AgentCapacityError(
+                    "No cmts_reachable agent gained free "
+                    f"{self.agent_priority} capacity after {waited:.1f}s; "
+                    "agent task was not sent"
+                )
+            await asyncio.sleep(min(0.25, remaining))
+
+        if wait_started is not None:
+            self.logger.info(
+                "CMTS %s capacity became available after %.1fs; sent %s via %s",
+                self.agent_priority,
+                time.monotonic() - wait_started,
+                command,
+                agent_id,
+            )
 
         result = await agent_manager.wait_for_task_async(task_id, timeout=timeout)
         if result and 'result' in result:

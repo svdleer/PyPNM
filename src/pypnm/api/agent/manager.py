@@ -20,6 +20,10 @@ from pypnm.api.agent.models import ConnectedAgent, PendingTask
 logger = logging.getLogger(__name__)
 
 
+class AgentCapacityError(RuntimeError):
+    """Raised before send when an agent priority pool has no free slots."""
+
+
 class AgentManager:
     """Manages WebSocket connections to remote agents."""
     
@@ -483,6 +487,7 @@ class AgentManager:
         capability: str,
         *,
         priority: str | None = None,
+        warn_if_unavailable: bool = True,
     ) -> Optional[str]:
         """
         Return agent_id of the next agent advertising *capability*, round-robin.
@@ -506,7 +511,8 @@ class AgentManager:
             )
         ]
         if not capable:
-            self.logger.warning(
+            log = self.logger.warning if warn_if_unavailable else self.logger.debug
+            log(
                 "No agent with free %s capacity for capability '%s' — connected agents: %s",
                 priority or "any",
                 capability,
@@ -571,7 +577,7 @@ class AgentManager:
             limit = int(agent.limits.get(priority, 1))
             used = int(agent.in_flight.get(priority, 0))
             if used >= limit:
-                raise RuntimeError(
+                raise AgentCapacityError(
                     f"Agent {agent_id} has no free {priority} slots ({used}/{limit})"
                 )
             agent.in_flight[priority] = used + 1
