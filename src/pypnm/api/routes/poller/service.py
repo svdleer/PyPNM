@@ -6407,7 +6407,7 @@ class PollerService:
                 "target_role": "cm",
                 "timeout": 2,
                 "retries": 0,
-                "max_concurrent": 1,
+                "max_concurrent": 3,
                 "allow_public_fallback": False,
             }
             try:
