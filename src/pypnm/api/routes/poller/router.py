@@ -9,6 +9,10 @@ from fastapi import APIRouter, HTTPException, Query
 logger = logging.getLogger(__name__)
 
 from pypnm.api.routes.poller.schema import (
+    InventoryMySQLBackfillAgentCollectionResponse,
+    InventoryMySQLBackfillCollectionResponse,
+    InventoryMySQLBackfillRequest,
+    InventoryMySQLBackfillResponse,
     ModemRefreshRequest,
     PollerJobsResponse,
     PollerRunRequest,
@@ -20,7 +24,11 @@ from pypnm.api.routes.poller.schema import (
     PollerSnapshotsAnalyticsResponse,
     PollerSnapshotsByDayResponse,
 )
-from pypnm.api.routes.poller.service import poller_service
+from pypnm.api.routes.poller.service import (
+    InventoryMySQLBackfillConflict,
+    InventoryMySQLBackfillUnavailable,
+    poller_service,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["poller"])
 
@@ -279,6 +287,94 @@ def rebuild_inventory_summary() -> dict:
         logger.error("inventory/summary/rebuild DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "materialized": True, **result}
+
+
+@router.post(
+    "/inventory/mysql-backfill",
+    response_model=InventoryMySQLBackfillResponse,
+    status_code=202,
+)
+def create_inventory_mysql_backfill(
+    payload: InventoryMySQLBackfillRequest,
+) -> InventoryMySQLBackfillResponse:
+    try:
+        job = poller_service.create_inventory_mysql_backfill(
+            agent_id=payload.agent_id,
+            page_size=payload.page_size,
+        )
+    except InventoryMySQLBackfillConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InventoryMySQLBackfillUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/mysql-backfill create error: %s", exc)
+        raise HTTPException(status_code=503, detail="Backfill service unavailable") from exc
+    return InventoryMySQLBackfillResponse(job=job)
+
+
+@router.get(
+    "/inventory/mysql-backfill/agents",
+    response_model=InventoryMySQLBackfillAgentCollectionResponse,
+)
+def list_inventory_mysql_backfill_agents(
+) -> InventoryMySQLBackfillAgentCollectionResponse:
+    try:
+        agents = poller_service.list_inventory_mysql_backfill_agents()
+    except Exception as exc:
+        logger.error("inventory/mysql-backfill agents error: %s", exc)
+        raise HTTPException(status_code=503, detail="Backfill service unavailable") from exc
+    return InventoryMySQLBackfillAgentCollectionResponse(agents=agents)
+
+
+@router.get(
+    "/inventory/mysql-backfill",
+    response_model=InventoryMySQLBackfillCollectionResponse,
+)
+def list_inventory_mysql_backfills(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> InventoryMySQLBackfillCollectionResponse:
+    try:
+        jobs = poller_service.list_inventory_mysql_backfills(limit=limit)
+    except Exception as exc:
+        logger.error("inventory/mysql-backfill list error: %s", exc)
+        raise HTTPException(status_code=503, detail="Backfill service unavailable") from exc
+    return InventoryMySQLBackfillCollectionResponse(jobs=jobs)
+
+
+@router.get(
+    "/inventory/mysql-backfill/{public_id}",
+    response_model=InventoryMySQLBackfillResponse,
+)
+def get_inventory_mysql_backfill(
+    public_id: str,
+) -> InventoryMySQLBackfillResponse:
+    try:
+        job = poller_service.get_inventory_mysql_backfill(public_id)
+    except Exception as exc:
+        logger.error("inventory/mysql-backfill get error: %s", exc)
+        raise HTTPException(status_code=503, detail="Backfill service unavailable") from exc
+    if not job:
+        raise HTTPException(status_code=404, detail="Backfill job not found")
+    return InventoryMySQLBackfillResponse(job=job)
+
+
+@router.post(
+    "/inventory/mysql-backfill/{public_id}/cancel",
+    response_model=InventoryMySQLBackfillResponse,
+)
+def cancel_inventory_mysql_backfill(
+    public_id: str,
+) -> InventoryMySQLBackfillResponse:
+    try:
+        job = poller_service.cancel_inventory_mysql_backfill(public_id)
+    except InventoryMySQLBackfillConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/mysql-backfill cancel error: %s", exc)
+        raise HTTPException(status_code=503, detail="Backfill service unavailable") from exc
+    if not job:
+        raise HTTPException(status_code=404, detail="Backfill job not found")
+    return InventoryMySQLBackfillResponse(job=job)
 
 
 @router.get("/inventory/modems/{mac_address}")

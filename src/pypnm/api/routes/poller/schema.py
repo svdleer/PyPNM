@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PollerSettingUpsertRequest(BaseModel):
@@ -47,6 +47,63 @@ class PollerSchedulerPollRequest(BaseModel):
 class ModemRefreshRequest(BaseModel):
     mac: str
     cmts: Optional[str] = Field(default=None)
+
+
+class InventoryMySQLBackfillRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    agent_id: str = Field(min_length=1, max_length=128)
+    page_size: int = Field(default=1000, ge=100, le=5000)
+
+
+class InventoryMySQLBackfillAgent(BaseModel):
+    agent_id: str
+    bulk_free_slots: int = Field(ge=0)
+
+
+class InventoryMySQLBackfillAgentCollectionResponse(BaseModel):
+    status: str = Field(default="success")
+    agents: List[InventoryMySQLBackfillAgent] = Field(default_factory=list)
+
+
+class InventoryMySQLBackfillJob(BaseModel):
+    public_id: str
+    status: str
+    agent_id: str
+    cursor: str = Field(default="")
+    page_size: int
+    source_total: Optional[int] = Field(default=None)
+    percent: Optional[float] = Field(default=None)
+    pages_received: int = Field(default=0)
+    rows_received: int = Field(default=0)
+    rows_matched: int = Field(default=0)
+    rows_updated: int = Field(default=0)
+    rows_skipped: int = Field(default=0)
+    rows_unmatched: int = Field(default=0)
+    rows_unchanged: int = Field(default=0)
+    vendor_unmapped: int = Field(default=0)
+    attempt_count: int = Field(default=0)
+    retry_count: int = Field(default=0)
+    error_code: Optional[str] = Field(default=None)
+    error_text: Optional[str] = Field(default=None)
+    cancellation_requested: bool = Field(default=False)
+    created_at: str
+    started_at: Optional[str] = Field(default=None)
+    last_attempt_at: Optional[str] = Field(default=None)
+    next_attempt_at: Optional[str] = Field(default=None)
+    cancel_requested_at: Optional[str] = Field(default=None)
+    updated_at: str
+    finished_at: Optional[str] = Field(default=None)
+
+
+class InventoryMySQLBackfillResponse(BaseModel):
+    status: str = Field(default="success")
+    job: InventoryMySQLBackfillJob
+
+
+class InventoryMySQLBackfillCollectionResponse(BaseModel):
+    status: str = Field(default="success")
+    jobs: List[InventoryMySQLBackfillJob] = Field(default_factory=list)
 
 
 class PollerSettingsResponse(BaseModel):

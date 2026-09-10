@@ -23,6 +23,8 @@ import pymysql
 import pymysql.cursors
 import requests
 
+from pypnm.api.routes.poller.inventory_vendor_oui import vendor_for_mac
+
 logger = logging.getLogger(__name__)
 
 _CPE_TASK_TYPE = "cpe_address_refresh"
@@ -48,6 +50,29 @@ _IDENTITY_SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
 _IDENTITY_FIRMWARE_OID = "1.3.6.1.2.1.69.1.3.2.0"
 _IDENTITY_DOCSIS_CAPABILITY_OID = "1.3.6.1.4.1.4491.2.1.28.1.1.0"
 _IDENTITY_REQUEST_SOURCE = "inventory-identity"
+_MYSQL_BACKFILL_CAPABILITY = "cm_poller_inventory"
+_MYSQL_BACKFILL_COMMAND = "cm_poller_modems_page"
+_MYSQL_BACKFILL_TASK_TIMEOUT_SECONDS = 90
+_MYSQL_BACKFILL_MAX_TRANSIENT_FAILURES = 5
+_MYSQL_BACKFILL_ROW_KEYS = frozenset(
+    {"c_mac", "l_ip", "model", "hw_rev", "sw_rev", "last_update"}
+)
+
+
+class InventoryMySQLBackfillConflict(RuntimeError):
+    """The requested backfill conflicts with migration or job state."""
+
+
+class InventoryMySQLBackfillUnavailable(RuntimeError):
+    """No suitable CM-poller inventory agent is currently available."""
+
+
+class _InventoryMySQLBackfillResponseError(RuntimeError):
+    """The pinned agent returned an invalid or unsuccessful page."""
+
+
+class _InventoryMySQLBackfillTransientError(RuntimeError):
+    """A page could not be dispatched because its pinned agent is unavailable."""
 
 
 class _IdentityDispatchBlocked(RuntimeError):
@@ -224,6 +249,7 @@ class PollerService:
                 docsis_version VARCHAR(32) NULL,
                 vendor VARCHAR(64) NULL,
                 model VARCHAR(128) NULL,
+                hardware_revision VARCHAR(80) NULL,
                 upstream_interface VARCHAR(128) NULL,
                 upstream_ifindex BIGINT NULL,
                 ofdm_ifindex BIGINT NULL,
@@ -957,6 +983,48 @@ class PollerService:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_mysql_backfill_job (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                public_id CHAR(36) NOT NULL,
+                status VARCHAR(24) NOT NULL DEFAULT 'queued',
+                claim_token CHAR(36) NULL,
+                agent_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                c_mac_cursor VARCHAR(17) NOT NULL DEFAULT '',
+                page_size SMALLINT UNSIGNED NOT NULL,
+                source_total BIGINT UNSIGNED NULL,
+                pages_received BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                rows_received BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                rows_matched BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                rows_updated BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                rows_skipped BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                vendor_unmapped BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
+                retry_count INT UNSIGNED NOT NULL DEFAULT 0,
+                consecutive_failures INT UNSIGNED NOT NULL DEFAULT 0,
+                next_attempt_at DATETIME NULL,
+                last_attempt_at DATETIME NULL,
+                error_code VARCHAR(64) NULL,
+                error_text VARCHAR(255) NULL,
+                cancel_requested_at DATETIME NULL,
+                created_at DATETIME NOT NULL,
+                started_at DATETIME NULL,
+                updated_at DATETIME NOT NULL,
+                finished_at DATETIME NULL,
+                active_agent_id VARCHAR(128) CHARACTER SET utf8mb4
+                    COLLATE utf8mb4_bin GENERATED ALWAYS AS (
+                    CASE WHEN status IN ('queued','running','finalizing')
+                    THEN agent_id ELSE NULL END
+                ) STORED,
+                UNIQUE KEY uk_inventory_mysql_backfill_public (public_id),
+                UNIQUE KEY uk_inventory_mysql_backfill_active_agent (active_agent_id),
+                INDEX idx_inventory_mysql_backfill_status
+                    (status, next_attempt_at, created_at),
+                INDEX idx_inventory_mysql_backfill_agent (agent_id, status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
         now = self._now()
         self._execute(
             "INSERT IGNORE INTO inventory_identity_cursor "
@@ -1060,13 +1128,19 @@ class PollerService:
             name="pypnm-refresh-worker",
             daemon=True,
         )
+        backfill_thread = threading.Thread(
+            target=self._mysql_backfill_worker_loop,
+            name="pypnm-mysql-backfill-worker",
+            daemon=True,
+        )
         poller_thread.start()
         refresh_thread.start()
+        backfill_thread.start()
         self._worker_started = True
 
     def _try_acquire_worker_lock(self, worker_kind: str = "poller"):
         """Return a dedicated connection holding one singleton worker lock."""
-        if worker_kind not in {"poller", "refresh"}:
+        if worker_kind not in {"poller", "refresh", "mysql-backfill"}:
             raise ValueError(f"Unsupported worker kind: {worker_kind}")
         conn = self._connect()
         lock_name = f"pypnm-{worker_kind}-worker:{self._db_name()}"[:64]
@@ -1335,6 +1409,75 @@ class PollerService:
                 logger.warning("Refresh queue scheduling failed: %s", exc)
 
             time.sleep(0.1)
+
+    def _recover_interrupted_mysql_backfill_work(self) -> None:
+        """Requeue an interrupted page without changing its cursor or counters."""
+        now = self._now()
+        self._execute(
+            "UPDATE inventory_mysql_backfill_job SET "
+            "status=CASE WHEN cancel_requested_at IS NULL THEN 'queued' "
+            "ELSE 'cancelled' END, "
+            "finished_at=CASE WHEN cancel_requested_at IS NULL THEN finished_at "
+            "ELSE %s END, next_attempt_at=NULL, claim_token=NULL, "
+            "error_code=CASE WHEN cancel_requested_at IS NULL "
+            "THEN 'worker_restarted' ELSE NULL END, "
+            "error_text=CASE WHEN cancel_requested_at IS NULL "
+            "THEN 'Recovered after backfill worker restart' ELSE NULL END, "
+            "updated_at=%s WHERE status='running'",
+            (now, now),
+        )
+        self._execute(
+            "UPDATE inventory_mysql_backfill_job SET claim_token=NULL, "
+            "updated_at=%s WHERE status='finalizing' AND claim_token IS NOT NULL",
+            (now,),
+        )
+
+    def _mysql_backfill_worker_loop(self) -> None:
+        """Run one durable CM-poller page per iteration behind an advisory lock."""
+        lock_conn = None
+        while True:
+            if lock_conn is None:
+                try:
+                    lock_conn = self._try_acquire_worker_lock("mysql-backfill")
+                    if lock_conn is not None:
+                        self._recover_interrupted_mysql_backfill_work()
+                except Exception as exc:
+                    logger.warning("MySQL backfill worker lock/recovery failed: %s", exc)
+                    if lock_conn is not None:
+                        try:
+                            lock_conn.close()
+                        except Exception:
+                            pass
+                        lock_conn = None
+                if lock_conn is None:
+                    time.sleep(2)
+                    continue
+
+            try:
+                lock_conn.ping(reconnect=False)
+            except Exception:
+                try:
+                    lock_conn.close()
+                except Exception:
+                    pass
+                lock_conn = None
+                continue
+
+            try:
+                self._process_one_mysql_backfill_iteration()
+            except Exception as exc:
+                logger.exception("MySQL inventory backfill iteration failed: %s", exc)
+                # A failure while persisting a claim transition can otherwise
+                # leave the only active job permanently running. Relinquish the
+                # singleton lock so the next acquisition runs fenced recovery.
+                try:
+                    lock_conn.close()
+                except Exception:
+                    pass
+                lock_conn = None
+                continue
+
+            time.sleep(0.5)
 
     def _scheduler_due(self) -> bool:
         last_tick = self._scheduler.get("last_tick")
@@ -6184,11 +6327,13 @@ class PollerService:
                 conn.begin()
                 cur = conn.cursor()
                 stale_eligible = self._identity_eligible_sql("i")
+                stale_enriched = self._inventory_enriched_sql("i")
                 cur.execute(
                     "DELETE r FROM modem_refresh_request r "
                     "LEFT JOIN modem_inventory_current i ON i.mac=r.mac "
                     "WHERE r.status='queued' AND r.requested_by=%s "
-                    f"AND (i.mac IS NULL OR NOT COALESCE(({stale_eligible}), FALSE))",
+                    f"AND (i.mac IS NULL OR NOT COALESCE(({stale_eligible}), FALSE) "
+                    f"OR COALESCE(({stale_enriched}), FALSE))",
                     (_IDENTITY_REQUEST_SOURCE,),
                 )
                 cur.execute(
@@ -6301,6 +6446,7 @@ class PollerService:
         claim_token = str(uuid.uuid4())
         task_id = str(uuid.uuid4())
         eligible = self._identity_eligible_sql("i")
+        enriched = self._inventory_enriched_sql("i")
         with self._db_lock:
             conn = self._connect()
             try:
@@ -6315,7 +6461,7 @@ class PollerService:
                     "WHERE r.status='queued' AND r.requested_by=%s "
                     "AND (r.next_attempt_at IS NULL "
                     "OR r.next_attempt_at<=UTC_TIMESTAMP()) "
-                    f"AND {eligible} "
+                    f"AND {eligible} AND NOT ({enriched}) "
                     "ORDER BY COALESCE(r.next_attempt_at, r.created_at), r.id "
                     "LIMIT 1 FOR UPDATE",
                     (_IDENTITY_REQUEST_SOURCE,),
@@ -7686,6 +7832,1057 @@ class PollerService:
             "coverage": coverage,
             "has_data": bool(point_rows),
         }
+
+    # ── CM-poller MySQL inventory backfill ─────────────────────
+
+    @staticmethod
+    def _mysql_backfill_timestamp(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            stamp = value
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return str(value)
+
+    @classmethod
+    def _mysql_backfill_job_status(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        source_total = row.get("source_total")
+        source_total = int(source_total) if source_total is not None else None
+        rows_received = int(row.get("rows_received") or 0)
+        rows_matched = int(row.get("rows_matched") or 0)
+        rows_updated = int(row.get("rows_updated") or 0)
+        job_status = str(row.get("status") or "")
+        percent = None
+        if source_total is not None:
+            if job_status in {"finalizing", "completed"}:
+                percent = 100.0
+            elif source_total == 0:
+                percent = 100.0 if int(row.get("pages_received") or 0) else 0.0
+            else:
+                # The source is live and each page uses a separate read-only
+                # transaction, so its first-page count is progress guidance,
+                # not an immutable snapshot boundary. Reserve 100% for the
+                # durable finalizing/completed states.
+                percent = round(
+                    min(99.99, rows_received * 100.0 / source_total),
+                    2,
+                )
+        return {
+            "public_id": str(row.get("public_id") or ""),
+            "status": job_status,
+            "agent_id": str(row.get("agent_id") or ""),
+            "cursor": str(row.get("c_mac_cursor") or ""),
+            "page_size": int(row.get("page_size") or 0),
+            "source_total": source_total,
+            "percent": percent,
+            "pages_received": int(row.get("pages_received") or 0),
+            "rows_received": rows_received,
+            "rows_matched": rows_matched,
+            "rows_updated": rows_updated,
+            "rows_skipped": int(row.get("rows_skipped") or 0),
+            "rows_unmatched": max(0, rows_received - rows_matched),
+            "rows_unchanged": max(0, rows_matched - rows_updated),
+            "vendor_unmapped": int(row.get("vendor_unmapped") or 0),
+            "attempt_count": int(row.get("attempt_count") or 0),
+            "retry_count": int(row.get("retry_count") or 0),
+            "error_code": row.get("error_code"),
+            "error_text": row.get("error_text"),
+            "cancellation_requested": row.get("cancel_requested_at") is not None,
+            "created_at": cls._mysql_backfill_timestamp(row.get("created_at")) or "",
+            "started_at": cls._mysql_backfill_timestamp(row.get("started_at")),
+            "last_attempt_at": cls._mysql_backfill_timestamp(row.get("last_attempt_at")),
+            "next_attempt_at": cls._mysql_backfill_timestamp(row.get("next_attempt_at")),
+            "cancel_requested_at": cls._mysql_backfill_timestamp(
+                row.get("cancel_requested_at")
+            ),
+            "updated_at": cls._mysql_backfill_timestamp(row.get("updated_at")) or "",
+            "finished_at": cls._mysql_backfill_timestamp(row.get("finished_at")),
+        }
+
+    @staticmethod
+    def _mysql_backfill_select_sql() -> str:
+        return (
+            "SELECT public_id, status, agent_id, c_mac_cursor, page_size, "
+            "source_total, pages_received, rows_received, rows_matched, "
+            "rows_updated, rows_skipped, vendor_unmapped, attempt_count, "
+            "retry_count, error_code, error_text, cancel_requested_at, "
+            "created_at, started_at, last_attempt_at, next_attempt_at, updated_at, "
+            "finished_at "
+            "FROM inventory_mysql_backfill_job"
+        )
+
+    def _mysql_backfill_column_ready(self) -> bool:
+        rows = self._query(
+            "SHOW COLUMNS FROM modem_inventory_current LIKE %s",
+            ("hardware_revision",),
+        )
+        if not rows:
+            return False
+        column = rows[0]
+        return (
+            str(column.get("Type") or "").strip().lower() == "varchar(80)"
+            and str(column.get("Null") or "").strip().upper() == "YES"
+        )
+
+    def list_inventory_mysql_backfill_agents(self) -> List[Dict[str, Any]]:
+        from pypnm.api.agent.manager import get_agent_manager
+
+        manager = get_agent_manager()
+        if manager is None:
+            return []
+        agents = []
+        for agent_id in sorted(
+            manager.get_all_agent_ids_for_capability(_MYSQL_BACKFILL_CAPABILITY)
+        ):
+            if not isinstance(agent_id, str) or not 1 <= len(agent_id) <= 128:
+                continue
+            agent = manager.get_agent(agent_id)
+            if (
+                agent is None
+                or not agent.authenticated
+                or not agent.is_alive()
+                or _MYSQL_BACKFILL_CAPABILITY not in agent.capabilities
+            ):
+                continue
+            agents.append(
+                {
+                    "agent_id": agent_id,
+                    "bulk_free_slots": manager.get_agent_free_slots(
+                        agent_id,
+                        "bulk",
+                    ),
+                }
+            )
+        return agents
+
+    def create_inventory_mysql_backfill(
+        self,
+        agent_id: str,
+        page_size: int = 1000,
+    ) -> Dict[str, Any]:
+        normalized_agent_id = str(agent_id or "").strip()
+        if not 1 <= len(normalized_agent_id) <= 128:
+            raise ValueError("agent_id must be between 1 and 128 characters")
+        if isinstance(page_size, bool) or not 100 <= int(page_size) <= 5000:
+            raise ValueError("page_size must be between 100 and 5000")
+        if not self._mysql_backfill_column_ready():
+            raise InventoryMySQLBackfillConflict(
+                "The hardware revision migration must be applied before backfill"
+            )
+
+        from pypnm.api.agent.manager import get_agent_manager
+
+        manager = get_agent_manager()
+        agent = manager.get_agent(normalized_agent_id) if manager else None
+        if (
+            agent is None
+            or not agent.authenticated
+            or not agent.is_alive()
+            or _MYSQL_BACKFILL_CAPABILITY not in agent.capabilities
+        ):
+            raise InventoryMySQLBackfillUnavailable(
+                "The selected CM-poller inventory agent is unavailable"
+            )
+        if self._query(
+            "SELECT public_id FROM inventory_mysql_backfill_job "
+            "WHERE agent_id=%s AND status IN ('queued','running','finalizing') LIMIT 1",
+            (normalized_agent_id,),
+        ):
+            raise InventoryMySQLBackfillConflict(
+                "The selected agent already has an active inventory MySQL backfill"
+            )
+
+        public_id = str(uuid.uuid4())
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT public_id FROM inventory_mysql_backfill_job "
+                    "WHERE agent_id=%s AND status IN ('queued','running','finalizing') "
+                    "LIMIT 1 FOR UPDATE",
+                    (normalized_agent_id,),
+                )
+                if cur.fetchone():
+                    raise InventoryMySQLBackfillConflict(
+                        "The selected agent already has an active inventory MySQL backfill"
+                    )
+                try:
+                    cur.execute(
+                        "INSERT INTO inventory_mysql_backfill_job "
+                        "(public_id, status, agent_id, c_mac_cursor, page_size, "
+                        "created_at, updated_at) VALUES (%s,'queued',%s,'',%s,%s,%s)",
+                        (
+                            public_id,
+                            normalized_agent_id,
+                            int(page_size),
+                            now,
+                            now,
+                        ),
+                    )
+                except pymysql.err.IntegrityError as exc:
+                    raise InventoryMySQLBackfillConflict(
+                        "The selected agent already has an active inventory MySQL backfill"
+                    ) from exc
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        job = self.get_inventory_mysql_backfill(public_id)
+        if not job:
+            raise RuntimeError("Queued inventory backfill could not be read")
+        return job
+
+    def list_inventory_mysql_backfills(self, limit: int = 50) -> List[Dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 200))
+        rows = self._query(
+            self._mysql_backfill_select_sql() + " ORDER BY id DESC LIMIT %s",
+            (bounded_limit,),
+        )
+        return [self._mysql_backfill_job_status(row) for row in rows]
+
+    def get_inventory_mysql_backfill(self, public_id: str) -> Dict[str, Any] | None:
+        normalized_id = str(public_id or "").strip()
+        if len(normalized_id) != 36:
+            return None
+        rows = self._query(
+            self._mysql_backfill_select_sql() + " WHERE public_id=%s LIMIT 1",
+            (normalized_id,),
+        )
+        return self._mysql_backfill_job_status(rows[0]) if rows else None
+
+    def cancel_inventory_mysql_backfill(self, public_id: str) -> Dict[str, Any] | None:
+        normalized_id = str(public_id or "").strip()
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status FROM inventory_mysql_backfill_job "
+                    "WHERE public_id=%s FOR UPDATE",
+                    (normalized_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    conn.rollback()
+                    return None
+                current_status = str(row.get("status") or "")
+                if current_status == "queued":
+                    cur.execute(
+                        "UPDATE inventory_mysql_backfill_job SET status='cancelled', "
+                        "cancel_requested_at=%s, updated_at=%s, finished_at=%s, "
+                        "next_attempt_at=NULL, error_code=NULL, error_text=NULL "
+                        "WHERE public_id=%s AND status='queued'",
+                        (now, now, now, normalized_id),
+                    )
+                elif current_status == "running":
+                    cur.execute(
+                        "UPDATE inventory_mysql_backfill_job SET "
+                        "cancel_requested_at=COALESCE(cancel_requested_at,%s), "
+                        "updated_at=%s WHERE public_id=%s AND status='running'",
+                        (now, now, normalized_id),
+                    )
+                else:
+                    raise InventoryMySQLBackfillConflict(
+                        f"Backfill in state {current_status} cannot be cancelled"
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return self.get_inventory_mysql_backfill(normalized_id)
+
+    @staticmethod
+    def _mysql_backfill_retry_delay(failure_count: int) -> int:
+        return min(5 * (2 ** max(0, failure_count - 1)), 300)
+
+    def _claim_inventory_mysql_backfill_page(self) -> Dict[str, Any] | None:
+        now = self._now()
+        claim_token = str(uuid.uuid4())
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, public_id, agent_id, c_mac_cursor, page_size, "
+                    "source_total, rows_received FROM inventory_mysql_backfill_job "
+                    "WHERE status='queued' AND cancel_requested_at IS NULL "
+                    "AND (next_attempt_at IS NULL OR next_attempt_at<=UTC_TIMESTAMP()) "
+                    "ORDER BY COALESCE(last_attempt_at, created_at), id "
+                    "LIMIT 1 FOR UPDATE"
+                )
+                job = cur.fetchone()
+                if not job:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "UPDATE inventory_mysql_backfill_job SET status='running', "
+                    "claim_token=%s, started_at=COALESCE(started_at,%s), "
+                    "last_attempt_at=%s, attempt_count=attempt_count+1, "
+                    "next_attempt_at=NULL, error_code=NULL, error_text=NULL, updated_at=%s "
+                    "WHERE id=%s AND status='queued' AND cancel_requested_at IS NULL",
+                    (claim_token, now, now, now, int(job["id"])),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                claimed = dict(job)
+                claimed["claim_token"] = claim_token
+                return claimed
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _cancel_claimed_mysql_backfill(self, job_id: int, claim_token: str) -> bool:
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE inventory_mysql_backfill_job SET status='cancelled', "
+                    "updated_at=%s, finished_at=%s, next_attempt_at=NULL, "
+                    "claim_token=NULL, error_code=NULL, error_text=NULL WHERE id=%s "
+                    "AND status='running' AND claim_token=%s "
+                    "AND cancel_requested_at IS NOT NULL",
+                    (now, now, int(job_id), claim_token),
+                )
+                changed = int(cur.rowcount or 0) == 1
+                conn.commit()
+                return changed
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _defer_busy_inventory_mysql_backfill(
+        self,
+        job_id: int,
+        claim_token: str,
+    ) -> None:
+        now = self._now()
+        next_attempt = (
+            datetime.now(timezone.utc) + timedelta(seconds=2)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        self._execute(
+            "UPDATE inventory_mysql_backfill_job SET "
+            "status=CASE WHEN cancel_requested_at IS NULL THEN 'queued' "
+            "ELSE 'cancelled' END, claim_token=NULL, "
+            "next_attempt_at=CASE WHEN cancel_requested_at IS NULL THEN %s "
+            "ELSE NULL END, finished_at=CASE WHEN cancel_requested_at IS NULL "
+            "THEN finished_at ELSE %s END, error_code=NULL, error_text=NULL, "
+            "updated_at=%s WHERE id=%s AND status='running' AND claim_token=%s",
+            (next_attempt, now, now, int(job_id), claim_token),
+        )
+
+    def _transition_mysql_backfill_failure(
+        self,
+        job_id: int,
+        *,
+        expected_status: str,
+        retry_status: str,
+        claim_token: str,
+        error_code: str,
+        error_text: str,
+        transient: bool,
+    ) -> None:
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status, claim_token, consecutive_failures, "
+                    "cancel_requested_at FROM inventory_mysql_backfill_job "
+                    "WHERE id=%s FOR UPDATE",
+                    (int(job_id),),
+                )
+                job = cur.fetchone()
+                if (
+                    not job
+                    or str(job.get("status") or "") != expected_status
+                    or str(job.get("claim_token") or "") != claim_token
+                ):
+                    conn.rollback()
+                    return
+                if job.get("cancel_requested_at") is not None:
+                    cur.execute(
+                        "UPDATE inventory_mysql_backfill_job SET status='cancelled', "
+                        "updated_at=%s, finished_at=%s, next_attempt_at=NULL, "
+                        "claim_token=NULL, error_code=NULL, error_text=NULL "
+                        "WHERE id=%s AND claim_token=%s",
+                        (now, now, int(job_id), claim_token),
+                    )
+                    conn.commit()
+                    return
+                failures = int(job.get("consecutive_failures") or 0) + 1
+                should_retry = transient and failures < _MYSQL_BACKFILL_MAX_TRANSIENT_FAILURES
+                if should_retry:
+                    delay = self._mysql_backfill_retry_delay(failures)
+                    next_attempt = (
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    cur.execute(
+                        "UPDATE inventory_mysql_backfill_job SET status=%s, "
+                        "claim_token=NULL, retry_count=retry_count+1, "
+                        "consecutive_failures=%s, next_attempt_at=%s, "
+                        "error_code=%s, error_text=%s, updated_at=%s "
+                        "WHERE id=%s AND status=%s AND claim_token=%s",
+                        (
+                            retry_status,
+                            failures,
+                            next_attempt,
+                            error_code[:64],
+                            error_text[:255],
+                            now,
+                            int(job_id),
+                            expected_status,
+                            claim_token,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE inventory_mysql_backfill_job SET status='failed', "
+                        "claim_token=NULL, consecutive_failures=%s, next_attempt_at=NULL, "
+                        "error_code=%s, error_text=%s, updated_at=%s, finished_at=%s "
+                        "WHERE id=%s AND status=%s AND claim_token=%s",
+                        (
+                            failures,
+                            error_code[:64],
+                            error_text[:255],
+                            now,
+                            now,
+                            int(job_id),
+                            expected_status,
+                            claim_token,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _validated_mysql_backfill_ip(value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        try:
+            address = ipaddress.ip_address(value.strip())
+        except ValueError as exc:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller l_ip is not a valid IP address"
+            ) from exc
+        if address.is_unspecified:
+            return None
+        return str(address)
+
+    def _validate_mysql_backfill_response(
+        self,
+        event: Any,
+        *,
+        cursor: str,
+        page_size: int,
+        source_total: int | None,
+    ) -> Dict[str, Any]:
+        if not isinstance(event, dict) or event.get("type") != "response":
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller agent returned an invalid response envelope"
+            )
+        result = event.get("result")
+        if not isinstance(result, dict):
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller agent returned an invalid page envelope"
+            )
+        if result.get("success") is not True:
+            if result.get("error_code") == "source_temporarily_unavailable":
+                raise _InventoryMySQLBackfillTransientError(
+                    "CM-poller source database is temporarily unavailable"
+                )
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller inventory page request failed"
+            )
+        required_result_keys = {
+            "success",
+            "rows",
+            "count",
+            "total_rows",
+            "next_cursor",
+            "has_more",
+        }
+        if set(result) != required_result_keys:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller agent returned an invalid page envelope"
+            )
+        rows = result.get("rows")
+        count = result.get("count")
+        total_rows = result.get("total_rows")
+        next_cursor = result.get("next_cursor")
+        has_more = result.get("has_more")
+        if not isinstance(rows, list):
+            raise _InventoryMySQLBackfillResponseError("CM-poller rows must be a list")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise _InventoryMySQLBackfillResponseError("CM-poller count is invalid")
+        if count != len(rows) or count < 0 or count > page_size:
+            raise _InventoryMySQLBackfillResponseError("CM-poller page count is invalid")
+        if not isinstance(has_more, bool):
+            raise _InventoryMySQLBackfillResponseError("CM-poller has_more is invalid")
+        if has_more and count == 0:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller page cannot continue without advancing"
+            )
+        if total_rows is not None and (
+            isinstance(total_rows, bool)
+            or not isinstance(total_rows, int)
+            or total_rows < 0
+        ):
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller source total is invalid"
+            )
+        if cursor == "" and total_rows is None:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller first page omitted source total"
+            )
+        if total_rows is not None and total_rows < count:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller source total is smaller than page count"
+            )
+        if source_total is not None and total_rows not in {None, source_total}:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller source total changed during backfill"
+            )
+        # Pages are separate read-only transactions over a live source. The
+        # first-page total supports progress reporting but must not be used as
+        # an exact completion invariant; keyset advancement plus has_more is
+        # the durable termination contract.
+        if not isinstance(next_cursor, str):
+            raise _InventoryMySQLBackfillResponseError("CM-poller next cursor is invalid")
+
+        normalized_rows: List[Dict[str, Any]] = []
+        previous_mac = cursor
+        epoch_ceiling = int(datetime.now(timezone.utc).timestamp()) + 86400
+        text_limits = {"l_ip": 45, "model": 128, "hw_rev": 80, "sw_rev": 128}
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != _MYSQL_BACKFILL_ROW_KEYS:
+                raise _InventoryMySQLBackfillResponseError(
+                    "CM-poller row envelope is invalid"
+                )
+            raw_mac = row.get("c_mac")
+            if (
+                not isinstance(raw_mac, str)
+                or self._normalize_mac(raw_mac) != raw_mac
+                or raw_mac <= previous_mac
+            ):
+                raise _InventoryMySQLBackfillResponseError(
+                    "CM-poller MAC cursor is not strictly monotonic"
+                )
+            normalized: Dict[str, Any] = {"c_mac": raw_mac}
+            for field, maximum in text_limits.items():
+                value = row.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise _InventoryMySQLBackfillResponseError(
+                        f"CM-poller {field} scalar is invalid"
+                    )
+                if value is not None and len(value) > maximum:
+                    raise _InventoryMySQLBackfillResponseError(
+                        f"CM-poller {field} exceeds its length limit"
+                    )
+                normalized[field] = value.strip() if value is not None else None
+            epoch = row.get("last_update")
+            if epoch is not None and (
+                isinstance(epoch, bool)
+                or not isinstance(epoch, int)
+                or epoch < 0
+                or epoch > epoch_ceiling
+            ):
+                raise _InventoryMySQLBackfillResponseError(
+                    "CM-poller last_update epoch is invalid"
+                )
+            normalized["source_seen_at"] = (
+                datetime.fromtimestamp(epoch, tz=timezone.utc).replace(tzinfo=None)
+                if epoch is not None
+                else None
+            )
+            normalized["normalized_ip"] = self._validated_mysql_backfill_ip(
+                normalized.get("l_ip")
+            )
+            normalized_rows.append(normalized)
+            previous_mac = raw_mac
+
+        expected_cursor = normalized_rows[-1]["c_mac"] if normalized_rows else cursor
+        if next_cursor != expected_cursor:
+            raise _InventoryMySQLBackfillResponseError(
+                "CM-poller next cursor does not match its page"
+            )
+        return {
+            "rows": normalized_rows,
+            "count": count,
+            "total_rows": total_rows,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
+
+    @staticmethod
+    def _mysql_backfill_target_seen(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None)
+        if value:
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(
+                    tzinfo=None
+                )
+            except ValueError:
+                return None
+        return None
+
+    def _apply_mysql_backfill_page(
+        self,
+        job: Dict[str, Any],
+        page: Dict[str, Any],
+    ) -> None:
+        source_rows = page["rows"]
+        macs = [row["c_mac"] for row in source_rows]
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status, claim_token, c_mac_cursor, source_total, "
+                    "cancel_requested_at FROM inventory_mysql_backfill_job "
+                    "WHERE id=%s FOR UPDATE",
+                    (int(job["id"]),),
+                )
+                state = cur.fetchone()
+                if (
+                    not state
+                    or str(state.get("status") or "") != "running"
+                    or str(state.get("claim_token") or "")
+                    != str(job.get("claim_token") or "")
+                    or str(state.get("c_mac_cursor") or "")
+                    != str(job.get("c_mac_cursor") or "")
+                ):
+                    conn.rollback()
+                    return
+                if state.get("cancel_requested_at") is not None:
+                    # Cancellation is serialized on the job row. If it won the
+                    # lock before this page, discard the response before any
+                    # inventory rows are selected or mutated.
+                    cur.execute(
+                        "UPDATE inventory_mysql_backfill_job SET status='cancelled', "
+                        "claim_token=NULL, next_attempt_at=NULL, error_code=NULL, "
+                        "error_text=NULL, updated_at=%s, finished_at=%s "
+                        "WHERE id=%s AND status='running' AND claim_token=%s "
+                        "AND cancel_requested_at IS NOT NULL",
+                        (
+                            now,
+                            now,
+                            int(job["id"]),
+                            str(job["claim_token"]),
+                        ),
+                    )
+                    if int(cur.rowcount or 0) != 1:
+                        raise RuntimeError("Backfill cancellation lost ownership")
+                    conn.commit()
+                    return
+
+                targets: Dict[str, Dict[str, Any]] = {}
+                if macs:
+                    placeholders = ",".join(["%s"] * len(macs))
+                    cur.execute(
+                        "SELECT mac, ip, vendor, model, hardware_revision, "
+                        "software_version, last_seen_at, inventory_state "
+                        f"FROM modem_inventory_current WHERE mac IN ({placeholders}) "
+                        "FOR UPDATE",
+                        tuple(macs),
+                    )
+                    targets = {str(row["mac"]): row for row in cur.fetchall()}
+
+                matched = 0
+                vendor_unmapped = 0
+                updates = []
+                for source in source_rows:
+                    mac = source["c_mac"]
+                    target = targets.get(mac)
+                    if not target or str(target.get("inventory_state") or "") != "active":
+                        continue
+                    matched += 1
+                    source_model = self._clean_identity_value(source.get("model"))
+                    source_hardware = self._clean_identity_value(source.get("hw_rev"))
+                    source_software = self._clean_identity_value(source.get("sw_rev"))
+
+                    vendor = target.get("vendor")
+                    model = target.get("model")
+                    hardware = target.get("hardware_revision")
+                    software = target.get("software_version")
+                    if self._stored_identity_value(model) is None and source_model:
+                        model = source_model
+                    if self._stored_identity_value(hardware) is None and source_hardware:
+                        hardware = source_hardware
+                    if self._stored_identity_value(software) is None and source_software:
+                        software = source_software
+                    if self._stored_identity_value(vendor) is None and source_software:
+                        inferred_vendor = vendor_for_mac(mac)
+                        if inferred_vendor:
+                            vendor = inferred_vendor
+                        else:
+                            vendor_unmapped += 1
+
+                    ip_value = target.get("ip")
+                    last_seen = target.get("last_seen_at")
+                    source_seen = source.get("source_seen_at")
+                    target_seen = self._mysql_backfill_target_seen(last_seen)
+                    if source_seen is not None and (
+                        target_seen is None or source_seen > target_seen
+                    ):
+                        last_seen = source_seen
+                        if source.get("normalized_ip"):
+                            ip_value = source["normalized_ip"]
+
+                    changed = any(
+                        (
+                            target.get("ip") != ip_value,
+                            target.get("vendor") != vendor,
+                            target.get("model") != model,
+                            target.get("hardware_revision") != hardware,
+                            target.get("software_version") != software,
+                            self._mysql_backfill_target_seen(target.get("last_seen_at"))
+                            != self._mysql_backfill_target_seen(last_seen),
+                        )
+                    )
+                    if changed:
+                        updates.append(
+                            (
+                                ip_value,
+                                vendor,
+                                model,
+                                hardware,
+                                software,
+                                last_seen,
+                                now,
+                                mac,
+                            )
+                        )
+
+                if updates:
+                    cur.executemany(
+                        "UPDATE modem_inventory_current SET ip=%s, vendor=%s, model=%s, "
+                        "hardware_revision=%s, software_version=%s, last_seen_at=%s, "
+                        "updated_at=%s WHERE mac=%s AND inventory_state='active'",
+                        updates,
+                    )
+                    if int(cur.rowcount or 0) != len(updates):
+                        raise RuntimeError("Backfill target update lost row ownership")
+
+                next_status = "queued" if page["has_more"] else "finalizing"
+                cur.execute(
+                    "UPDATE inventory_mysql_backfill_job SET status=%s, "
+                    "claim_token=NULL, c_mac_cursor=%s, "
+                    "source_total=COALESCE(source_total,%s), "
+                    "pages_received=pages_received+1, "
+                    "rows_received=rows_received+%s, rows_matched=rows_matched+%s, "
+                    "rows_updated=rows_updated+%s, rows_skipped=rows_skipped+%s, "
+                    "vendor_unmapped=vendor_unmapped+%s, consecutive_failures=0, "
+                    "next_attempt_at=NULL, error_code=NULL, error_text=NULL, "
+                    "updated_at=%s, finished_at=%s WHERE id=%s AND status='running' "
+                    "AND claim_token=%s",
+                    (
+                        next_status,
+                        page["next_cursor"],
+                        page["total_rows"],
+                        int(page["count"]),
+                        matched,
+                        len(updates),
+                        int(page["count"]) - len(updates),
+                        vendor_unmapped,
+                        now,
+                        None,
+                        int(job["id"]),
+                        str(job["claim_token"]),
+                    ),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise RuntimeError("Backfill page transition lost ownership")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _claim_inventory_mysql_backfill_finalization(self) -> Dict[str, Any] | None:
+        now = self._now()
+        claim_token = str(uuid.uuid4())
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM inventory_mysql_backfill_job "
+                    "WHERE status='finalizing' AND claim_token IS NULL "
+                    "AND (next_attempt_at IS NULL OR next_attempt_at<=UTC_TIMESTAMP()) "
+                    "ORDER BY created_at, id LIMIT 1 FOR UPDATE"
+                )
+                job = cur.fetchone()
+                if not job:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "UPDATE inventory_mysql_backfill_job SET claim_token=%s, "
+                    "last_attempt_at=%s, attempt_count=attempt_count+1, "
+                    "error_code=NULL, error_text=NULL, updated_at=%s "
+                    "WHERE id=%s AND status='finalizing' AND claim_token IS NULL",
+                    (claim_token, now, now, int(job["id"])),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                return {"id": int(job["id"]), "claim_token": claim_token}
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _inventory_mysql_backfill_claim_owned(
+        self,
+        job_id: int,
+        claim_token: str,
+        expected_status: str,
+    ) -> bool:
+        rows = self._query(
+            "SELECT status, claim_token FROM inventory_mysql_backfill_job "
+            "WHERE id=%s LIMIT 1",
+            (int(job_id),),
+        )
+        if not rows:
+            return False
+        job = rows[0]
+        return (
+            str(job.get("status") or "") == expected_status
+            and str(job.get("claim_token") or "") == claim_token
+        )
+
+    def _finalize_inventory_mysql_backfill(
+        self,
+        job_id: int,
+        claim_token: str,
+    ) -> None:
+        # Do not start the externally visible summary rebuild for a claim that
+        # recovery or another worker has already fenced out.
+        if not self._inventory_mysql_backfill_claim_owned(
+            job_id,
+            claim_token,
+            "finalizing",
+        ):
+            return
+        self.rebuild_inventory_summaries()
+        now = self._now()
+        enriched = self._inventory_enriched_sql("i")
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status, claim_token FROM inventory_mysql_backfill_job "
+                    "WHERE id=%s FOR UPDATE",
+                    (int(job_id),),
+                )
+                job = cur.fetchone()
+                if (
+                    not job
+                    or str(job.get("status") or "") != "finalizing"
+                    or str(job.get("claim_token") or "") != claim_token
+                ):
+                    conn.rollback()
+                    return
+                cur.execute(
+                    "DELETE r FROM modem_refresh_request r "
+                    "JOIN modem_inventory_current i ON i.mac=r.mac "
+                    "WHERE r.status='queued' AND r.requested_by=%s "
+                    f"AND i.inventory_state='active' AND ({enriched})",
+                    (_IDENTITY_REQUEST_SOURCE,),
+                )
+                cur.execute(
+                    "UPDATE inventory_mysql_backfill_job SET status='completed', "
+                    "claim_token=NULL, consecutive_failures=0, next_attempt_at=NULL, "
+                    "error_code=NULL, error_text=NULL, updated_at=%s, finished_at=%s "
+                    "WHERE id=%s AND status='finalizing' AND claim_token=%s",
+                    (now, now, int(job_id), claim_token),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise RuntimeError("Backfill completion lost ownership")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _process_one_mysql_backfill_iteration(self) -> None:
+        finalizing = self._claim_inventory_mysql_backfill_finalization()
+        if finalizing:
+            job_id = int(finalizing["id"])
+            claim_token = str(finalizing["claim_token"])
+            try:
+                self._finalize_inventory_mysql_backfill(job_id, claim_token)
+            except Exception as exc:
+                logger.exception("Inventory MySQL backfill finalization failed: %s", exc)
+                self._transition_mysql_backfill_failure(
+                    job_id,
+                    expected_status="finalizing",
+                    retry_status="finalizing",
+                    claim_token=claim_token,
+                    error_code="finalization_failed",
+                    error_text="Inventory backfill finalization failed",
+                    transient=True,
+                )
+            return
+
+        job = self._claim_inventory_mysql_backfill_page()
+        if not job:
+            return
+        job_id = int(job["id"])
+        claim_token = str(job["claim_token"])
+        if self._cancel_claimed_mysql_backfill(job_id, claim_token):
+            return
+        if not self._mysql_backfill_column_ready():
+            self._transition_mysql_backfill_failure(
+                job_id,
+                expected_status="running",
+                retry_status="queued",
+                claim_token=claim_token,
+                error_code="migration_required",
+                error_text="The hardware revision migration is not applied",
+                transient=False,
+            )
+            return
+
+        try:
+            from pypnm.api.agent.manager import AgentCapacityError, get_agent_manager
+
+            manager = get_agent_manager()
+            agent = manager.get_agent(str(job["agent_id"])) if manager else None
+            if (
+                not manager
+                or not agent
+                or not agent.authenticated
+                or not agent.is_alive()
+                or _MYSQL_BACKFILL_CAPABILITY not in agent.capabilities
+            ):
+                raise _InventoryMySQLBackfillTransientError(
+                    "Pinned CM-poller inventory agent is unavailable"
+                )
+            if manager.get_agent_free_slots(agent.agent_id, "bulk") <= 0:
+                self._defer_busy_inventory_mysql_backfill(job_id, claim_token)
+                return
+            try:
+                event = manager.send_task_and_wait(
+                    agent.agent_id,
+                    _MYSQL_BACKFILL_COMMAND,
+                    {
+                        "cursor": str(job.get("c_mac_cursor") or ""),
+                        "page_size": int(job["page_size"]),
+                    },
+                    timeout=_MYSQL_BACKFILL_TASK_TIMEOUT_SECONDS,
+                    priority="bulk",
+                )
+            except AgentCapacityError:
+                self._defer_busy_inventory_mysql_backfill(job_id, claim_token)
+                return
+            except Exception as exc:
+                raise _InventoryMySQLBackfillTransientError(
+                    "Pinned CM-poller inventory agent is unavailable"
+                ) from exc
+            if event is None:
+                raise _InventoryMySQLBackfillTransientError(
+                    "CM-poller inventory page timed out"
+                )
+            if isinstance(event, dict) and event.get("type") == "error":
+                reason = str(event.get("terminal_reason") or "").lower()
+                text = str(event.get("error") or "").lower()
+                if reason in {"timeout", "send_failed", "agent_reconnected"} or any(
+                    marker in text
+                    for marker in ("timeout", "unavailable", "not connected", "disconnect")
+                ):
+                    raise _InventoryMySQLBackfillTransientError(
+                        "CM-poller inventory agent task was interrupted"
+                    )
+            page = self._validate_mysql_backfill_response(
+                event,
+                cursor=str(job.get("c_mac_cursor") or ""),
+                page_size=int(job["page_size"]),
+                source_total=(
+                    int(job["source_total"])
+                    if job.get("source_total") is not None
+                    else None
+                ),
+            )
+            self._apply_mysql_backfill_page(job, page)
+        except _InventoryMySQLBackfillTransientError as exc:
+            self._transition_mysql_backfill_failure(
+                job_id,
+                expected_status="running",
+                retry_status="queued",
+                claim_token=claim_token,
+                error_code="agent_temporarily_unavailable",
+                error_text=str(exc),
+                transient=True,
+            )
+        except _InventoryMySQLBackfillResponseError as exc:
+            self._transition_mysql_backfill_failure(
+                job_id,
+                expected_status="running",
+                retry_status="queued",
+                claim_token=claim_token,
+                error_code="invalid_agent_response",
+                error_text=str(exc),
+                transient=False,
+            )
+        except pymysql.MySQLError as exc:
+            logger.warning("Inventory MySQL backfill target DB unavailable: %s", exc)
+            self._transition_mysql_backfill_failure(
+                job_id,
+                expected_status="running",
+                retry_status="queued",
+                claim_token=claim_token,
+                error_code="target_temporarily_unavailable",
+                error_text="Inventory target database is temporarily unavailable",
+                transient=True,
+            )
+        except Exception as exc:
+            logger.exception("Inventory MySQL backfill page failed: %s", exc)
+            self._transition_mysql_backfill_failure(
+                job_id,
+                expected_status="running",
+                retry_status="queued",
+                claim_token=claim_token,
+                error_code="page_failed",
+                error_text="Inventory backfill page failed",
+                transient=False,
+            )
 
     def rebuild_inventory_summaries(self) -> Dict[str, Any]:
         """Recompute summaries in bounded, restart-safe per-CMTS transactions."""
