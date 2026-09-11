@@ -235,13 +235,21 @@ def inventory_summary(
     cmts: str | None = None,
     area: str = "all",
     top_n: int = Query(default=25, ge=1, le=100),
+    vendor: str | None = Query(default=None, max_length=255),
+    model: str | None = Query(default=None, max_length=255),
+    software: str | None = Query(default=None, max_length=255),
+    docsis: str | None = Query(default=None, max_length=255),
 ) -> dict:
-    """Return vendor/model/firmware/DOCSIS count breakdowns for the inventory dashboard."""
+    """Return correlated vendor/model/firmware/DOCSIS inventory facets."""
     try:
         data = poller_service.get_inventory_summary(
             cmts=cmts,
             area=area,
             top_n=top_n,
+            vendor=vendor,
+            model=model,
+            software=software,
+            docsis=docsis,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

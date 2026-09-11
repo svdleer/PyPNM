@@ -7591,11 +7591,34 @@ class PollerService:
         cmts: Optional[str] = None,
         top_n: int = 25,
         area: Optional[str] = "all",
+        vendor: Optional[str] = None,
+        model: Optional[str] = None,
+        software: Optional[str] = None,
+        docsis: Optional[str] = None,
     ) -> dict:
-        """Read normalized materialized inventory summaries only."""
+        """Read inventory facets, correlating active filters against live rows."""
         top = max(1, min(int(top_n), 100))
         normalized_area = self._normalize_inventory_area(area)
         cmts_value = str(cmts).strip() if cmts else None
+        facet_columns = {
+            "vendor": "vendor",
+            "model": "model",
+            "software_version": "software_version",
+            "docsis_version": "docsis_version",
+        }
+        supplied_filters = {
+            "vendor": vendor,
+            "model": model,
+            "software_version": software,
+            "docsis_version": docsis,
+        }
+        facet_filters: Dict[str, str] = {}
+        for dimension, raw_value in supplied_filters.items():
+            value = str(raw_value).strip() if raw_value is not None else ""
+            if len(value) > 255:
+                raise ValueError("Inventory facet filters must not exceed 255 characters")
+            if value:
+                facet_filters[dimension] = value
 
         def _scope(alias: str) -> tuple[str, List[Any]]:
             predicates: List[str] = []
@@ -7614,6 +7637,44 @@ class PollerService:
                 params,
             )
 
+        def _facet_value_sql(dimension: str) -> str:
+            column = f"m.{facet_columns[dimension]}"
+            if dimension in {"vendor", "model", "software_version"}:
+                return (
+                    f"CASE WHEN {self._identity_value_sql(column)} "
+                    f"THEN TRIM({column}) ELSE '(unknown)' END"
+                )
+            return f"COALESCE(NULLIF(TRIM({column}),''), '(unknown)')"
+
+        def _live_scope(exclude_dimension: Optional[str] = None) -> tuple[str, List[Any]]:
+            predicates = ["m.inventory_state='active'"]
+            params: List[Any] = []
+            if cmts_value:
+                predicates.append("(m.cmts=%s OR m.cmts_ip=%s)")
+                params.extend([cmts_value, cmts_value])
+            area_predicate, area_params = self._area_sql_predicate(
+                "s.area", normalized_area
+            )
+            if area_predicate:
+                predicates.append(
+                    "EXISTS (SELECT 1 FROM inventory_summary_status s "
+                    f"WHERE s.cmts_ip=m.cmts_ip AND {area_predicate})"
+                )
+                params.extend(area_params)
+            for dimension, value in facet_filters.items():
+                if dimension == exclude_dimension:
+                    continue
+                column = f"m.{facet_columns[dimension]}"
+                if value == "(unknown)":
+                    if dimension in {"vendor", "model", "software_version"}:
+                        predicates.append(f"NOT ({self._identity_value_sql(column)})")
+                    else:
+                        predicates.append(f"COALESCE(TRIM({column}),'')=''")
+                else:
+                    predicates.append(f"{column}=%s")
+                    params.append(value)
+            return " WHERE " + " AND ".join(predicates), params
+
         status_where, status_params = _scope("s")
         status_rows = self._query(
             "SELECT COUNT(*) AS covered_cmts, "
@@ -7628,6 +7689,7 @@ class PollerService:
         covered_cmts = int(status.get("covered_cmts") or 0)
         total = int(status.get("total") or 0)
         enriched = int(status.get("enriched") or 0)
+        last_updated = status.get("last_updated")
 
         snapshot_where, snapshot_params = _scope("snap")
         snapshot_rows = self._query(
@@ -7641,19 +7703,35 @@ class PollerService:
 
         count_where, count_params = _scope("s")
         results: Dict[str, List[Dict[str, Any]]] = {}
-        for dimension in ("vendor", "model", "software_version", "docsis_version"):
+        dimensions = ("vendor", "model", "software_version", "docsis_version")
+        for dimension in dimensions:
+            requires_live_facet = bool(facet_filters) and any(
+                key != dimension for key in facet_filters
+            )
+            if requires_live_facet:
+                continue
             dimension_predicate = (
                 f"{count_where} AND c.dimension=%s"
                 if count_where
                 else " WHERE c.dimension=%s"
             )
+            selected_value = facet_filters.get(dimension)
+            priority_sql = (
+                "CASE WHEN c.value=%s THEN 0 ELSE 1 END, "
+                if selected_value is not None
+                else ""
+            )
+            query_params = count_params + [dimension]
+            if selected_value is not None:
+                query_params.append(selected_value)
+            query_params.append(top)
             rows = self._query(
                 "SELECT c.value, SUM(c.row_count) AS count "
                 "FROM inventory_summary_count c "
                 "JOIN inventory_summary_status s ON s.cmts_ip=c.cmts_ip "
                 f"{dimension_predicate} GROUP BY c.value "
-                "ORDER BY count DESC, c.value ASC LIMIT %s",
-                tuple(count_params + [dimension, top]),
+                f"ORDER BY {priority_sql}count DESC, c.value ASC LIMIT %s",
+                tuple(query_params),
             )
             results[dimension] = [
                 {
@@ -7663,16 +7741,65 @@ class PollerService:
                 for row in rows
             ]
 
+        if facet_filters:
+            live_where, live_params = _live_scope()
+            live_rows = self._query(
+                "SELECT COUNT(*) AS total, "
+                f"SUM(CASE WHEN {self._inventory_enriched_sql('m')} "
+                "THEN 1 ELSE 0 END) AS enriched, MAX(m.updated_at) AS last_updated "
+                f"FROM modem_inventory_current m{live_where}",
+                tuple(live_params),
+            )
+            live_status = (live_rows[0] if live_rows else {}) or {}
+            total = int(live_status.get("total") or 0)
+            enriched = int(live_status.get("enriched") or 0)
+            last_updated = live_status.get("last_updated")
+
+            for dimension in dimensions:
+                if not any(key != dimension for key in facet_filters):
+                    continue
+                facet_where, facet_params = _live_scope(exclude_dimension=dimension)
+                value_sql = _facet_value_sql(dimension)
+                selected_value = facet_filters.get(dimension)
+                priority_sql = (
+                    f"CASE WHEN {value_sql}=%s THEN 0 ELSE 1 END, "
+                    if selected_value is not None
+                    else ""
+                )
+                query_params = list(facet_params)
+                if selected_value is not None:
+                    query_params.append(selected_value)
+                query_params.append(top)
+                rows = self._query(
+                    f"SELECT {value_sql} AS value, COUNT(*) AS count "
+                    f"FROM modem_inventory_current m{facet_where} "
+                    f"GROUP BY 1 ORDER BY {priority_sql}count DESC, value ASC LIMIT %s",
+                    tuple(query_params),
+                )
+                results[dimension] = [
+                    {
+                        "value": str(row.get("value") or ""),
+                        "count": int(row.get("count") or 0),
+                    }
+                    for row in rows
+                ]
+
         return {
             "total": total,
             "enriched": enriched,
             "enriched_pct": round(enriched / total * 100, 1) if total else 0.0,
-            "last_updated": str(status.get("last_updated") or ""),
+            "last_updated": str(last_updated or ""),
             "vendors": results.get("vendor", []),
             "models": results.get("model", []),
             "firmwares": results.get("software_version", []),
             "docsis_versions": results.get("docsis_version", []),
-            "materialized": True,
+            "materialized": not bool(facet_filters),
+            "filters": {
+                "vendor": facet_filters.get("vendor"),
+                "model": facet_filters.get("model"),
+                "software": facet_filters.get("software_version"),
+                "docsis": facet_filters.get("docsis_version"),
+            },
             "area": normalized_area,
             "coverage": {
                 "covered_cmts": covered_cmts,
