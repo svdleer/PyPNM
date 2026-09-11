@@ -50,12 +50,12 @@ _IDENTITY_SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
 _IDENTITY_FIRMWARE_OID = "1.3.6.1.2.1.69.1.3.2.0"
 _IDENTITY_DOCSIS_CAPABILITY_OID = "1.3.6.1.4.1.4491.2.1.28.1.1.0"
 _IDENTITY_REQUEST_SOURCE = "inventory-identity"
-_MYSQL_BACKFILL_CAPABILITY = "cm_poller_inventory"
-_MYSQL_BACKFILL_COMMAND = "cm_poller_modems_page"
+_MYSQL_BACKFILL_CAPABILITY = "cm_poller_inventory_v2"
+_MYSQL_BACKFILL_COMMAND = "cm_poller_modems_page_v2"
 _MYSQL_BACKFILL_TASK_TIMEOUT_SECONDS = 90
 _MYSQL_BACKFILL_MAX_TRANSIENT_FAILURES = 5
 _MYSQL_BACKFILL_ROW_KEYS = frozenset(
-    {"c_mac", "l_ip", "model", "hw_rev", "sw_rev", "last_update"}
+    {"c_mac", "l_ip", "model", "hw_rev", "sw_rev", "cnr", "last_update"}
 )
 
 
@@ -268,6 +268,7 @@ class PollerService:
                 last_seen_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
                 source_poller VARCHAR(64) NULL,
+                source_area VARCHAR(16) NOT NULL DEFAULT 'unknown',
                 snapshot_id CHAR(36) NULL,
                 inventory_state VARCHAR(24) NOT NULL DEFAULT 'active',
                 missing_since DATETIME NULL,
@@ -510,6 +511,7 @@ class PollerService:
             "ofdm_channel_count": "INT NULL",
             "ofdma_channel_count": "INT NULL",
             "snapshot_id": "CHAR(36) NULL",
+            "source_area": "VARCHAR(16) NOT NULL DEFAULT 'unknown'",
             "inventory_state": "VARCHAR(24) NOT NULL DEFAULT 'active'",
             "missing_since": "DATETIME NULL",
             "consecutive_full_misses": "INT NOT NULL DEFAULT 0",
@@ -519,6 +521,25 @@ class PollerService:
             str(row.get("Field"))
             for row in self._query("SHOW COLUMNS FROM modem_inventory_current")
         }
+        if "source_area" not in existing_inventory_columns:
+            try:
+                self._execute(
+                    "ALTER TABLE modem_inventory_current "
+                    "ADD COLUMN source_area VARCHAR(16) NOT NULL DEFAULT 'unknown', "
+                    "ALGORITHM=INSTANT"
+                )
+            except Exception as exc:
+                remaining = {
+                    str(row.get("Field"))
+                    for row in self._query(
+                        "SHOW COLUMNS FROM modem_inventory_current"
+                    )
+                }
+                if "source_area" not in remaining:
+                    raise RuntimeError(
+                        "Failed to add source_area with ALGORITHM=INSTANT"
+                    ) from exc
+            existing_inventory_columns.add("source_area")
         missing_inventory_columns = [
             name for name in inventory_columns if name not in existing_inventory_columns
         ]
@@ -841,36 +862,9 @@ class PollerService:
                         "Failed to add required inventory summary area column"
                     ) from exc
 
-        # Repair interrupted area migrations one unknown CMTS at a time. The
-        # existing cmts_ip index bounds each aggregate and each autocommitted
-        # update makes the migration restart-safe without one long DB query that
-        # can time out and prevent the poller router from loading.
-        area_sql = self._inventory_area_aggregate_sql("m")
-        pending_area_rows = self._query(
-            "SELECT cmts_ip FROM inventory_summary_status "
-            "WHERE area='unknown' AND COALESCE(cmts_ip,'')<>'' "
-            "ORDER BY cmts_ip"
-        )
-        for pending_area_row in pending_area_rows:
-            cmts_ip = str(pending_area_row.get("cmts_ip") or "").strip()
-            if not cmts_ip:
-                continue
-            classified_rows = self._query(
-                f"SELECT {area_sql} AS area FROM modem_inventory_current m "
-                "WHERE m.inventory_state='active' AND m.cmts_ip=%s",
-                (cmts_ip,),
-            )
-            classified_area = str(
-                (classified_rows[0] if classified_rows else {}).get("area")
-                or "unknown"
-            ).strip().lower()
-            if classified_area not in {"fziggo", "fupc"}:
-                continue
-            self._execute(
-                "UPDATE inventory_summary_status SET area=%s "
-                "WHERE cmts_ip=%s AND area='unknown'",
-                (classified_area, cmts_ip),
-            )
+        # Source-area summaries are rebuilt after each durable CNR backfill.
+        # Startup only propagates already-materialized recognized areas; semantic
+        # unknown values are terminal and must not trigger a 3M-row rescan.
         self._execute(
             "UPDATE cmts_inventory_snapshot snap "
             "JOIN inventory_summary_status s ON s.cmts_ip=snap.cmts_ip "
@@ -2182,25 +2176,13 @@ class PollerService:
 
     @staticmethod
     def _inventory_area_aggregate_sql(alias: str = "") -> str:
-        """Classify one CMTS from recognized modem management IPv4 addresses."""
+        """Classify one CMTS from authoritative CM-poller CNR areas."""
         prefix = f"{alias}." if alias else ""
-        management_ip = f"TRIM({prefix}ip)"
-        address = f"INET_ATON({management_ip})"
-        dotted_ipv4 = (
-            f"LENGTH({management_ip})-"
-            f"LENGTH(REPLACE({management_ip},'.',''))=3"
+        source_area = f"LOWER(TRIM(COALESCE({prefix}source_area,'')))"
+        fziggo_count = (
+            f"SUM(CASE WHEN {source_area}='fziggo' THEN 1 ELSE 0 END)"
         )
-        fziggo = (
-            f"({dotted_ipv4} AND "
-            f"{address} BETWEEN 2147483648 AND 2149580799)"
-        )
-        fupc = (
-            f"({dotted_ipv4} AND ("
-            f"{address} BETWEEN 2684354560 AND 2686451711 OR "
-            f"{address} BETWEEN 180355072 AND 182452223))"
-        )
-        fziggo_count = f"SUM(CASE WHEN {fziggo} THEN 1 ELSE 0 END)"
-        fupc_count = f"SUM(CASE WHEN {fupc} THEN 1 ELSE 0 END)"
+        fupc_count = f"SUM(CASE WHEN {source_area}='fupc' THEN 1 ELSE 0 END)"
         return (
             f"CASE WHEN {fziggo_count}>0 AND {fupc_count}=0 THEN 'fziggo' "
             f"WHEN {fupc_count}>0 AND {fziggo_count}=0 THEN 'fupc' "
@@ -8523,6 +8505,22 @@ class PollerService:
             return None
         return str(address)
 
+    @staticmethod
+    def _source_area_from_cnr(value: str | None) -> str:
+        """Map a CM-poller CNR IPv4 host suffix to its inventory area."""
+        if value is None or not value.strip():
+            return "unknown"
+        try:
+            address = ipaddress.IPv4Address(value.strip())
+        except ValueError:
+            return "unknown"
+        final_octet = int(address.packed[-1])
+        if 218 <= final_octet <= 221:
+            return "fupc"
+        if 230 <= final_octet <= 236:
+            return "fziggo"
+        return "unknown"
+
     def _validate_mysql_backfill_response(
         self,
         event: Any,
@@ -8607,7 +8605,13 @@ class PollerService:
         normalized_rows: List[Dict[str, Any]] = []
         previous_mac = cursor
         epoch_ceiling = int(datetime.now(timezone.utc).timestamp()) + 86400
-        text_limits = {"l_ip": 45, "model": 128, "hw_rev": 80, "sw_rev": 128}
+        text_limits = {
+            "l_ip": 45,
+            "model": 128,
+            "hw_rev": 80,
+            "sw_rev": 128,
+            "cnr": 45,
+        }
         for row in rows:
             if not isinstance(row, dict) or set(row) != _MYSQL_BACKFILL_ROW_KEYS:
                 raise _InventoryMySQLBackfillResponseError(
@@ -8651,6 +8655,9 @@ class PollerService:
             )
             normalized["normalized_ip"] = self._validated_mysql_backfill_ip(
                 normalized.get("l_ip")
+            )
+            normalized["source_area"] = self._source_area_from_cnr(
+                normalized.get("cnr")
             )
             normalized_rows.append(normalized)
             previous_mac = raw_mac
@@ -8738,7 +8745,7 @@ class PollerService:
                     placeholders = ",".join(["%s"] * len(macs))
                     cur.execute(
                         "SELECT mac, ip, vendor, model, hardware_revision, "
-                        "software_version, last_seen_at, inventory_state "
+                        "software_version, source_area, last_seen_at, inventory_state "
                         f"FROM modem_inventory_current WHERE mac IN ({placeholders}) "
                         "FOR UPDATE",
                         tuple(macs),
@@ -8762,6 +8769,7 @@ class PollerService:
                     model = target.get("model")
                     hardware = target.get("hardware_revision")
                     software = target.get("software_version")
+                    source_area = source["source_area"]
                     if self._stored_identity_value(model) is None and source_model:
                         model = source_model
                     if self._stored_identity_value(hardware) is None and source_hardware:
@@ -8793,6 +8801,7 @@ class PollerService:
                             target.get("model") != model,
                             target.get("hardware_revision") != hardware,
                             target.get("software_version") != software,
+                            str(target.get("source_area") or "unknown") != source_area,
                             self._mysql_backfill_target_seen(target.get("last_seen_at"))
                             != self._mysql_backfill_target_seen(last_seen),
                         )
@@ -8805,6 +8814,7 @@ class PollerService:
                                 model,
                                 hardware,
                                 software,
+                                source_area,
                                 last_seen,
                                 now,
                                 mac,
@@ -8814,8 +8824,9 @@ class PollerService:
                 if updates:
                     cur.executemany(
                         "UPDATE modem_inventory_current SET ip=%s, vendor=%s, model=%s, "
-                        "hardware_revision=%s, software_version=%s, last_seen_at=%s, "
-                        "updated_at=%s WHERE mac=%s AND inventory_state='active'",
+                        "hardware_revision=%s, software_version=%s, source_area=%s, "
+                        "last_seen_at=%s, updated_at=%s "
+                        "WHERE mac=%s AND inventory_state='active'",
                         updates,
                     )
                     if int(cur.rowcount or 0) != len(updates):
@@ -9140,6 +9151,15 @@ class PollerService:
                             cur,
                             cmts_ip=cmts_ip,
                             cmts=cmts,
+                            refreshed_at=now,
+                        )
+                        self._replace_daily_inventory_summary_cursor(
+                            cur,
+                            snapshot_date=now[:10],
+                            cmts_ip=cmts_ip,
+                            cmts=cmts,
+                            area=area,
+                            collected_at=now,
                             refreshed_at=now,
                         )
                         cur.execute(
