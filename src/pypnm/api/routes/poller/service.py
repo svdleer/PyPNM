@@ -38,6 +38,10 @@ _INVENTORY_FULL_TASK_TYPE = "inventory_full"
 _INVENTORY_FULL_SYSTEM_KEY = "inventory-daily-full"
 _INVENTORY_FULL_NAME = "Inventory daily full refresh"
 _INVENTORY_FULL_SCHEDULE = datetime_time(hour=1)
+_IDENTITY_BACKFILL_TASK_TYPE = "identity_backfill"
+_IDENTITY_BACKFILL_SYSTEM_KEY = "inventory-identity-backfill"
+_IDENTITY_BACKFILL_NAME = "Inventory identity enrichment"
+_MANUAL_ONLY_TASK_TYPES = frozenset({_IDENTITY_BACKFILL_TASK_TYPE})
 _INVENTORY_TASK_TYPES = frozenset(
     {
         "inventory",
@@ -354,6 +358,7 @@ class PollerService:
                 modems_attempted INT NOT NULL DEFAULT 0,
                 modems_succeeded INT NOT NULL DEFAULT 0,
                 modems_failed INT NOT NULL DEFAULT 0,
+                modems_remaining INT NOT NULL DEFAULT 0,
                 requested_by VARCHAR(64) NULL,
                 request_payload JSON NULL,
                 started_at DATETIME NULL,
@@ -628,6 +633,12 @@ class PollerService:
                 "ALTER TABLE poller_job "
                 "ADD COLUMN `scheduled_slot_utc` DATETIME NULL"
             )
+        if "modems_remaining" not in job_columns:
+            self._execute(
+                "ALTER TABLE poller_job "
+                "ADD COLUMN `modems_remaining` INT NOT NULL DEFAULT 0, "
+                "ALGORITHM=INSTANT"
+            )
 
         required_indexes = {
             "poller_setting": (
@@ -795,6 +806,13 @@ class PollerService:
             interval_minutes=1440,
             max_runtime_sec=43200,
         )
+        _ensure_inventory_system_task(
+            name=_IDENTITY_BACKFILL_NAME,
+            task_type=_IDENTITY_BACKFILL_TASK_TYPE,
+            system_key=_IDENTITY_BACKFILL_SYSTEM_KEY,
+            interval_minutes=1440,
+            max_runtime_sec=172800,
+        )
 
         snapshot_columns = {
             "revision_at": "DATETIME NULL",
@@ -952,6 +970,7 @@ class PollerService:
             """
             CREATE TABLE IF NOT EXISTS modem_refresh_request (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                poller_job_id BIGINT NULL,
                 mac VARCHAR(17) NOT NULL,
                 cmts VARCHAR(128) NULL,
                 status VARCHAR(24) NOT NULL DEFAULT 'queued',
@@ -976,6 +995,7 @@ class PollerService:
                     CASE WHEN status IN ('queued','running') THEN mac ELSE NULL END
                 ) STORED,
                 INDEX idx_refresh_status (status, next_attempt_at, created_at),
+                INDEX idx_refresh_job_status (poller_job_id, status),
                 INDEX idx_refresh_mac (mac, created_at),
                 UNIQUE KEY uk_refresh_active_mac (active_key)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -985,7 +1005,10 @@ class PollerService:
             """
             CREATE TABLE IF NOT EXISTS inventory_identity_cursor (
                 id TINYINT PRIMARY KEY,
+                poller_job_id BIGINT NULL,
                 cursor_mac VARCHAR(17) NOT NULL DEFAULT '',
+                max_mac VARCHAR(17) NOT NULL DEFAULT '',
+                target_total BIGINT NOT NULL DEFAULT 0,
                 cycle_started_at DATETIME NOT NULL,
                 next_scan_at DATETIME NULL,
                 queued_count BIGINT NOT NULL DEFAULT 0,
@@ -993,6 +1016,16 @@ class PollerService:
                 failed_count BIGINT NOT NULL DEFAULT 0,
                 last_error VARCHAR(500) NULL,
                 updated_at DATETIME NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_identity_backfill_target (
+                poller_job_id BIGINT NOT NULL,
+                mac VARCHAR(17) NOT NULL,
+                created_at DATETIME NOT NULL,
+                PRIMARY KEY (poller_job_id, mac)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -1044,11 +1077,25 @@ class PollerService:
             "(id, cursor_mac, cycle_started_at, updated_at) VALUES (1,'',%s,%s)",
             (now, now),
         )
+        cursor_columns = {
+            str(row.get("Field"))
+            for row in self._query("SHOW COLUMNS FROM inventory_identity_cursor")
+        }
+        for column, ddl in (
+            ("poller_job_id", "BIGINT NULL"),
+            ("max_mac", "VARCHAR(17) NOT NULL DEFAULT ''"),
+            ("target_total", "BIGINT NOT NULL DEFAULT 0"),
+        ):
+            if column not in cursor_columns:
+                self._execute(
+                    f"ALTER TABLE inventory_identity_cursor ADD COLUMN {column} {ddl}"
+                )
         refresh_columns = {
             str(row.get("Field"))
             for row in self._query("SHOW COLUMNS FROM modem_refresh_request")
         }
         for column, ddl in (
+            ("poller_job_id", "BIGINT NULL"),
             ("attempt_count", "INT NOT NULL DEFAULT 0"),
             ("next_attempt_at", "DATETIME NULL"),
             ("last_attempt_at", "DATETIME NULL"),
@@ -1063,8 +1110,10 @@ class PollerService:
             ("target_inventory_updated_at", "DATETIME NULL"),
         ):
             if column not in refresh_columns:
+                algorithm = ", ALGORITHM=INSTANT" if column == "poller_job_id" else ""
                 self._execute(
-                    f"ALTER TABLE modem_refresh_request ADD COLUMN {column} {ddl}"
+                    "ALTER TABLE modem_refresh_request "
+                    f"ADD COLUMN {column} {ddl}{algorithm}"
                 )
         if "active_key" not in refresh_columns:
             self._execute(
@@ -1126,6 +1175,12 @@ class PollerService:
             self._execute(
                 "CREATE INDEX idx_refresh_dispatch ON modem_refresh_request "
                 "(status, dispatch_deadline_at)"
+            )
+        if "idx_refresh_job_status" not in refresh_indexes:
+            self._execute(
+                "ALTER TABLE modem_refresh_request "
+                "ADD INDEX idx_refresh_job_status (poller_job_id, status), "
+                "ALGORITHM=INPLACE, LOCK=NONE"
             )
 
     def _start_worker(self) -> None:
@@ -1197,7 +1252,7 @@ class PollerService:
         self._execute(
             """
             UPDATE poller_job
-            SET status='queued', started_at=NULL, finished_at=NULL,
+            SET status='queued', finished_at=NULL,
                 error_text='Recovered after poller worker restart'
             WHERE status='running'
             """
@@ -1206,23 +1261,60 @@ class PollerService:
     def _recover_interrupted_refresh_work(self) -> None:
         """Recover orphaned refresh work without bypassing identity backoff."""
         now = self._now()
-        with self._db_lock:
-            conn = self._connect()
-            try:
-                conn.begin()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT id, attempt_count, dispatched_at "
-                    "FROM modem_refresh_request "
-                    "WHERE status='running' AND requested_by=%s "
-                    "AND (dispatch_deadline_at IS NULL "
-                    "OR dispatch_deadline_at<=UTC_TIMESTAMP()) FOR UPDATE",
-                    (_IDENTITY_REQUEST_SOURCE,),
-                )
-                identity_rows = cur.fetchall()
-                terminal_failures = 0
-                for row in identity_rows:
-                    req_id = int(row["id"])
+        identity_rows = self._query(
+            "SELECT id, poller_job_id FROM modem_refresh_request "
+            "WHERE status='running' AND requested_by=%s "
+            "AND (dispatch_deadline_at IS NULL "
+            "OR dispatch_deadline_at<=UTC_TIMESTAMP()) ORDER BY id",
+            (_IDENTITY_REQUEST_SOURCE,),
+        )
+        for identity_row in identity_rows:
+            req_id = int(identity_row.get("id") or 0)
+            parent_job_id = int(identity_row.get("poller_job_id") or 0)
+            with self._db_lock:
+                conn = self._connect()
+                try:
+                    conn.begin()
+                    cur = conn.cursor()
+                    parent = {}
+                    if parent_job_id > 0:
+                        cur.execute(
+                            "SELECT status FROM poller_job "
+                            "WHERE id=%s FOR UPDATE",
+                            (parent_job_id,),
+                        )
+                        parent = cur.fetchone() or {}
+                        cur.execute(
+                            "SELECT poller_job_id FROM inventory_identity_cursor "
+                            "WHERE id=1 FOR UPDATE"
+                        )
+                    cur.execute(
+                        "SELECT id, attempt_count, dispatched_at "
+                        "FROM modem_refresh_request WHERE id=%s "
+                        "AND poller_job_id<=>%s AND status='running' "
+                        "AND requested_by=%s AND (dispatch_deadline_at IS NULL "
+                        "OR dispatch_deadline_at<=UTC_TIMESTAMP()) FOR UPDATE",
+                        (
+                            req_id,
+                            parent_job_id or None,
+                            _IDENTITY_REQUEST_SOURCE,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        conn.rollback()
+                        continue
+                    if str(parent.get("status") or "") not in {"queued", "running"}:
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='cancelled', "
+                            "finished_at=%s, next_attempt_at=NULL, "
+                            "claim_token=NULL, dispatch_deadline_at=NULL, "
+                            "error_text='Identity parent job is not active' "
+                            "WHERE id=%s AND status='running'",
+                            (now, req_id),
+                        )
+                        conn.commit()
+                        continue
                     attempt_count = int(row.get("attempt_count") or 0)
                     if not row.get("dispatched_at"):
                         next_attempt_at = (
@@ -1239,6 +1331,7 @@ class PollerService:
                             "AND dispatched_at IS NULL",
                             (next_attempt_at, req_id),
                         )
+                        conn.commit()
                         continue
                     if attempt_count >= self._identity_max_attempts():
                         cur.execute(
@@ -1250,7 +1343,15 @@ class PollerService:
                             "WHERE id=%s AND status='running'",
                             (now, req_id),
                         )
-                        terminal_failures += int(cur.rowcount or 0)
+                        if int(cur.rowcount or 0) == 1 and parent_job_id > 0:
+                            cur.execute(
+                                "UPDATE inventory_identity_cursor SET "
+                                "failed_count=failed_count+1, "
+                                "last_error='Identity retry limit reached during recovery', "
+                                "updated_at=%s WHERE id=1 AND poller_job_id=%s",
+                                (now, parent_job_id),
+                            )
+                        conn.commit()
                         continue
                     next_attempt_at = (
                         datetime.now(timezone.utc)
@@ -1266,27 +1367,19 @@ class PollerService:
                         "WHERE id=%s AND status='running'",
                         (next_attempt_at, req_id),
                     )
-                if terminal_failures:
-                    cur.execute(
-                        "UPDATE inventory_identity_cursor SET "
-                        "failed_count=failed_count+%s, "
-                        "last_error='Identity retry limit reached during recovery', "
-                        "updated_at=%s WHERE id=1",
-                        (terminal_failures, now),
-                    )
-                cur.execute(
-                    "UPDATE modem_refresh_request SET status='queued', "
-                    "started_at=NULL, finished_at=NULL, claim_token=NULL, "
-                    "error_text='Recovered after refresh worker restart' "
-                    "WHERE status='running' AND COALESCE(requested_by,'')<>%s",
-                    (_IDENTITY_REQUEST_SOURCE,),
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+        self._execute(
+            "UPDATE modem_refresh_request SET status='queued', "
+            "started_at=NULL, finished_at=NULL, claim_token=NULL, "
+            "error_text='Recovered after refresh worker restart' "
+            "WHERE status='running' AND COALESCE(requested_by,'')<>%s",
+            (_IDENTITY_REQUEST_SOURCE,),
+        )
 
     def _worker_loop(self) -> None:
         lock_conn = None
@@ -1406,7 +1499,8 @@ class PollerService:
                 if tick >= maintenance_due:
                     self._timeout_stale_refresh_requests()
                     self._expire_identity_dispatches()
-                    self._seed_identity_refresh_queue()
+                    self._cancel_orphaned_identity_requests()
+                    self._advance_identity_backfill_job()
                     maintenance_due = tick + 2.0
                 if completed_events or tick >= dispatch_due:
                     self._dispatch_identity_tasks()
@@ -1507,19 +1601,76 @@ class PollerService:
             return True
 
     def _timeout_stale_jobs(self) -> None:
-        max_runtime = max(60, int(os.environ.get("DATA_STORE_JOB_MAX_RUNTIME_SEC", "14400")))
-        self._execute(
-            """
-            UPDATE poller_job j
-            LEFT JOIN poller_setting p ON p.id = j.poller_id
-            SET j.status=%s,
-                j.finished_at=%s,
-                j.error_text=CONCAT('Timed out after ', COALESCE(NULLIF(p.max_runtime_sec, 0), %s), 's')
-            WHERE j.status='running' AND j.started_at IS NOT NULL
-              AND TIMESTAMPDIFF(SECOND, j.started_at, UTC_TIMESTAMP()) > COALESCE(NULLIF(p.max_runtime_sec, 0), %s)
-            """,
-            ("timed_out", self._now(), max_runtime, max_runtime),
+        default_max_runtime = max(
+            60,
+            int(os.environ.get("DATA_STORE_JOB_MAX_RUNTIME_SEC", "14400")),
         )
+        candidates = self._query(
+            "SELECT id FROM poller_job "
+            "WHERE status='running' AND started_at IS NOT NULL ORDER BY id"
+        )
+        for candidate in candidates:
+            job_id = int(candidate.get("id") or 0)
+            now = self._now()
+            with self._db_lock:
+                conn = self._connect()
+                try:
+                    conn.begin()
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT status, poller_id FROM poller_job "
+                        "WHERE id=%s FOR UPDATE",
+                        (job_id,),
+                    )
+                    job = cur.fetchone() or {}
+                    if str(job.get("status") or "") != "running":
+                        conn.rollback()
+                        continue
+                    cur.execute(
+                        "SELECT task_type, max_runtime_sec FROM poller_setting "
+                        "WHERE id=%s",
+                        (int(job.get("poller_id") or 0),),
+                    )
+                    setting = cur.fetchone() or {}
+                    configured_runtime = int(setting.get("max_runtime_sec") or 0)
+                    max_runtime = configured_runtime or default_max_runtime
+                    cur.execute(
+                        "UPDATE poller_job SET status='timed_out', finished_at=%s, "
+                        "error_text=%s WHERE id=%s AND status='running' "
+                        "AND started_at IS NOT NULL AND "
+                        "TIMESTAMPDIFF(SECOND, started_at, UTC_TIMESTAMP())>%s",
+                        (
+                            now,
+                            f"Timed out after {max_runtime}s",
+                            job_id,
+                            max_runtime,
+                        ),
+                    )
+                    if int(cur.rowcount or 0) != 1:
+                        conn.rollback()
+                        continue
+                    if str(setting.get("task_type") or "") == _IDENTITY_BACKFILL_TASK_TYPE:
+                        cur.execute(
+                            "UPDATE inventory_identity_cursor "
+                            "SET poller_job_id=NULL, updated_at=%s "
+                            "WHERE id=1 AND poller_job_id=%s",
+                            (now, job_id),
+                        )
+                        cur.execute(
+                            "UPDATE modem_refresh_request SET status='cancelled', "
+                            "finished_at=%s, next_attempt_at=NULL, "
+                            "claim_token=NULL, dispatch_deadline_at=NULL, "
+                            "error_text='Identity parent job timed out' "
+                            "WHERE poller_job_id=%s AND requested_by=%s "
+                            "AND status IN ('queued','running')",
+                            (now, job_id, _IDENTITY_REQUEST_SOURCE),
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
 
     def _timeout_stale_refresh_requests(self) -> None:
         # Manual refreshes can consume 70 seconds for identity plus 180 seconds
@@ -3782,6 +3933,7 @@ class PollerService:
             is_fixed_task = str(candidate.get("task_type") or "inventory") in {
                 _CPE_TASK_TYPE,
                 _INVENTORY_FULL_TASK_TYPE,
+                *_MANUAL_ONLY_TASK_TYPES,
             }
             inside_window = self._inside_run_window(
                 candidate.get("run_window_start"),
@@ -3819,7 +3971,11 @@ class PollerService:
             is_enabled_inventory = (
                 int(current_setting.get("enabled") or 0) == 1
                 and str(current_setting.get("task_type") or "inventory")
-                not in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}
+                not in {
+                    _CPE_TASK_TYPE,
+                    _INVENTORY_FULL_TASK_TYPE,
+                    *_MANUAL_ONLY_TASK_TYPES,
+                }
             )
             if is_enabled_inventory and not self._inside_run_window(
                 current_setting.get("run_window_start"),
@@ -3838,13 +3994,26 @@ class PollerService:
                 )
                 return
 
-        self._execute(
-            "UPDATE poller_job SET status=%s, started_at=%s WHERE id=%s",
-            ("running", self._now(), job_id),
-        )
-        claimed = self._query("SELECT status FROM poller_job WHERE id=%s", (job_id,))
-        if not claimed or str((claimed[0] or {}).get("status") or "") != "running":
-            return
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE poller_job SET status=%s, "
+                    "started_at=COALESCE(started_at,%s) "
+                    "WHERE id=%s AND status='queued'",
+                    ("running", self._now(), job_id),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
         rows_collected = 0
         modems_attempted = 0
@@ -3880,6 +4049,9 @@ class PollerService:
                     modems_failed=0,
                 )
                 task_type = str(poller.get("task_type") or "inventory")
+                if task_type == _IDENTITY_BACKFILL_TASK_TYPE:
+                    self._start_identity_backfill_job(job_id)
+                    return
                 if task_type == _CPE_TASK_TYPE:
                     targets = self._cmts_targets_for_poller(poller)
                     self._process_cpe_job(job_id, poller, targets)
@@ -4537,6 +4709,19 @@ class PollerService:
         if int(poller.get("enabled") or 0) != 1:
             return {"state": "disabled", "job_id": 0}
 
+        task_type = str(poller.get("task_type") or "inventory")
+        if task_type == _IDENTITY_BACKFILL_TASK_TYPE:
+            identity_enabled = os.environ.get(
+                "DATA_STORE_IDENTITY_ENRICHMENT_ENABLED",
+                "true",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if not identity_enabled:
+                return {
+                    "state": "enrichment_disabled",
+                    "job_id": 0,
+                    "detail": "Inventory identity enrichment is disabled by configuration",
+                }
+
         active = self._query(
             "SELECT id FROM poller_job WHERE poller_id=%s "
             "AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",
@@ -4550,7 +4735,11 @@ class PollerService:
 
         if (
             str(poller.get("task_type") or "inventory")
-            not in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}
+            not in {
+                _CPE_TASK_TYPE,
+                _INVENTORY_FULL_TASK_TYPE,
+                *_MANUAL_ONLY_TASK_TYPES,
+            }
             and not self._inside_run_window(
                 poller.get("run_window_start"),
                 poller.get("run_window_end"),
@@ -4591,7 +4780,11 @@ class PollerService:
     ) -> int:
         pid = int(poller_id)
         now = self._now()
-        trigger = "scheduler" if (source or "api") == "scheduler" else "manual"
+        trigger = (
+            "manual"
+            if explicit_request
+            else ("scheduler" if (source or "api") == "scheduler" else "manual")
+        )
         payload = json.dumps({"source": source or "api"})
         sql = (
             "INSERT IGNORE INTO poller_job "
@@ -4609,6 +4802,10 @@ class PollerService:
             )
             setting = cur.fetchone()
             if not setting:
+                conn.rollback()
+                return 0
+            task_type = str(setting.get("task_type") or "inventory")
+            if task_type in _MANUAL_ONLY_TASK_TYPES and not explicit_request:
                 conn.rollback()
                 return 0
 
@@ -4655,7 +4852,11 @@ class PollerService:
             if (
                 explicit_request
                 and str(setting.get("task_type") or "inventory")
-                not in {_CPE_TASK_TYPE, _INVENTORY_FULL_TASK_TYPE}
+                not in {
+                    _CPE_TASK_TYPE,
+                    _INVENTORY_FULL_TASK_TYPE,
+                    *_MANUAL_ONLY_TASK_TYPES,
+                }
                 and not self._inside_run_window(
                     setting.get("run_window_start"),
                     setting.get("run_window_end"),
@@ -4715,8 +4916,8 @@ class PollerService:
             f"SELECT j.id, j.poller_id, p.name AS poller_name, "
             f"p.task_type, j.trigger_type, j.status, j.rows_collected, "
             f"j.modems_attempted, j.modems_succeeded, j.modems_failed, "
-            f"j.error_text, j.cmts_breakdown, j.scheduled_slot_utc, "
-            f"j.started_at, j.finished_at, j.created_at, "
+            f"j.modems_remaining, j.error_text, j.cmts_breakdown, "
+            f"j.scheduled_slot_utc, j.started_at, j.finished_at, j.created_at, "
             f"TIMESTAMPDIFF(SECOND, j.started_at, "
             f"COALESCE(j.finished_at, UTC_TIMESTAMP())) AS duration_seconds "
             f"FROM poller_job j LEFT JOIN poller_setting p ON p.id=j.poller_id "
@@ -4725,41 +4926,107 @@ class PollerService:
         )
         return rows
 
+    def _clear_jobs_with_condition(self, condition: str) -> int:
+        """Delete terminal parent jobs and their linked identity children."""
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    f"SELECT id FROM poller_job WHERE {condition} FOR UPDATE"
+                )
+                if not cur.fetchall():
+                    conn.rollback()
+                    return 0
+                cur.execute(
+                    "DELETE t FROM inventory_identity_backfill_target t "
+                    "JOIN poller_job j ON j.id=t.poller_job_id "
+                    f"WHERE j.{condition}"
+                )
+                cur.execute(
+                    "DELETE r FROM modem_refresh_request r "
+                    "JOIN poller_job j ON j.id=r.poller_job_id "
+                    f"WHERE j.{condition}"
+                )
+                cur.execute(f"DELETE FROM poller_job WHERE {condition}")
+                deleted = int(cur.rowcount or 0)
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def clear_jobs(self) -> int:
-        before = self._query("SELECT COUNT(*) AS c FROM poller_job WHERE status IN ('done','failed','cancelled','timed_out','completed')")
-        count_before = int((before[0] or {}).get("c") or 0) if before else 0
-        self._execute("DELETE FROM poller_job WHERE status IN ('done','failed','cancelled','timed_out','completed')")
-        return count_before
+        return self._clear_jobs_with_condition(
+            "status IN ('done','failed','cancelled','timed_out','completed')"
+        )
 
     def clear_all_jobs(self) -> int:
-        before = self._query("SELECT COUNT(*) AS c FROM poller_job WHERE status NOT IN ('running','queued')")
-        count_before = int((before[0] or {}).get("c") or 0) if before else 0
-        self._execute("DELETE FROM poller_job WHERE status NOT IN ('running','queued')")
-        return count_before
+        return self._clear_jobs_with_condition(
+            "status NOT IN ('running','queued')"
+        )
 
     def kill_job(self, job_id: int) -> Dict[str, Any]:
-        rows = self._query(
-            "SELECT id, status, poller_id FROM poller_job WHERE id=%s",
-            (int(job_id),),
-        )
-        if not rows:
-            return {"killed": 0, "state": "not_found"}
-
-        state = str((rows[0] or {}).get("status") or "").lower()
-        if state in {"done", "failed", "cancelled", "timed_out", "completed"}:
-            return {"killed": 0, "state": state}
-
-        self._execute(
-            "UPDATE poller_job SET status=%s, finished_at=%s, error_text=%s "
-            "WHERE id=%s AND status IN ('queued','running')",
-            ("cancelled", self._now(), "Killed by admin", int(job_id)),
-        )
-        self._execute(
-            "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
-            "WHERE id=%s",
-            (self._now(), int(rows[0].get("poller_id") or 0)),
-        )
-        return {"killed": 1, "state": "cancelled"}
+        jid = int(job_id)
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT j.id, j.status, j.poller_id, p.task_type "
+                    "FROM poller_job j LEFT JOIN poller_setting p "
+                    "ON p.id=j.poller_id WHERE j.id=%s FOR UPDATE",
+                    (jid,),
+                )
+                job = cur.fetchone()
+                if not job:
+                    conn.rollback()
+                    return {"killed": 0, "state": "not_found"}
+                state = str(job.get("status") or "").lower()
+                if state in {"done", "failed", "cancelled", "timed_out", "completed"}:
+                    conn.rollback()
+                    return {"killed": 0, "state": state}
+                cur.execute(
+                    "UPDATE poller_job SET status='cancelled', finished_at=%s, "
+                    "error_text='Killed by admin' WHERE id=%s "
+                    "AND status IN ('queued','running')",
+                    (now, jid),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    return {"killed": 0, "state": "not_active"}
+                if str(job.get("task_type") or "") == _IDENTITY_BACKFILL_TASK_TYPE:
+                    cur.execute(
+                        "UPDATE inventory_identity_cursor SET poller_job_id=NULL, "
+                        "updated_at=%s WHERE id=1 AND poller_job_id=%s",
+                        (now, jid),
+                    )
+                    cur.execute(
+                        "UPDATE modem_refresh_request SET status='cancelled', "
+                        "finished_at=%s, next_attempt_at=NULL, claim_token=NULL, "
+                        "dispatch_deadline_at=NULL, "
+                        "error_text='Identity parent job killed by admin' "
+                        "WHERE poller_job_id=%s AND requested_by=%s "
+                        "AND status IN ('queued','running')",
+                        (now, jid, _IDENTITY_REQUEST_SOURCE),
+                    )
+                cur.execute(
+                    "UPDATE poller_setting SET last_target_offset=0, updated_at=%s "
+                    "WHERE id=%s",
+                    (now, int(job.get("poller_id") or 0)),
+                )
+                conn.commit()
+                return {"killed": 1, "state": "cancelled"}
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def get_scheduler_status(self) -> Dict[str, Any]:
         out = dict(self._scheduler)
@@ -4974,6 +5241,16 @@ class PollerService:
                 if pid <= 0:
                     continue
                 pname = p.get("name") or f"poller-{pid}"
+                task_type = str(p.get("task_type") or "inventory")
+
+                if task_type in _MANUAL_ONLY_TASK_TYPES:
+                    decisions.append({
+                        "poller_id": pid,
+                        "poller_name": pname,
+                        "decision": "skip",
+                        "reason": "manual_only",
+                    })
+                    continue
 
                 if int(p.get("enabled") or 0) != 1:
                     decisions.append({"poller_id": pid, "poller_name": pname, "decision": "skip", "reason": "disabled"})
@@ -6289,6 +6566,295 @@ class PollerService:
             **identity,
         }
 
+    def _start_identity_backfill_job(self, job_id: int) -> None:
+        """Initialize or resume one visible, manually started identity run."""
+        now = self._now()
+        identity_enabled = os.environ.get(
+            "DATA_STORE_IDENTITY_ENRICHMENT_ENABLED",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not identity_enabled:
+            self._execute(
+                "UPDATE poller_job SET status='failed', finished_at=%s, "
+                "error_text=%s WHERE id=%s AND status='running'",
+                (
+                    now,
+                    "Inventory identity enrichment is disabled by configuration",
+                    int(job_id),
+                ),
+            )
+            return
+        eligible = self._identity_eligible_sql()
+        enriched = self._inventory_enriched_sql()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT j.status, p.task_type FROM poller_job j "
+                    "JOIN poller_setting p ON p.id=j.poller_id "
+                    "WHERE j.id=%s FOR UPDATE",
+                    (int(job_id),),
+                )
+                job = cur.fetchone() or {}
+                if (
+                    str(job.get("status") or "") != "running"
+                    or str(job.get("task_type") or "")
+                    != _IDENTITY_BACKFILL_TASK_TYPE
+                ):
+                    conn.rollback()
+                    return
+                cur.execute(
+                    "SELECT poller_job_id FROM inventory_identity_cursor "
+                    "WHERE id=1 FOR UPDATE"
+                )
+                cursor = cur.fetchone() or {}
+                if int(cursor.get("poller_job_id") or 0) == int(job_id):
+                    conn.commit()
+                    return
+                cur.execute(
+                    "DELETE FROM inventory_identity_backfill_target "
+                    "WHERE poller_job_id=%s",
+                    (int(job_id),),
+                )
+                cur.execute(
+                    "INSERT INTO inventory_identity_backfill_target "
+                    "(poller_job_id, mac, created_at) "
+                    "SELECT %s, mac, %s FROM modem_inventory_current "
+                    f"WHERE {eligible} AND NOT ({enriched})",
+                    (int(job_id), now),
+                )
+                cur.execute(
+                    "SELECT MAX(mac) AS max_mac, COUNT(*) AS target_total "
+                    "FROM inventory_identity_backfill_target "
+                    "WHERE poller_job_id=%s",
+                    (int(job_id),),
+                )
+                cohort = cur.fetchone() or {}
+                max_mac = str(cohort.get("max_mac") or "")
+                target_total = int(cohort.get("target_total") or 0)
+                if target_total <= 0 or not max_mac:
+                    cur.execute(
+                        "UPDATE poller_job SET status='done', finished_at=%s, "
+                        "rows_collected=0, modems_attempted=0, "
+                        "modems_succeeded=0, modems_failed=0, "
+                        "modems_remaining=0, error_text=%s "
+                        "WHERE id=%s AND status='running'",
+                        (now, "Identity backfill: no incomplete eligible modems", int(job_id)),
+                    )
+                    conn.commit()
+                    return
+                cur.execute(
+                    "UPDATE modem_refresh_request r "
+                    "JOIN inventory_identity_backfill_target t "
+                    "ON t.poller_job_id=%s AND t.mac=r.mac "
+                    "SET r.poller_job_id=%s "
+                    "WHERE r.requested_by=%s "
+                    "AND r.status IN ('queued','running') "
+                    "AND r.poller_job_id IS NULL",
+                    (
+                        int(job_id),
+                        int(job_id),
+                        _IDENTITY_REQUEST_SOURCE,
+                    ),
+                )
+                adopted = int(cur.rowcount or 0)
+                cur.execute(
+                    "UPDATE inventory_identity_cursor SET poller_job_id=%s, "
+                    "cursor_mac='', max_mac=%s, target_total=%s, "
+                    "cycle_started_at=%s, next_scan_at=NULL, queued_count=%s, "
+                    "completed_count=0, failed_count=0, last_error=NULL, "
+                    "updated_at=%s WHERE id=1",
+                    (
+                        int(job_id),
+                        max_mac,
+                        target_total,
+                        now,
+                        adopted,
+                        now,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE poller_job SET rows_collected=0, "
+                    "modems_attempted=%s, modems_succeeded=0, modems_failed=0, "
+                    "modems_remaining=%s, error_text=%s WHERE id=%s "
+                    "AND status='running'",
+                    (
+                        adopted,
+                        target_total,
+                        f"Identity backfill started: {target_total} eligible modems",
+                        int(job_id),
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _cancel_orphaned_identity_requests(self) -> int:
+        """Fence identity children whose manual parent is no longer active."""
+        parent_rows = self._query(
+            "SELECT DISTINCT poller_job_id FROM modem_refresh_request "
+            "WHERE requested_by=%s AND status IN ('queued','running')",
+            (_IDENTITY_REQUEST_SOURCE,),
+        )
+        cancelled = 0
+        now = self._now()
+        for parent_row in parent_rows:
+            parent_job_id = int(parent_row.get("poller_job_id") or 0)
+            with self._db_lock:
+                conn = self._connect()
+                try:
+                    conn.begin()
+                    cur = conn.cursor()
+                    parent = {}
+                    if parent_job_id > 0:
+                        cur.execute(
+                            "SELECT status FROM poller_job "
+                            "WHERE id=%s FOR UPDATE",
+                            (parent_job_id,),
+                        )
+                        parent = cur.fetchone() or {}
+                    if str(parent.get("status") or "") in {"queued", "running"}:
+                        conn.rollback()
+                        continue
+                    if parent_job_id > 0:
+                        cur.execute(
+                            "UPDATE inventory_identity_cursor "
+                            "SET poller_job_id=NULL, updated_at=%s "
+                            "WHERE id=1 AND poller_job_id=%s",
+                            (now, parent_job_id),
+                        )
+                        parent_clause = "poller_job_id=%s"
+                        parent_params = (parent_job_id,)
+                    else:
+                        parent_clause = "poller_job_id IS NULL"
+                        parent_params = ()
+                    cur.execute(
+                        "UPDATE modem_refresh_request SET status='cancelled', "
+                        "finished_at=%s, next_attempt_at=NULL, claim_token=NULL, "
+                        "dispatch_deadline_at=NULL, "
+                        "error_text='Identity parent job is not running' "
+                        "WHERE requested_by=%s AND status IN ('queued','running') "
+                        f"AND {parent_clause}",
+                        (now, _IDENTITY_REQUEST_SOURCE, *parent_params),
+                    )
+                    cancelled += int(cur.rowcount or 0)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+        return cancelled
+
+    def _advance_identity_backfill_job(self) -> None:
+        """Top up and publish progress for the single manual identity run."""
+        jobs = self._query(
+            "SELECT j.id FROM poller_job j "
+            "JOIN poller_setting p ON p.id=j.poller_id "
+            "WHERE j.status='running' AND p.task_type=%s "
+            "ORDER BY j.id ASC LIMIT 1",
+            (_IDENTITY_BACKFILL_TASK_TYPE,),
+        )
+        if not jobs:
+            return
+        job_id = int(jobs[0]["id"])
+        self._seed_identity_refresh_queue(job_id)
+        rows = self._query(
+            "SELECT poller_job_id, target_total, next_scan_at, queued_count, "
+            "completed_count, failed_count, last_error "
+            "FROM inventory_identity_cursor WHERE id=1"
+        )
+        state = rows[0] if rows else {}
+        if int(state.get("poller_job_id") or 0) != job_id:
+            return
+        active_rows = self._query(
+            "SELECT COUNT(*) AS c FROM modem_refresh_request "
+            "WHERE poller_job_id=%s AND requested_by=%s "
+            "AND status IN ('queued','running')",
+            (job_id, _IDENTITY_REQUEST_SOURCE),
+        )
+        active = int((active_rows[0] or {}).get("c") or 0) if active_rows else 0
+        target_total = int(state.get("target_total") or 0)
+        queued = min(target_total, int(state.get("queued_count") or 0))
+        completed = int(state.get("completed_count") or 0)
+        failed = int(state.get("failed_count") or 0)
+        remaining = max(0, target_total - completed - failed)
+        message = (
+            "Identity backfill: "
+            f"targeted {queued}/{target_total}, succeeded {completed}, "
+            f"failed {failed}, remaining {remaining}, active {active}"
+        )
+        self._execute(
+            "UPDATE poller_job SET rows_collected=%s, modems_attempted=%s, "
+            "modems_succeeded=%s, modems_failed=%s, modems_remaining=%s, "
+            "error_text=%s WHERE id=%s AND status='running'",
+            (completed, queued, completed, failed, remaining, message, job_id),
+        )
+        if state.get("next_scan_at") is None or active > 0:
+            return
+        eligible = self._identity_eligible_sql("i")
+        enriched = self._inventory_enriched_sql("i")
+        residual_rows = self._query(
+            "SELECT COUNT(*) AS c "
+            "FROM inventory_identity_backfill_target t "
+            "JOIN modem_inventory_current i ON i.mac=t.mac "
+            "WHERE t.poller_job_id=%s "
+            f"AND {eligible} AND NOT ({enriched})",
+            (job_id,),
+        )
+        residual = int((residual_rows[0] or {}).get("c") or 0) if residual_rows else 0
+        final_message = (
+            "Identity backfill completed: "
+            f"targeted {queued}, succeeded {completed}, failed {failed}, "
+            f"still incomplete {residual}"
+        )
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status FROM poller_job WHERE id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                job = cur.fetchone() or {}
+                if str(job.get("status") or "") != "running":
+                    conn.rollback()
+                    return
+                cur.execute(
+                    "UPDATE poller_job SET status='done', finished_at=%s, "
+                    "rows_collected=%s, modems_attempted=%s, "
+                    "modems_succeeded=%s, modems_failed=%s, "
+                    "modems_remaining=%s, error_text=%s WHERE id=%s",
+                    (
+                        now,
+                        completed,
+                        queued,
+                        completed,
+                        failed,
+                        residual,
+                        final_message,
+                        job_id,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE inventory_identity_cursor SET poller_job_id=NULL, "
+                    "updated_at=%s WHERE id=1 AND poller_job_id=%s",
+                    (now, job_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def _identity_queue_depth(self) -> int:
         try:
             return max(
@@ -6341,8 +6907,8 @@ class PollerService:
             base = 60
         return min(base * (2 ** max(0, attempt_count - 1)), 21600)
 
-    def _seed_identity_refresh_queue(self) -> int:
-        """Keep a tiny durable queue fed by a persisted primary-key cursor."""
+    def _seed_identity_refresh_queue(self, job_id: int) -> int:
+        """Keep one manual identity job's durable child queue filled."""
         enabled = os.environ.get(
             "DATA_STORE_IDENTITY_ENRICHMENT_ENABLED",
             "true",
@@ -6356,20 +6922,48 @@ class PollerService:
             try:
                 conn.begin()
                 cur = conn.cursor()
+                cur.execute(
+                    "SELECT status, poller_id FROM poller_job "
+                    "WHERE id=%s FOR UPDATE",
+                    (int(job_id),),
+                )
+                parent = cur.fetchone() or {}
+                if str(parent.get("status") or "") != "running":
+                    conn.rollback()
+                    return 0
+                cur.execute(
+                    "SELECT task_type FROM poller_setting WHERE id=%s",
+                    (int(parent.get("poller_id") or 0),),
+                )
+                setting = cur.fetchone() or {}
+                if str(setting.get("task_type") or "") != _IDENTITY_BACKFILL_TASK_TYPE:
+                    conn.rollback()
+                    return 0
+                cur.execute(
+                    "SELECT poller_job_id, cursor_mac, next_scan_at "
+                    "FROM inventory_identity_cursor WHERE id=1 FOR UPDATE"
+                )
+                state = cur.fetchone() or {}
+                if int(state.get("poller_job_id") or 0) != int(job_id):
+                    conn.rollback()
+                    return 0
+
                 stale_eligible = self._identity_eligible_sql("i")
                 stale_enriched = self._inventory_enriched_sql("i")
                 cur.execute(
                     "DELETE r FROM modem_refresh_request r "
                     "LEFT JOIN modem_inventory_current i ON i.mac=r.mac "
                     "WHERE r.status='queued' AND r.requested_by=%s "
+                    "AND r.poller_job_id=%s "
                     f"AND (i.mac IS NULL OR NOT COALESCE(({stale_eligible}), FALSE) "
                     f"OR COALESCE(({stale_enriched}), FALSE))",
-                    (_IDENTITY_REQUEST_SOURCE,),
+                    (_IDENTITY_REQUEST_SOURCE, int(job_id)),
                 )
                 cur.execute(
                     "SELECT COUNT(*) AS c FROM modem_refresh_request "
-                    "WHERE status IN ('queued','running') AND requested_by=%s",
-                    (_IDENTITY_REQUEST_SOURCE,),
+                    "WHERE status IN ('queued','running') AND requested_by=%s "
+                    "AND poller_job_id=%s",
+                    (_IDENTITY_REQUEST_SOURCE, int(job_id)),
                 )
                 active = int((cur.fetchone() or {}).get("c") or 0)
                 available = self._identity_queue_depth() - active
@@ -6377,49 +6971,27 @@ class PollerService:
                     conn.commit()
                     return 0
 
-                cur.execute(
-                    "SELECT cursor_mac, next_scan_at FROM inventory_identity_cursor "
-                    "WHERE id=1 FOR UPDATE"
-                )
-                state = cur.fetchone() or {}
-                next_scan_at = state.get("next_scan_at")
-                if next_scan_at and next_scan_at > datetime.now():
+                if state.get("next_scan_at") is not None:
                     conn.commit()
                     return 0
                 cursor_mac = str(state.get("cursor_mac") or "")
-                eligible = self._identity_eligible_sql()
-                enriched = self._inventory_enriched_sql()
+                eligible = self._identity_eligible_sql("i")
+                enriched = self._inventory_enriched_sql("i")
                 cur.execute(
-                    "SELECT mac, cmts FROM modem_inventory_current "
-                    f"WHERE mac>%s AND {eligible} AND NOT ({enriched}) "
-                    "ORDER BY mac LIMIT %s",
-                    (cursor_mac, available),
+                    "SELECT t.mac, i.cmts "
+                    "FROM inventory_identity_backfill_target t "
+                    "JOIN modem_inventory_current i ON i.mac=t.mac "
+                    "WHERE t.poller_job_id=%s AND t.mac>%s "
+                    f"AND {eligible} AND NOT ({enriched}) "
+                    "ORDER BY t.mac LIMIT %s",
+                    (int(job_id), cursor_mac, available),
                 )
                 candidates = cur.fetchall()
                 if not candidates:
-                    try:
-                        rescan_seconds = max(
-                            300,
-                            min(
-                                int(
-                                    os.environ.get(
-                                        "DATA_STORE_IDENTITY_RESCAN_SEC",
-                                        "86400",
-                                    )
-                                ),
-                                604800,
-                            ),
-                        )
-                    except (TypeError, ValueError):
-                        rescan_seconds = 86400
-                    next_scan = (
-                        datetime.now() + timedelta(seconds=rescan_seconds)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
                     cur.execute(
-                        "UPDATE inventory_identity_cursor SET cursor_mac='', "
-                        "cycle_started_at=%s, next_scan_at=%s, updated_at=%s "
-                        "WHERE id=1",
-                        (now, next_scan, now),
+                        "UPDATE inventory_identity_cursor SET next_scan_at=%s, "
+                        "updated_at=%s WHERE id=1 AND poller_job_id=%s",
+                        (now, now, int(job_id)),
                     )
                     conn.commit()
                     return 0
@@ -6429,9 +7001,15 @@ class PollerService:
                 for row in candidates:
                     cur.execute(
                         "INSERT IGNORE INTO modem_refresh_request "
-                        "(mac, cmts, status, requested_by, created_at) "
-                        "VALUES (%s,%s,'queued',%s,%s)",
-                        (row["mac"], row.get("cmts"), _IDENTITY_REQUEST_SOURCE, now),
+                        "(poller_job_id, mac, cmts, status, requested_by, created_at) "
+                        "VALUES (%s,%s,%s,'queued',%s,%s)",
+                        (
+                            int(job_id),
+                            row["mac"],
+                            row.get("cmts"),
+                            _IDENTITY_REQUEST_SOURCE,
+                            now,
+                        ),
                     )
                     if int(cur.rowcount or 0) == 1:
                         queued += 1
@@ -6439,9 +7017,10 @@ class PollerService:
                         continue
                     cur.execute(
                         "SELECT id FROM modem_refresh_request WHERE active_key=%s "
-                        "AND requested_by=%s AND status IN ('queued','running') "
+                        "AND requested_by=%s AND poller_job_id=%s "
+                        "AND status IN ('queued','running') "
                         "LIMIT 1 FOR UPDATE",
-                        (row["mac"], _IDENTITY_REQUEST_SOURCE),
+                        (row["mac"], _IDENTITY_REQUEST_SOURCE, int(job_id)),
                     )
                     if cur.fetchone():
                         owned_cursor = row["mac"]
@@ -6452,8 +7031,8 @@ class PollerService:
                     cur.execute(
                         "UPDATE inventory_identity_cursor SET cursor_mac=%s, "
                         "next_scan_at=NULL, queued_count=queued_count+%s, updated_at=%s "
-                        "WHERE id=1",
-                        (owned_cursor, queued, now),
+                        "WHERE id=1 AND poller_job_id=%s",
+                        (owned_cursor, queued, now, int(job_id)),
                     )
                 conn.commit()
                 return queued
@@ -6469,6 +7048,22 @@ class PollerService:
 
     def _claim_next_identity_request(self, agent_id: str) -> Dict[str, Any] | None:
         """Durably claim one identity row and snapshot its dispatch target."""
+        candidates = self._query(
+            "SELECT r.id, r.poller_job_id "
+            "FROM modem_refresh_request r "
+            "JOIN poller_job j ON j.id=r.poller_job_id "
+            "WHERE r.status='queued' AND r.requested_by=%s "
+            "AND j.status='running' "
+            "AND (r.next_attempt_at IS NULL "
+            "OR r.next_attempt_at<=UTC_TIMESTAMP()) "
+            "ORDER BY COALESCE(r.next_attempt_at, r.created_at), r.id LIMIT 1",
+            (_IDENTITY_REQUEST_SOURCE,),
+        )
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        request_id = int(candidate.get("id") or 0)
+        parent_job_id = int(candidate.get("poller_job_id") or 0)
         now = self._now()
         deadline = (
             datetime.now(timezone.utc) + timedelta(seconds=60)
@@ -6483,23 +7078,62 @@ class PollerService:
                 conn.begin()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT r.id, r.mac, r.cmts, r.attempt_count, "
-                    "i.ip AS target_ip, "
-                    "i.cmts_ip AS target_cmts_ip, i.updated_at AS target_updated_at "
-                    "FROM modem_refresh_request r "
-                    "JOIN modem_inventory_current i ON i.mac=r.mac "
-                    "WHERE r.status='queued' AND r.requested_by=%s "
-                    "AND (r.next_attempt_at IS NULL "
-                    "OR r.next_attempt_at<=UTC_TIMESTAMP()) "
-                    f"AND {eligible} AND NOT ({enriched}) "
-                    "ORDER BY COALESCE(r.next_attempt_at, r.created_at), r.id "
-                    "LIMIT 1 FOR UPDATE",
-                    (_IDENTITY_REQUEST_SOURCE,),
+                    "SELECT status, poller_id FROM poller_job "
+                    "WHERE id=%s FOR UPDATE",
+                    (parent_job_id,),
+                )
+                parent = cur.fetchone() or {}
+                if str(parent.get("status") or "") != "running":
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "SELECT task_type FROM poller_setting WHERE id=%s",
+                    (int(parent.get("poller_id") or 0),),
+                )
+                setting = cur.fetchone() or {}
+                if str(setting.get("task_type") or "") != _IDENTITY_BACKFILL_TASK_TYPE:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "SELECT poller_job_id FROM inventory_identity_cursor "
+                    "WHERE id=1 FOR UPDATE"
+                )
+                cursor = cur.fetchone() or {}
+                if int(cursor.get("poller_job_id") or 0) != parent_job_id:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "SELECT id, poller_job_id, mac, cmts, attempt_count "
+                    "FROM modem_refresh_request "
+                    "WHERE id=%s AND poller_job_id=%s AND status='queued' "
+                    "AND requested_by=%s AND (next_attempt_at IS NULL "
+                    "OR next_attempt_at<=UTC_TIMESTAMP()) FOR UPDATE",
+                    (request_id, parent_job_id, _IDENTITY_REQUEST_SOURCE),
                 )
                 request = cur.fetchone()
                 if not request:
                     conn.rollback()
                     return None
+                cur.execute(
+                    "SELECT i.ip AS target_ip, i.cmts_ip AS target_cmts_ip, "
+                    "i.updated_at AS target_updated_at "
+                    "FROM modem_inventory_current i "
+                    "JOIN inventory_identity_backfill_target t "
+                    "ON t.poller_job_id=%s AND t.mac=i.mac "
+                    "WHERE i.mac=%s "
+                    f"AND {eligible} AND NOT ({enriched}) FOR UPDATE",
+                    (parent_job_id, request.get("mac")),
+                )
+                target = cur.fetchone()
+                if not target:
+                    cur.execute(
+                        "DELETE FROM modem_refresh_request "
+                        "WHERE id=%s AND status='queued'",
+                        (request_id,),
+                    )
+                    conn.commit()
+                    return None
+                request.update(target)
                 cur.execute(
                     "UPDATE modem_refresh_request SET status='running', "
                     "started_at=%s, finished_at=NULL, next_attempt_at=NULL, "
@@ -6517,7 +7151,7 @@ class PollerService:
                         request.get("target_ip"),
                         request.get("target_cmts_ip"),
                         request.get("target_updated_at"),
-                        int(request["id"]),
+                        request_id,
                         _IDENTITY_REQUEST_SOURCE,
                     ),
                 )
@@ -6733,8 +7367,12 @@ class PollerService:
                 cur.execute(
                     "UPDATE inventory_identity_cursor SET "
                     "failed_count=failed_count+1, last_error=%s, updated_at=%s "
-                    "WHERE id=1",
-                    (error_text[:500], now),
+                    "WHERE id=1 AND poller_job_id=%s",
+                    (
+                        error_text[:500],
+                        now,
+                        int(request.get("poller_job_id") or 0),
+                    ),
                 )
 
     def _apply_identity_task_event(self, event: dict) -> None:
@@ -6744,27 +7382,64 @@ class PollerService:
             return
         now = self._now()
         response_event = event.get("type") == "response"
-        target = None
-        if response_event:
-            rows = self._query(
-                "SELECT target_cmts_ip, cmts FROM modem_refresh_request "
-                "WHERE agent_task_id=%s AND status='running'",
-                (task_id,),
-            )
-            target = rows[0] if rows else None
-            if not target:
-                return
+        rows = self._query(
+            "SELECT poller_job_id, target_cmts_ip, cmts "
+            "FROM modem_refresh_request "
+            "WHERE agent_task_id=%s AND status='running'",
+            (task_id,),
+        )
+        target = rows[0] if rows else None
+        if not target:
+            return
+        parent_job_id = int(target.get("poller_job_id") or 0)
         with self._db_lock:
             conn = self._connect()
             try:
                 conn.begin()
                 cur = conn.cursor()
+                cur.execute(
+                    "SELECT status FROM poller_job WHERE id=%s FOR UPDATE",
+                    (parent_job_id,),
+                )
+                parent = cur.fetchone() or {}
+                if str(parent.get("status") or "") != "running":
+                    cur.execute(
+                        "UPDATE modem_refresh_request SET status='cancelled', "
+                        "finished_at=%s, claim_token=NULL, "
+                        "dispatch_deadline_at=NULL, "
+                        "error_text='Identity parent job is not running' "
+                        "WHERE agent_task_id=%s AND status='running' "
+                        "AND poller_job_id=%s",
+                        (now, task_id, parent_job_id),
+                    )
+                    conn.commit()
+                    return
+                cur.execute(
+                    "SELECT poller_job_id FROM inventory_identity_cursor "
+                    "WHERE id=1 FOR UPDATE"
+                )
+                cursor = cur.fetchone() or {}
+                if int(cursor.get("poller_job_id") or 0) != parent_job_id:
+                    conn.rollback()
+                    return
+                cur.execute(
+                    "SELECT id, poller_job_id, mac, cmts, status, attempt_count, "
+                    "claim_token, agent_task_id, agent_id, dispatched_at, "
+                    "target_ip, target_cmts_ip, target_inventory_updated_at "
+                    "FROM modem_refresh_request "
+                    "WHERE agent_task_id=%s AND poller_job_id=%s FOR UPDATE",
+                    (task_id, parent_job_id),
+                )
+                request = cur.fetchone()
+                if not request or str(request.get("status") or "") != "running":
+                    conn.rollback()
+                    return
                 if response_event:
                     target_cmts_ip = str(
-                        (target or {}).get("target_cmts_ip") or ""
+                        target.get("target_cmts_ip") or ""
                     ).strip()
                     target_cmts = str(
-                        (target or {}).get("cmts") or target_cmts_ip
+                        target.get("cmts") or target_cmts_ip
                     ).strip()
                     self._lock_inventory_snapshot_cursor(
                         cur,
@@ -6772,18 +7447,6 @@ class PollerService:
                         cmts=target_cmts or target_cmts_ip,
                         locked_at=now,
                     )
-                cur.execute(
-                    "SELECT id, mac, cmts, status, attempt_count, claim_token, "
-                    "agent_task_id, agent_id, dispatched_at, dispatch_deadline_at, "
-                    "target_ip, target_cmts_ip, target_inventory_updated_at "
-                    "FROM modem_refresh_request "
-                    "WHERE agent_task_id=%s FOR UPDATE",
-                    (task_id,),
-                )
-                request = cur.fetchone()
-                if not request or str(request.get("status") or "") != "running":
-                    conn.rollback()
-                    return
 
                 event_type = str(event.get("type") or "")
                 if event_type == "sent":
@@ -6980,8 +7643,8 @@ class PollerService:
                 cur.execute(
                     "UPDATE inventory_identity_cursor SET "
                     "completed_count=completed_count+1, last_error=NULL, "
-                    "updated_at=%s WHERE id=1",
-                    (now,),
+                    "updated_at=%s WHERE id=1 AND poller_job_id=%s",
+                    (now, int(request.get("poller_job_id") or 0)),
                 )
                 cur.execute(
                     "DELETE FROM modem_refresh_request WHERE id=%s "
