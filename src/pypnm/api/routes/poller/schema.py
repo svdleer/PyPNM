@@ -49,6 +49,11 @@ class ModemRefreshRequest(BaseModel):
     cmts: Optional[str] = Field(default=None)
 
 
+class InventoryDeltaEnrichmentRequest(BaseModel):
+    cmts: str = Field(min_length=1, max_length=255)
+    max_batch: int = Field(default=25, ge=1, le=25)
+
+
 class InventoryMySQLBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 

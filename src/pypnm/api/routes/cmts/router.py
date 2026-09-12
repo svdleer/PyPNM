@@ -19,7 +19,11 @@ from pypnm.api.routes.cmts.schemas import (
     CMTSModemRequest,
     CMTSModemResponse,
 )
-from pypnm.api.routes.cmts.service import CMTSModemService, cancel_enrichment
+from pypnm.api.routes.cmts.service import (
+    CMTSModemService,
+    cancel_enrichment,
+    clear_enrichment_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +247,18 @@ async def query_cpe_addresses(payload: CPECollectionRequest) -> CPECollectionRes
             count=0,
             error=str(exc),
         )
+
+
+@router.post("/cache/clear")
+async def clear_cmts_cache(
+    cmts_ip: str = Query(min_length=1, max_length=45),
+) -> dict:
+    """Invalidate one process-local CMTS cache generation."""
+    try:
+        result = clear_enrichment_cache(cmts_ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "success", **result}
 
 
 @router.post("/enrich/cancel")

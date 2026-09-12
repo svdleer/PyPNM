@@ -7,7 +7,9 @@ import asyncio
 import ipaddress
 import logging
 import os
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Any
 
@@ -24,9 +26,131 @@ from pypnm.lib.vendor_capabilities import get_vendor_from_mac
 #                       timestamp, cancelled}
 _enrichment_cache: Dict[str, Dict[str, Any]] = {}
 _enrichment_lock = asyncio.Lock()
+_enrichment_generation_lock = threading.RLock()
+_enrichment_generation_tokens: Dict[str, str] = {}
 _live_walk_locks: Dict[str, asyncio.Lock] = {}
 _LIVE_CACHE_TTL_SECONDS = 7200
 _LIVE_REFRESH_COOLDOWN_SECONDS = 300
+
+
+def _current_enrichment_generation(cmts_ip: str) -> str:
+    """Return the current process-local generation token for one CMTS."""
+    with _enrichment_generation_lock:
+        return _enrichment_generation_tokens.setdefault(cmts_ip, str(uuid.uuid4()))
+
+
+def _enrichment_generation_is_current(cmts_ip: str, token: str) -> bool:
+    with _enrichment_generation_lock:
+        return _enrichment_generation_tokens.get(cmts_ip) == token
+
+
+def _rotate_enrichment_generation(
+    cmts_ip: str,
+    expected_token: str,
+) -> str | None:
+    """Replace one generation token only if the request still owns it."""
+    with _enrichment_generation_lock:
+        if _enrichment_generation_tokens.get(cmts_ip) != expected_token:
+            return None
+        token = str(uuid.uuid4())
+        _enrichment_generation_tokens[cmts_ip] = token
+        return token
+
+
+def _replace_enrichment_cache(
+    cmts_ip: str,
+    token: str,
+    entry: Dict[str, Any],
+    *,
+    refuse_cancelled: bool = False,
+) -> bool:
+    """Replace one cache entry only while its generation still owns the key."""
+    with _enrichment_generation_lock:
+        if _enrichment_generation_tokens.get(cmts_ip) != token:
+            return False
+        current = _enrichment_cache.get(cmts_ip) or {}
+        if refuse_cancelled and current.get("cancelled"):
+            return False
+        _enrichment_cache[cmts_ip] = {
+            **entry,
+            "generation_token": token,
+        }
+        return True
+
+
+def _update_enrichment_cache(
+    cmts_ip: str,
+    token: str,
+    updates: Dict[str, Any],
+    *,
+    refuse_cancelled: bool = False,
+) -> bool:
+    """Update one cache entry only while its generation still owns the key."""
+    with _enrichment_generation_lock:
+        if _enrichment_generation_tokens.get(cmts_ip) != token:
+            return False
+        current = _enrichment_cache.get(cmts_ip)
+        if current is None or (refuse_cancelled and current.get("cancelled")):
+            return False
+        current.update(updates)
+        current["generation_token"] = token
+        return True
+
+
+def _cache_clear_tombstone(cmts_ip: str, token: str) -> Dict[str, Any]:
+    return {
+        "modems": [],
+        "enriched": False,
+        "enriching": False,
+        "cancelled": True,
+        "enrichment_cancelled": True,
+        "expired": True,
+        "timestamp": 0.0,
+        "cmts_ip": cmts_ip,
+        "generation_token": token,
+    }
+
+
+def clear_enrichment_cache(cmts_ip: str) -> Dict[str, Any]:
+    """Invalidate one CMTS generation and leave a non-reusable tombstone."""
+    raw_cmts_ip = str(cmts_ip or "").strip()
+    try:
+        ipaddress.ip_address(raw_cmts_ip)
+    except ValueError as exc:
+        raise ValueError("cmts_ip must be a valid IP address") from exc
+
+    with _enrichment_generation_lock:
+        existing = _enrichment_cache.get(raw_cmts_ip) or {}
+        cleared = bool(existing and not existing.get("expired"))
+        cancelled = bool(existing.get("enriching"))
+        token = str(uuid.uuid4())
+        _enrichment_generation_tokens[raw_cmts_ip] = token
+        _enrichment_cache[raw_cmts_ip] = _cache_clear_tombstone(
+            raw_cmts_ip,
+            token,
+        )
+    return {
+        "cmts_ip": raw_cmts_ip,
+        "cleared": cleared,
+        "cancelled": cancelled,
+    }
+
+
+def clear_all_enrichment_cache() -> int:
+    """Invalidate every known generation while retaining scoped tombstones."""
+    with _enrichment_generation_lock:
+        cmts_ips = set(_enrichment_cache) | set(_enrichment_generation_tokens)
+        cleared = sum(
+            1
+            for cmts_ip in cmts_ips
+            if _enrichment_cache.get(cmts_ip)
+            and not _enrichment_cache[cmts_ip].get("expired")
+        )
+        for cmts_ip in cmts_ips:
+            token = str(uuid.uuid4())
+            _enrichment_generation_tokens[cmts_ip] = token
+            _enrichment_cache[cmts_ip] = _cache_clear_tombstone(cmts_ip, token)
+        return cleared
 
 
 async def _get_live_walk_lock(cmts_ip: str) -> asyncio.Lock:
@@ -66,13 +190,14 @@ def _agent_capacity_wait_seconds() -> int:
 
 def cancel_enrichment(cmts_ip: str) -> bool:
     """Mark a running CMTS-side enrichment as cancelled."""
-    entry = _enrichment_cache.get(cmts_ip)
-    if entry and entry.get('enriching'):
-        entry['cancelled'] = True
-        entry['enriching'] = False
-        entry['enriched'] = False
-        entry['enrichment_cancelled'] = True
-        return True
+    with _enrichment_generation_lock:
+        entry = _enrichment_cache.get(cmts_ip)
+        if entry and entry.get('enriching'):
+            entry['cancelled'] = True
+            entry['enriching'] = False
+            entry['enriched'] = False
+            entry['enrichment_cancelled'] = True
+            return True
     return False
 
 # ── CMTS SNMP OIDs ──────────────────────────────────────────────────────────
@@ -783,22 +908,56 @@ class CMTSModemService:
         cmts: str,
         cmts_ip: str,
         source_poller: str,
+        generation_token: str,
+        require_active_cache: bool = False,
     ) -> tuple[int, str | None]:
-        """Persist enrichment and propagate the resulting cache revision."""
+        """Persist enrichment only while its process-local generation is current."""
         from pypnm.api.routes.poller.service import poller_service
 
-        written = poller_service.persist_enrichment_rows(
-            modems,
-            cmts=cmts,
-            cmts_ip=cmts_ip,
-            source_poller=source_poller,
-        )
-        snapshot = poller_service.get_inventory_snapshot(cmts_ip)
-        revision_at = (snapshot or {}).get('revision_at')
-        cached = _enrichment_cache.get(cmts_ip)
-        if revision_at and cached is not None:
-            cached['revision_at'] = revision_at
-        return written, revision_at
+        with _enrichment_generation_lock:
+            if not _enrichment_generation_is_current(cmts_ip, generation_token):
+                return 0, None
+            cached = _enrichment_cache.get(cmts_ip) or {}
+            if require_active_cache and cached.get("cancelled"):
+                return 0, None
+            written = poller_service.persist_enrichment_rows(
+                modems,
+                cmts=cmts,
+                cmts_ip=cmts_ip,
+                source_poller=source_poller,
+            )
+            snapshot = poller_service.get_inventory_snapshot(cmts_ip)
+            revision_at = (snapshot or {}).get('revision_at')
+            if revision_at:
+                _update_enrichment_cache(
+                    cmts_ip,
+                    generation_token,
+                    {"revision_at": revision_at},
+                    refuse_cancelled=require_active_cache,
+                )
+            return written, revision_at
+
+    def _launch_background_enrich(
+        self,
+        cmts_ip: str,
+        modems: list,
+        *,
+        cmts_hostname: str,
+        generation_token: str,
+    ) -> bool:
+        """Launch enrichment only for the generation that currently owns the key."""
+        with _enrichment_generation_lock:
+            if not _enrichment_generation_is_current(cmts_ip, generation_token):
+                return False
+            asyncio.create_task(
+                self._background_enrich(
+                    cmts_ip,
+                    modems,
+                    cmts_hostname=cmts_hostname,
+                    generation_token=generation_token,
+                )
+            )
+            return True
 
     # ── dedicated CPE collection ────────────────────────────────────────────
 
@@ -998,6 +1157,7 @@ class CMTSModemService:
         global _enrichment_cache
         self.cmts_ip = cmts_ip
         self.community = community
+        generation_token = _current_enrichment_generation(cmts_ip)
         limit = max(1, min(int(limit or 1), 50000))
         if collection_mode not in {"light", "full"}:
             raise ValueError("collection_mode must be 'light' or 'full'")
@@ -1011,7 +1171,8 @@ class CMTSModemService:
             age = time.time() - cached.get('timestamp', 0)
             cache_sufficient = self._cache_sufficient(cached, limit)
             if (
-                age < _LIVE_CACHE_TTL_SECONDS
+                cached.get('generation_token') == generation_token
+                and age < _LIVE_CACHE_TTL_SECONDS
                 and cache_sufficient
                 and self._collection_mode_compatible(cached, collection_mode)
                 and not (
@@ -1020,22 +1181,25 @@ class CMTSModemService:
                 and (not collect_cpe or 'cpe_addresses' in cached)
             ):
                 if enrich and not cached.get('enriched') and not cached.get('enriching'):
-                    cached.update({
-                        'cancelled': False,
-                        'enrichment_cancelled': False,
-                        'enrichment_failed': False,
-                        'enriching': True,
-                        'enrich_progress': {
-                            'completed': 0,
-                            'total': len(cached.get('modems') or []),
+                    _update_enrichment_cache(
+                        cmts_ip,
+                        generation_token,
+                        {
+                            'cancelled': False,
+                            'enrichment_cancelled': False,
+                            'enrichment_failed': False,
+                            'enriching': True,
+                            'enrich_progress': {
+                                'completed': 0,
+                                'total': len(cached.get('modems') or []),
+                            },
                         },
-                    })
-                    asyncio.create_task(
-                        self._background_enrich(
-                            cmts_ip,
-                            cached.get('modems') or [],
-                            cmts_hostname=cmts_hostname,
-                        )
+                    )
+                    self._launch_background_enrich(
+                        cmts_ip,
+                        cached.get('modems') or [],
+                        cmts_hostname=cmts_hostname,
+                        generation_token=generation_token,
                     )
                 self.logger.info(
                     "Returning cached generation for %s (age=%.0fs, enrich=%s)",
@@ -1133,8 +1297,21 @@ class CMTSModemService:
                 )
 
                 if not collect_cpe:
+                    base_generation_token = _rotate_enrichment_generation(
+                        cmts_ip,
+                        generation_token,
+                    )
+                    generation_owned = base_generation_token is not None
+                    if base_generation_token is not None:
+                        generation_token = base_generation_token
+
                     enrichment_error = None
-                    if enrich and wait_for_enrichment and not is_enriched:
+                    if (
+                        generation_owned
+                        and enrich
+                        and wait_for_enrichment
+                        and not is_enriched
+                    ):
                         interface_result = await self._enrich_cmts_interfaces(
                             inv_modems
                         )
@@ -1164,6 +1341,7 @@ class CMTSModemService:
                                     cmts=cmts_label,
                                     cmts_ip=cmts_ip,
                                     source_poller='live-enrich',
+                                    generation_token=generation_token,
                                 )
                                 if revision_at:
                                     inventory_meta['revision_at'] = revision_at
@@ -1175,34 +1353,41 @@ class CMTSModemService:
                                     db_exc,
                                 )
                     enriching = bool(
-                        enrich and not wait_for_enrichment and not is_enriched
+                        generation_owned
+                        and enrich
+                        and not wait_for_enrichment
+                        and not is_enriched
                     )
                     self.logger.info(
                         f"Returning {len(inv_modems)} modems for {cmts_ip} "
                         f"from MySQL inventory (age={age_s:.0f}s, "
                         f"complete={snapshot_complete}, enriched={is_enriched})"
                     )
-                    _enrichment_cache[cmts_ip] = {
-                        'modems': inv_modems,
-                        'enriched': is_enriched,
-                        'enriching': enriching,
-                        'enrichment_failed': bool(
-                            enrich and wait_for_enrichment and not is_enriched
-                        ),
-                        'timestamp': time.time(),
-                        'enrich_progress': {
-                            'completed': len(inv_modems) if is_enriched else 0,
-                            'total': len(inv_modems),
+                    cache_written = _replace_enrichment_cache(
+                        cmts_ip,
+                        generation_token,
+                        {
+                            'modems': inv_modems,
+                            'enriched': is_enriched,
+                            'enriching': enriching,
+                            'enrichment_failed': bool(
+                                enrich and wait_for_enrichment and not is_enriched
+                            ),
+                            'timestamp': time.time(),
+                            'enrich_progress': {
+                                'completed': len(inv_modems) if is_enriched else 0,
+                                'total': len(inv_modems),
+                            },
+                            **inventory_meta,
                         },
-                        **inventory_meta,
-                    }
+                    )
+                    enriching = enriching and cache_written
                     if enriching:
-                        asyncio.create_task(
-                            self._background_enrich(
-                                cmts_ip,
-                                inv_modems,
-                                cmts_hostname=cmts_hostname,
-                            )
+                        self._launch_background_enrich(
+                            cmts_ip,
+                            inv_modems,
+                            cmts_hostname=cmts_hostname,
+                            generation_token=generation_token,
                         )
                     return {
                         'success': True,
@@ -1253,6 +1438,7 @@ class CMTSModemService:
             cached = _enrichment_cache.get(cmts_ip)
             if (
                 cached
+                and cached.get('generation_token') == generation_token
                 and self._collection_mode_compatible(cached, collection_mode)
                 and self._cache_sufficient(cached, limit)
                 and not (
@@ -1267,22 +1453,25 @@ class CMTSModemService:
                 )
                 if age < max_age:
                     if enrich and not cached.get('enriched') and not cached.get('enriching'):
-                        cached.update({
-                            'cancelled': False,
-                            'enrichment_cancelled': False,
-                            'enrichment_failed': False,
-                            'enriching': True,
-                            'enrich_progress': {
-                                'completed': 0,
-                                'total': len(cached.get('modems') or []),
+                        _update_enrichment_cache(
+                            cmts_ip,
+                            generation_token,
+                            {
+                                'cancelled': False,
+                                'enrichment_cancelled': False,
+                                'enrichment_failed': False,
+                                'enriching': True,
+                                'enrich_progress': {
+                                    'completed': 0,
+                                    'total': len(cached.get('modems') or []),
+                                },
                             },
-                        })
-                        asyncio.create_task(
-                            self._background_enrich(
-                                cmts_ip,
-                                cached.get('modems') or [],
-                                cmts_hostname=cmts_hostname,
-                            )
+                        )
+                        self._launch_background_enrich(
+                            cmts_ip,
+                            cached.get('modems') or [],
+                            cmts_hostname=cmts_hostname,
+                            generation_token=generation_token,
                         )
                     self.logger.info(
                         "Reusing single-flight generation for %s "
@@ -1544,42 +1733,74 @@ class CMTSModemService:
                 cmts_ip,
             )
 
+            base_generation_token = _rotate_enrichment_generation(
+                cmts_ip,
+                generation_token,
+            )
+            generation_owned = base_generation_token is not None
+            if base_generation_token is not None:
+                generation_token = base_generation_token
+
             # Cache every live base generation, including non-enrichment and
             # unsuccessful capability attempts. Completeness metadata prevents
             # a small partial preview from satisfying a larger request.
-            _enrichment_cache[cmts_ip] = {
-                'modems': modems,
-                'enriched': False,
-                'enriching': False,
-                'timestamp': time.time(),
-                **inventory_meta,
-            }
+            generation_owned = _replace_enrichment_cache(
+                cmts_ip,
+                generation_token,
+                {
+                    'modems': modems,
+                    'enriched': False,
+                    'enriching': False,
+                    'timestamp': time.time(),
+                    **inventory_meta,
+                },
+            )
 
             # GUI-triggered generations carry a hostname. Scheduled poller
             # requests intentionally omit it and persist in their own workflow.
-            if str(cmts_hostname or '').strip():
+            if generation_owned and str(cmts_hostname or '').strip():
                 try:
                     from pypnm.api.routes.poller.service import poller_service
-                    poller_service.persist_inventory_generation(
-                        modems,
-                        cmts_hostname=cmts_hostname,
-                        cmts_ip=cmts_ip,
-                        metadata=inventory_meta,
-                        source_poller='live-gui',
-                    )
-                    persisted_snapshot = poller_service.get_inventory_snapshot(cmts_ip)
-                    persisted_revision = (persisted_snapshot or {}).get('revision_at')
-                    persisted_snapshot_id = (persisted_snapshot or {}).get('snapshot_id')
-                    if persisted_revision:
-                        inventory_meta['revision_at'] = persisted_revision
-                    if persisted_snapshot_id:
-                        inventory_meta['snapshot_id'] = persisted_snapshot_id
-                    cached_generation = _enrichment_cache.get(cmts_ip)
-                    if cached_generation is not None:
+
+                    with _enrichment_generation_lock:
+                        if not _enrichment_generation_is_current(
+                            cmts_ip,
+                            generation_token,
+                        ):
+                            raise RuntimeError(
+                                "CMTS cache generation was cleared before persistence"
+                            )
+                        poller_service.persist_inventory_generation(
+                            modems,
+                            cmts_hostname=cmts_hostname,
+                            cmts_ip=cmts_ip,
+                            metadata=inventory_meta,
+                            source_poller='live-gui',
+                        )
+                        persisted_snapshot = poller_service.get_inventory_snapshot(
+                            cmts_ip
+                        )
+                        persisted_revision = (persisted_snapshot or {}).get(
+                            'revision_at'
+                        )
+                        persisted_snapshot_id = (persisted_snapshot or {}).get(
+                            'snapshot_id'
+                        )
                         if persisted_revision:
-                            cached_generation['revision_at'] = persisted_revision
+                            inventory_meta['revision_at'] = persisted_revision
                         if persisted_snapshot_id:
-                            cached_generation['snapshot_id'] = persisted_snapshot_id
+                            inventory_meta['snapshot_id'] = persisted_snapshot_id
+                        cache_updates = {}
+                        if persisted_revision:
+                            cache_updates['revision_at'] = persisted_revision
+                        if persisted_snapshot_id:
+                            cache_updates['snapshot_id'] = persisted_snapshot_id
+                        if cache_updates:
+                            _update_enrichment_cache(
+                                cmts_ip,
+                                generation_token,
+                                cache_updates,
+                            )
                 except Exception as db_exc:
                     self.logger.warning(
                         "Live inventory persistence failed for %s: %s",
@@ -1588,26 +1809,31 @@ class CMTSModemService:
 
             # ── Step 3: Enrichment ───────────────────────────────────────
             if (
-                collection_mode == "full"
+                generation_owned
+                and collection_mode == "full"
                 and enrich
                 and wait_for_enrichment
                 and modems
             ):
                 interface_result = await self._enrich_cmts_interfaces(modems)
                 enrichment_succeeded = interface_result.get('success') is True
-                _enrichment_cache[cmts_ip] = {
-                    **_enrichment_cache.get(cmts_ip, {}),
-                    'modems': modems,
-                    'enriched': enrichment_succeeded,
-                    'enriching': False,
-                    'cmts_enriched': enrichment_succeeded,
-                    'enrichment_failed': not enrichment_succeeded,
-                    'timestamp': time.time(),
-                    'enrich_progress': {
-                        'completed': len(modems) if enrichment_succeeded else 0,
-                        'total': len(modems),
+                _replace_enrichment_cache(
+                    cmts_ip,
+                    generation_token,
+                    {
+                        **(_enrichment_cache.get(cmts_ip) or {}),
+                        'modems': modems,
+                        'enriched': enrichment_succeeded,
+                        'enriching': False,
+                        'cmts_enriched': enrichment_succeeded,
+                        'enrichment_failed': not enrichment_succeeded,
+                        'timestamp': time.time(),
+                        'enrich_progress': {
+                            'completed': len(modems) if enrichment_succeeded else 0,
+                            'total': len(modems),
+                        },
                     },
-                }
+                )
                 if enrichment_succeeded and str(cmts_hostname or '').strip():
                     try:
                         _, revision_at = self._persist_enrichment_rows(
@@ -1615,6 +1841,7 @@ class CMTSModemService:
                             cmts=cmts_hostname,
                             cmts_ip=cmts_ip,
                             source_poller='live-enrich',
+                            generation_token=generation_token,
                         )
                         if revision_at:
                             inventory_meta['revision_at'] = revision_at
@@ -1637,7 +1864,7 @@ class CMTSModemService:
                     **inventory_meta,
                 }
 
-            if enrich and modems:
+            if generation_owned and enrich and modems:
                 # Guard: don't start a second enrichment if one is already running
                 existing = _enrichment_cache.get(cmts_ip, {})
                 existing_sufficient = (
@@ -1665,31 +1892,42 @@ class CMTSModemService:
                     }
 
                 # Store base modems in cache and kick off background enrichment
-                _enrichment_cache[cmts_ip] = {
-                    'modems': modems,
-                    'enriched': False,
-                    'enriching': True,
-                    'timestamp': time.time(),
-                    'requested_limit': limit,
-                    **inventory_meta,
-                    'enrich_progress': {'completed': 0, 'total': 0},
-                }
-                
-                # Fire-and-forget background enrichment
-                asyncio.create_task(
-                    self._background_enrich(
-                        cmts_ip, modems, cmts_hostname=cmts_hostname
-                    )
+                background_cache_written = _replace_enrichment_cache(
+                    cmts_ip,
+                    generation_token,
+                    {
+                        'modems': modems,
+                        'enriched': False,
+                        'enriching': True,
+                        'timestamp': time.time(),
+                        'requested_limit': limit,
+                        **inventory_meta,
+                        'enrich_progress': {'completed': 0, 'total': 0},
+                    },
                 )
+
+                # Fire-and-forget background enrichment
+                if background_cache_written:
+                    self._launch_background_enrich(
+                        cmts_ip,
+                        modems,
+                        cmts_hostname=cmts_hostname,
+                        generation_token=generation_token,
+                    )
                 
-                self.logger.info(f"Returning {len(modems)} modems immediately, enrichment started in background")
+                if background_cache_written:
+                    self.logger.info(
+                        "Returning %s modems immediately, enrichment started "
+                        "in background",
+                        len(modems),
+                    )
                 return {
                     'success': True,
                     'modems': modems,
                     'count': len(modems),
                     'cmts_ip': cmts_ip,
                     'enriched': False,
-                    'enriching': True,
+                    'enriching': background_cache_written,
                     **inventory_meta,
                 }
 
@@ -1715,12 +1953,21 @@ class CMTSModemService:
         cmts_ip: str,
         modems: list,
         cmts_hostname: str = "",
+        *,
+        generation_token: str,
     ):
-        """Run CMTS-side enrichment and update the inventory cache."""
-        global _enrichment_cache
+        """Run CMTS-side enrichment only while its generation owns the cache."""
         try:
-            if _enrichment_cache.get(cmts_ip, {}).get('cancelled'):
-                return
+            with _enrichment_generation_lock:
+                existing_cache = _enrichment_cache.get(cmts_ip) or {}
+                if (
+                    not _enrichment_generation_is_current(
+                        cmts_ip,
+                        generation_token,
+                    )
+                    or existing_cache.get('cancelled')
+                ):
+                    return
             self.logger.info(
                 "CMTS-side enrichment started for %s (%s modems)",
                 cmts_ip,
@@ -1728,24 +1975,39 @@ class CMTSModemService:
             )
 
             interface_result = await self._enrich_cmts_interfaces(modems)
-            existing_cache = _enrichment_cache.get(cmts_ip, {})
-            if existing_cache.get('cancelled'):
-                self.logger.info("CMTS-side enrichment cancelled for %s", cmts_ip)
-                return
+            with _enrichment_generation_lock:
+                existing_cache = dict(_enrichment_cache.get(cmts_ip) or {})
+                if (
+                    not _enrichment_generation_is_current(
+                        cmts_ip,
+                        generation_token,
+                    )
+                    or existing_cache.get('cancelled')
+                ):
+                    self.logger.info(
+                        "CMTS-side enrichment generation expired for %s",
+                        cmts_ip,
+                    )
+                    return
             if interface_result.get('success') is not True:
-                _enrichment_cache[cmts_ip] = {
-                    **existing_cache,
-                    'modems': modems,
-                    'enriched': False,
-                    'enriching': False,
-                    'cmts_enriched': False,
-                    'enrichment_failed': True,
-                    'timestamp': time.time(),
-                    'enrich_progress': {
-                        'completed': 0,
-                        'total': len(modems),
+                _replace_enrichment_cache(
+                    cmts_ip,
+                    generation_token,
+                    {
+                        **existing_cache,
+                        'modems': modems,
+                        'enriched': False,
+                        'enriching': False,
+                        'cmts_enriched': False,
+                        'enrichment_failed': True,
+                        'timestamp': time.time(),
+                        'enrich_progress': {
+                            'completed': 0,
+                            'total': len(modems),
+                        },
                     },
-                }
+                    refuse_cancelled=True,
+                )
                 self.logger.warning(
                     "CMTS-side enrichment failed for %s: %s",
                     cmts_ip,
@@ -1753,19 +2015,26 @@ class CMTSModemService:
                 )
                 return
 
-            _enrichment_cache[cmts_ip] = {
-                **existing_cache,
-                'modems': modems,
-                'enriched': True,
-                'enriching': False,
-                'cmts_enriched': True,
-                'enrichment_failed': False,
-                'timestamp': time.time(),
-                'enrich_progress': {
-                    'completed': len(modems),
-                    'total': len(modems),
+            cache_updated = _replace_enrichment_cache(
+                cmts_ip,
+                generation_token,
+                {
+                    **existing_cache,
+                    'modems': modems,
+                    'enriched': True,
+                    'enriching': False,
+                    'cmts_enriched': True,
+                    'enrichment_failed': False,
+                    'timestamp': time.time(),
+                    'enrich_progress': {
+                        'completed': len(modems),
+                        'total': len(modems),
+                    },
                 },
-            }
+                refuse_cancelled=True,
+            )
+            if not cache_updated:
+                return
             self.logger.info("CMTS-side enrichment complete for %s", cmts_ip)
 
             # Stamp cmts/cmts_ip on every modem for MySQL inventory.
@@ -1784,12 +2053,18 @@ class CMTSModemService:
                     cmts=cmts_label,
                     cmts_ip=cmts_ip,
                     source_poller='live-enrich',
+                    generation_token=generation_token,
+                    require_active_cache=True,
                 )
-                self.logger.info(
-                    "Wrote %s enriched modems to MySQL inventory for %s",
-                    written,
+                if _enrichment_generation_is_current(
                     cmts_ip,
-                )
+                    generation_token,
+                ):
+                    self.logger.info(
+                        "Wrote %s enriched modems to MySQL inventory for %s",
+                        written,
+                        cmts_ip,
+                    )
             except Exception as db_exc:
                 self.logger.warning(
                     "MySQL inventory write-back failed for %s: %s",
@@ -1798,11 +2073,12 @@ class CMTSModemService:
                 )
         except Exception as e:
             self.logger.exception(f"Background enrichment failed for {cmts_ip}: {e}")
-            if cmts_ip in _enrichment_cache:
-                existing_cache = _enrichment_cache[cmts_ip]
-                if existing_cache.get('cancelled'):
-                    return
-                _enrichment_cache[cmts_ip] = {
+            with _enrichment_generation_lock:
+                existing_cache = dict(_enrichment_cache.get(cmts_ip) or {})
+            _replace_enrichment_cache(
+                cmts_ip,
+                generation_token,
+                {
                     **existing_cache,
                     'modems': existing_cache.get('modems', modems),
                     'enriched': False,
@@ -1813,7 +2089,9 @@ class CMTSModemService:
                         'completed': 0,
                         'total': len(modems),
                     },
-                }
+                },
+                refuse_cancelled=True,
+            )
 
     # ── correlation logic (moved from agent._async_cmts_get_modems) ─────
 

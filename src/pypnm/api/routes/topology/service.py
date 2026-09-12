@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import logging
 import os
 import re
-import time
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from pypnm.lib.mac_address import MacAddress, MacAddressFormat
+
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_bare_mac(value: object) -> str | None:
@@ -90,6 +94,7 @@ class DatasetFiles:
 class TopologyStorage:
     def __init__(self) -> None:
         self._db_lock = threading.Lock()
+        self._schema_initialized = False
 
     @staticmethod
     def _node_location_from_description(description: object) -> dict[str, str | None]:
@@ -136,7 +141,11 @@ class TopologyStorage:
         )
 
     def init_db(self) -> None:
+        if self._schema_initialized:
+            return
         with self._db_lock:
+            if self._schema_initialized:
+                return
             conn = self._connect()
             cur = conn.cursor()
 
@@ -338,6 +347,7 @@ class TopologyStorage:
             )
 
             conn.close()
+            self._schema_initialized = True
 
     # ── CMTS fiber-node cache CRUD ──────────────────────────────────
 
@@ -489,48 +499,86 @@ class TopologyStorage:
                 conn.close()
                 return resolved_date, []
 
-            base_sql = (
+            select_sql = (
                 "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.address, m.address1, m.address2, m.locality, "
-                "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match, "
-                "h.path AS hierarchy_path, h.cmts AS cmts "
-                "FROM topology_modems m "
-                "LEFT JOIN ("
-                "  SELECT snapshot_id, node_id, MIN(path) AS path, MIN(cmts) AS cmts "
-                "  FROM topology_hierarchy "
-                "  GROUP BY snapshot_id, node_id"
-                ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
-                "WHERE m.snapshot_id=%s "
+                "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match "
+                "FROM topology_modems m WHERE m.snapshot_id=%s "
             )
 
             st = (search_type or "").strip().lower()
             vv = (value or "").strip()
             hn = (house_number or "").strip()
+            rows: list[dict[str, Any]] = []
 
-            if st == "fibernode":
-                cur.execute(
-                    base_sql + "AND m.fibernode LIKE %s ORDER BY m.mac ASC LIMIT %s",
-                    (snapshot_id, f"%{vv}%", int(limit)),
+            if st in {"fibernode", "customer_id"}:
+                column = "m.fibernode" if st == "fibernode" else "m.customer_id"
+                # Preserve the legacy contains cohort while filling the bounded
+                # result in exact, prefix, then remaining-contains order.
+                search_phases = (
+                    (f"{column}=%s", (vv,)),
+                    (
+                        f"{column} LIKE %s AND {column}<>%s",
+                        (f"{vv}%", vv),
+                    ),
+                    (
+                        f"{column} LIKE %s AND NOT ({column} LIKE %s)",
+                        (f"%{vv}%", f"{vv}%"),
+                    ),
                 )
-            elif st == "customer_id":
-                cur.execute(
-                    base_sql + "AND m.customer_id LIKE %s ORDER BY m.mac ASC LIMIT %s",
-                    (snapshot_id, f"%{vv}%", int(limit)),
-                )
+                for predicate, phase_params in search_phases:
+                    remaining = int(limit) - len(rows)
+                    if remaining <= 0:
+                        break
+                    cur.execute(
+                        select_sql
+                        + f"AND {predicate} ORDER BY m.mac ASC LIMIT %s",
+                        (snapshot_id, *phase_params, remaining),
+                    )
+                    rows.extend(dict(item) for item in (cur.fetchall() or []))
             elif st == "postal_house":
                 if not vv or not hn:
                     conn.close()
                     return resolved_date, []
                 cur.execute(
-                    base_sql + "AND m.postalcode=%s AND m.house_number=%s ORDER BY m.mac ASC LIMIT %s",
+                    select_sql + "AND m.postalcode=%s AND m.house_number=%s ORDER BY m.mac ASC LIMIT %s",
                     (snapshot_id, vv, hn, int(limit)),
                 )
+                rows = [dict(item) for item in (cur.fetchall() or [])]
             else:
                 conn.close()
                 return resolved_date, []
 
-            rows = cur.fetchall() or []
+            # Resolve hierarchy only for nodes represented in the bounded modem
+            # result. Aggregating every hierarchy row in a snapshot took tens of
+            # seconds on production data even when only a few nodes were needed.
+            node_ids = sorted(
+                {
+                    str(item.get("fibernode") or "").strip()
+                    for item in rows
+                    if str(item.get("fibernode") or "").strip()
+                }
+            )
+            hierarchy_by_node: dict[str, dict[str, Any]] = {}
+            if node_ids:
+                placeholders = ",".join(["%s"] * len(node_ids))
+                cur.execute(
+                    "SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts "
+                    "FROM topology_hierarchy WHERE snapshot_id=%s "
+                    f"AND node_id IN ({placeholders}) GROUP BY node_id",
+                    tuple([snapshot_id, *node_ids]),
+                )
+                hierarchy_by_node = {
+                    str(item.get("node_id") or ""): dict(item)
+                    for item in (cur.fetchall() or [])
+                }
+
+            for item in rows:
+                hierarchy = hierarchy_by_node.get(str(item.get("fibernode") or ""), {})
+                item["hierarchy_path"] = hierarchy.get("path")
+                item["cmts"] = hierarchy.get("cmts")
+
             conn.close()
-            return resolved_date, [dict(r) for r in rows]
+            return resolved_date, rows
 
     def get_modem_by_mac(
         self,
@@ -2452,10 +2500,46 @@ class TopologyService:
         for row in rows:
             if isinstance(row, dict) and "mac" in row:
                 row["mac"] = self._normalize_mac(row.get("mac") or "")
+
+        # Topology determines the search cohort; current inventory supplies
+        # operational identity/capability fields in one indexed API-owned read.
+        # Preserve topology CMTS identity separately when current inventory says
+        # that a modem has moved.
+        inventory_merge_degraded = False
+        try:
+            from pypnm.api.routes.poller.service import poller_service
+
+            current_rows = poller_service.get_inventory_modems_bulk(
+                [row.get("mac") for row in rows if isinstance(row, dict)]
+            )
+            current_by_mac = {
+                normalize_bare_mac(current.get("mac_address")): current
+                for current in current_rows
+                if normalize_bare_mac(current.get("mac_address")) is not None
+            }
+            for row in rows:
+                bare_mac = normalize_bare_mac(row.get("mac"))
+                current = current_by_mac.get(bare_mac)
+                row["inventory_match"] = current is not None
+                if not current:
+                    continue
+                row["topology_cmts"] = row.get("cmts") or ""
+                row["mac_address"] = current.get("mac_address") or row.get("mac")
+                for field, current_value in current.items():
+                    if field == "mac_address" or current_value is None or current_value == "":
+                        continue
+                    row[field] = current_value
+        except Exception as exc:
+            inventory_merge_degraded = True
+            logger.warning("Topology search inventory merge failed: %s", exc)
+            for row in rows:
+                row["inventory_match"] = False
+
         return {
             "snapshot_date": snapshot_date,
             "search_type": search_type,
             "count": len(rows),
+            "inventory_merge_degraded": inventory_merge_degraded,
             "modems": rows,
         }
 

@@ -83,9 +83,9 @@ def health() -> dict[str, str]:
 @app.post("/cache/clear", tags=["health"])
 def clear_cache() -> dict[str, str]:
     """Clear all in-memory caches (enrichment, etc.)."""
-    from pypnm.api.routes.cmts.service import _enrichment_cache
-    count = len(_enrichment_cache)
-    _enrichment_cache.clear()
+    from pypnm.api.routes.cmts.service import clear_all_enrichment_cache
+
+    count = clear_all_enrichment_cache()
     return {"status": "ok", "cleared": str(count)}
 
 app.add_middleware(GZipMiddleware, minimum_size=100_000)

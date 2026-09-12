@@ -6130,6 +6130,93 @@ class PollerService:
 
     # ── Modem refresh (on-demand single-modem enrichment) ──────────
 
+    def enqueue_inventory_delta_enrichment(
+        self,
+        *,
+        cmts: str,
+        max_batch: int = 25,
+    ) -> Dict[str, Any]:
+        """Queue a bounded identity delta directly from active inventory."""
+        cmts_value = str(cmts or "").strip()
+        if not cmts_value:
+            raise ValueError("cmts is required")
+        if isinstance(max_batch, bool):
+            raise ValueError("max_batch must be between 1 and 25")
+        try:
+            batch_limit = int(max_batch)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_batch must be between 1 and 25") from exc
+        if not 1 <= batch_limit <= 25:
+            raise ValueError("max_batch must be between 1 and 25")
+
+        try:
+            ipaddress.ip_address(cmts_value)
+            scope_column = "m.cmts_ip"
+        except ValueError:
+            scope_column = "m.cmts"
+
+        vendor_present = self._identity_value_sql("m.vendor")
+        software_present = self._identity_value_sql("m.software_version")
+        missing_identity = f"NOT ({vendor_present}) OR NOT ({software_present})"
+        base_from = (
+            "FROM modem_inventory_current m "
+            f"WHERE m.inventory_state='active' AND {scope_column}=%s"
+        )
+        active_refresh = (
+            "EXISTS (SELECT 1 FROM modem_refresh_request r "
+            "WHERE r.mac=m.mac AND r.status IN ('queued','running'))"
+        )
+        summary_rows = self._query(
+            "SELECT COUNT(*) AS total_modems, "
+            f"SUM(CASE WHEN {missing_identity} THEN 1 ELSE 0 END) AS missing_count "
+            + base_from,
+            (cmts_value,),
+        )
+        summary = (summary_rows[0] if summary_rows else {}) or {}
+        already_queued_rows = self._query(
+            "SELECT COUNT(*) AS c "
+            + base_from
+            + f" AND ({missing_identity}) AND {active_refresh}",
+            (cmts_value,),
+        )
+        already_queued = (
+            int((already_queued_rows[0] or {}).get("c") or 0)
+            if already_queued_rows
+            else 0
+        )
+        candidates = self._query(
+            "SELECT m.mac "
+            + base_from
+            + f" AND ({missing_identity}) "
+            "AND COALESCE(TRIM(m.mac),'')<>'' "
+            f"AND NOT ({active_refresh}) "
+            "ORDER BY m.mac ASC LIMIT %s",
+            (cmts_value, batch_limit),
+        )
+
+        accepted_macs: List[str] = []
+        for candidate in candidates:
+            mac = self._normalize_mac(str(candidate.get("mac") or ""))
+            if not mac:
+                continue
+            request_id = self.enqueue_modem_refresh(
+                mac,
+                cmts_value,
+                requested_by="delta-enrich",
+            )
+            if request_id:
+                accepted_macs.append(mac)
+
+        return {
+            "cmts": cmts_value,
+            "total_modems": int(summary.get("total_modems") or 0),
+            "missing_count": int(summary.get("missing_count") or 0),
+            "already_queued": already_queued,
+            "enqueued": len(accepted_macs),
+            "max_batch": batch_limit,
+            "sample_enqueued_macs": accepted_macs[:20],
+        }
+
     def enqueue_modem_refresh(self, mac: str, cmts: str | None = None, requested_by: str | None = None) -> int:
         normalized_mac = self._normalize_mac(mac)
         if not normalized_mac:

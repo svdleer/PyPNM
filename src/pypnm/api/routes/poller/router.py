@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query
 logger = logging.getLogger(__name__)
 
 from pypnm.api.routes.poller.schema import (
+    InventoryDeltaEnrichmentRequest,
     InventoryMySQLBackfillAgentCollectionResponse,
     InventoryMySQLBackfillCollectionResponse,
     InventoryMySQLBackfillRequest,
@@ -295,6 +296,24 @@ def rebuild_inventory_summary() -> dict:
         logger.error("inventory/summary/rebuild DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "success", "materialized": True, **result}
+
+
+@router.post("/inventory/enrich/delta")
+def enqueue_inventory_delta_enrichment(
+    payload: InventoryDeltaEnrichmentRequest,
+) -> dict:
+    """Queue a bounded identity delta from authoritative active inventory."""
+    try:
+        result = poller_service.enqueue_inventory_delta_enrichment(
+            cmts=payload.cmts,
+            max_batch=payload.max_batch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/enrich/delta DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", **result}
 
 
 @router.post(
