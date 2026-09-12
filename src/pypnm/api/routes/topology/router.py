@@ -9,6 +9,7 @@ from pypnm.api.routes.topology.schema import (
     PhysicalFiberNodeReconcileResponse,
     TopologyDatasetsResponse,
     TopologyImportResponse,
+    TopologyFiberNodeScanTargetsRequest,
     TopologyModemsByMacsRequest,
     TopologyPathsByModemsRequest,
     TopologySummaryResponse,
@@ -181,6 +182,29 @@ def topology_modems_by_macs(body: TopologyModemsByMacsRequest) -> dict:
         return {"status": "success", **payload}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/fiber-nodes/scan-targets",
+    response_model=PhysicalFiberNodeReconcileResponse,
+)
+async def resolve_fiber_node_scan_targets(
+    body: TopologyFiberNodeScanTargetsRequest,
+) -> PhysicalFiberNodeReconcileResponse:
+    try:
+        payload = await topology_service.resolve_fiber_node_scan_targets(
+            selected_date=body.date,
+            fiber_node=body.fiber_node,
+            anchor_mac_address=body.anchor_mac_address,
+            refresh=body.refresh,
+        )
+        return PhysicalFiberNodeReconcileResponse(status="success", **payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

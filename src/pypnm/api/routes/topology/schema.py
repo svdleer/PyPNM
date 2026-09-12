@@ -50,6 +50,15 @@ class PhysicalFiberNodeReconcileRequest(BaseModel):
     refresh: Literal[False] = False
 
 
+class TopologyFiberNodeScanTargetsRequest(BaseModel):
+    """Resolve one exact technical topology FiberNode into current scan targets."""
+
+    date: str | None = None
+    fiber_node: str = Field(min_length=1, max_length=128)
+    anchor_mac_address: str = Field(min_length=1)
+    refresh: Literal[False] = False
+
+
 class PhysicalFiberNodeTarget(BaseModel):
     anchor_mac_address: str
     cmts: str
@@ -86,6 +95,7 @@ class PhysicalFiberNodeReconcileRecord(BaseModel):
 class PhysicalFiberNodeReconcileResponse(BaseModel):
     status: str = "success"
     snapshot_date: str
+    topology_fiber_node: str | None = None
     target: PhysicalFiberNodeTarget
     inventory: PhysicalFiberNodeInventoryQuality
     count: int

@@ -736,6 +736,63 @@ class TopologyStorage:
             conn.close()
             return snapshot_date, rows
 
+    def get_modems_by_exact_fiber_node(
+        self,
+        snapshot_date: str | None,
+        fiber_node: str,
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Return only modem rows whose technical FiberNode exactly matches."""
+        requested_node = str(fiber_node or "").strip()
+        if not requested_node:
+            return snapshot_date, []
+
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                resolved_date = str(snapshot_date or "").strip() or None
+                if not resolved_date:
+                    cur.execute(
+                        "SELECT snapshot_date FROM topology_snapshots "
+                        "ORDER BY snapshot_date DESC LIMIT 1"
+                    )
+                    latest = cur.fetchone() or {}
+                    resolved_date = str(latest.get("snapshot_date") or "") or None
+                if not resolved_date:
+                    return None, []
+
+                cur.execute(
+                    "SELECT id FROM topology_snapshots WHERE snapshot_date=%s",
+                    (resolved_date,),
+                )
+                snapshot = cur.fetchone() or {}
+                snapshot_id = int(snapshot.get("id") or 0)
+                if snapshot_id <= 0:
+                    return resolved_date, []
+
+                cur.execute(
+                    """
+                    SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id,
+                           m.lat, m.lon, m.address, m.address1, m.address2,
+                           m.locality, m.postalcode, m.house_number,
+                           m.house_number_extension, m.linked_node_id,
+                           m.linked_node_type, m.link_match,
+                           h.path AS hierarchy_path, h.cmts AS cmts
+                    FROM topology_modems AS m FORCE INDEX (idx_modems_snapshot_fn)
+                    LEFT JOIN (
+                        SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts
+                        FROM topology_hierarchy WHERE snapshot_id=%s
+                        GROUP BY node_id
+                    ) AS h ON h.node_id=m.fibernode
+                    WHERE m.snapshot_id=%s AND m.fibernode=%s
+                    ORDER BY m.mac ASC
+                    """,
+                    (snapshot_id, snapshot_id, requested_node),
+                )
+                return resolved_date, [dict(row) for row in (cur.fetchall() or [])]
+            finally:
+                conn.close()
+
     def get_paths_by_modems(
         self,
         snapshot_date: str | None,
@@ -2831,6 +2888,76 @@ class TopologyService:
             "count": len(records),
             "records": records,
         }
+
+    async def resolve_fiber_node_scan_targets(
+        self,
+        *,
+        selected_date: str | None,
+        fiber_node: str,
+        anchor_mac_address: str,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve one exact technical FiberNode before joining current inventory."""
+        requested_node = str(fiber_node or "").strip()
+        if not requested_node:
+            raise ValueError("fiber_node is required")
+        if refresh:
+            raise ValueError(
+                "refresh must be false; scan-target resolution reads current API inventory"
+            )
+
+        self.storage.init_db()
+        snapshot_date, topology_rows = self.storage.get_modems_by_exact_fiber_node(
+            snapshot_date=selected_date,
+            fiber_node=requested_node,
+        )
+        if not snapshot_date:
+            raise ValueError("No topology snapshot is available")
+        if self.storage.get_snapshot_meta(snapshot_date) is None:
+            raise ValueError(f"Topology snapshot {snapshot_date} was not found")
+
+        def canonical_mac(value: object) -> str | None:
+            bare = normalize_bare_mac(value)
+            if bare is None:
+                return None
+            return ":".join(bare[index:index + 2] for index in range(0, 12, 2))
+
+        exact_rows_by_mac: dict[str, dict[str, Any]] = {}
+        requested_node_normalized = requested_node.casefold()
+        for source in topology_rows:
+            node = str(source.get("fibernode") or "").strip()
+            mac = canonical_mac(source.get("mac"))
+            if mac is None or node.casefold() != requested_node_normalized:
+                continue
+            row = dict(source)
+            row["mac"] = mac
+            exact_rows_by_mac.setdefault(mac, row)
+        if not exact_rows_by_mac:
+            raise LookupError(
+                f"No topology modems found for exact FiberNode {requested_node} "
+                f"in snapshot {snapshot_date}"
+            )
+
+        anchor_mac = canonical_mac(anchor_mac_address)
+        if anchor_mac is None:
+            raise ValueError("anchor_mac_address must be a valid MAC address")
+        if anchor_mac not in exact_rows_by_mac:
+            raise ValueError(
+                "anchor_mac_address is not a member of the requested topology FiberNode"
+            )
+
+        result = await self.reconcile_physical_fiber_node(
+            selected_date=snapshot_date,
+            expected_mac_addresses=list(exact_rows_by_mac),
+            anchor_mac_address=anchor_mac,
+            refresh=False,
+        )
+        for record in result.get("records") or []:
+            mac = canonical_mac(record.get("mac_address"))
+            if mac in exact_rows_by_mac:
+                record["expected"] = exact_rows_by_mac[mac]
+        result["topology_fiber_node"] = requested_node
+        return result
 
     def get_paths_by_modems(
         self,
