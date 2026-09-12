@@ -659,15 +659,15 @@ class TopologyStorage:
                 "h.path AS hierarchy_path, h.cmts AS cmts "
                 "FROM topology_modems m "
                 "LEFT JOIN ("
-                "  SELECT snapshot_id, node_id, MIN(path) AS path, MIN(cmts) AS cmts "
-                "  FROM topology_hierarchy "
-                "  GROUP BY snapshot_id, node_id"
-                ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
+                "  SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts "
+                "  FROM topology_hierarchy WHERE snapshot_id=%s "
+                "  GROUP BY node_id"
+                ") h ON h.node_id=m.fibernode "
                 "WHERE m.snapshot_id=%s "
                 "AND LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))=%s "
                 "LIMIT 1"
             )
-            cur.execute(sql, (snapshot_id, mac_bare))
+            cur.execute(sql, (snapshot_id, snapshot_id, mac_bare))
             modem = cur.fetchone()
             conn.close()
             return resolved_date, (dict(modem) if modem else None)
@@ -724,13 +724,14 @@ class TopologyStorage:
                     "h.path AS hierarchy_path, h.cmts AS cmts "
                     "FROM topology_modems m "
                     "LEFT JOIN ("
-                    "  SELECT snapshot_id, node_id, MIN(path) AS path, MIN(cmts) AS cmts "
-                    "  FROM topology_hierarchy GROUP BY snapshot_id, node_id"
-                    ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
+                    "  SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts "
+                    "  FROM topology_hierarchy WHERE snapshot_id=%s "
+                    "  GROUP BY node_id"
+                    ") h ON h.node_id=m.fibernode "
                     "WHERE m.snapshot_id=%s "
                     f"AND m.mac IN ({placeholders})"
                 )
-                cur.execute(sql, (snapshot_id, *candidates))
+                cur.execute(sql, (snapshot_id, snapshot_id, *candidates))
                 rows.extend(dict(row) for row in (cur.fetchall() or []))
             conn.close()
             return snapshot_date, rows
@@ -2635,12 +2636,7 @@ class TopologyService:
     ) -> dict[str, Any]:
         """Return topology identities for a bounded MAC cohort."""
         self.storage.init_db()
-        snapshot_date = selected_date
-        if not snapshot_date:
-            snapshot_date, _ = self.storage.get_modem_by_mac(
-                snapshot_date=None,
-                mac_address=mac_addresses[0],
-            )
+        snapshot_date = selected_date or self.storage.get_latest_snapshot_date()
         if not snapshot_date:
             return {"snapshot_date": None, "count": 0, "modems": []}
         snapshot_date, modems = self.storage.get_modems_by_macs(
