@@ -2889,6 +2889,47 @@ class TopologyService:
             "records": records,
         }
 
+    @staticmethod
+    def _derive_scan_target_topology_levels(source_node: object) -> dict[str, str]:
+        """Derive scanner hierarchy labels from an exact topology linked node."""
+        parts = [part.strip() for part in str(source_node or "").split(".") if part.strip()]
+        levels = {
+            "topology_node_id": ".".join(parts[:2]),
+            "topology_group_amplifier": "",
+            "topology_end_amplifier": "",
+            "topology_tap": "",
+        }
+        if not parts:
+            return levels
+
+        group_index = next(
+            (index for index, part in enumerate(parts) if re.fullmatch(r"G\d+", part, re.I)),
+            -1,
+        )
+        end_index = next(
+            (index for index, part in enumerate(parts) if re.fullmatch(r"E\d+", part, re.I)),
+            -1,
+        )
+        tap_index = next(
+            (index for index, part in enumerate(parts) if re.fullmatch(r"T\d+", part, re.I)),
+            -1,
+        )
+        if group_index >= 0:
+            levels["topology_group_amplifier"] = ".".join(parts[:group_index + 1])
+        if end_index >= 0:
+            levels["topology_end_amplifier"] = ".".join(parts[:end_index + 1])
+        if tap_index >= 0:
+            levels["topology_tap"] = ".".join(parts[:tap_index + 1])
+
+        # Customer-chain convention: node.group.end.tap hierarchy by depth.
+        if not levels["topology_group_amplifier"] and len(parts) >= 4:
+            levels["topology_group_amplifier"] = ".".join(parts[:4])
+        if not levels["topology_end_amplifier"] and len(parts) >= 5:
+            levels["topology_end_amplifier"] = ".".join(parts[:5])
+        if not levels["topology_tap"] and len(parts) >= 6:
+            levels["topology_tap"] = ".".join(parts[:6])
+        return levels
+
     async def resolve_fiber_node_scan_targets(
         self,
         *,
@@ -2931,6 +2972,11 @@ class TopologyService:
                 continue
             row = dict(source)
             row["mac"] = mac
+            row.update(
+                self._derive_scan_target_topology_levels(
+                    row.get("linked_node_id") or row.get("fibernode")
+                )
+            )
             exact_rows_by_mac.setdefault(mac, row)
         if not exact_rows_by_mac:
             raise LookupError(
