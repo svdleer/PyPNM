@@ -3002,6 +3002,16 @@ class TopologyService:
             mac = canonical_mac(record.get("mac_address"))
             if mac in exact_rows_by_mac:
                 record["expected"] = exact_rows_by_mac[mac]
+        # Topology defines the exact technical-path cohort. Authoritative SNMP
+        # inventory determines which members are currently on the anchor's
+        # physical FiberNode and may be shown as scan targets.
+        result["records"] = [
+            record
+            for record in result.get("records") or []
+            if record.get("classification") == "expected_current_member"
+            and record.get("selectable") is True
+        ]
+        result["count"] = len(result["records"])
         result["topology_fiber_node"] = requested_node
         return result
 
