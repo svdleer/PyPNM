@@ -499,10 +499,13 @@ class TopologyStorage:
                 conn.close()
                 return resolved_date, []
 
-            select_sql = (
+            select_columns = (
                 "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.address, m.address1, m.address2, m.locality, "
                 "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match "
-                "FROM topology_modems m WHERE m.snapshot_id=%s "
+            )
+            select_sql = (
+                select_columns
+                + "FROM topology_modems m WHERE m.snapshot_id=%s "
             )
 
             st = (search_type or "").strip().lower()
@@ -511,18 +514,27 @@ class TopologyStorage:
             rows: list[dict[str, Any]] = []
 
             if st in {"fibernode", "customer_id"}:
-                column = "m.fibernode" if st == "fibernode" else "m.customer_id"
+                column_name = "fibernode" if st == "fibernode" else "customer_id"
+                column = f"m.{column_name}"
+                search_index = (
+                    "idx_modems_snapshot_fn"
+                    if st == "fibernode"
+                    else "idx_modems_snapshot_customer"
+                )
+                ranked_select_sql = (
+                    select_columns
+                    + f"FROM topology_modems m FORCE INDEX ({search_index}) "
+                    "WHERE m.snapshot_id=%s "
+                )
                 # Preserve the legacy contains cohort while filling the bounded
                 # result in exact, prefix, then remaining-contains order.
+                # Force the selective value index so ORDER BY mac cannot make
+                # MySQL scan the full snapshot through the MAC index.
                 search_phases = (
                     (f"{column}=%s", (vv,)),
                     (
                         f"{column} LIKE %s AND {column}<>%s",
                         (f"{vv}%", vv),
-                    ),
-                    (
-                        f"{column} LIKE %s AND NOT ({column} LIKE %s)",
-                        (f"%{vv}%", f"{vv}%"),
                     ),
                 )
                 for predicate, phase_params in search_phases:
@@ -530,9 +542,39 @@ class TopologyStorage:
                     if remaining <= 0:
                         break
                     cur.execute(
-                        select_sql
+                        ranked_select_sql
                         + f"AND {predicate} ORDER BY m.mac ASC LIMIT %s",
                         (snapshot_id, *phase_params, remaining),
+                    )
+                    rows.extend(dict(item) for item in (cur.fetchall() or []))
+
+                remaining = int(limit) - len(rows)
+                if remaining > 0:
+                    # A leading-wildcard predicate cannot seek into a B-tree.
+                    # Materialize matching labels from the narrow covering
+                    # index, then join back through that same value index. This
+                    # keeps the full-row result bounded without client-side
+                    # label materialization or query fan-out.
+                    cur.execute(
+                        select_columns
+                        + f"FROM topology_modems m FORCE INDEX ({search_index}) "
+                        "INNER JOIN ("
+                        f"SELECT DISTINCT labels.{column_name} "
+                        "AS match_value FROM topology_modems labels "
+                        f"FORCE INDEX ({search_index}) "
+                        "WHERE labels.snapshot_id=%s "
+                        f"AND labels.{column_name} LIKE %s "
+                        f"AND NOT (labels.{column_name} LIKE %s)"
+                        ") matches ON matches.match_value="
+                        f"m.{column_name} "
+                        "WHERE m.snapshot_id=%s ORDER BY m.mac ASC LIMIT %s",
+                        (
+                            snapshot_id,
+                            f"%{vv}%",
+                            f"{vv}%",
+                            snapshot_id,
+                            remaining,
+                        ),
                     )
                     rows.extend(dict(item) for item in (cur.fetchall() or []))
             elif st == "postal_house":
