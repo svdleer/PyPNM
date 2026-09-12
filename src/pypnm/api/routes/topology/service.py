@@ -582,6 +582,59 @@ class TopologyStorage:
             conn.close()
             return resolved_date, (dict(modem) if modem else None)
 
+    def get_modems_by_macs(
+        self,
+        snapshot_date: str,
+        mac_addresses: list[str],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Return topology rows for MACs from exactly one requested snapshot."""
+        bare_macs = list(
+            dict.fromkeys(
+                mac
+                for mac in (normalize_bare_mac(value) for value in mac_addresses)
+                if mac is not None
+            )
+        )
+        if not bare_macs:
+            return snapshot_date, []
+
+        with self._db_lock:
+            conn = self._connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id FROM topology_snapshots WHERE snapshot_date=%s",
+                (snapshot_date,),
+            )
+            snapshot = cur.fetchone() or {}
+            snapshot_id = int(snapshot.get("id") or 0)
+            if snapshot_id <= 0:
+                conn.close()
+                return snapshot_date, []
+
+            rows: list[dict[str, Any]] = []
+            for offset in range(0, len(bare_macs), 500):
+                batch = bare_macs[offset:offset + 500]
+                placeholders = ",".join(["%s"] * len(batch))
+                sql = (
+                    "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, "
+                    "m.address, m.address1, m.address2, m.locality, m.postalcode, "
+                    "m.house_number, m.house_number_extension, m.linked_node_id, "
+                    "m.linked_node_type, m.link_match, h.path AS hierarchy_path, "
+                    "h.cmts AS cmts "
+                    "FROM topology_modems m "
+                    "LEFT JOIN ("
+                    "  SELECT snapshot_id, node_id, MIN(path) AS path, MIN(cmts) AS cmts "
+                    "  FROM topology_hierarchy GROUP BY snapshot_id, node_id"
+                    ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
+                    "WHERE m.snapshot_id=%s "
+                    "AND LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', '')) "
+                    f"IN ({placeholders})"
+                )
+                cur.execute(sql, (snapshot_id, *batch))
+                rows.extend(dict(row) for row in (cur.fetchall() or []))
+            conn.close()
+            return snapshot_date, rows
+
     def get_paths_by_modems(
         self,
         snapshot_date: str | None,
@@ -2437,6 +2490,211 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "mac_address": mac_address,
             "modem": modem,
+        }
+
+    async def reconcile_physical_fiber_node(
+        self,
+        *,
+        selected_date: str,
+        expected_mac_addresses: list[str],
+        anchor_mac_address: str,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Reconcile immutable topology MACs with current physical-FN inventory."""
+        if refresh:
+            raise ValueError(
+                "refresh must be false; reconciliation reads current API inventory"
+            )
+        self.storage.init_db()
+
+        def canonical_mac(value: object) -> str | None:
+            bare = normalize_bare_mac(value)
+            if bare is None:
+                return None
+            return ":".join(bare[index:index + 2] for index in range(0, 12, 2))
+
+        expected_macs: list[str] = []
+        for value in expected_mac_addresses:
+            mac = canonical_mac(value)
+            if mac is None:
+                raise ValueError(f"Invalid expected MAC address: {value}")
+            if mac not in expected_macs:
+                expected_macs.append(mac)
+        if not expected_macs:
+            raise ValueError("expected_mac_addresses must be a non-empty list")
+
+        anchor_mac = canonical_mac(anchor_mac_address)
+        if anchor_mac is None:
+            raise ValueError("anchor_mac_address must be a valid MAC address")
+        if anchor_mac not in expected_macs:
+            raise ValueError("anchor_mac_address must belong to expected_mac_addresses")
+
+        snapshot_date = str(selected_date or "").strip()
+        if not snapshot_date:
+            raise ValueError("date is required")
+        if self.storage.get_snapshot_meta(snapshot_date) is None:
+            raise ValueError(f"Topology snapshot {snapshot_date} was not found")
+
+        _, topology_rows = self.storage.get_modems_by_macs(
+            snapshot_date=snapshot_date,
+            mac_addresses=expected_macs,
+        )
+        topology_by_mac: dict[str, dict[str, Any]] = {}
+        for source in topology_rows:
+            mac = canonical_mac(source.get("mac"))
+            if mac is None or mac not in expected_macs:
+                continue
+            row = dict(source)
+            row["mac"] = mac
+            topology_by_mac[mac] = row
+        missing_topology_macs = [
+            mac for mac in expected_macs if mac not in topology_by_mac
+        ]
+        if missing_topology_macs:
+            preview = ", ".join(missing_topology_macs[:5])
+            suffix = "" if len(missing_topology_macs) <= 5 else ", ..."
+            raise ValueError(
+                "Expected MAC addresses are not members of topology snapshot "
+                f"{snapshot_date}: {preview}{suffix}"
+            )
+
+        from pypnm.api.routes.poller.service import poller_service
+
+        current_rows = poller_service.get_inventory_modems_bulk(expected_macs)
+        current_by_mac = {
+            mac: row
+            for row in current_rows
+            if (mac := canonical_mac(row.get("mac_address"))) is not None
+        }
+        anchor_current = current_by_mac.get(anchor_mac)
+        if anchor_current is None:
+            raise LookupError(
+                "Anchor modem has no active current inventory row; "
+                "physical location cannot be resolved"
+            )
+
+        target_cmts_ip = str(anchor_current.get("cmts_ip") or "").strip()
+        if not target_cmts_ip:
+            raise LookupError("Anchor modem current CMTS IP is unresolved")
+
+        target_fiber_node = str(anchor_current.get("fiber_node") or "").strip()
+        if not target_cmts_ip or not target_fiber_node:
+            raise LookupError("Anchor modem current physical FiberNode is unresolved")
+
+        target_rows = poller_service.list_active_modems_on_physical_fiber_node(
+            cmts_ip=target_cmts_ip,
+            fiber_node=target_fiber_node,
+        )
+        target_by_mac = {
+            mac: row
+            for row in target_rows
+            if (mac := canonical_mac(row.get("mac_address"))) is not None
+        }
+        if anchor_mac not in target_by_mac:
+            raise LookupError(
+                "Anchor modem is not present in its resolved current physical "
+                "FiberNode inventory"
+            )
+
+        records: list[dict[str, Any]] = []
+        for mac in expected_macs:
+            expected = topology_by_mac[mac]
+            current = current_by_mac.get(mac)
+            if mac in target_by_mac:
+                current = target_by_mac[mac]
+                classification = "expected_current_member"
+                selectable = True
+                disabled_reason = None
+            elif current is None:
+                classification = "expected_not_current"
+                selectable = False
+                disabled_reason = (
+                    "No active current inventory row; movement is not inferred "
+                    "from absence"
+                )
+            else:
+                current_cmts_ip = str(current.get("cmts_ip") or "").strip()
+                current_fiber_node = str(current.get("fiber_node") or "").strip()
+                if not current_cmts_ip or not current_fiber_node:
+                    classification = "expected_location_unknown"
+                    selectable = False
+                    disabled_reason = "Current CMTS or physical FiberNode is unresolved"
+                else:
+                    classification = "expected_moved"
+                    selectable = False
+                    location = current.get("cmts") or current_cmts_ip
+                    disabled_reason = (
+                        f"Currently connected to {location} / {current_fiber_node}"
+                    )
+            records.append(
+                {
+                    "mac_address": mac,
+                    "expected": expected,
+                    "current": current,
+                    "classification": classification,
+                    "selectable": selectable,
+                    "disabled_reason": disabled_reason,
+                }
+            )
+
+        expected_set = set(expected_macs)
+        for mac in sorted(target_by_mac):
+            if mac in expected_set:
+                continue
+            records.append(
+                {
+                    "mac_address": mac,
+                    "expected": None,
+                    "current": target_by_mac[mac],
+                    "classification": "current_physical_fn_member",
+                    "selectable": True,
+                    "disabled_reason": None,
+                }
+            )
+
+        snapshot = poller_service.get_inventory_snapshot(target_cmts_ip) or {}
+        collected_at = snapshot.get("collected_at")
+        stale = False
+        if collected_at:
+            try:
+                collected = datetime.fromisoformat(
+                    str(collected_at).replace("Z", "+00:00")
+                )
+                if collected.tzinfo is None:
+                    collected = collected.replace(tzinfo=timezone.utc)
+                freshness_seconds = max(
+                    1,
+                    int(os.environ.get("INVENTORY_FRESHNESS_SECONDS", "172800")),
+                )
+                age_seconds = (
+                    datetime.now(timezone.utc) - collected
+                ).total_seconds()
+                stale = age_seconds >= freshness_seconds
+            except (TypeError, ValueError):
+                stale = False
+
+        target_cmts = str(anchor_current.get("cmts") or target_cmts_ip).strip()
+        return {
+            "snapshot_date": snapshot_date,
+            "target": {
+                "anchor_mac_address": anchor_mac,
+                "cmts": target_cmts,
+                "cmts_ip": target_cmts_ip,
+                "physical_fiber_node": target_fiber_node,
+            },
+            "inventory": {
+                "source": str(snapshot.get("source") or "modem_inventory_current"),
+                "snapshot_id": snapshot.get("snapshot_id"),
+                "collected_at": collected_at,
+                "revision_at": snapshot.get("revision_at"),
+                "complete": snapshot.get("complete") is True,
+                "truncated": snapshot.get("truncated") is True,
+                "authoritative": snapshot.get("authoritative") is True,
+                "stale": stale,
+                "quarantined": snapshot.get("quarantined") is True,
+            },
+            "count": len(records),
+            "records": records,
         }
 
     def get_paths_by_modems(

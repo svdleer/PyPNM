@@ -5980,6 +5980,31 @@ class PollerService:
             results.extend(self._map_inventory_row(r) for r in rows)
         return results
 
+    def list_active_modems_on_physical_fiber_node(
+        self,
+        cmts_ip: str,
+        fiber_node: str,
+    ) -> list[dict[str, Any]]:
+        """Return active inventory rows on one exact CMTS/FiberNode pair."""
+        target_cmts_ip = str(cmts_ip or "").strip()
+        target_fiber_node = str(fiber_node or "").strip()
+        if not target_cmts_ip or not target_fiber_node:
+            return []
+        rows = self._query(
+            "SELECT mac, ip, cmts, cmts_ip, cmts_index, docsif3_index, "
+            "fiber_node, cable_mac, mac_domain, status, docsis_version, vendor, model, "
+            "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
+            "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
+            "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
+            "partial_service_upstream, partial_service_state, software_version, "
+            "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
+            "FROM modem_inventory_current "
+            "WHERE inventory_state='active' AND cmts_ip=%s "
+            "AND LOWER(TRIM(fiber_node))=LOWER(%s) ORDER BY mac ASC",
+            (target_cmts_ip, target_fiber_node),
+        )
+        return [self._map_inventory_row(row) for row in rows]
+
     def clear_inventory_modems(self, cmts: Optional[str] = None, cmts_ip: Optional[str] = None) -> int:
         """Delete inventory rows scoped to a CMTS hostname and/or IP."""
         cmts_name = str(cmts or "").strip()

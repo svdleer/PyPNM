@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +36,56 @@ class TopologyPathsByModemsRequest(BaseModel):
     mac_addresses: list[str] = Field(default_factory=list)
     date: str | None = None
     max_hops: int = Field(default=32, ge=1, le=64)
+
+
+class PhysicalFiberNodeReconcileRequest(BaseModel):
+    date: str = Field(min_length=1)
+    expected_mac_addresses: list[str] = Field(min_length=1, max_length=5000)
+    anchor_mac_address: str = Field(min_length=1)
+    refresh: Literal[False] = False
+
+
+class PhysicalFiberNodeTarget(BaseModel):
+    anchor_mac_address: str
+    cmts: str
+    cmts_ip: str
+    physical_fiber_node: str
+
+
+class PhysicalFiberNodeInventoryQuality(BaseModel):
+    source: str
+    snapshot_id: str | None = None
+    collected_at: str | None = None
+    revision_at: str | None = None
+    complete: bool = False
+    truncated: bool = False
+    authoritative: bool = False
+    stale: bool = False
+    quarantined: bool = False
+
+
+class PhysicalFiberNodeReconcileRecord(BaseModel):
+    mac_address: str
+    expected: dict[str, Any] | None = None
+    current: dict[str, Any] | None = None
+    classification: Literal[
+        "expected_current_member",
+        "expected_moved",
+        "expected_not_current",
+        "expected_location_unknown",
+        "current_physical_fn_member",
+    ]
+    selectable: bool
+    disabled_reason: str | None = None
+
+
+class PhysicalFiberNodeReconcileResponse(BaseModel):
+    status: str = "success"
+    snapshot_date: str
+    target: PhysicalFiberNodeTarget
+    inventory: PhysicalFiberNodeInventoryQuality
+    count: int
+    records: list[PhysicalFiberNodeReconcileRecord] = Field(default_factory=list)
 
 
 class TopologySummaryResponse(BaseModel):

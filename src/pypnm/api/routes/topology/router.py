@@ -5,6 +5,8 @@ from fastapi.responses import FileResponse
 
 from pypnm.api.routes.topology.schema import (
     ImportJobStatusResponse,
+    PhysicalFiberNodeReconcileRequest,
+    PhysicalFiberNodeReconcileResponse,
     TopologyDatasetsResponse,
     TopologyImportResponse,
     TopologyPathsByModemsRequest,
@@ -164,6 +166,29 @@ def topology_modem_by_mac(
             mac_address=mm,
         )
         return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/reconcile/physical-fiber-node",
+    response_model=PhysicalFiberNodeReconcileResponse,
+)
+async def reconcile_physical_fiber_node(
+    body: PhysicalFiberNodeReconcileRequest,
+) -> PhysicalFiberNodeReconcileResponse:
+    try:
+        payload = await topology_service.reconcile_physical_fiber_node(
+            selected_date=body.date,
+            expected_mac_addresses=body.expected_mac_addresses,
+            anchor_mac_address=body.anchor_mac_address,
+            refresh=body.refresh,
+        )
+        return PhysicalFiberNodeReconcileResponse(status="success", **payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
