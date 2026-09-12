@@ -78,7 +78,6 @@ class PhysicalFiberNodeReconcileRecord(BaseModel):
         "expected_moved",
         "expected_not_current",
         "expected_location_unknown",
-        "current_physical_fn_member",
     ]
     selectable: bool
     disabled_reason: str | None = None

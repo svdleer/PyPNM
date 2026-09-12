@@ -2741,31 +2741,14 @@ class TopologyService:
         if not target_cmts_ip or not target_fiber_node:
             raise LookupError("Anchor modem current physical FiberNode is unresolved")
 
-        target_rows = poller_service.list_active_modems_on_physical_fiber_node(
-            cmts_ip=target_cmts_ip,
-            fiber_node=target_fiber_node,
-        )
-        target_by_mac = {
-            mac: row
-            for row in target_rows
-            if (mac := canonical_mac(row.get("mac_address"))) is not None
-        }
-        if anchor_mac not in target_by_mac:
-            raise LookupError(
-                "Anchor modem is not present in its resolved current physical "
-                "FiberNode inventory"
-            )
-
+        # The topology search cohort is authoritative. A physical FiberNode can
+        # serve several topology FiberNodes, so current inventory may refresh
+        # cohort members' location/status but must never add neighboring paths.
         records: list[dict[str, Any]] = []
         for mac in expected_macs:
             expected = topology_by_mac[mac]
             current = current_by_mac.get(mac)
-            if mac in target_by_mac:
-                current = target_by_mac[mac]
-                classification = "expected_current_member"
-                selectable = True
-                disabled_reason = None
-            elif current is None:
+            if current is None:
                 classification = "expected_not_current"
                 selectable = False
                 disabled_reason = (
@@ -2779,6 +2762,13 @@ class TopologyService:
                     classification = "expected_location_unknown"
                     selectable = False
                     disabled_reason = "Current CMTS or physical FiberNode is unresolved"
+                elif (
+                    current_cmts_ip == target_cmts_ip
+                    and current_fiber_node == target_fiber_node
+                ):
+                    classification = "expected_current_member"
+                    selectable = True
+                    disabled_reason = None
                 else:
                     classification = "expected_moved"
                     selectable = False
@@ -2794,21 +2784,6 @@ class TopologyService:
                     "classification": classification,
                     "selectable": selectable,
                     "disabled_reason": disabled_reason,
-                }
-            )
-
-        expected_set = set(expected_macs)
-        for mac in sorted(target_by_mac):
-            if mac in expected_set:
-                continue
-            records.append(
-                {
-                    "mac_address": mac,
-                    "expected": None,
-                    "current": target_by_mac[mac],
-                    "classification": "current_physical_fn_member",
-                    "selectable": True,
-                    "disabled_reason": None,
                 }
             )
 
