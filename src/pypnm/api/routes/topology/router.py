@@ -9,6 +9,7 @@ from pypnm.api.routes.topology.schema import (
     PhysicalFiberNodeReconcileResponse,
     TopologyDatasetsResponse,
     TopologyImportResponse,
+    TopologyModemsByMacsRequest,
     TopologyPathsByModemsRequest,
     TopologySummaryResponse,
 )
@@ -166,6 +167,20 @@ def topology_modem_by_mac(
             mac_address=mm,
         )
         return {"status": "success", **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/modems/by-macs")
+def topology_modems_by_macs(body: TopologyModemsByMacsRequest) -> dict:
+    try:
+        payload = topology_service.get_modems_by_macs(
+            selected_date=body.date,
+            mac_addresses=body.mac_addresses,
+        )
+        return {"status": "success", **payload}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

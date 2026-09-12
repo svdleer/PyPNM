@@ -38,6 +38,11 @@ class TopologyPathsByModemsRequest(BaseModel):
     max_hops: int = Field(default=32, ge=1, le=64)
 
 
+class TopologyModemsByMacsRequest(BaseModel):
+    mac_addresses: list[str] = Field(min_length=1, max_length=5000)
+    date: str | None = None
+
+
 class PhysicalFiberNodeReconcileRequest(BaseModel):
     date: str = Field(min_length=1)
     expected_mac_addresses: list[str] = Field(min_length=1, max_length=5000)

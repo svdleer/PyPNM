@@ -614,23 +614,33 @@ class TopologyStorage:
             rows: list[dict[str, Any]] = []
             for offset in range(0, len(bare_macs), 500):
                 batch = bare_macs[offset:offset + 500]
-                placeholders = ",".join(["%s"] * len(batch))
+                candidates: list[str] = []
+                for mac in batch:
+                    pairs = [mac[index:index + 2] for index in range(0, 12, 2)]
+                    candidates.extend(
+                        (
+                            mac,
+                            ":".join(pairs),
+                            "-".join(pairs),
+                            f"{mac[:4]}.{mac[4:8]}.{mac[8:12]}",
+                        )
+                    )
+                placeholders = ",".join(["%s"] * len(candidates))
                 sql = (
                     "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, "
-                    "m.address, m.address1, m.address2, m.locality, m.postalcode, "
-                    "m.house_number, m.house_number_extension, m.linked_node_id, "
-                    "m.linked_node_type, m.link_match, h.path AS hierarchy_path, "
-                    "h.cmts AS cmts "
+                    "m.lat, m.lon, m.address, m.address1, m.address2, m.locality, "
+                    "m.postalcode, m.house_number, m.house_number_extension, "
+                    "m.linked_node_id, m.linked_node_type, m.link_match, "
+                    "h.path AS hierarchy_path, h.cmts AS cmts "
                     "FROM topology_modems m "
                     "LEFT JOIN ("
                     "  SELECT snapshot_id, node_id, MIN(path) AS path, MIN(cmts) AS cmts "
                     "  FROM topology_hierarchy GROUP BY snapshot_id, node_id"
                     ") h ON h.snapshot_id=m.snapshot_id AND h.node_id=m.fibernode "
                     "WHERE m.snapshot_id=%s "
-                    "AND LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', '')) "
-                    f"IN ({placeholders})"
+                    f"AND m.mac IN ({placeholders})"
                 )
-                cur.execute(sql, (snapshot_id, *batch))
+                cur.execute(sql, (snapshot_id, *candidates))
                 rows.extend(dict(row) for row in (cur.fetchall() or []))
             conn.close()
             return snapshot_date, rows
@@ -2490,6 +2500,34 @@ class TopologyService:
             "snapshot_date": snapshot_date,
             "mac_address": mac_address,
             "modem": modem,
+        }
+
+    def get_modems_by_macs(
+        self,
+        selected_date: str | None,
+        mac_addresses: list[str],
+    ) -> dict[str, Any]:
+        """Return topology identities for a bounded MAC cohort."""
+        self.storage.init_db()
+        snapshot_date = selected_date
+        if not snapshot_date:
+            snapshot_date, _ = self.storage.get_modem_by_mac(
+                snapshot_date=None,
+                mac_address=mac_addresses[0],
+            )
+        if not snapshot_date:
+            return {"snapshot_date": None, "count": 0, "modems": []}
+        snapshot_date, modems = self.storage.get_modems_by_macs(
+            snapshot_date=snapshot_date,
+            mac_addresses=mac_addresses,
+        )
+        for modem in modems:
+            if isinstance(modem, dict) and "mac" in modem:
+                modem["mac"] = self._normalize_mac(modem.get("mac") or "")
+        return {
+            "snapshot_date": snapshot_date,
+            "count": len(modems),
+            "modems": modems,
         }
 
     async def reconcile_physical_fiber_node(
