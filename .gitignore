@@ -62,3 +62,5 @@ gitleaks-report.json
 # Local memory artifacts
 memories/
 /memories/
+# Untracked Markdown notes and generated reports
+*.md
