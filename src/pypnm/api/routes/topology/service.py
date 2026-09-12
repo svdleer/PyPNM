@@ -500,7 +500,7 @@ class TopologyStorage:
                 return resolved_date, []
 
             select_columns = (
-                "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.address, m.address1, m.address2, m.locality, "
+                "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.lat, m.lon, m.address, m.address1, m.address2, m.locality, "
                 "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match "
             )
             select_sql = (
