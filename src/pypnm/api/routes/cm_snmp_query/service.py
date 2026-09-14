@@ -821,19 +821,27 @@ class CmSnmpQueryService:
     # ── Options ───────────────────────────────────────────────
 
     def get_cmts_options(self, affiliate: str = "all") -> list[str]:
+        """Return CMTS names from the cached authoritative ISW directory.
+
+        Modem inventory is intentionally not read while the user is selecting a
+        CMTS.  The final target plan remains responsible for enforcing the
+        authoritative directory membership against live inventory.
+        """
         normalized_affiliate = self._normalize_affiliate(affiliate)
-        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(normalized_affiliate)
-        role_filter = "AND LOWER(cmts) LIKE %s"
-        params: tuple[str, ...] = ("%ccap%", *affiliate_params)
-        rows = self._query(
-            f"SELECT DISTINCT TRIM(cmts) AS cmts FROM modem_inventory_current m "
-            f"WHERE m.inventory_state<>'retired' "
-            f"AND cmts IS NOT NULL AND TRIM(cmts)<>'' "
-            f"{self._online_inventory_filter()} {role_filter} {affiliate_filter} "
-            f"ORDER BY TRIM(cmts)",
-            params,
+        allowed_affiliates = (
+            {"fupc", "fziggo"}
+            if normalized_affiliate in {"all", "vfz"}
+            else {normalized_affiliate}
         )
-        return [str(r["cmts"]) for r in rows]
+        return sorted(
+            {
+                row["hostname"]
+                for row in self._get_cmts_directory()
+                if row["affiliate"] in allowed_affiliates
+                and row["hostname"]
+                and "ccap" in row["hostname"]
+            }
+        )
 
     def get_fiber_node_options(self, cmts: str, affiliate: str = "all") -> list[str]:
         normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
