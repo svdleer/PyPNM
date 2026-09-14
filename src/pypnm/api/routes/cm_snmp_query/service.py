@@ -278,9 +278,31 @@ class CmSnmpQueryService:
 
         return self.get_job(public_id)
 
+    @staticmethod
+    def _normalize_affiliate(value: object) -> str:
+        affiliate = "all" if value is None else str(value).strip().lower()
+        if affiliate not in {"all", "vfz", "fziggo", "fupc"}:
+            raise ValueError("affiliate must be one of: all, vfz, fziggo, fupc")
+        return affiliate
+
+    @staticmethod
+    def _affiliate_sql_predicate(affiliate: str) -> tuple[str, list[str]]:
+        source_area = "LOWER(TRIM(COALESCE(m.source_area,'')))"
+        if affiliate == "all":
+            return "", []
+        if affiliate == "vfz":
+            return f"AND {source_area} IN (%s,%s)", ["fziggo", "fupc"]
+        return f"AND {source_area}=%s", [affiliate]
+
+    @staticmethod
+    def _online_inventory_filter() -> str:
+        return "AND m.status IN ('operational','registrationComplete','ipComplete','online')"
+
     def _resolve_targets(self, scope_type: str, scope: dict, max_modems: int | None) -> list[dict]:
         limit_clause = f"LIMIT {int(max_modems)}" if max_modems else ""
-        online_filter = "AND m.status IN ('operational','registrationComplete','ipComplete','online')"
+        affiliate = self._normalize_affiliate(scope.get("affiliate"))
+        affiliate_filter, affiliate_params = self._affiliate_sql_predicate(affiliate)
+        online_filter = self._online_inventory_filter()
         table_rows = self._query(
             "SELECT COUNT(*) AS table_count FROM information_schema.TABLES "
             "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN "
@@ -314,8 +336,9 @@ class CmSnmpQueryService:
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
-                f"WHERE m.inventory_state<>'retired' {online_filter} "
-                f"ORDER BY RAND() {limit_clause}"
+                f"WHERE m.inventory_state<>'retired' {online_filter} {affiliate_filter} "
+                f"ORDER BY RAND() {limit_clause}",
+                affiliate_params,
             )
         elif scope_type == "cmts":
             cmts_names = [str(c).strip() for c in (scope.get("cmts") or []) if str(c).strip()]
@@ -326,9 +349,9 @@ class CmSnmpQueryService:
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
                 f"WHERE m.inventory_state<>'retired' "
-                f"AND m.cmts IN ({placeholders}) {online_filter} "
+                f"AND m.cmts IN ({placeholders}) {online_filter} {affiliate_filter} "
                 f"ORDER BY RAND() {limit_clause}",
-                cmts_names,
+                (*cmts_names, *affiliate_params),
             )
         elif scope_type == "fiber_node":
             cmts_name = str(scope.get("cmts") or "").strip()
@@ -359,9 +382,10 @@ class CmSnmpQueryService:
                       ORDER BY s.snapshot_date DESC, s.id DESC LIMIT 1
                   )
                   {online_filter}
+                  {affiliate_filter}
                 ORDER BY RAND() {limit_clause}
                 """,
-                (cmts_name, *fiber_nodes),
+                (cmts_name, *fiber_nodes, *affiliate_params),
             )
         else:
             rows = []
@@ -651,9 +675,12 @@ class CmSnmpQueryService:
         )
         return [str(r["cmts"]) for r in rows]
 
-    def get_fiber_node_options(self, cmts: str) -> list[str]:
+    def get_fiber_node_options(self, cmts: str, affiliate: str = "all") -> list[str]:
+        normalized_affiliate = self._normalize_affiliate(affiliate)
+        affiliate_filter, affiliate_params = self._affiliate_sql_predicate(normalized_affiliate)
+        online_filter = self._online_inventory_filter()
         rows = self._query(
-            """
+            f"""
             SELECT DISTINCT t.fiber_node
             FROM topology_fiber_node_map t
             WHERE t.snapshot_id = (
@@ -669,11 +696,13 @@ class CmSnmpQueryService:
                 ) COLLATE ascii_bin
                 FROM modem_inventory_current m
                 WHERE m.inventory_state<>'retired' AND m.cmts = %s
+                {online_filter}
+                {affiliate_filter}
             )
             AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
             ORDER BY t.fiber_node
             """,
-            (cmts,),
+            (cmts, *affiliate_params),
         )
         return [str(r["fiber_node"]) for r in rows]
 

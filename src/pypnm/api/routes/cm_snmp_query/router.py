@@ -50,10 +50,14 @@ def get_cmts_options(limit: int = Query(default=5000, ge=1, le=10000)) -> dict:
 @router.get("/options/fiber-nodes")
 def get_fiber_node_options(
     cmts: str = Query(max_length=128),
+    affiliate: str = Query(default="all", pattern="^(all|vfz|fziggo|fupc)$"),
     limit: int = Query(default=5000, ge=1, le=10000),
 ) -> dict:
     try:
-        return {"status": "success", "fiber_nodes": cm_snmp_query_service.get_fiber_node_options(cmts)[:limit]}
+        fiber_nodes = cm_snmp_query_service.get_fiber_node_options(cmts, affiliate)
+        return {"status": "success", "fiber_nodes": fiber_nodes[:limit]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 

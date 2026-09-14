@@ -46,9 +46,10 @@ class SnmpQueryPlanRequest(BaseModel):
     """Create a custom SNMP query job."""
     scope: dict[str, Any] = Field(
         description=(
-            '{"type": "cmts", "cmts": ["CMTS-NAME"]} | '
-            '{"type": "fiber_node", "cmts": "CMTS-NAME", "fiber_nodes": ["FN01"]} | '
-            '{"type": "all_network"}'
+            '{"type": "cmts", "cmts": ["CMTS-NAME"], "affiliate": "all|vfz|fziggo|fupc"} | '
+            '{"type": "fiber_node", "cmts": "CMTS-NAME", "fiber_nodes": ["TECHNICAL-FN"], '
+            '"affiliate": "all|vfz|fziggo|fupc"} | '
+            '{"type": "all_network", "affiliate": "all|vfz|fziggo|fupc"}'
         )
     )
     oids: list[OidEntry] = Field(min_length=1, max_length=50)
