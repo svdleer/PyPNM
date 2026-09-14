@@ -8443,6 +8443,87 @@ class PollerService:
 
     # ── Inventory summary (admin dashboard) ──────────────────────
 
+    def get_inventory_modem_facet_options(
+        self,
+        *,
+        dimension: str,
+        area: Optional[str] = "all",
+        cmts: Optional[str] = None,
+        modem_vendor: Optional[str] = None,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """Return fast inventory-backed modem vendor or model choices.
+
+        This intentionally reads the materialized inventory summary tables only.
+        It is suitable for selector options, not final Custom SNMP target selection.
+        """
+        normalized_dimension = str(dimension or "").strip().lower()
+        if normalized_dimension not in {"vendor", "model"}:
+            raise ValueError("dimension must be one of: vendor, model")
+        normalized_area = self._normalize_inventory_area(area)
+        try:
+            requested_limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be between 1 and 10000") from exc
+        if not 1 <= requested_limit <= 10000:
+            raise ValueError("limit must be between 1 and 10000")
+
+        cmts_value = str(cmts or "").strip()
+        if len(cmts_value) > 128:
+            raise ValueError("cmts must not exceed 128 characters")
+        vendor_value = str(modem_vendor or "").strip()
+        if len(vendor_value) > 64:
+            raise ValueError("modem_vendor must not exceed 64 characters")
+
+        if normalized_dimension == "model" and vendor_value:
+            predicates = ["f.vendor=%s", "f.model<>'(unknown)'", "f.model<>''"]
+            params: List[Any] = [vendor_value]
+            if cmts_value:
+                predicates.append("(s.cmts=%s OR s.cmts_ip=%s)")
+                params.extend([cmts_value, cmts_value])
+            area_predicate, area_params = self._area_sql_predicate(
+                "s.area", normalized_area
+            )
+            if area_predicate:
+                predicates.append(area_predicate)
+                params.extend(area_params)
+            rows = self._query(
+                "SELECT f.model AS value, SUM(f.row_count) AS count "
+                "FROM inventory_summary_facet f "
+                "JOIN inventory_summary_status s ON s.cmts_ip=f.cmts_ip "
+                "WHERE " + " AND ".join(predicates) + " "
+                "GROUP BY f.model ORDER BY count DESC, value ASC LIMIT %s",
+                tuple(params + [requested_limit]),
+            )
+        else:
+            predicates = ["c.dimension=%s", "c.value<>'(unknown)'", "c.value<>''"]
+            params = [normalized_dimension]
+            if cmts_value:
+                predicates.append("(s.cmts=%s OR s.cmts_ip=%s)")
+                params.extend([cmts_value, cmts_value])
+            area_predicate, area_params = self._area_sql_predicate(
+                "s.area", normalized_area
+            )
+            if area_predicate:
+                predicates.append(area_predicate)
+                params.extend(area_params)
+            rows = self._query(
+                "SELECT c.value, SUM(c.row_count) AS count "
+                "FROM inventory_summary_count c "
+                "JOIN inventory_summary_status s ON s.cmts_ip=c.cmts_ip "
+                "WHERE " + " AND ".join(predicates) + " "
+                "GROUP BY c.value ORDER BY count DESC, c.value ASC LIMIT %s",
+                tuple(params + [requested_limit]),
+            )
+
+        return [
+            {
+                "value": str(row.get("value") or ""),
+                "count": int(row.get("count") or 0),
+            }
+            for row in rows
+        ]
+
     def get_inventory_summary(
         self,
         cmts: Optional[str] = None,

@@ -27,6 +27,7 @@ from pypnm.api.routes.cm_snmp_query.service import (
     CmtsDirectoryUnavailableError,
     cm_snmp_query_service,
 )
+from pypnm.api.routes.poller.service import poller_service
 from pypnm.api.routes.cm_snmp_query.worker import cm_snmp_query_worker
 
 logger = logging.getLogger(__name__)
@@ -86,16 +87,14 @@ def get_modem_vendor_options(
     try:
         return {
             "status": "success",
-            "modem_vendors": cm_snmp_query_service.get_modem_vendor_options(
-                affiliate, cmts
-            )[:limit],
+            "modem_vendors": poller_service.get_inventory_modem_facet_options(
+                dimension="vendor", area=affiliate, cmts=cmts, limit=limit
+            ),
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except CmtsDirectoryUnavailableError as exc:
-        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+        raise HTTPException(status_code=503, detail="Inventory summary unavailable") from exc
 
 
 @router.get("/options/modem-types")
@@ -108,16 +107,18 @@ def get_modem_type_options(
     try:
         return {
             "status": "success",
-            "modem_types": cm_snmp_query_service.get_modem_type_options(
-                affiliate, cmts, modem_vendor
-            )[:limit],
+            "modem_types": poller_service.get_inventory_modem_facet_options(
+                dimension="model",
+                area=affiliate,
+                cmts=cmts,
+                modem_vendor=modem_vendor,
+                limit=limit,
+            ),
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except CmtsDirectoryUnavailableError as exc:
-        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+        raise HTTPException(status_code=503, detail="Inventory summary unavailable") from exc
 
 
 # ── Templates ────────────────────────────────────────────────

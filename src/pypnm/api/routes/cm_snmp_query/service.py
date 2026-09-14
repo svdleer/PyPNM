@@ -868,61 +868,6 @@ class CmSnmpQueryService:
         )
         return [str(r["fiber_node"]) for r in rows]
 
-    def _option_inventory_predicate(
-        self, affiliate: str, cmts: str | None = None, modem_vendor: str | None = None
-    ) -> tuple[str, list[str]]:
-        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(
-            self._normalize_affiliate(affiliate)
-        )
-        clauses = ["m.inventory_state<>'retired'", self._online_inventory_filter()]
-        params: list[str] = []
-        if cmts is not None:
-            normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
-            clauses.append("AND LOWER(TRIM(COALESCE(m.cmts,'')))=%s")
-            params.append(normalized_cmts.casefold())
-        if modem_vendor is not None:
-            normalized_vendor = self._scope_facet({"modem_vendor": modem_vendor}, "modem_vendor", 64)
-            clauses.append("AND TRIM(COALESCE(m.vendor,''))=%s")
-            params.append(normalized_vendor)
-        clauses.append(affiliate_filter)
-        return " ".join(clauses), [*params, *affiliate_params]
-
-    def get_modem_vendor_options(self, affiliate: str = "all", cmts: str | None = None) -> list[dict[str, Any]]:
-        predicate, params = self._option_inventory_predicate(affiliate, cmts)
-        rows = self._query(
-            f"""
-            SELECT TRIM(m.vendor) AS modem_vendor, COUNT(*) AS count
-            FROM modem_inventory_current m
-            WHERE {predicate} AND m.vendor IS NOT NULL AND TRIM(m.vendor)<>''
-            GROUP BY TRIM(m.vendor)
-            ORDER BY TRIM(m.vendor)
-            """,
-            params,
-        )
-        return [
-            {"value": str(row["modem_vendor"]), "count": int(row.get("count") or 0)}
-            for row in rows
-        ]
-
-    def get_modem_type_options(
-        self, affiliate: str = "all", cmts: str | None = None, modem_vendor: str | None = None
-    ) -> list[dict[str, Any]]:
-        predicate, params = self._option_inventory_predicate(affiliate, cmts, modem_vendor)
-        rows = self._query(
-            f"""
-            SELECT TRIM(m.model) AS modem_type, COUNT(*) AS count
-            FROM modem_inventory_current m
-            WHERE {predicate} AND m.model IS NOT NULL AND TRIM(m.model)<>''
-            GROUP BY TRIM(m.model)
-            ORDER BY TRIM(m.model)
-            """,
-            params,
-        )
-        return [
-            {"value": str(row["modem_type"]), "count": int(row.get("count") or 0)}
-            for row in rows
-        ]
-
     # ── Formatting ────────────────────────────────────────────
 
     @staticmethod
