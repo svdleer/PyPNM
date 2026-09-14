@@ -8,17 +8,25 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Iterator, Optional
 
 import pymysql
 import pymysql.cursors
+import requests
 
 logger = logging.getLogger(__name__)
 
 _MAX_CONCURRENCY = 20
 _DEFAULT_CONCURRENCY = 10
+_DIRECTORY_CACHE_TTL_SECONDS = 60
+_DIRECTORY_CACHE_MAX_STALE_SECONDS = 300
+
+
+class CmtsDirectoryUnavailableError(RuntimeError):
+    """The authoritative CMTS directory cannot be used safely."""
 
 
 class CmSnmpQueryService:
@@ -27,6 +35,8 @@ class CmSnmpQueryService:
     def __init__(self) -> None:
         self._db_lock = threading.Lock()
         self._schema_ensured = False
+        self._directory_cache_lock = threading.Lock()
+        self._directory_cache: tuple[float, list[dict[str, str]]] | None = None
 
     # ── DB helpers ────────────────────────────────────────────
 
@@ -286,22 +296,170 @@ class CmSnmpQueryService:
         return affiliate
 
     @staticmethod
-    def _affiliate_sql_predicate(affiliate: str) -> tuple[str, list[str]]:
-        source_area = "LOWER(TRIM(COALESCE(m.source_area,'')))"
-        if affiliate == "all":
-            return "", []
-        if affiliate == "vfz":
-            return f"AND {source_area} IN (%s,%s)", ["fziggo", "fupc"]
-        return f"AND {source_area}=%s", [affiliate]
-
-    @staticmethod
     def _online_inventory_filter() -> str:
         return "AND m.status IN ('operational','registrationComplete','ipComplete','online')"
 
+    @staticmethod
+    def _directory_cache_seconds(name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _get_cmts_directory(self) -> list[dict[str, str]]:
+        """Return normalized, non-VCAS Device API rows from a successful response."""
+        now = time.monotonic()
+        ttl = self._directory_cache_seconds(
+            "CM_SNMP_DIRECTORY_CACHE_TTL_SECONDS", _DIRECTORY_CACHE_TTL_SECONDS
+        )
+        max_stale = max(
+            ttl,
+            self._directory_cache_seconds(
+                "CM_SNMP_DIRECTORY_CACHE_MAX_STALE_SECONDS",
+                _DIRECTORY_CACHE_MAX_STALE_SECONDS,
+            ),
+        )
+        with self._directory_cache_lock:
+            if self._directory_cache and now - self._directory_cache[0] <= ttl:
+                return [dict(row) for row in self._directory_cache[1]]
+            try:
+                api_url = os.environ.get(
+                    "APPDB_API_URL", "https://appdb.oss.local/isw/api"
+                ).rstrip("/")
+                api_user = os.environ.get("APPDB_API_USER", "")
+                api_pass = os.environ.get("APPDB_API_PASS", "")
+                response = requests.get(
+                    f"{api_url}/search",
+                    params={"type": "hostname", "q": "*"},
+                    auth=(api_user, api_pass) if api_user else None,
+                    verify=False,
+                    timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json() if response.content else []
+                if isinstance(payload, list):
+                    raw_rows = payload
+                elif isinstance(payload, dict):
+                    raw_rows = next(
+                        (
+                            payload[key]
+                            for key in ("data", "results", "items")
+                            if isinstance(payload.get(key), list)
+                        ),
+                        None,
+                    )
+                    if raw_rows is None:
+                        raise ValueError("Device API response has no record list")
+                else:
+                    raise ValueError("Device API response is not a record list")
+
+                records: list[dict[str, str]] = []
+                for row in raw_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    hostname = str(
+                        row.get("HostName") or row.get("hostname") or row.get("name") or ""
+                    ).strip()
+                    if "-vcas" in hostname.casefold():
+                        continue
+                    ip_address = str(
+                        row.get("IPAddress") or row.get("ip") or row.get("ip_address") or ""
+                    ).strip()
+                    if not hostname and not ip_address:
+                        continue
+                    alias = str(row.get("Alias") or row.get("alias") or "").strip()
+                    records.append(
+                        {
+                            "hostname": hostname.casefold(),
+                            "ip_address": ip_address.casefold(),
+                            "affiliate": "fupc" if alias else "fziggo",
+                        }
+                    )
+                self._directory_cache = (now, records)
+                return [dict(row) for row in records]
+            except Exception as exc:
+                if self._directory_cache and now - self._directory_cache[0] <= max_stale:
+                    logger.warning("Using bounded-stale CMTS directory cache: %s", exc)
+                    return [dict(row) for row in self._directory_cache[1]]
+                raise CmtsDirectoryUnavailableError(
+                    "Authoritative CMTS directory is unavailable"
+                ) from exc
+
+    def _affiliate_inventory_predicate(self, affiliate: str) -> tuple[str, list[str]]:
+        """Constrain inventory to Device API members classified by Alias."""
+        if affiliate == "all":
+            return "", []
+        directory = self._get_cmts_directory()
+        allowed = {"fupc", "fziggo"} if affiliate == "vfz" else {affiliate}
+        hostnames = sorted(
+            {row["hostname"] for row in directory if row["affiliate"] in allowed and row["hostname"]}
+        )
+        ip_addresses = sorted(
+            {row["ip_address"] for row in directory if row["affiliate"] in allowed and row["ip_address"]}
+        )
+        if not hostnames and not ip_addresses:
+            return "AND 1=0", []
+        clauses: list[str] = []
+        params: list[str] = []
+        if hostnames:
+            clauses.append(
+                "LOWER(TRIM(COALESCE(m.cmts,''))) IN (" + ",".join(["%s"] * len(hostnames)) + ")"
+            )
+            params.extend(hostnames)
+        if ip_addresses:
+            clauses.append(
+                "LOWER(TRIM(COALESCE(m.cmts_ip,''))) IN ("
+                + ",".join(["%s"] * len(ip_addresses))
+                + ")"
+            )
+            params.extend(ip_addresses)
+        return "AND (" + " OR ".join(clauses) + ")", params
+
+    @staticmethod
+    def _scope_facet(scope: dict, key: str, max_length: int) -> str | None:
+        value = scope.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{key} must not be blank")
+        if len(normalized) > max_length:
+            raise ValueError(f"{key} must be at most {max_length} characters")
+        return normalized
+
+    def _inventory_scope_predicates(self, scope: dict) -> tuple[str, list[str]]:
+        vendor = self._scope_facet(scope, "modem_vendor", 64)
+        modem_type = self._scope_facet(scope, "modem_type", 128)
+        clauses: list[str] = []
+        params: list[str] = []
+        if vendor is not None:
+            clauses.append("AND TRIM(COALESCE(m.vendor,''))=%s")
+            params.append(vendor)
+        if modem_type is not None:
+            clauses.append("AND TRIM(COALESCE(m.model,''))=%s")
+            params.append(modem_type)
+        return " ".join(clauses), params
+
+    @staticmethod
+    def _scope_strings(value: object, name: str, max_length: int) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError(f"{name} must be a list")
+        values = [str(item).strip() for item in value if str(item).strip()]
+        if not values:
+            raise ValueError(f"{name} requires at least one value")
+        if any(len(item) > max_length for item in values):
+            raise ValueError(f"{name} values must be at most {max_length} characters")
+        return values
+
     def _resolve_targets(self, scope_type: str, scope: dict, max_modems: int | None) -> list[dict]:
+        if max_modems is not None and not 1 <= int(max_modems) <= 100000:
+            raise ValueError("max_modems must be between 1 and 100000")
         limit_clause = f"LIMIT {int(max_modems)}" if max_modems else ""
         affiliate = self._normalize_affiliate(scope.get("affiliate"))
-        affiliate_filter, affiliate_params = self._affiliate_sql_predicate(affiliate)
+        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(affiliate)
+        facet_filter, facet_params = self._inventory_scope_predicates(scope)
         online_filter = self._online_inventory_filter()
         table_rows = self._query(
             "SELECT COUNT(*) AS table_count FROM information_schema.TABLES "
@@ -336,30 +494,26 @@ class CmSnmpQueryService:
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
-                f"WHERE m.inventory_state<>'retired' {online_filter} {affiliate_filter} "
+                f"WHERE m.inventory_state<>'retired' {online_filter} {affiliate_filter} {facet_filter} "
                 f"ORDER BY RAND() {limit_clause}",
-                affiliate_params,
+                (*affiliate_params, *facet_params),
             )
         elif scope_type == "cmts":
-            cmts_names = [str(c).strip() for c in (scope.get("cmts") or []) if str(c).strip()]
-            if not cmts_names:
-                raise ValueError("cmts scope requires at least one CMTS name")
-            placeholders = ",".join(["%s"] * len(cmts_names))
+            cmts_names = self._scope_strings(scope.get("cmts"), "cmts", 128)
+            normalized_cmts = [name.casefold() for name in cmts_names]
+            placeholders = ",".join(["%s"] * len(normalized_cmts))
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
                 f"WHERE m.inventory_state<>'retired' "
-                f"AND m.cmts IN ({placeholders}) {online_filter} {affiliate_filter} "
+                f"AND LOWER(TRIM(COALESCE(m.cmts,''))) IN ({placeholders}) "
+                f"{online_filter} {affiliate_filter} {facet_filter} "
                 f"ORDER BY RAND() {limit_clause}",
-                (*cmts_names, *affiliate_params),
+                (*normalized_cmts, *affiliate_params, *facet_params),
             )
         elif scope_type == "fiber_node":
-            cmts_name = str(scope.get("cmts") or "").strip()
-            fiber_nodes = [str(fn).strip() for fn in (scope.get("fiber_nodes") or []) if str(fn).strip()]
-            if not cmts_name:
-                raise ValueError("fiber_node scope requires 'cmts'")
-            if not fiber_nodes:
-                raise ValueError("fiber_node scope requires at least one fiber node")
+            cmts_name = self._scope_facet(scope, "cmts", 128)
+            fiber_nodes = self._scope_strings(scope.get("fiber_nodes"), "fiber_nodes", 128)
             if not topology_tables_ready:
                 raise ValueError("Fiber-node topology data is unavailable")
             fn_placeholders = ",".join(["%s"] * len(fiber_nodes))
@@ -373,8 +527,8 @@ class CmSnmpQueryService:
                       USING ascii
                   ) COLLATE ascii_bin
                 WHERE m.inventory_state<>'retired'
-                  AND m.cmts = %s
-                  AND t.fiber_node IN ({fn_placeholders})
+                  AND LOWER(TRIM(COALESCE(m.cmts,''))) = %s
+                  AND TRIM(t.fiber_node) IN ({fn_placeholders})
                   AND t.snapshot_id = (
                       SELECT s.id FROM topology_snapshots s
                       JOIN topology_fiber_node_map_state ms
@@ -383,9 +537,10 @@ class CmSnmpQueryService:
                   )
                   {online_filter}
                   {affiliate_filter}
+                  {facet_filter}
                 ORDER BY RAND() {limit_clause}
                 """,
-                (cmts_name, *fiber_nodes, *affiliate_params),
+                (cmts_name.casefold(), *fiber_nodes, *affiliate_params, *facet_params),
             )
         else:
             rows = []
@@ -665,23 +820,29 @@ class CmSnmpQueryService:
 
     # ── Options ───────────────────────────────────────────────
 
-    def get_cmts_options(self) -> list[str]:
+    def get_cmts_options(self, affiliate: str = "all") -> list[str]:
+        normalized_affiliate = self._normalize_affiliate(affiliate)
+        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(normalized_affiliate)
+        role_filter = "AND LOWER(cmts) LIKE %s"
+        params: tuple[str, ...] = ("%ccap%", *affiliate_params)
         rows = self._query(
-            "SELECT DISTINCT cmts FROM modem_inventory_current "
-            "WHERE inventory_state<>'retired' "
-            "AND cmts IS NOT NULL AND TRIM(cmts)<>'' "
-            "AND LOWER(cmts) LIKE %s ORDER BY cmts",
-            ("%ccap%",),
+            f"SELECT DISTINCT TRIM(cmts) AS cmts FROM modem_inventory_current m "
+            f"WHERE m.inventory_state<>'retired' "
+            f"AND cmts IS NOT NULL AND TRIM(cmts)<>'' "
+            f"{self._online_inventory_filter()} {role_filter} {affiliate_filter} "
+            f"ORDER BY TRIM(cmts)",
+            params,
         )
         return [str(r["cmts"]) for r in rows]
 
     def get_fiber_node_options(self, cmts: str, affiliate: str = "all") -> list[str]:
+        normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
         normalized_affiliate = self._normalize_affiliate(affiliate)
-        affiliate_filter, affiliate_params = self._affiliate_sql_predicate(normalized_affiliate)
+        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(normalized_affiliate)
         online_filter = self._online_inventory_filter()
         rows = self._query(
             f"""
-            SELECT DISTINCT t.fiber_node
+            SELECT DISTINCT TRIM(t.fiber_node) AS fiber_node
             FROM topology_fiber_node_map t
             WHERE t.snapshot_id = (
                 SELECT s.id FROM topology_snapshots s
@@ -695,16 +856,72 @@ class CmSnmpQueryService:
                     USING ascii
                 ) COLLATE ascii_bin
                 FROM modem_inventory_current m
-                WHERE m.inventory_state<>'retired' AND m.cmts = %s
+                WHERE m.inventory_state<>'retired'
+                  AND LOWER(TRIM(COALESCE(m.cmts,''))) = %s
                 {online_filter}
                 {affiliate_filter}
             )
             AND t.fiber_node IS NOT NULL AND TRIM(t.fiber_node) <> ''
-            ORDER BY t.fiber_node
+            ORDER BY TRIM(t.fiber_node)
             """,
-            (cmts, *affiliate_params),
+            (normalized_cmts.casefold(), *affiliate_params),
         )
         return [str(r["fiber_node"]) for r in rows]
+
+    def _option_inventory_predicate(
+        self, affiliate: str, cmts: str | None = None, modem_vendor: str | None = None
+    ) -> tuple[str, list[str]]:
+        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(
+            self._normalize_affiliate(affiliate)
+        )
+        clauses = ["m.inventory_state<>'retired'", self._online_inventory_filter()]
+        params: list[str] = []
+        if cmts is not None:
+            normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
+            clauses.append("AND LOWER(TRIM(COALESCE(m.cmts,'')))=%s")
+            params.append(normalized_cmts.casefold())
+        if modem_vendor is not None:
+            normalized_vendor = self._scope_facet({"modem_vendor": modem_vendor}, "modem_vendor", 64)
+            clauses.append("AND TRIM(COALESCE(m.vendor,''))=%s")
+            params.append(normalized_vendor)
+        clauses.append(affiliate_filter)
+        return " ".join(clauses), [*params, *affiliate_params]
+
+    def get_modem_vendor_options(self, affiliate: str = "all", cmts: str | None = None) -> list[dict[str, Any]]:
+        predicate, params = self._option_inventory_predicate(affiliate, cmts)
+        rows = self._query(
+            f"""
+            SELECT TRIM(m.vendor) AS modem_vendor, COUNT(*) AS count
+            FROM modem_inventory_current m
+            WHERE {predicate} AND m.vendor IS NOT NULL AND TRIM(m.vendor)<>''
+            GROUP BY TRIM(m.vendor)
+            ORDER BY TRIM(m.vendor)
+            """,
+            params,
+        )
+        return [
+            {"value": str(row["modem_vendor"]), "count": int(row.get("count") or 0)}
+            for row in rows
+        ]
+
+    def get_modem_type_options(
+        self, affiliate: str = "all", cmts: str | None = None, modem_vendor: str | None = None
+    ) -> list[dict[str, Any]]:
+        predicate, params = self._option_inventory_predicate(affiliate, cmts, modem_vendor)
+        rows = self._query(
+            f"""
+            SELECT TRIM(m.model) AS modem_type, COUNT(*) AS count
+            FROM modem_inventory_current m
+            WHERE {predicate} AND m.model IS NOT NULL AND TRIM(m.model)<>''
+            GROUP BY TRIM(m.model)
+            ORDER BY TRIM(m.model)
+            """,
+            params,
+        )
+        return [
+            {"value": str(row["modem_type"]), "count": int(row.get("count") or 0)}
+            for row in rows
+        ]
 
     # ── Formatting ────────────────────────────────────────────
 

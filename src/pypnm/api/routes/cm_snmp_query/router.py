@@ -23,7 +23,10 @@ from pypnm.api.routes.cm_snmp_query.schema import (
     SnmpTemplateCreateRequest,
     SnmpTemplateListResponse,
 )
-from pypnm.api.routes.cm_snmp_query.service import cm_snmp_query_service
+from pypnm.api.routes.cm_snmp_query.service import (
+    CmtsDirectoryUnavailableError,
+    cm_snmp_query_service,
+)
 from pypnm.api.routes.cm_snmp_query.worker import cm_snmp_query_worker
 
 logger = logging.getLogger(__name__)
@@ -40,9 +43,19 @@ def get_capabilities() -> SnmpQueryCapabilitiesResponse:
 # ── Options ──────────────────────────────────────────────────
 
 @router.get("/options/cmts")
-def get_cmts_options(limit: int = Query(default=5000, ge=1, le=10000)) -> dict:
+def get_cmts_options(
+    affiliate: str = Query(default="all", pattern="^(all|vfz|fziggo|fupc)$"),
+    limit: int = Query(default=5000, ge=1, le=10000),
+) -> dict:
     try:
-        return {"status": "success", "cmts": cm_snmp_query_service.get_cmts_options()[:limit]}
+        return {
+            "status": "success",
+            "cmts": cm_snmp_query_service.get_cmts_options(affiliate)[:limit],
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
@@ -58,6 +71,51 @@ def get_fiber_node_options(
         return {"status": "success", "fiber_nodes": fiber_nodes[:limit]}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
+@router.get("/options/modem-vendors")
+def get_modem_vendor_options(
+    affiliate: str = Query(default="all", pattern="^(all|vfz|fziggo|fupc)$"),
+    cmts: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=5000, ge=1, le=10000),
+) -> dict:
+    try:
+        return {
+            "status": "success",
+            "modem_vendors": cm_snmp_query_service.get_modem_vendor_options(
+                affiliate, cmts
+            )[:limit],
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
+@router.get("/options/modem-types")
+def get_modem_type_options(
+    affiliate: str = Query(default="all", pattern="^(all|vfz|fziggo|fupc)$"),
+    cmts: str | None = Query(default=None, max_length=128),
+    modem_vendor: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=5000, ge=1, le=10000),
+) -> dict:
+    try:
+        return {
+            "status": "success",
+            "modem_types": cm_snmp_query_service.get_modem_type_options(
+                affiliate, cmts, modem_vendor
+            )[:limit],
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
@@ -121,6 +179,8 @@ def create_plan(payload: SnmpQueryPlanRequest) -> SnmpQueryPlanResponse:
         return SnmpQueryPlanResponse(job=SnmpQueryJob(**job))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
     except Exception as exc:
         logger.error("SNMP query plan failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Plan creation failed") from exc

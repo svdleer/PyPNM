@@ -49,7 +49,10 @@ class SnmpQueryPlanRequest(BaseModel):
             '{"type": "cmts", "cmts": ["CMTS-NAME"], "affiliate": "all|vfz|fziggo|fupc"} | '
             '{"type": "fiber_node", "cmts": "CMTS-NAME", "fiber_nodes": ["TECHNICAL-FN"], '
             '"affiliate": "all|vfz|fziggo|fupc"} | '
-            '{"type": "all_network", "affiliate": "all|vfz|fziggo|fupc"}'
+            '{"type": "all_network", "affiliate": "all|vfz|fziggo|fupc"}. '
+            'All scope variants may additionally contain "modem_vendor" (inventory vendor, max 64 chars) '
+            'and "modem_type" (inventory model, max 128 chars). modem_type is backed by '
+            'modem_inventory_current.model, not a Device API type.'
         )
     )
     oids: list[OidEntry] = Field(min_length=1, max_length=50)
