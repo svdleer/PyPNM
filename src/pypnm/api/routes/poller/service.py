@@ -8443,6 +8443,20 @@ class PollerService:
 
     # ── Inventory summary (admin dashboard) ──────────────────────
 
+    def get_inventory_modem_total(self, *, area: Optional[str] = "all") -> int:
+        """Return the materialized active-modem total for an inventory area."""
+        normalized_area = self._normalize_inventory_area(area)
+        area_predicate, area_params = self._area_sql_predicate(
+            "s.area", normalized_area
+        )
+        where_sql = f" WHERE {area_predicate}" if area_predicate else ""
+        rows = self._query(
+            "SELECT COALESCE(SUM(s.active_total),0) AS total "
+            f"FROM inventory_summary_status s{where_sql}",
+            tuple(area_params),
+        )
+        return int((rows[0] if rows else {}).get("total") or 0)
+
     def get_inventory_modem_facet_options(
         self,
         *,

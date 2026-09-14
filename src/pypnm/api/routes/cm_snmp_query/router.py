@@ -52,6 +52,10 @@ def get_cmts_options(
         return {
             "status": "success",
             "cmts": cm_snmp_query_service.get_cmts_options(affiliate)[:limit],
+            "aggregate": {
+                "kind": "affiliate_all",
+                "modem_count": poller_service.get_inventory_modem_total(area=affiliate),
+            },
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
