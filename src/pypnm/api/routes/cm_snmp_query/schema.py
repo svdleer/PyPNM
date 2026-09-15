@@ -56,6 +56,11 @@ class SnmpQueryPlanRequest(BaseModel):
         )
     )
     oids: list[OidEntry] = Field(min_length=1, max_length=50)
+    verification_receipts: list[str] = Field(
+        min_length=1,
+        max_length=50,
+        description="One API-issued, unexpired modem-verification receipt per OID.",
+    )
     max_modems: int | None = Field(default=None, ge=1, le=100000)
     template_id: int | None = Field(default=None, description="Use OIDs from saved template instead of inline list")
     requested_by: str | None = Field(default=None, max_length=64)

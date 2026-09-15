@@ -177,6 +177,7 @@ def create_plan(payload: SnmpQueryPlanRequest) -> SnmpQueryPlanResponse:
         job = cm_snmp_query_service.create_plan({
             "scope": payload.scope,
             "oids": oids_dicts,
+            "verification_receipts": payload.verification_receipts,
             "max_modems": payload.max_modems,
             "template_id": payload.template_id,
             "requested_by": payload.requested_by,
@@ -394,6 +395,14 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                         "modem_ip": modem_ip,
                         "cmts_ip": target["cmts_ip"],
                         "target": {**attempt, "modem_ip": modem_ip},
+                        "verification_receipt": cm_snmp_query_service.issue_verification_receipt(
+                            numeric_oid=oid,
+                            target_mode=payload.target_mode,
+                            affiliate=payload.affiliate,
+                            cmts=selected_cmts,
+                            modem_vendor=payload.modem_vendor,
+                            modem_type=payload.modem_type,
+                        ),
                         "attempts_used": len(attempts),
                         "attempts_limit": len(candidates),
                         "attempts": attempts,

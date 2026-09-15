@@ -99,6 +99,23 @@ class CmSnmpQueryService:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
+            CREATE TABLE IF NOT EXISTS snmp_query_oid_verification (
+                receipt_id CHAR(36) NOT NULL,
+                numeric_oid VARCHAR(256) NOT NULL,
+                target_mode VARCHAR(8) NOT NULL,
+                affiliate VARCHAR(16) NOT NULL,
+                cmts VARCHAR(128) NULL,
+                modem_vendor VARCHAR(64) NULL,
+                modem_type VARCHAR(128) NULL,
+                verified_at DATETIME NOT NULL,
+                expires_at DATETIME NOT NULL,
+                used_at DATETIME NULL,
+                used_job_id BIGINT NULL,
+                PRIMARY KEY (receipt_id),
+                INDEX idx_snmp_query_oid_verification_expiry (expires_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
             CREATE TABLE IF NOT EXISTS snmp_query_job (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 public_id CHAR(36) NOT NULL,
@@ -219,6 +236,136 @@ class CmSnmpQueryService:
 
     # ── Job planning ──────────────────────────────────────────
 
+    def issue_verification_receipt(
+        self,
+        *,
+        numeric_oid: str,
+        target_mode: str,
+        affiliate: str,
+        cmts: str | None,
+        modem_vendor: str | None,
+        modem_type: str | None,
+    ) -> dict[str, str]:
+        """Persist a short-lived proof from a successful OID verification."""
+        self.ensure_schema()
+        receipt_id = str(uuid.uuid4())
+        normalized_affiliate = self._normalize_affiliate(affiliate)
+        normalized_cmts = str(cmts or "").strip().casefold() or None
+        vendor = str(modem_vendor or "").strip() or None
+        model = str(modem_type or "").strip() or None
+        verified_at = datetime.now(timezone.utc)
+        expires_at = verified_at + timedelta(minutes=15)
+        self._execute(
+            """
+            INSERT INTO snmp_query_oid_verification
+            (receipt_id, numeric_oid, target_mode, affiliate, cmts, modem_vendor,
+             modem_type, verified_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                receipt_id,
+                numeric_oid,
+                target_mode,
+                normalized_affiliate,
+                normalized_cmts,
+                vendor,
+                model,
+                verified_at.strftime("%Y-%m-%d %H:%M:%S"),
+                expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        return {
+            "receipt_id": receipt_id,
+            "expires_at": expires_at.isoformat(),
+            "target_mode": target_mode,
+        }
+
+    def _plan_verification_context(self, scope_type: str, scope: dict) -> dict[str, str | None]:
+        """Return the modem-query scope a verification receipt must match."""
+        affiliate = self._normalize_affiliate(scope.get("affiliate"))
+        vendor = self._scope_facet(scope, "modem_vendor", 64)
+        model = self._scope_facet(scope, "modem_type", 128)
+        if scope_type == "cmts":
+            cmts_values = self._scope_strings(scope.get("cmts"), "cmts", 128)
+            if len(cmts_values) != 1:
+                raise ValueError("Verified modem OIDs require exactly one CMTS per task")
+            cmts = cmts_values[0].casefold()
+        elif scope_type == "fiber_node":
+            cmts = self._scope_facet(scope, "cmts", 128)
+            cmts = cmts.casefold() if cmts else None
+        else:
+            cmts = None
+        return {
+            "affiliate": affiliate,
+            "cmts": cmts,
+            "modem_vendor": vendor,
+            "modem_type": model,
+        }
+
+    def _consume_verification_receipts(
+        self,
+        cursor,
+        *,
+        oids: list[dict],
+        receipt_ids: object,
+        scope_type: str,
+        scope: dict,
+        job_id: int,
+        now: str,
+    ) -> None:
+        """Atomically validate and consume modem OID verification receipts."""
+        if not isinstance(receipt_ids, list) or not receipt_ids:
+            raise ValueError("Verify every OID on a cable modem before creating a task")
+        normalized_receipt_ids = [str(value).strip() for value in receipt_ids]
+        if any(not value for value in normalized_receipt_ids):
+            raise ValueError("Invalid OID verification receipt")
+        if len(set(normalized_receipt_ids)) != len(normalized_receipt_ids):
+            raise ValueError("Each OID requires a distinct verification receipt")
+
+        from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
+
+        numeric_oids = [resolve_oid(str(entry.get("oid") or "").strip()) for entry in oids]
+        if len(set(numeric_oids)) != len(numeric_oids):
+            raise ValueError("Duplicate OIDs require a single labeled entry")
+        if len(normalized_receipt_ids) != len(numeric_oids):
+            raise ValueError("Every OID requires one verification receipt")
+
+        placeholders = ",".join(["%s"] * len(normalized_receipt_ids))
+        cursor.execute(
+            f"SELECT * FROM snmp_query_oid_verification WHERE receipt_id IN ({placeholders}) FOR UPDATE",
+            tuple(normalized_receipt_ids),
+        )
+        receipts = {str(row["receipt_id"]): row for row in cursor.fetchall()}
+        if len(receipts) != len(normalized_receipt_ids):
+            raise ValueError("OID verification receipt is missing or invalid")
+
+        context = self._plan_verification_context(scope_type, scope)
+        expected_by_oid = {row["numeric_oid"]: row for row in receipts.values()}
+        if set(expected_by_oid) != set(numeric_oids):
+            raise ValueError("OID verification receipts do not match the planned OIDs")
+        current_time = datetime.now(timezone.utc).replace(tzinfo=None)
+        for numeric_oid in numeric_oids:
+            receipt = expected_by_oid[numeric_oid]
+            if receipt.get("used_at") is not None:
+                raise ValueError("OID verification receipt has already been used")
+            expires_at = receipt.get("expires_at")
+            if not expires_at or expires_at <= current_time:
+                raise ValueError("OID verification receipt has expired; verify the OID again")
+            if receipt.get("target_mode") != "modem":
+                raise ValueError("Modem query tasks require cable-modem OID verification")
+            for field, expected in context.items():
+                actual = receipt.get(field)
+                if actual != expected:
+                    raise ValueError(
+                        "OID verification does not match the selected modem query scope"
+                    )
+
+        cursor.execute(
+            f"UPDATE snmp_query_oid_verification SET used_at=%s, used_job_id=%s "
+            f"WHERE receipt_id IN ({placeholders})",
+            (now, job_id, *normalized_receipt_ids),
+        )
+
     def create_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.ensure_schema()
         scope = dict(payload.get("scope") or {})
@@ -240,6 +387,10 @@ class CmSnmpQueryService:
 
         max_modems = payload.get("max_modems")
         requested_by = str(payload.get("requested_by") or "admin").strip()[:64]
+        verification_receipts = payload.get("verification_receipts")
+        targets = self._resolve_targets(scope_type, scope, max_modems)
+        if not targets:
+            raise ValueError("No targets resolved from scope")
 
         public_id = str(uuid.uuid4())
         scope_json = json.dumps(scope, separators=(",", ":"))
@@ -259,10 +410,15 @@ class CmSnmpQueryService:
                     (public_id, scope_type, scope_json, oids_json, requested_by, now, now),
                 )
                 job_id = cursor.lastrowid
-
-                targets = self._resolve_targets(scope_type, scope, max_modems)
-                if not targets:
-                    raise ValueError("No targets resolved from scope")
+                self._consume_verification_receipts(
+                    cursor,
+                    oids=oids,
+                    receipt_ids=verification_receipts,
+                    scope_type=scope_type,
+                    scope=scope,
+                    job_id=job_id,
+                    now=now,
+                )
 
                 insert_sql = """
                     INSERT INTO snmp_query_target
