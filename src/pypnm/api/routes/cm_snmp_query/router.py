@@ -274,86 +274,161 @@ def download_report(
 
 @router.post("/verify-oid")
 async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
-    """Test an OID against a sample modem to verify it returns data."""
+    """Verify an OID against bounded CM or CMTS candidates via configured agents."""
+    import asyncio
+
+    from pypnm.api.agent.manager import get_agent_manager
     from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
 
     oid_raw = payload.oid.strip()
-    cmts = (payload.cmts or "").strip()
     if not oid_raw:
         raise HTTPException(status_code=400, detail="oid is required")
-
     oid = resolve_oid(oid_raw)
+    selected_cmts = (payload.cmts or "").strip() or None
 
-    cm_snmp_query_service.ensure_schema()
-    if cmts:
-        modems = cm_snmp_query_service._query(
-            "SELECT ip FROM modem_inventory_current "
-            "WHERE inventory_state<>'retired' AND cmts=%s "
-            "AND ip IS NOT NULL AND TRIM(ip)<>'' "
-            "AND status IN ('operational','registrationComplete','ipComplete','online') "
-            "ORDER BY RAND() LIMIT 1",
-            (cmts,),
+    try:
+        cmts_candidates = await asyncio.to_thread(
+            cm_snmp_query_service.get_verify_cmts_candidates,
+            affiliate=payload.affiliate,
+            cmts=selected_cmts,
+            limit=1 if selected_cmts else 3,
         )
-    else:
-        modems = cm_snmp_query_service._query(
-            "SELECT ip FROM modem_inventory_current "
-            "WHERE inventory_state<>'retired' "
-            "AND ip IS NOT NULL AND TRIM(ip)<>'' "
-            "AND status IN ('operational','registrationComplete','ipComplete','online') "
-            "ORDER BY RAND() LIMIT 1",
-        )
+        if not cmts_candidates:
+            raise HTTPException(status_code=404, detail="No eligible CMTS verification target found")
 
-    if not modems:
-        raise HTTPException(status_code=404, detail="No online modem found to test against")
+        attempts: list[dict[str, object]] = []
+        if payload.target_mode == "cmts":
+            candidates = [
+                {
+                    "role": "cmts",
+                    "ip": cmts["ip_address"],
+                    "cmts": cmts["hostname"],
+                    "cmts_ip": cmts["ip_address"],
+                    "mac": None,
+                }
+                for cmts in cmts_candidates
+            ]
+        else:
+            candidates = []
+            modem_limit = 3 if selected_cmts else 1
+            for cmts in cmts_candidates:
+                modems = await asyncio.to_thread(
+                    cm_snmp_query_service.get_verify_modem_candidates,
+                    cmts=cmts["hostname"],
+                    modem_vendor=payload.modem_vendor,
+                    modem_type=payload.modem_type,
+                    limit=modem_limit,
+                )
+                candidates.extend(
+                    {
+                        "role": "cm",
+                        "ip": modem["ip"],
+                        "cmts": modem["cmts"],
+                        "cmts_ip": modem["cmts_ip"],
+                        "mac": modem["mac"],
+                    }
+                    for modem in modems
+                )
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No eligible modem verification target found")
 
-    modem_ip = modems[0]["ip"]
+        agent_manager = get_agent_manager()
+        if not agent_manager:
+            raise HTTPException(status_code=503, detail="Agent manager not available")
+        capability = "cm_reachable" if payload.target_mode == "modem" else "cmts_reachable"
 
-    from pypnm.api.agent.manager import get_agent_manager
+        for target in candidates:
+            attempt = {
+                "role": target["role"],
+                "ip": target["ip"],
+                "cmts": target["cmts"],
+                "cmts_ip": target["cmts_ip"],
+                "mac": target["mac"],
+            }
+            try:
+                agent_id = agent_manager.get_agent_id_for_capability(
+                    capability, priority="interactive"
+                )
+                if not agent_id:
+                    raise RuntimeError(
+                        f"No {capability} agent with interactive capacity"
+                    )
+                task_id = await agent_manager.send_task(
+                    agent_id,
+                    "snmp_get",
+                    {
+                        "target_ip": target["ip"],
+                        "oid": oid,
+                        "target_role": target["role"],
+                        "timeout": 3,
+                        "retries": 0,
+                    },
+                    timeout=5,
+                    priority="interactive",
+                )
+                result = await agent_manager.wait_for_task_async(task_id, timeout=5)
+                response = result.get("result") if isinstance(result, dict) else None
+                if not isinstance(response, dict):
+                    error = (
+                        result.get("error")
+                        if isinstance(result, dict)
+                        else "Agent returned an invalid task response"
+                    )
+                    raise RuntimeError(str(error or "Agent task failed"))
 
-    agent_manager = get_agent_manager()
-    if not agent_manager:
-        raise HTTPException(status_code=503, detail="Agent manager not available")
+                output = str(response.get("output") or "")
+                value = output.split(" = ", 1)[1].strip() if " = " in output else output.strip()
+                if response.get("success") and value and value.lower() not in {
+                    "no such object",
+                    "no such instance",
+                }:
+                    attempt["success"] = True
+                    attempts.append(attempt)
+                    modem_ip = target["ip"] if target["role"] == "cm" else None
+                    return {
+                        "success": True,
+                        "oid": oid_raw,
+                        "numeric_oid": oid,
+                        "value": value,
+                        "target_mode": payload.target_mode,
+                        "modem_ip": modem_ip,
+                        "cmts_ip": target["cmts_ip"],
+                        "target": {**attempt, "modem_ip": modem_ip},
+                        "attempts_used": len(attempts),
+                        "attempts_limit": len(candidates),
+                        "attempts": attempts,
+                    }
+                error = response.get("error")
+                if not error and value:
+                    error = f"OID returned no usable value ({value})"
+                raise RuntimeError(str(error or "OID returned no value"))
+            except Exception as exc:
+                attempt["success"] = False
+                attempt["error"] = str(exc)
+            attempts.append(attempt)
 
-    agent = agent_manager.get_agent_for_capability("cm_reachable")
-    if not agent:
-        raise HTTPException(status_code=503, detail="No cm_reachable agent connected")
-
-    params = {
-        "target_ip": modem_ip,
-        "oid": oid,
-        "target_role": "cm",
-        "timeout": 5,
-        "retries": 1,
-    }
-    if payload.community:
-        params["community"] = payload.community
-
-    task_id = await agent_manager.send_task(
-        agent.agent_id,
-        "snmp_get",
-        params,
-        timeout=15,
-        priority="interactive",
-    )
-    result = await agent_manager.wait_for_task_async(task_id, timeout=15)
-
-    if not result or result.get("type") != "response":
-        return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": "Agent timeout", "modem_ip": modem_ip}
-
-    res_data = result.get("result", {})
-    if not res_data.get("success"):
-        return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": res_data.get("error", "SNMP GET failed"), "modem_ip": modem_ip}
-
-    output = str(res_data.get("output") or "")
-    if " = " in output:
-        value = output.split(" = ", 1)[1].strip()
-    else:
-        value = output.strip() or None
-
-    if not value or value.lower() in ("no such object", "no such instance", ""):
-        return {"success": False, "oid": oid_raw, "numeric_oid": oid, "error": f"OID not found on modem ({value or 'empty'})", "modem_ip": modem_ip}
-
-    return {"success": True, "oid": oid_raw, "numeric_oid": oid, "value": value, "modem_ip": modem_ip}
+        first_target = candidates[0]
+        return {
+            "success": False,
+            "oid": oid_raw,
+            "numeric_oid": oid,
+            "target_mode": payload.target_mode,
+            "modem_ip": first_target["ip"] if first_target["role"] == "cm" else None,
+            "cmts_ip": first_target["cmts_ip"],
+            "error": "OID verification failed for all selected candidates",
+            "attempts_used": len(attempts),
+            "attempts_limit": len(candidates),
+            "attempts": attempts,
+        }
+    except HTTPException:
+        raise
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("OID verification candidate selection failed")
+        raise HTTPException(status_code=503, detail="OID verification unavailable") from exc
 
 
 @router.get("/mib-search")

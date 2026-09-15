@@ -843,6 +843,98 @@ class CmSnmpQueryService:
             }
         )
 
+    def get_verify_cmts_candidates(
+        self, *, affiliate: str = "all", cmts: str | None = None, limit: int = 3
+    ) -> list[dict[str, str]]:
+        """Return bounded randomized CMTS verification candidates from ISW cache."""
+        normalized_affiliate = self._normalize_affiliate(affiliate)
+        normalized_cmts = str(cmts or "").strip().casefold()
+        if len(normalized_cmts) > 128:
+            raise ValueError("cmts must be at most 128 characters")
+        allowed_affiliates = (
+            {"fupc", "fziggo"}
+            if normalized_affiliate in {"all", "vfz"}
+            else {normalized_affiliate}
+        )
+        candidates = [
+            dict(row)
+            for row in self._get_cmts_directory()
+            if row["affiliate"] in allowed_affiliates
+            and row["hostname"]
+            and row["ip_address"]
+            and "ccap" in row["hostname"]
+            and (not normalized_cmts or row["hostname"] == normalized_cmts)
+        ]
+        if normalized_cmts and not candidates:
+            raise ValueError("Selected CMTS is not available in the authoritative directory")
+        unique_candidates = {
+            (row["hostname"], row["ip_address"]): row for row in candidates
+        }
+        ordered = sorted(unique_candidates.values(), key=lambda _: uuid.uuid4().hex)
+        return ordered[: max(1, min(int(limit), 3))]
+
+    def get_verify_modem_candidates(
+        self,
+        *,
+        cmts: str,
+        modem_vendor: str | None = None,
+        modem_type: str | None = None,
+        limit: int = 3,
+    ) -> list[dict[str, str]]:
+        """Return a bounded randomized modem sample without ORDER BY RAND()."""
+        normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
+        vendor = self._scope_facet(
+            {"modem_vendor": modem_vendor}, "modem_vendor", 64
+        ) if modem_vendor else None
+        model = self._scope_facet(
+            {"modem_type": modem_type}, "modem_type", 128
+        ) if modem_type else None
+        requested_limit = max(1, min(int(limit), 3))
+        window = max(6, requested_limit * 3)
+        token = uuid.uuid4().int & ((1 << 48) - 1)
+        compact_mac = f"{token:012x}"
+        start_mac = ":".join(compact_mac[index:index + 2] for index in range(0, 12, 2))
+        filters = [
+            "m.inventory_state<>'retired'",
+            "LOWER(TRIM(COALESCE(m.cmts,'')))=%s",
+            "m.ip IS NOT NULL",
+            "TRIM(m.ip)<>''",
+            "m.status IN ('operational','registrationComplete','ipComplete','online')",
+        ]
+        filter_params: list[str] = [normalized_cmts]
+        if vendor:
+            filters.append("TRIM(COALESCE(m.vendor,''))=%s")
+            filter_params.append(vendor)
+        if model:
+            filters.append("TRIM(COALESCE(m.model,''))=%s")
+            filter_params.append(model)
+
+        def _sample(comparison: str, count: int) -> list[dict[str, Any]]:
+            rows = self._query(
+                "SELECT m.mac, m.ip, m.cmts, m.cmts_ip FROM modem_inventory_current m "
+                "WHERE " + " AND ".join(filters) + f" AND m.mac {comparison} %s "
+                "ORDER BY m.mac LIMIT %s",
+                tuple(filter_params + [start_mac, count]),
+            )
+            return rows
+
+        rows = _sample(">=", window)
+        if len(rows) < window:
+            rows.extend(_sample("<", window - len(rows)))
+        unique_rows = {
+            str(row.get("ip") or ""): row for row in rows if str(row.get("ip") or "")
+        }
+        selected = sorted(unique_rows.values(), key=lambda _: uuid.uuid4().hex)
+        return [
+            {
+                "mac": str(row.get("mac") or ""),
+                "ip": str(row.get("ip") or ""),
+                "cmts": str(row.get("cmts") or normalized_cmts),
+                "cmts_ip": str(row.get("cmts_ip") or ""),
+            }
+            for row in selected[:requested_limit]
+        ]
+
     def get_fiber_node_options(self, cmts: str, affiliate: str = "all") -> list[str]:
         normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
         normalized_affiliate = self._normalize_affiliate(affiliate)

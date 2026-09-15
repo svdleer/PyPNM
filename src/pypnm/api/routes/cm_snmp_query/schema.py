@@ -68,8 +68,11 @@ class SnmpQueryJobStartRequest(BaseModel):
 
 class SnmpOidVerifyRequest(BaseModel):
     oid: str = Field(min_length=1)
+    target_mode: str = Field(default="modem", pattern="^(modem|cmts)$")
+    affiliate: str = Field(default="all", pattern="^(all|vfz|fziggo|fupc)$")
     cmts: str | None = Field(default=None, max_length=128)
-    community: str | None = Field(default=None, description="Optional cable-modem SNMP community")
+    modem_vendor: str | None = Field(default=None, max_length=64)
+    modem_type: str | None = Field(default=None, max_length=128)
 
 
 # ── Job responses ────────────────────────────────────────────
