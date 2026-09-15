@@ -14,6 +14,7 @@ from pypnm.api.routes.poller.schema import (
     InventoryMySQLBackfillCollectionResponse,
     InventoryMySQLBackfillRequest,
     InventoryMySQLBackfillResponse,
+    BulkModemRefreshRequest,
     ModemRefreshRequest,
     PollerJobsResponse,
     PollerRunRequest,
@@ -499,6 +500,40 @@ def poller_snapshots_analytics(
 
 
 # ── Modem refresh (on-demand single-modem enrichment) ──────────
+
+
+@router.post("/inventory/modem-refresh-jobs")
+def create_bulk_modem_refresh_job(payload: BulkModemRefreshRequest) -> dict:
+    try:
+        job = poller_service.enqueue_bulk_modem_refresh(
+            vendor=payload.vendor,
+            model=payload.model,
+            max_in_flight=payload.max_in_flight,
+            queue_depth=payload.queue_depth,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "success", "job": job}
+
+
+@router.get("/inventory/modem-refresh-jobs/{job_id}")
+def get_bulk_modem_refresh_job(job_id: int) -> dict:
+    job = poller_service.get_bulk_modem_refresh_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk modem refresh job not found")
+    return {"status": "success", "job": job}
+
+
+@router.post("/inventory/modem-refresh-jobs/{job_id}/cancel")
+def cancel_bulk_modem_refresh_job(job_id: int) -> dict:
+    result = poller_service.kill_job(job_id)
+    if result.get("state") == "not_found":
+        raise HTTPException(status_code=404, detail="Bulk modem refresh job not found")
+    if result.get("killed") != 1:
+        raise HTTPException(status_code=409, detail="Bulk modem refresh job is not cancellable")
+    return {"status": "success", **result}
 
 
 @router.post("/modem-refresh")

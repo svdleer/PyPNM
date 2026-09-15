@@ -41,6 +41,8 @@ _INVENTORY_FULL_SCHEDULE = datetime_time(hour=1)
 _IDENTITY_BACKFILL_TASK_TYPE = "identity_backfill"
 _IDENTITY_BACKFILL_SYSTEM_KEY = "inventory-identity-backfill"
 _IDENTITY_BACKFILL_NAME = "Inventory identity enrichment"
+_BULK_MODEM_REFRESH_SYSTEM_KEY = "bulk-modem-refresh"
+_BULK_MODEM_REFRESH_NAME = "Bulk modem inventory refresh"
 _MANUAL_ONLY_TASK_TYPES = frozenset({_IDENTITY_BACKFILL_TASK_TYPE})
 _INVENTORY_TASK_TYPES = frozenset(
     {
@@ -6678,6 +6680,170 @@ class PollerService:
             **identity,
         }
 
+    def _identity_job_options(self, request_payload: object) -> dict[str, Any]:
+        """Normalize optional vendor/model scope for one identity parent job."""
+        payload = request_payload
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = {}
+        if not isinstance(payload, dict) or payload.get("mode") != "bulk_modem_refresh":
+            return {
+                "bulk": False,
+                "force_refresh": False,
+                "vendor": None,
+                "model": None,
+                "max_in_flight": self._identity_max_in_flight(),
+                "queue_depth": self._identity_queue_depth(),
+            }
+        vendor = str(payload.get("vendor") or "").strip()
+        model = str(payload.get("model") or "").strip()
+        if not vendor or not model:
+            raise ValueError("Bulk modem refresh job has no vendor/model scope")
+        max_in_flight = max(1, min(int(payload.get("max_in_flight") or 8), 32))
+        queue_depth = max(max_in_flight, min(int(payload.get("queue_depth") or 128), 512))
+        return {
+            "bulk": True,
+            "force_refresh": True,
+            "vendor": vendor,
+            "model": model,
+            "max_in_flight": max_in_flight,
+            "queue_depth": queue_depth,
+        }
+
+    @staticmethod
+    def _identity_job_scope_sql(options: dict[str, Any], alias: str = "") -> tuple[str, list[Any]]:
+        if not options.get("bulk"):
+            return "", []
+        prefix = f"{alias}." if alias else ""
+        return (
+            f" AND LOWER(TRIM(COALESCE({prefix}vendor,'')))=LOWER(%s) "
+            f"AND LOWER(TRIM(COALESCE({prefix}model,'')))=LOWER(%s)",
+            [options["vendor"], options["model"]],
+        )
+
+    def enqueue_bulk_modem_refresh(
+        self,
+        *,
+        vendor: str,
+        model: str,
+        max_in_flight: int = 8,
+        queue_depth: int = 128,
+    ) -> dict[str, Any]:
+        """Create one durable, bounded identity refresh run for a modem cohort."""
+        vendor_value = str(vendor or "").strip()
+        model_value = str(model or "").strip()
+        if not vendor_value or not model_value:
+            raise ValueError("vendor and model are required")
+        max_in_flight = max(1, min(int(max_in_flight), 32))
+        queue_depth = max(max_in_flight, min(int(queue_depth), 512))
+        payload = {
+            "mode": "bulk_modem_refresh",
+            "vendor": vendor_value,
+            "model": model_value,
+            "max_in_flight": max_in_flight,
+            "queue_depth": queue_depth,
+        }
+        now = self._now()
+        with self._db_lock:
+            conn = self._connect()
+            try:
+                conn.begin()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO poller_setting
+                    (name, task_type, system_key, enabled, scope_type, created_at, updated_at)
+                    VALUES (%s, %s, %s, 1, 'all_cmts', %s, %s)
+                    ON DUPLICATE KEY UPDATE name=VALUES(name), task_type=VALUES(task_type),
+                    enabled=1, updated_at=VALUES(updated_at)
+                    """,
+                    (
+                        _BULK_MODEM_REFRESH_NAME,
+                        _IDENTITY_BACKFILL_TASK_TYPE,
+                        _BULK_MODEM_REFRESH_SYSTEM_KEY,
+                        now,
+                        now,
+                    ),
+                )
+                cur.execute(
+                    "SELECT id FROM poller_setting WHERE system_key=%s FOR UPDATE",
+                    (_BULK_MODEM_REFRESH_SYSTEM_KEY,),
+                )
+                setting = cur.fetchone() or {}
+                poller_id = int(setting.get("id") or 0)
+                if not poller_id:
+                    raise RuntimeError("Bulk modem refresh setting is unavailable")
+                cur.execute(
+                    """
+                    SELECT j.id FROM poller_job j
+                    JOIN poller_setting p ON p.id=j.poller_id
+                    WHERE p.task_type=%s AND j.status IN ('queued','running')
+                    ORDER BY j.id DESC LIMIT 1 FOR UPDATE
+                    """,
+                    (_IDENTITY_BACKFILL_TASK_TYPE,),
+                )
+                active = cur.fetchone()
+                if active:
+                    raise RuntimeError(
+                        f"Identity refresh job {int(active['id'])} is already active"
+                    )
+                eligible = self._identity_eligible_sql("m")
+                scope_sql, scope_params = self._identity_job_scope_sql(
+                    self._identity_job_options(payload), "m"
+                )
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM modem_inventory_current m "
+                    f"WHERE {eligible}{scope_sql}",
+                    tuple(scope_params),
+                )
+                target_total = int((cur.fetchone() or {}).get("c") or 0)
+                if target_total <= 0:
+                    raise ValueError("No active eligible modems match the vendor/model scope")
+                cur.execute(
+                    """
+                    INSERT INTO poller_job
+                    (poller_id, trigger_type, status, requested_by, request_payload, created_at)
+                    VALUES (%s, 'manual', 'queued', 'api', %s, %s)
+                    """,
+                    (poller_id, json.dumps(payload, separators=(",", ":")), now),
+                )
+                job_id = int(cur.lastrowid or 0)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return self.get_bulk_modem_refresh_job(job_id) or {"id": job_id, "status": "queued"}
+
+    def get_bulk_modem_refresh_job(self, job_id: int) -> dict[str, Any] | None:
+        rows = self._query(
+            """
+            SELECT j.id, j.status, j.rows_collected, j.modems_attempted,
+                   j.modems_succeeded, j.modems_failed, j.modems_remaining,
+                   j.error_text, j.started_at, j.finished_at, j.created_at,
+                   j.request_payload
+            FROM poller_job j JOIN poller_setting p ON p.id=j.poller_id
+            WHERE j.id=%s AND p.system_key=%s LIMIT 1
+            """,
+            (int(job_id), _BULK_MODEM_REFRESH_SYSTEM_KEY),
+        )
+        if not rows:
+            return None
+        job = dict(rows[0])
+        options = self._identity_job_options(job.pop("request_payload", {}))
+        job.update(
+            {
+                "vendor": options["vendor"],
+                "model": options["model"],
+                "max_in_flight": options["max_in_flight"],
+                "queue_depth": options["queue_depth"],
+            }
+        )
+        return job
+
     def _start_identity_backfill_job(self, job_id: int) -> None:
         """Initialize or resume one visible, manually started identity run."""
         now = self._now()
@@ -6696,15 +6862,13 @@ class PollerService:
                 ),
             )
             return
-        eligible = self._identity_eligible_sql()
-        enriched = self._inventory_enriched_sql()
         with self._db_lock:
             conn = self._connect()
             try:
                 conn.begin()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT j.status, p.task_type FROM poller_job j "
+                    "SELECT j.status, j.request_payload, p.task_type FROM poller_job j "
                     "JOIN poller_setting p ON p.id=j.poller_id "
                     "WHERE j.id=%s FOR UPDATE",
                     (int(job_id),),
@@ -6717,6 +6881,12 @@ class PollerService:
                 ):
                     conn.rollback()
                     return
+                options = self._identity_job_options(job.get("request_payload"))
+                scope_sql, scope_params = self._identity_job_scope_sql(options)
+                eligible = self._identity_eligible_sql()
+                target_predicate = f"{eligible}{scope_sql}"
+                if not options["force_refresh"]:
+                    target_predicate += f" AND NOT ({self._inventory_enriched_sql()})"
                 cur.execute(
                     "SELECT poller_job_id FROM inventory_identity_cursor "
                     "WHERE id=1 FOR UPDATE"
@@ -6734,8 +6904,8 @@ class PollerService:
                     "INSERT INTO inventory_identity_backfill_target "
                     "(poller_job_id, mac, created_at) "
                     "SELECT %s, mac, %s FROM modem_inventory_current "
-                    f"WHERE {eligible} AND NOT ({enriched})",
-                    (int(job_id), now),
+                    f"WHERE {target_predicate}",
+                    (int(job_id), now, *scope_params),
                 )
                 cur.execute(
                     "SELECT MAX(mac) AS max_mac, COUNT(*) AS target_total "
@@ -6753,7 +6923,16 @@ class PollerService:
                         "modems_succeeded=0, modems_failed=0, "
                         "modems_remaining=0, error_text=%s "
                         "WHERE id=%s AND status='running'",
-                        (now, "Identity backfill: no incomplete eligible modems", int(job_id)),
+                        (
+                            now,
+                            (
+                                f"Bulk modem refresh: no eligible {options['vendor']} "
+                                f"{options['model']} modems"
+                                if options["bulk"]
+                                else "Identity backfill: no incomplete eligible modems"
+                            ),
+                            int(job_id),
+                        ),
                     )
                     conn.commit()
                     return
@@ -6795,7 +6974,12 @@ class PollerService:
                     (
                         adopted,
                         target_total,
-                        f"Identity backfill started: {target_total} eligible modems",
+                        (
+                            f"Bulk modem refresh started: {target_total} "
+                            f"{options['vendor']} {options['model']} modems"
+                            if options["bulk"]
+                            else f"Identity backfill started: {target_total} eligible modems"
+                        ),
                         int(job_id),
                     ),
                 )
@@ -6866,7 +7050,7 @@ class PollerService:
     def _advance_identity_backfill_job(self) -> None:
         """Top up and publish progress for the single manual identity run."""
         jobs = self._query(
-            "SELECT j.id FROM poller_job j "
+            "SELECT j.id, j.request_payload FROM poller_job j "
             "JOIN poller_setting p ON p.id=j.poller_id "
             "WHERE j.status='running' AND p.task_type=%s "
             "ORDER BY j.id ASC LIMIT 1",
@@ -6875,6 +7059,7 @@ class PollerService:
         if not jobs:
             return
         job_id = int(jobs[0]["id"])
+        options = self._identity_job_options(jobs[0].get("request_payload"))
         self._seed_identity_refresh_queue(job_id)
         rows = self._query(
             "SELECT poller_job_id, target_total, next_scan_at, queued_count, "
@@ -6896,8 +7081,13 @@ class PollerService:
         completed = int(state.get("completed_count") or 0)
         failed = int(state.get("failed_count") or 0)
         remaining = max(0, target_total - completed - failed)
+        message_prefix = (
+            f"Bulk modem refresh ({options['vendor']} {options['model']}):"
+            if options["bulk"]
+            else "Identity backfill:"
+        )
         message = (
-            "Identity backfill: "
+            f"{message_prefix} "
             f"targeted {queued}/{target_total}, succeeded {completed}, "
             f"failed {failed}, remaining {remaining}, active {active}"
         )
@@ -6909,21 +7099,29 @@ class PollerService:
         )
         if state.get("next_scan_at") is None or active > 0:
             return
-        eligible = self._identity_eligible_sql("i")
-        enriched = self._inventory_enriched_sql("i")
-        residual_rows = self._query(
-            "SELECT COUNT(*) AS c "
-            "FROM inventory_identity_backfill_target t "
-            "JOIN modem_inventory_current i ON i.mac=t.mac "
-            "WHERE t.poller_job_id=%s "
-            f"AND {eligible} AND NOT ({enriched})",
-            (job_id,),
-        )
-        residual = int((residual_rows[0] or {}).get("c") or 0) if residual_rows else 0
+        if options["force_refresh"]:
+            residual = remaining
+        else:
+            scope_sql, scope_params = self._identity_job_scope_sql(options, "i")
+            target_predicate = f"{self._identity_eligible_sql('i')}{scope_sql}"
+            target_predicate += f" AND NOT ({self._inventory_enriched_sql('i')})"
+            residual_rows = self._query(
+                "SELECT COUNT(*) AS c "
+                "FROM inventory_identity_backfill_target t "
+                "JOIN modem_inventory_current i ON i.mac=t.mac "
+                "WHERE t.poller_job_id=%s "
+                f"AND {target_predicate}",
+                (job_id, *scope_params),
+            )
+            residual = (
+                int((residual_rows[0] or {}).get("c") or 0)
+                if residual_rows
+                else 0
+            )
         final_message = (
-            "Identity backfill completed: "
+            f"{message_prefix} completed: "
             f"targeted {queued}, succeeded {completed}, failed {failed}, "
-            f"still incomplete {residual}"
+            f"still eligible {residual}"
         )
         now = self._now()
         with self._db_lock:
@@ -7035,7 +7233,7 @@ class PollerService:
                 conn.begin()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT status, poller_id FROM poller_job "
+                    "SELECT status, poller_id, request_payload FROM poller_job "
                     "WHERE id=%s FOR UPDATE",
                     (int(job_id),),
                 )
@@ -7051,6 +7249,11 @@ class PollerService:
                 if str(setting.get("task_type") or "") != _IDENTITY_BACKFILL_TASK_TYPE:
                     conn.rollback()
                     return 0
+                options = self._identity_job_options(parent.get("request_payload"))
+                scope_sql, scope_params = self._identity_job_scope_sql(options, "i")
+                valid_predicate = f"{self._identity_eligible_sql('i')}{scope_sql}"
+                if not options["force_refresh"]:
+                    valid_predicate += f" AND NOT ({self._inventory_enriched_sql('i')})"
                 cur.execute(
                     "SELECT poller_job_id, cursor_mac, next_scan_at "
                     "FROM inventory_identity_cursor WHERE id=1 FOR UPDATE"
@@ -7060,16 +7263,13 @@ class PollerService:
                     conn.rollback()
                     return 0
 
-                stale_eligible = self._identity_eligible_sql("i")
-                stale_enriched = self._inventory_enriched_sql("i")
                 cur.execute(
                     "DELETE r FROM modem_refresh_request r "
                     "LEFT JOIN modem_inventory_current i ON i.mac=r.mac "
                     "WHERE r.status='queued' AND r.requested_by=%s "
                     "AND r.poller_job_id=%s "
-                    f"AND (i.mac IS NULL OR NOT COALESCE(({stale_eligible}), FALSE) "
-                    f"OR COALESCE(({stale_enriched}), FALSE))",
-                    (_IDENTITY_REQUEST_SOURCE, int(job_id)),
+                    f"AND (i.mac IS NULL OR NOT COALESCE(({valid_predicate}), FALSE))",
+                    (_IDENTITY_REQUEST_SOURCE, int(job_id), *scope_params),
                 )
                 cur.execute(
                     "SELECT COUNT(*) AS c FROM modem_refresh_request "
@@ -7078,7 +7278,7 @@ class PollerService:
                     (_IDENTITY_REQUEST_SOURCE, int(job_id)),
                 )
                 active = int((cur.fetchone() or {}).get("c") or 0)
-                available = self._identity_queue_depth() - active
+                available = options["queue_depth"] - active
                 if available <= 0:
                     conn.commit()
                     return 0
@@ -7087,16 +7287,14 @@ class PollerService:
                     conn.commit()
                     return 0
                 cursor_mac = str(state.get("cursor_mac") or "")
-                eligible = self._identity_eligible_sql("i")
-                enriched = self._inventory_enriched_sql("i")
                 cur.execute(
                     "SELECT t.mac, i.cmts "
                     "FROM inventory_identity_backfill_target t "
                     "JOIN modem_inventory_current i ON i.mac=t.mac "
                     "WHERE t.poller_job_id=%s AND t.mac>%s "
-                    f"AND {eligible} AND NOT ({enriched}) "
+                    f"AND {valid_predicate} "
                     "ORDER BY t.mac LIMIT %s",
-                    (int(job_id), cursor_mac, available),
+                    (int(job_id), cursor_mac, *scope_params, available),
                 )
                 candidates = cur.fetchall()
                 if not candidates:
@@ -7182,15 +7380,13 @@ class PollerService:
         ).strftime("%Y-%m-%d %H:%M:%S")
         claim_token = str(uuid.uuid4())
         task_id = str(uuid.uuid4())
-        eligible = self._identity_eligible_sql("i")
-        enriched = self._inventory_enriched_sql("i")
         with self._db_lock:
             conn = self._connect()
             try:
                 conn.begin()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT status, poller_id FROM poller_job "
+                    "SELECT status, poller_id, request_payload FROM poller_job "
                     "WHERE id=%s FOR UPDATE",
                     (parent_job_id,),
                 )
@@ -7198,6 +7394,20 @@ class PollerService:
                 if str(parent.get("status") or "") != "running":
                     conn.rollback()
                     return None
+                options = self._identity_job_options(parent.get("request_payload"))
+                if options["bulk"]:
+                    cur.execute(
+                        "SELECT COUNT(*) AS c FROM modem_refresh_request "
+                        "WHERE poller_job_id=%s AND requested_by=%s AND status='running'",
+                        (parent_job_id, _IDENTITY_REQUEST_SOURCE),
+                    )
+                    if int((cur.fetchone() or {}).get("c") or 0) >= options["max_in_flight"]:
+                        conn.rollback()
+                        return None
+                scope_sql, scope_params = self._identity_job_scope_sql(options, "i")
+                target_predicate = f"{self._identity_eligible_sql('i')}{scope_sql}"
+                if not options["force_refresh"]:
+                    target_predicate += f" AND NOT ({self._inventory_enriched_sql('i')})"
                 cur.execute(
                     "SELECT task_type FROM poller_setting WHERE id=%s",
                     (int(parent.get("poller_id") or 0),),
@@ -7233,8 +7443,8 @@ class PollerService:
                     "JOIN inventory_identity_backfill_target t "
                     "ON t.poller_job_id=%s AND t.mac=i.mac "
                     "WHERE i.mac=%s "
-                    f"AND {eligible} AND NOT ({enriched}) FOR UPDATE",
-                    (parent_job_id, request.get("mac")),
+                    f"AND {target_predicate} FOR UPDATE",
+                    (parent_job_id, request.get("mac"), *scope_params),
                 )
                 target = cur.fetchone()
                 if not target:

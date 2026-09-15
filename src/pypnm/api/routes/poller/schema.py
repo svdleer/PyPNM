@@ -49,6 +49,13 @@ class ModemRefreshRequest(BaseModel):
     cmts: Optional[str] = Field(default=None)
 
 
+class BulkModemRefreshRequest(BaseModel):
+    vendor: str = Field(min_length=1, max_length=64)
+    model: str = Field(min_length=1, max_length=128)
+    max_in_flight: int = Field(default=8, ge=1, le=32)
+    queue_depth: int = Field(default=128, ge=16, le=512)
+
+
 class InventoryDeltaEnrichmentRequest(BaseModel):
     cmts: str = Field(min_length=1, max_length=255)
     max_batch: int = Field(default=25, ge=1, le=25)
