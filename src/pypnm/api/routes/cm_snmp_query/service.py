@@ -366,6 +366,124 @@ class CmSnmpQueryService:
             (now, job_id, *normalized_receipt_ids),
         )
 
+    def _create_all_matching_plan(
+        self,
+        *,
+        scope_type: str,
+        scope: dict,
+        oids: list[dict],
+        verification_receipts: object,
+        requested_by: str,
+    ) -> dict[str, Any]:
+        """Persist a pending all-matching plan without expanding its targets inline."""
+        public_id = str(uuid.uuid4())
+        scope_json = json.dumps(scope, separators=(",", ":"))
+        oids_json = json.dumps(oids, separators=(",", ":"))
+        now = self._now()
+        conn = self._connect(autocommit=False)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO snmp_query_job
+                    (public_id, status, scope_type, scope_json, oids_json,
+                     requested_by, created_at, updated_at)
+                    VALUES (%s, 'planning', %s, %s, %s, %s, %s, %s)
+                    """,
+                    (public_id, scope_type, scope_json, oids_json, requested_by, now, now),
+                )
+                job_id = int(cursor.lastrowid)
+                self._consume_verification_receipts(
+                    cursor,
+                    oids=oids,
+                    receipt_ids=verification_receipts,
+                    scope_type=scope_type,
+                    scope=scope,
+                    job_id=job_id,
+                    now=now,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self.get_job(public_id)
+
+    def materialize_all_matching_plan(self, public_id: str) -> None:
+        """Resolve and batch-persist every target for a pending all-matching plan."""
+        self.ensure_schema()
+        jobs = self._query(
+            "SELECT id, status, scope_type, scope_json FROM snmp_query_job WHERE public_id=%s LIMIT 1",
+            (public_id,),
+        )
+        if not jobs or jobs[0]["status"] != "planning":
+            return
+        job = jobs[0]
+        job_id = int(job["id"])
+        now = self._now()
+        self._execute(
+            "UPDATE snmp_query_job SET status='materializing', updated_at=%s "
+            "WHERE id=%s AND status='planning'",
+            (now, job_id),
+        )
+        try:
+            scope_raw = job.get("scope_json")
+            scope = json.loads(scope_raw) if isinstance(scope_raw, str) else dict(scope_raw or {})
+            targets = self._resolve_targets(str(job["scope_type"]), scope, None)
+            if not targets:
+                raise ValueError("No targets resolved from scope")
+
+            conn = self._connect(autocommit=False)
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT status FROM snmp_query_job WHERE id=%s FOR UPDATE", (job_id,)
+                    )
+                    current = cursor.fetchone()
+                    if not current or current["status"] != "materializing":
+                        conn.rollback()
+                        return
+                    insert_sql = """
+                        INSERT INTO snmp_query_target
+                        (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node, state, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'planned', %s, %s)
+                    """
+                    batch_size = 1000
+                    for offset in range(0, len(targets), batch_size):
+                        batch = [
+                            (
+                                job_id,
+                                target["mac"],
+                                target.get("ip"),
+                                target.get("cmts"),
+                                target.get("cmts_ip"),
+                                target.get("fiber_node"),
+                                now,
+                                now,
+                            )
+                            for target in targets[offset:offset + batch_size]
+                        ]
+                        cursor.executemany(insert_sql, batch)
+                    cursor.execute(
+                        "UPDATE snmp_query_job SET status='planned', targets_total=%s, "
+                        "updated_at=%s WHERE id=%s",
+                        (len(targets), now, job_id),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.exception("All-matching SNMP plan %s failed", public_id)
+            self._execute(
+                "UPDATE snmp_query_job SET status='failed', error_text=%s, "
+                "finished_at=%s, updated_at=%s WHERE id=%s",
+                (str(exc)[:500], self._now(), self._now(), job_id),
+            )
+
     def create_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.ensure_schema()
         scope = dict(payload.get("scope") or {})
@@ -388,6 +506,16 @@ class CmSnmpQueryService:
         max_modems = payload.get("max_modems")
         requested_by = str(payload.get("requested_by") or "admin").strip()[:64]
         verification_receipts = payload.get("verification_receipts")
+        if bool(payload.get("all_matching_modems")):
+            if max_modems is not None:
+                raise ValueError("all_matching_modems cannot be combined with max_modems")
+            return self._create_all_matching_plan(
+                scope_type=scope_type,
+                scope=scope,
+                oids=oids,
+                verification_receipts=verification_receipts,
+                requested_by=requested_by,
+            )
         targets = self._resolve_targets(scope_type, scope, max_modems)
         if not targets:
             raise ValueError("No targets resolved from scope")
@@ -613,6 +741,7 @@ class CmSnmpQueryService:
         if max_modems is not None and not 1 <= int(max_modems) <= 100000:
             raise ValueError("max_modems must be between 1 and 100000")
         limit_clause = f"LIMIT {int(max_modems)}" if max_modems else ""
+        order_clause = "ORDER BY RAND()" if max_modems else "ORDER BY m.mac"
         affiliate = self._normalize_affiliate(scope.get("affiliate"))
         affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(affiliate)
         facet_filter, facet_params = self._inventory_scope_predicates(scope)
@@ -651,7 +780,7 @@ class CmSnmpQueryService:
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
                 f"WHERE m.inventory_state<>'retired' {online_filter} {affiliate_filter} {facet_filter} "
-                f"ORDER BY RAND() {limit_clause}",
+                f"{order_clause} {limit_clause}",
                 (*affiliate_params, *facet_params),
             )
         elif scope_type == "cmts":
@@ -664,7 +793,7 @@ class CmSnmpQueryService:
                 f"WHERE m.inventory_state<>'retired' "
                 f"AND LOWER(TRIM(COALESCE(m.cmts,''))) IN ({placeholders}) "
                 f"{online_filter} {affiliate_filter} {facet_filter} "
-                f"ORDER BY RAND() {limit_clause}",
+                f"{order_clause} {limit_clause}",
                 (*normalized_cmts, *affiliate_params, *facet_params),
             )
         elif scope_type == "fiber_node":
@@ -694,7 +823,7 @@ class CmSnmpQueryService:
                   {online_filter}
                   {affiliate_filter}
                   {facet_filter}
-                ORDER BY RAND() {limit_clause}
+                {order_clause} {limit_clause}
                 """,
                 (cmts_name.casefold(), *fiber_nodes, *affiliate_params, *facet_params),
             )

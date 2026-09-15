@@ -171,7 +171,7 @@ def list_jobs(limit: int = Query(default=50, ge=1, le=200)) -> SnmpQueryJobListR
 
 
 @router.post("/jobs/plan", response_model=SnmpQueryPlanResponse)
-def create_plan(payload: SnmpQueryPlanRequest) -> SnmpQueryPlanResponse:
+async def create_plan(payload: SnmpQueryPlanRequest) -> SnmpQueryPlanResponse:
     try:
         oids_dicts = [e.model_dump() for e in payload.oids] if payload.oids else []
         job = cm_snmp_query_service.create_plan({
@@ -179,9 +179,20 @@ def create_plan(payload: SnmpQueryPlanRequest) -> SnmpQueryPlanResponse:
             "oids": oids_dicts,
             "verification_receipts": payload.verification_receipts,
             "max_modems": payload.max_modems,
+            "all_matching_modems": payload.all_matching_modems,
             "template_id": payload.template_id,
             "requested_by": payload.requested_by,
         })
+        if payload.all_matching_modems:
+            import asyncio
+
+            asyncio.create_task(
+                asyncio.to_thread(
+                    cm_snmp_query_service.materialize_all_matching_plan,
+                    job["public_id"],
+                ),
+                name=f"snmp-plan-{job['public_id']}",
+            )
         return SnmpQueryPlanResponse(job=SnmpQueryJob(**job))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

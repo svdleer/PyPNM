@@ -62,6 +62,10 @@ class SnmpQueryPlanRequest(BaseModel):
         description="One API-issued, unexpired modem-verification receipt per OID.",
     )
     max_modems: int | None = Field(default=None, ge=1, le=100000)
+    all_matching_modems: bool = Field(
+        default=False,
+        description="Plan every modem matching the selected scope and modem facets asynchronously.",
+    )
     template_id: int | None = Field(default=None, description="Use OIDs from saved template instead of inline list")
     requested_by: str | None = Field(default=None, max_length=64)
 
