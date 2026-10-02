@@ -5949,6 +5949,55 @@ class PollerService:
         )
         return [str(row.get('ip_address')) for row in rows if row.get('ip_address')]
 
+    def suggest_inventory_macs(
+        self,
+        query: str,
+        limit: int = 10,
+        include_suspect_missing: bool = True,
+    ) -> list[Dict[str, Any]]:
+        """Return bounded authoritative MAC suggestions without loading modem rows.
+
+        The result intentionally exposes only identity and lifecycle metadata.
+        """
+        raw_query = str(query or '').strip()
+        if not re.fullmatch(r'[0-9a-fA-F:.\-\s]+', raw_query):
+            raise ValueError(
+                'MAC suggestions require hexadecimal characters and MAC separators only'
+            )
+        compact = re.sub(r'[:.\-\s]', '', raw_query).lower()
+        if not 2 <= len(compact) <= 12:
+            raise ValueError(
+                'MAC suggestions require 2 to 12 hexadecimal characters'
+            )
+
+        mac_prefix = ':'.join(
+            compact[index:index + 2] for index in range(0, len(compact), 2)
+        )
+        states = (
+            ('active', 'suspect_missing')
+            if include_suspect_missing
+            else ('active',)
+        )
+        placeholders = ','.join(['%s'] * len(states))
+        suggestion_limit = max(1, min(int(limit or 10), 50))
+        rows = self._query(
+            "SELECT mac, inventory_state, missing_since "
+            "FROM modem_inventory_current FORCE INDEX (PRIMARY) "
+            f"WHERE inventory_state IN ({placeholders}) AND mac LIKE %s "
+            "ORDER BY CASE inventory_state WHEN 'active' THEN 0 ELSE 1 END, "
+            "mac ASC LIMIT %s",
+            (*states, mac_prefix + '%', suggestion_limit),
+        )
+        return [
+            {
+                'mac_address': str(row.get('mac') or ''),
+                'inventory_state': str(row.get('inventory_state') or 'active'),
+                'missing_since': row.get('missing_since'),
+            }
+            for row in rows
+            if row.get('mac')
+        ]
+
     def get_inventory_modems_bulk(self, mac_addresses: list[str]) -> list[Dict[str, Any]]:
         """Look up multiple modems by MAC address using a single indexed query."""
         if not mac_addresses:

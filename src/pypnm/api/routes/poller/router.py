@@ -232,6 +232,27 @@ def suggest_cpe_addresses(
     return {"status": "success", "suggestions": suggestions}
 
 
+@router.get("/inventory/modems/mac-suggestions")
+def suggest_inventory_macs(
+    q: str = Query(min_length=2, max_length=32),
+    limit: int = Query(default=10, ge=1, le=50),
+    include_suspect_missing: bool = Query(default=True),
+) -> dict:
+    """Suggest authoritative MAC identities without triggering live collection."""
+    try:
+        suggestions = poller_service.suggest_inventory_macs(
+            q,
+            limit=limit,
+            include_suspect_missing=include_suspect_missing,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("inventory/modems/mac-suggestions DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "success", "suggestions": suggestions}
+
+
 @router.get("/inventory/summary")
 def inventory_summary(
     cmts: str | None = None,
