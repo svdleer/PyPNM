@@ -8,13 +8,16 @@ from pypnm.api.routes.topology.schema import (
     PhysicalFiberNodeReconcileRequest,
     PhysicalFiberNodeReconcileResponse,
     TopologyDatasetsResponse,
-    TopologyImportResponse,
     TopologyFiberNodeScanTargetsRequest,
+    TopologyImportResponse,
     TopologyModemsByMacsRequest,
     TopologyPathsByModemsRequest,
     TopologySummaryResponse,
 )
-from pypnm.api.routes.topology.service import topology_service
+from pypnm.api.routes.topology.service import (
+    TopologyBulkBusyError,
+    topology_service,
+)
 
 router = APIRouter(prefix="/api/topology", tags=["topology"])
 
@@ -75,6 +78,12 @@ def import_topology_status(
         started_at=d["started_at"],
         finished_at=d["finished_at"],
     )
+
+
+@router.get("/status")
+def topology_status() -> dict:
+    """Expose non-secret topology capacity telemetry for operations."""
+    return {"status": "success", **topology_service.get_status()}
 
 
 @router.get("/summary", response_model=TopologySummaryResponse)
@@ -180,6 +189,12 @@ def topology_modems_by_macs(body: TopologyModemsByMacsRequest) -> dict:
             mac_addresses=body.mac_addresses,
         )
         return {"status": "success", **payload}
+    except TopologyBulkBusyError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": "2"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

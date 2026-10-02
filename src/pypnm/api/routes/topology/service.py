@@ -21,6 +21,10 @@ from pypnm.lib.mac_address import MacAddress, MacAddressFormat
 logger = logging.getLogger(__name__)
 
 
+class TopologyBulkBusyError(RuntimeError):
+    """Raised when the API-owned topology bulk lane is already occupied."""
+
+
 def normalize_bare_mac(value: object) -> str | None:
     """Return a canonical 12-character lowercase hexadecimal MAC."""
     bare = re.sub(r"[:.\-]", "", str(value or "").strip()).lower()
@@ -628,57 +632,29 @@ class TopologyStorage:
         snapshot_date: str | None,
         mac_address: str,
     ) -> tuple[str | None, dict[str, Any] | None]:
-        with self._db_lock:
-            conn = self._connect()
-            cur = conn.cursor()
-
-            resolved_date = snapshot_date
-            if not resolved_date:
-                cur.execute("SELECT snapshot_date FROM topology_snapshots ORDER BY snapshot_date DESC LIMIT 1")
-                latest = cur.fetchone() or {}
-                resolved_date = str(latest.get("snapshot_date") or "") or None
-            if not resolved_date:
-                conn.close()
-                return None, None
-
-            cur.execute("SELECT id FROM topology_snapshots WHERE snapshot_date=%s", (resolved_date,))
-            row = cur.fetchone() or {}
-            snapshot_id = int(row.get("id") or 0)
-            if snapshot_id <= 0:
-                conn.close()
-                return resolved_date, None
-
-            mac = (mac_address or "").strip().lower()
-            mac_bare = re.sub(r"[^0-9a-f]", "", mac)
-            if len(mac_bare) != 12:
-                conn.close()
-                return resolved_date, None
-
-            sql = (
-                "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, m.address, m.address1, m.address2, m.locality, "
-                "m.postalcode, m.house_number, m.house_number_extension, m.linked_node_id, m.linked_node_type, m.link_match, "
-                "h.path AS hierarchy_path, h.cmts AS cmts "
-                "FROM topology_modems m "
-                "LEFT JOIN ("
-                "  SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts "
-                "  FROM topology_hierarchy WHERE snapshot_id=%s "
-                "  GROUP BY node_id"
-                ") h ON h.node_id=m.fibernode "
-                "WHERE m.snapshot_id=%s "
-                "AND LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))=%s "
-                "LIMIT 1"
-            )
-            cur.execute(sql, (snapshot_id, snapshot_id, mac_bare))
-            modem = cur.fetchone()
-            conn.close()
-            return resolved_date, (dict(modem) if modem else None)
+        """Return one indexed topology modem without scanning snapshot hierarchy."""
+        mac_bare = normalize_bare_mac(mac_address)
+        if mac_bare is None:
+            return snapshot_date, None
+        resolved_date = snapshot_date or self.get_latest_snapshot_date()
+        if not resolved_date:
+            return None, None
+        resolved_date, modems = self.get_modems_by_macs(
+            snapshot_date=resolved_date,
+            mac_addresses=[mac_bare],
+        )
+        return resolved_date, (modems[0] if modems else None)
 
     def get_modems_by_macs(
         self,
         snapshot_date: str,
         mac_addresses: list[str],
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Return topology rows for MACs from exactly one requested snapshot."""
+        """Return indexed topology rows for a bounded MAC cohort.
+
+        Bulk reads use their own connection and never take ``_db_lock`` so an
+        interactive exact lookup can proceed while a bounded cohort is loading.
+        """
         bare_macs = list(
             dict.fromkeys(
                 mac
@@ -689,8 +665,8 @@ class TopologyStorage:
         if not bare_macs:
             return snapshot_date, []
 
-        with self._db_lock:
-            conn = self._connect()
+        conn = self._connect()
+        try:
             cur = conn.cursor()
             cur.execute(
                 "SELECT id FROM topology_snapshots WHERE snapshot_date=%s",
@@ -699,12 +675,11 @@ class TopologyStorage:
             snapshot = cur.fetchone() or {}
             snapshot_id = int(snapshot.get("id") or 0)
             if snapshot_id <= 0:
-                conn.close()
                 return snapshot_date, []
 
             rows: list[dict[str, Any]] = []
-            for offset in range(0, len(bare_macs), 500):
-                batch = bare_macs[offset:offset + 500]
+            for offset in range(0, len(bare_macs), 100):
+                batch = bare_macs[offset:offset + 100]
                 candidates: list[str] = []
                 for mac in batch:
                     pairs = [mac[index:index + 2] for index in range(0, 12, 2)]
@@ -717,25 +692,47 @@ class TopologyStorage:
                         )
                     )
                 placeholders = ",".join(["%s"] * len(candidates))
-                sql = (
-                    "SELECT m.mac, m.fibernode, m.customer_id, m.topology_link_id, "
-                    "m.lat, m.lon, m.address, m.address1, m.address2, m.locality, "
-                    "m.postalcode, m.house_number, m.house_number_extension, "
-                    "m.linked_node_id, m.linked_node_type, m.link_match, "
-                    "h.path AS hierarchy_path, h.cmts AS cmts "
-                    "FROM topology_modems m "
-                    "LEFT JOIN ("
-                    "  SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts "
-                    "  FROM topology_hierarchy WHERE snapshot_id=%s "
-                    "  GROUP BY node_id"
-                    ") h ON h.node_id=m.fibernode "
+                cur.execute(
+                    "SELECT m.mac, m.fibernode, m.customer_id, "
+                    "m.topology_link_id, m.lat, m.lon, m.address, "
+                    "m.address1, m.address2, m.locality, m.postalcode, "
+                    "m.house_number, m.house_number_extension, "
+                    "m.linked_node_id, m.linked_node_type, m.link_match "
+                    "FROM topology_modems m FORCE INDEX (idx_modems_snapshot_mac) "
                     "WHERE m.snapshot_id=%s "
-                    f"AND m.mac IN ({placeholders})"
+                    f"AND m.mac IN ({placeholders})",
+                    (snapshot_id, *candidates),
                 )
-                cur.execute(sql, (snapshot_id, snapshot_id, *candidates))
                 rows.extend(dict(row) for row in (cur.fetchall() or []))
-            conn.close()
+
+            node_ids = sorted(
+                {
+                    str(row.get("fibernode") or "").strip()
+                    for row in rows
+                    if str(row.get("fibernode") or "").strip()
+                }
+            )
+            hierarchy_by_node: dict[str, dict[str, Any]] = {}
+            if node_ids:
+                placeholders = ",".join(["%s"] * len(node_ids))
+                cur.execute(
+                    "SELECT node_id, MIN(path) AS path, MIN(cmts) AS cmts "
+                    "FROM topology_hierarchy FORCE INDEX (idx_hierarchy_snapshot_node) "
+                    "WHERE snapshot_id=%s "
+                    f"AND node_id IN ({placeholders}) GROUP BY node_id",
+                    (snapshot_id, *node_ids),
+                )
+                hierarchy_by_node = {
+                    str(row.get("node_id") or ""): dict(row)
+                    for row in (cur.fetchall() or [])
+                }
+            for row in rows:
+                hierarchy = hierarchy_by_node.get(str(row.get("fibernode") or ""), {})
+                row["hierarchy_path"] = hierarchy.get("path")
+                row["cmts"] = hierarchy.get("cmts")
             return snapshot_date, rows
+        finally:
+            conn.close()
 
     def get_modems_by_exact_fiber_node(
         self,
@@ -1888,6 +1885,25 @@ class TopologyService:
             )
         except (TypeError, ValueError):
             self._summary_cache_ttl_seconds = 300
+        try:
+            self._bulk_max_macs = max(
+                1, min(int(os.environ.get("TOPOLOGY_BULK_MAX_MACS", "100")), 100)
+            )
+        except (TypeError, ValueError):
+            self._bulk_max_macs = 100
+        try:
+            self._bulk_concurrency = max(
+                1, min(int(os.environ.get("TOPOLOGY_BULK_CONCURRENCY", "1")), 4)
+            )
+        except (TypeError, ValueError):
+            self._bulk_concurrency = 1
+        self._bulk_gate = threading.BoundedSemaphore(self._bulk_concurrency)
+        self._bulk_metrics_lock = threading.Lock()
+        self._bulk_in_flight = 0
+        self._bulk_rejected = 0
+        self._bulk_completed = 0
+        self._bulk_failed = 0
+        self._bulk_last_duration_seconds: float | None = None
 
     def _get_summary_payload(
         self, snapshot_date: str, sample_limit: int
@@ -2739,22 +2755,87 @@ class TopologyService:
         selected_date: str | None,
         mac_addresses: list[str],
     ) -> dict[str, Any]:
-        """Return topology identities for a bounded MAC cohort."""
-        self.storage.init_db()
-        snapshot_date = selected_date or self.storage.get_latest_snapshot_date()
-        if not snapshot_date:
-            return {"snapshot_date": None, "count": 0, "modems": []}
-        snapshot_date, modems = self.storage.get_modems_by_macs(
-            snapshot_date=snapshot_date,
-            mac_addresses=mac_addresses,
-        )
-        for modem in modems:
-            if isinstance(modem, dict) and "mac" in modem:
-                modem["mac"] = self._normalize_mac(modem.get("mac") or "")
+        """Return topology identities through the bounded bulk execution lane."""
+        unique_macs = {
+            mac
+            for mac in (normalize_bare_mac(value) for value in mac_addresses)
+            if mac is not None
+        }
+        if len(unique_macs) > self._bulk_max_macs:
+            raise ValueError(
+                f"at most {self._bulk_max_macs} topology MAC addresses are allowed"
+            )
+        if not self._bulk_gate.acquire(blocking=False):
+            with self._bulk_metrics_lock:
+                self._bulk_rejected += 1
+            raise TopologyBulkBusyError("topology bulk lane is busy; retry shortly")
+
+        started = time.monotonic()
+        with self._bulk_metrics_lock:
+            self._bulk_in_flight += 1
+        try:
+            self.storage.init_db()
+            snapshot_date = selected_date or self.storage.get_latest_snapshot_date()
+            if not snapshot_date:
+                return {"snapshot_date": None, "count": 0, "modems": []}
+            snapshot_date, modems = self.storage.get_modems_by_macs(
+                snapshot_date=snapshot_date,
+                mac_addresses=list(unique_macs),
+            )
+            for modem in modems:
+                if isinstance(modem, dict) and "mac" in modem:
+                    modem["mac"] = self._normalize_mac(modem.get("mac") or "")
+            with self._bulk_metrics_lock:
+                self._bulk_completed += 1
+            return {
+                "snapshot_date": snapshot_date,
+                "count": len(modems),
+                "modems": modems,
+            }
+        except Exception:
+            with self._bulk_metrics_lock:
+                self._bulk_failed += 1
+            raise
+        finally:
+            elapsed = time.monotonic() - started
+            with self._bulk_metrics_lock:
+                self._bulk_in_flight -= 1
+                self._bulk_last_duration_seconds = round(elapsed, 6)
+            self._bulk_gate.release()
+
+    def get_status(self) -> dict[str, Any]:
+        """Return non-secret topology capacity and cache telemetry."""
+        with self._bulk_metrics_lock:
+            bulk = {
+                "max_macs": self._bulk_max_macs,
+                "concurrency": self._bulk_concurrency,
+                "in_flight": self._bulk_in_flight,
+                "rejected": self._bulk_rejected,
+                "completed": self._bulk_completed,
+                "failed": self._bulk_failed,
+                "last_duration_seconds": self._bulk_last_duration_seconds,
+            }
+        with self._summary_cache_lock:
+            summary_cache_entries = len(self._summary_cache)
+        with _import_jobs_lock:
+            imports = {
+                date: {
+                    "state": job.state,
+                    "stage": job.stage,
+                    "pct": job.pct,
+                }
+                for date, job in _import_jobs.items()
+                if job.state in {"queued", "running"}
+            }
         return {
-            "snapshot_date": snapshot_date,
-            "count": len(modems),
-            "modems": modems,
+            "storage_backend": "mysql",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary_cache": {
+                "entries": summary_cache_entries,
+                "ttl_seconds": self._summary_cache_ttl_seconds,
+            },
+            "bulk": bulk,
+            "imports": imports,
         }
 
     async def reconcile_physical_fiber_node(

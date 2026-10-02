@@ -39,7 +39,7 @@ class TopologyPathsByModemsRequest(BaseModel):
 
 
 class TopologyModemsByMacsRequest(BaseModel):
-    mac_addresses: list[str] = Field(min_length=1, max_length=5000)
+    mac_addresses: list[str] = Field(min_length=1, max_length=100)
     date: str | None = None
 
 
