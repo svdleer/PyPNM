@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import gzip
 import json
@@ -8,14 +9,14 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from pypnm.lib.mac_address import MacAddress, MacAddressFormat
-
 
 logger = logging.getLogger(__name__)
 
@@ -1590,7 +1591,10 @@ class TopologyStorage:
                 "house_number, house_number_extension, customer_id, linked_node_id, linked_node_type, link_match "
                 "FROM topology_modems WHERE snapshot_id=%s "
                 "AND link_match=1 "
-                "ORDER BY RAND() LIMIT %s",
+                # The `(snapshot_id, link_match)` index has the primary key as
+                # its InnoDB suffix, so this is a bounded index walk. Avoid
+                # `ORDER BY RAND()` which sorted every matching modem.
+                "ORDER BY id ASC LIMIT %s",
                 (snapshot_id, int(sample_limit)),
             )
             sample_modems = [
@@ -1876,6 +1880,48 @@ class TopologyService:
 
     def __init__(self) -> None:
         self.storage = TopologyStorage()
+        self._summary_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+        self._summary_cache_lock = threading.Lock()
+        try:
+            self._summary_cache_ttl_seconds = max(
+                1, int(os.environ.get("TOPOLOGY_SUMMARY_CACHE_TTL", "300"))
+            )
+        except (TypeError, ValueError):
+            self._summary_cache_ttl_seconds = 300
+
+    def _get_summary_payload(
+        self, snapshot_date: str, sample_limit: int
+    ) -> dict[str, Any] | None:
+        """Return a defensive copy of a bounded, API-owned summary cache entry."""
+        cache_key = (snapshot_date, int(sample_limit))
+        now = time.monotonic()
+        with self._summary_cache_lock:
+            cached = self._summary_cache.get(cache_key)
+            if cached and (now - cached[0]) < self._summary_cache_ttl_seconds:
+                return copy.deepcopy(cached[1])
+            if cached:
+                self._summary_cache.pop(cache_key, None)
+
+        payload = self.storage.load_summary_payload(
+            snapshot_date=snapshot_date,
+            sample_limit=sample_limit,
+        )
+        if payload is None:
+            return None
+
+        with self._summary_cache_lock:
+            self._summary_cache[cache_key] = (now, copy.deepcopy(payload))
+        return payload
+
+    def _invalidate_summary_cache(self, snapshot_date: str | None = None) -> None:
+        """Drop cached summaries after an API-owned topology import changes a snapshot."""
+        with self._summary_cache_lock:
+            if snapshot_date is None:
+                self._summary_cache.clear()
+                return
+            for cache_key in tuple(self._summary_cache):
+                if cache_key[0] == snapshot_date:
+                    self._summary_cache.pop(cache_key, None)
 
     def _volume_dir(self) -> Path:
         return Path(os.environ.get("TOPOLOGY_VOLUME_DIR", "/app/data/topology")).resolve()
@@ -2506,6 +2552,7 @@ class TopologyService:
             modemlocation_signature=modem_sig,
             payload=parsed_payload,
         )
+        self._invalidate_summary_cache(snapshot_date)
         return {
             "snapshot_date": snapshot_date,
             "imported": True,
@@ -2568,6 +2615,7 @@ class TopologyService:
                     modemlocation_signature=modem_sig,
                     job=job,
                 )
+                self._invalidate_summary_cache(snapshot_date)
                 job.finish(stats)
             except Exception as exc:
                 job.fail(str(exc))
@@ -3115,7 +3163,10 @@ class TopologyService:
                 },
             }
 
-        payload = self.storage.load_summary_payload(snapshot_date=snapshot_date, sample_limit=sample_limit)
+        payload = self._get_summary_payload(
+            snapshot_date=snapshot_date,
+            sample_limit=sample_limit,
+        )
         if payload is None:
             return {
                 "files": {
