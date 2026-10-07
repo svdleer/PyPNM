@@ -270,6 +270,7 @@ class PollerService:
                 partial_service_upstream BOOLEAN NULL,
                 partial_service_state VARCHAR(16) NULL,
                 software_version VARCHAR(128) NULL,
+                sys_descr VARCHAR(512) NULL,
                 first_seen_at DATETIME NOT NULL,
                 last_seen_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
@@ -509,6 +510,7 @@ class PollerService:
         # most once on MySQL versions that cannot apply ADD COLUMN instantly.
         inventory_columns = {
             "software_version": "VARCHAR(128) NULL",
+            "sys_descr": "VARCHAR(512) NULL",
             "partial_service_downstream": "BOOLEAN NULL",
             "partial_service_upstream": "BOOLEAN NULL",
             "partial_service_state": "VARCHAR(16) NULL",
@@ -5889,7 +5891,7 @@ class PollerService:
             "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
             "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
             "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-            "partial_service_upstream, partial_service_state, software_version, "
+            "partial_service_upstream, partial_service_state, software_version, sys_descr, "
             "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
             f"FROM modem_inventory_current WHERE inventory_state='active' "
             f"AND mac IN ({marker}, {marker}, {marker}) "
@@ -6022,7 +6024,7 @@ class PollerService:
                 "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
                 "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
                 "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-                "partial_service_upstream, partial_service_state, software_version, "
+                "partial_service_upstream, partial_service_state, software_version, sys_descr, "
             "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
                 f"FROM modem_inventory_current WHERE inventory_state='active' "
                 f"AND mac IN ({placeholders})",
@@ -6047,7 +6049,7 @@ class PollerService:
             "upstream_interface, upstream_ifindex, ofdm_ifindex, ofdma_ifindex, "
             "ofdm_channel_count, ofdma_channel_count, ofdma_rf_port_ifindex, "
             "ofdm_enabled, ofdma_enabled, partial_service, partial_service_downstream, "
-            "partial_service_upstream, partial_service_state, software_version, "
+            "partial_service_upstream, partial_service_state, software_version, sys_descr, "
             "inventory_state, missing_since, consecutive_full_misses, retired_at, updated_at "
             "FROM modem_inventory_current "
             "WHERE inventory_state='active' AND cmts_ip=%s "
@@ -6172,6 +6174,7 @@ class PollerService:
             "partial_service_upstream": _to_bool(row.get("partial_service_upstream")),
             "partial_service_state": row.get("partial_service_state"),
             "software_version": row.get("software_version"),
+            "sys_descr": row.get("sys_descr"),
             "inventory_state": row.get("inventory_state") or "active",
             "missing_since": row.get("missing_since"),
             "consecutive_full_misses": int(row.get("consecutive_full_misses") or 0),
@@ -7898,7 +7901,7 @@ class PollerService:
                 cmts = str(request.get("cmts") or cmts_ip).strip()
                 cur.execute(
                     "SELECT inventory_state, ip, cmts, cmts_ip, status, updated_at, "
-                    "vendor, model, software_version, docsis_version "
+                    "vendor, model, software_version, sys_descr, docsis_version "
                     "FROM modem_inventory_current WHERE mac=%s AND cmts_ip=%s "
                     "FOR UPDATE",
                     (request.get("mac"), cmts_ip),
@@ -7933,6 +7936,7 @@ class PollerService:
                     "vendor": inventory.get("vendor"),
                     "model": inventory.get("model"),
                     "software_version": inventory.get("software_version"),
+                    "sys_descr": inventory.get("sys_descr"),
                     "docsis_version": inventory.get("docsis_version"),
                 }
                 after = {
@@ -7944,6 +7948,8 @@ class PollerService:
                         identity.get("software_version")
                     )
                     or before["software_version"],
+                    "sys_descr": self._clean_identity_value(sys_descr)
+                    or before["sys_descr"],
                     "docsis_version": self._stronger_docsis_version(
                         before["docsis_version"],
                         docsis_version,
@@ -7954,6 +7960,7 @@ class PollerService:
                     "vendor=COALESCE(NULLIF(%s,''), vendor), "
                     "model=COALESCE(NULLIF(%s,''), model), "
                     "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                    "sys_descr=COALESCE(NULLIF(%s,''), sys_descr), "
                     "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                     "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
                     "AND inventory_state='active'",
@@ -7961,6 +7968,7 @@ class PollerService:
                         after["vendor"],
                         after["model"],
                         after["software_version"],
+                        after["sys_descr"],
                         after["docsis_version"],
                         now,
                         request.get("mac"),
@@ -8043,6 +8051,7 @@ class PollerService:
                 None,
                 payload.get("docsis_version"),
             ),
+            "sys_descr": self._clean_identity_value(payload.get("sys_descr")),
             "queried_ip": str(payload.get("modem_ip") or "").strip(),
             "queried_cmts_ip": str(payload.get("cmts_ip") or "").strip(),
             "inventory_updated_at": payload.get("inventory_updated_at"),
@@ -8271,6 +8280,9 @@ class PollerService:
             discovered_software = self._clean_identity_value(
                 identity.get("software_version")
             )
+            discovered_sys_descr = self._clean_identity_value(
+                identity.get("sys_descr")
+            )
             discovered_docsis_version = self._stronger_docsis_version(
                 cable_source.get("docsis_version"),
                 identity.get("docsis_version"),
@@ -8318,6 +8330,7 @@ class PollerService:
             cable_mac = interface_values.get("cable_mac")
             fiber_node = interface_values.get("fiber_node")
             docsis_version = interface_values.get("docsis_version")
+            sys_descr = discovered_sys_descr or cable_source.get("sys_descr")
 
             cmts_address = str(cable_source.get("cmts_ip") or "").strip()
             if identity_only:
@@ -8346,7 +8359,7 @@ class PollerService:
                     )
                     cur.execute(
                         "SELECT inventory_state, ip, cmts, cmts_ip, status, updated_at, "
-                        "vendor, model, software_version, docsis_version "
+                        "vendor, model, software_version, sys_descr, docsis_version "
                         "FROM modem_inventory_current "
                         "WHERE mac=%s AND cmts_ip=%s FOR UPDATE",
                         (inventory_mac, cmts_address),
@@ -8407,6 +8420,7 @@ class PollerService:
                         "vendor": inventory_row.get("vendor"),
                         "model": inventory_row.get("model"),
                         "software_version": inventory_row.get("software_version"),
+                        "sys_descr": inventory_row.get("sys_descr"),
                         "docsis_version": inventory_row.get("docsis_version"),
                     }
                     identity_after = {
@@ -8415,6 +8429,7 @@ class PollerService:
                         "software_version": (
                             software_ver or identity_before["software_version"]
                         ),
+                        "sys_descr": sys_descr or identity_before["sys_descr"],
                         "docsis_version": (
                             docsis_version or identity_before["docsis_version"]
                         ),
@@ -8426,6 +8441,7 @@ class PollerService:
                             "vendor=COALESCE(NULLIF(%s,''), vendor), "
                             "model=COALESCE(NULLIF(%s,''), model), "
                             "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                            "sys_descr=COALESCE(NULLIF(%s,''), sys_descr), "
                             "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
                             "updated_at=%s WHERE mac=%s AND cmts_ip=%s "
                             "AND inventory_state='active'",
@@ -8433,6 +8449,7 @@ class PollerService:
                                 vendor,
                                 model_name,
                                 software_ver,
+                                sys_descr,
                                 docsis_version,
                                 now,
                                 inventory_mac,
@@ -8443,6 +8460,7 @@ class PollerService:
                         vendor
                         or model_name
                         or software_ver
+                        or sys_descr
                         or cable_mac
                         or fiber_node
                         or docsis_version
@@ -8452,6 +8470,7 @@ class PollerService:
                             "vendor=COALESCE(NULLIF(%s,''), vendor), "
                             "model=COALESCE(NULLIF(%s,''), model), "
                             "software_version=COALESCE(NULLIF(%s,''), software_version), "
+                            "sys_descr=COALESCE(NULLIF(%s,''), sys_descr), "
                             "cable_mac=COALESCE(NULLIF(%s,''), cable_mac), "
                             "fiber_node=COALESCE(NULLIF(%s,''), fiber_node), "
                             "docsis_version=COALESCE(NULLIF(%s,''), docsis_version), "
@@ -8461,6 +8480,7 @@ class PollerService:
                                 vendor,
                                 model_name,
                                 software_ver,
+                                sys_descr,
                                 cable_mac,
                                 fiber_node,
                                 docsis_version,

@@ -99,3 +99,10 @@ def test_pinned_cm_agent_fails_closed(
 
     with pytest.raises(RuntimeError, match=message):
         transport._get_manager_and_agent("cm", "cm-agent-test")
+
+
+def test_channel_stats_agent_context_never_transports_communities() -> None:
+    from pypnm.api.routes.cm.channel_stats.router import _agent_snmp_context
+
+    assert _agent_snmp_context("cm", "gui-modem-community") == {"target_role": "cm"}
+    assert _agent_snmp_context("cmts", "gui-cmts-community") == {"target_role": "cmts"}
