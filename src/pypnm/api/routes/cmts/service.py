@@ -330,11 +330,79 @@ class CMTSModemService:
             return result
         return {'success': False, 'error': 'No result from agent'}
 
+    async def _resolve_targeted_if_names(self, cmts_ip: str, raw: dict) -> dict[int, str]:
+        """Resolve only interface indexes referenced by the modem inventory.
+
+        A full IF-MIB ifName walk is unbounded on large CMTS platforms and can
+        consume the per-tree inventory budget. Targeted GETs preserve the
+        optional display names without blocking the critical MAC collection.
+        """
+        needed: set[int] = set()
+        for item in raw.get(OID_OLD_US_CH_IF, []) or []:
+            try:
+                value = int(item.get('value'))
+                if value > 0:
+                    needed.add(value)
+            except (TypeError, ValueError):
+                continue
+        for item in raw.get(OID_US_CH_ID, []) or []:
+            try:
+                suffix = self._extract_index(item.get('oid', ''), OID_US_CH_ID)
+                parts = suffix.split('.')
+                if len(parts) >= 2:
+                    value = int(parts[1])
+                    if value > 0:
+                        needed.add(value)
+            except (TypeError, ValueError):
+                continue
+
+        # Interface names are optional metadata. Bound the request so an
+        # unusually fragmented CMTS cannot create another unbounded operation.
+        indexes = sorted(needed)[:2000]
+        if not indexes:
+            return {}
+        oids = [f'{OID_IF_NAME}.{index}' for index in indexes]
+        try:
+            result = await self._send_agent_command(
+                'snmp_bulk_get',
+                {
+                    'target_ip': cmts_ip,
+                    'oids': oids,
+                    'timeout': 5,
+                    'retries': 0,
+                    'max_concurrent': 25,
+                },
+                timeout=90,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Targeted ifName lookup skipped for %s (%s indexes): %s",
+                cmts_ip,
+                len(indexes),
+                exc,
+            )
+            return {}
+
+        names: dict[int, str] = {}
+        for oid, response in (result.get('results') or {}).items():
+            try:
+                index = int(str(oid).rsplit('.', 1)[-1])
+            except (TypeError, ValueError):
+                continue
+            name = self._agent_scalar_value(response)
+            if name:
+                names[index] = name
+        self.logger.info(
+            "Resolved %s/%s targeted CMTS interface names for %s",
+            len(names), len(indexes), cmts_ip,
+        )
+        return names
+
     @staticmethod
-    def _agent_scalar_value(result: dict) -> str | None:
-        """Extract a scalar value from a normalized agent SNMP response."""
+    def _agent_scalar_value(result: dict | None) -> str | None:
+        """Extract one scalar from an agent GET/bulk-get response."""
         payload = result or {}
-        nested = payload.get('result')
+        nested = payload.get('result') if isinstance(payload, dict) else None
         if isinstance(nested, dict):
             payload = nested
         if payload.get('success') is not True:
@@ -352,6 +420,7 @@ class CMTSModemService:
                 text = text[len(prefix):].strip()
                 break
         return text.strip('"') or None
+
 
     async def resolve_modem_interface(
         self,
@@ -1488,7 +1557,7 @@ class CMTSModemService:
             full_walk_oids = [
                 OID_D3_MAC, OID_OLD_MAC, OID_OLD_IP, OID_OLD_STATUS,
                 OID_OLD_US_CH_IF,
-                OID_US_CH_ID, OID_IF_NAME,
+                OID_US_CH_ID,
                 OID_DS_PROFILE_LIST, OID_US_PROFILE_LIST, OID_PARTIAL_SVC,
                 OID_D4_ADV_CAP,
             ]
@@ -1715,8 +1784,14 @@ class CMTSModemService:
                     and all(oid in completed_oids for oid in cpe_oids)
                 )
 
+            # Resolve only referenced IF-MIB indexes. Never walk the full
+            # ifName table as part of the critical large-CMTS inventory walk.
+            targeted_if_names = {}
+            if collection_mode == "full":
+                targeted_if_names = await self._resolve_targeted_if_names(cmts_ip, raw)
+
             # ── Step 2: Parse raw results into lookup maps ───────────────
-            modems = self._correlate_modem_data(raw, limit)
+            modems = self._correlate_modem_data(raw, limit, targeted_if_names)
             if collect_cpe:
                 cpe_addresses, skipped_cpe_rows = self._correlate_cpe_data(raw, modems)
                 inventory_meta.update({
@@ -2095,7 +2170,12 @@ class CMTSModemService:
 
     # ── correlation logic (moved from agent._async_cmts_get_modems) ─────
 
-    def _correlate_modem_data(self, raw: dict, limit: int = 50000) -> List[Dict[str, Any]]:
+    def _correlate_modem_data(
+        self,
+        raw: dict,
+        limit: int = 50000,
+        targeted_if_names: dict[int, str] | None = None,
+    ) -> List[Dict[str, Any]]:
         """Build the modem list from raw parallel-walk results.
 
         ``raw`` is ``{oid_base: [{'oid': full, 'value': parsed, 'type': t}, …]}``.
@@ -2138,7 +2218,7 @@ class CMTSModemService:
                 pass
 
         # ---- IF-MIB::ifName ----
-        if_name_map: dict[int, str] = {}
+        if_name_map: dict[int, str] = dict(targeted_if_names or {})
         for item in raw.get(OID_IF_NAME, []):
             name = str(item['value'])
             if name and 'No Such' not in name:
