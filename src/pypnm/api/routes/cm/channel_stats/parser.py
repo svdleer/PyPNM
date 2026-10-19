@@ -26,6 +26,7 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
         'docsIf31CmStatusOfdmaUsTable': '1.3.6.1.4.1.4491.2.1.28.1.12',
         'docsIf31CmUsOfdmaProfileStatsTable': '1.3.6.1.4.1.4491.2.1.28.1.14',
         'docsPnmCmDsOfdmRxMerTable': '1.3.6.1.4.1.4491.2.1.27.1.2.5',
+        'docsQosCmDsidStatsTable': '1.3.6.1.4.1.4491.2.1.21.1.22',
     }
     
     # Column mappings (from agent)
@@ -79,6 +80,10 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
         'docsPnmCmDsOfdmRxMerTable': {
             # col 3: rxMerMean (in 1/10 dB), col 4: rxMerStdDev
             3: 'rxMerMean', 4: 'rxMerStdDev'
+        },
+        'docsQosCmDsidStatsTable': {
+            1: 'dsid', 2: 'seq_num_missing', 3: 'skew_thresh_exceeds',
+            4: 'out_of_range_packets', 5: 'num_packets',
         },
     }
     
@@ -205,6 +210,7 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
     ds_rx_status = tables_data.get('docsIf31RxChStatusTable', {})
     ds_ofdm_profile_stats = tables_data.get('docsIf31CmDsOfdmProfileStatsTable', {})
     ds_ofdm_rxmer = tables_data.get('docsPnmCmDsOfdmRxMerTable', {})
+    ds_dsid_stats = tables_data.get('docsQosCmDsidStatsTable', {})
     us_up = tables_data.get('docsIfUpChannelTable', {})
     us_status = tables_data.get('docsIf3CmStatusUsTable', {})
     us_ofdma = tables_data.get('docsIf31CmUsOfdmaChanTable', {})
@@ -411,6 +417,22 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
         
         us_ofdma_channels.append(ofdma_ch)
     
+    ds_dsid_rows = []
+    for dsid_index in sorted(ds_dsid_stats):
+        row = ds_dsid_stats.get(dsid_index, {})
+        dsid = row.get('dsid', dsid_index)
+        try:
+            dsid = int(dsid)
+        except (TypeError, ValueError):
+            dsid = dsid_index
+        ds_dsid_rows.append({
+            'dsid': dsid,
+            'seq_num_missing': row.get('seq_num_missing', 0),
+            'skew_thresh_exceeds': row.get('skew_thresh_exceeds', 0),
+            'out_of_range_packets': row.get('out_of_range_packets', 0),
+            'num_packets': row.get('num_packets', 0),
+        })
+
     parse_time = time.time() - start_parse
     
     return {
@@ -444,6 +466,7 @@ def parse_channel_stats_raw(raw_results: dict, walk_time: float, mac_address: st
                 'count': len(us_ofdma_channels),
             },
         },
+        'ds_dsid_stats': ds_dsid_rows,
     }
 
 
@@ -491,6 +514,7 @@ def parse_ofdm_stats_raw(
     cm_us_ofdma_channels: list | None = None,
     ifname_result=None,
     cmts_profile_result=None,
+    ds_dsid_stats: list | None = None,
 ) -> dict:
     """
     Parse CMTS-side OFDM/OFDMA statistics into a structured dict for the GUI.
@@ -499,7 +523,7 @@ def parse_ofdm_stats_raw(
       ds_profiles   - per DS-channel, per-profile: codewords (CM) + speed (CMTS) + partial reason
       us_iuc_stats  - per US-OFDMA channel ifIndex, per IUC: total/corrected/unreliable codewords
       ds_subcarrier - per DS-channel ifIndex, per range: main modulation
-    """
+      ds_dsid_stats - per-DSID downstream resequencing counters    """
 
     # ── 0. Build ifIndex → ifName map from CMTS ifXTable walk ──
     ifname_base = '1.3.6.1.2.1.31.1.1.1.1'
@@ -731,4 +755,5 @@ def parse_ofdm_stats_raw(
         'ds_profiles':   ds_profiles,
         'us_iuc_stats':  us_iuc_channels,
         'ds_subcarrier': ds_subcarrier,
+        'ds_dsid_stats': list(ds_dsid_stats or []),
     }

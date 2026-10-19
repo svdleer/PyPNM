@@ -303,6 +303,7 @@ class ChannelStatsRouter:
                     '1.3.6.1.4.1.4491.2.1.28.1.12', # docsIf31CmStatusOfdmaUsTable
                     '1.3.6.1.4.1.4491.2.1.28.1.14', # docsIf31CmUsOfdmaProfileStatsTable (OFDMA IUC stats)
                     '1.3.6.1.4.1.4491.2.1.27.1.2.5', # docsPnmCmDsOfdmRxMerTable (OFDM DS MER mean)
+                    '1.3.6.1.4.1.4491.2.1.21.1.22',  # docsQosCmDsidStatsTable (DSID resequencing)
                 ]
 
                 # Experimental compact mode: fewer roots can be faster on some CMTS,
@@ -313,6 +314,7 @@ class ChannelStatsRouter:
                         '1.3.6.1.4.1.4491.2.1.20.1',   # docsIf3 root
                         '1.3.6.1.4.1.4491.2.1.28.1',   # docsIf31 root
                         '1.3.6.1.4.1.4491.2.1.27.1.2.5',
+                        '1.3.6.1.4.1.4491.2.1.21.1.22',
                     ]
                 else:
                     table_oids = canonical_table_oids
@@ -1271,6 +1273,7 @@ class ChannelStatsRouter:
                         # CM-side DS profile stats already in parsed
                         cm_ds_ofdm_channels=parsed.get('downstream', {}).get('ofdm', {}).get('channels', []),
                         cm_us_ofdma_channels=parsed.get('upstream', {}).get('ofdma', {}).get('channels', []),
+                        ds_dsid_stats=parsed.get('ds_dsid_stats', []),
                     )
 
                     # Align stats-page rows with authoritative current markers
