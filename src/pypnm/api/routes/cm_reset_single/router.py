@@ -14,7 +14,7 @@ from pypnm.api.routes.cm_reset_single.service import cm_single_reset_service
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/cm-reset", tags=["CM single reset"])
 
-_CONFIRMATION_PASSPHRASE = "have you tried turning it on and off again?"
+_CONFIRMATION_LETTERS = {"y", "e", "s"}
 _DOCS_DEV_RESET_NOW_OID = "1.3.6.1.2.1.69.1.1.3.0"
 
 
@@ -24,10 +24,11 @@ async def reset_single_modem(payload: CmSingleResetRequest) -> CmSingleResetResp
 
     This endpoint deliberately does not create a bulk-reset job and does not
     apply the bulk maintenance-window policy. The GUI authentication boundary
-    and exact confirmation phrase protect access to this operation.
+    and three-letter confirmation protect access to this operation.
     """
-    if payload.confirmation_passphrase.strip().lower() != _CONFIRMATION_PASSPHRASE:
-        raise HTTPException(status_code=403, detail="Incorrect reset confirmation phrase")
+    clicks = [str(letter).strip().lower() for letter in payload.confirmation_clicks]
+    if len(clicks) != 3 or len(set(clicks)) != 3 or set(clicks) != _CONFIRMATION_LETTERS:
+        raise HTTPException(status_code=403, detail="Click Y, E, and S to confirm the modem reset")
 
     try:
         modem = cm_single_reset_service.resolve_modem(payload.mac)
