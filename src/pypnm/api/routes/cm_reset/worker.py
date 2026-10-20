@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from datetime import datetime
 from typing import Any
@@ -15,17 +14,6 @@ logger = logging.getLogger(__name__)
 
 # OID for docsDevResetNow — SET to 1 (true) triggers modem reset
 _DOCS_DEV_RESET_NOW_OID = "1.3.6.1.2.1.69.1.1.3.0"
-
-
-def _configured_modem_community() -> str | None:
-    """Resolve the optional modem write community from environment/config."""
-    from pypnm.config.pnm_config_manager import PnmConfigManager
-    community = (
-        os.environ.get("MODEM_COMMUNITY")
-        or os.environ.get("CM_SNMP_COMMUNITY")
-        or PnmConfigManager.get_write_community()
-    )
-    return str(community) if community else None
 
 
 class CmResetWorker:
@@ -196,7 +184,6 @@ class CmResetWorker:
             if not agent:
                 raise RuntimeError("No cm_reachable agent connected")
 
-            community = _configured_modem_community()
             params = {
                 "target_ip": modem_ip,
                 "oid": _DOCS_DEV_RESET_NOW_OID,
@@ -206,8 +193,6 @@ class CmResetWorker:
                 "timeout": 3,
                 "retries": 0,
             }
-            if community:
-                params["community"] = community
 
             # Fire-and-forget: send the SET but don't wait long for confirmation
             # (modem will reset and drop the connection anyway)
