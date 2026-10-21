@@ -14,7 +14,7 @@ from pypnm.api.routes.cm_reset_single.service import cm_single_reset_service
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/cm-reset", tags=["CM single reset"])
 
-_CONFIRMATION_LETTERS = {"y", "e", "s"}
+_CONFIRMATION_SEQUENCE = ["y", "e", "s"]
 _DOCS_DEV_RESET_NOW_OID = "1.3.6.1.2.1.69.1.1.3.0"
 
 
@@ -27,8 +27,11 @@ async def reset_single_modem(payload: CmSingleResetRequest) -> CmSingleResetResp
     and three-letter confirmation protect access to this operation.
     """
     clicks = [str(letter).strip().lower() for letter in payload.confirmation_clicks]
-    if len(clicks) != 3 or len(set(clicks)) != 3 or set(clicks) != _CONFIRMATION_LETTERS:
-        raise HTTPException(status_code=403, detail="Click Y, E, and S to confirm the modem reset")
+    if clicks != _CONFIRMATION_SEQUENCE:
+        raise HTTPException(
+            status_code=403,
+            detail="Click Y, E, then S in that exact order to confirm the modem reset",
+        )
 
     try:
         modem = cm_single_reset_service.resolve_modem(payload.mac)
