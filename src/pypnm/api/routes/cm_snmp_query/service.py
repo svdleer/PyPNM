@@ -109,6 +109,7 @@ class CmSnmpQueryService:
                 modem_vendor VARCHAR(64) NULL,
                 modem_type VARCHAR(128) NULL,
                 modem_mac VARCHAR(20) NULL,
+                modem_ip VARCHAR(45) NULL,
                 verified_at DATETIME NOT NULL,
                 expires_at DATETIME NOT NULL,
                 used_at DATETIME NULL,
@@ -174,14 +175,15 @@ class CmSnmpQueryService:
             conn.commit()
         finally:
             conn.close()
-        try:
-            self._execute(
-                "ALTER TABLE snmp_query_oid_verification "
-                "ADD COLUMN modem_mac VARCHAR(20) NULL"
-            )
-        except pymysql.err.OperationalError:
-            # Existing deployments already have this migration.
-            pass
+        for migration in (
+            "ALTER TABLE snmp_query_oid_verification ADD COLUMN modem_mac VARCHAR(20) NULL",
+            "ALTER TABLE snmp_query_oid_verification ADD COLUMN modem_ip VARCHAR(45) NULL",
+        ):
+            try:
+                self._execute(migration)
+            except pymysql.err.OperationalError:
+                # Existing deployments already have this migration.
+                pass
         self._schema_ensured = True
 
     # ── Templates ─────────────────────────────────────────────
@@ -256,6 +258,7 @@ class CmSnmpQueryService:
         modem_vendor: str | None,
         modem_type: str | None,
         modem_mac: str | None = None,
+        modem_ip: str | None = None,
     ) -> dict[str, str]:
         """Persist a short-lived proof from a successful OID verification."""
         self.ensure_schema()
@@ -270,8 +273,8 @@ class CmSnmpQueryService:
             """
             INSERT INTO snmp_query_oid_verification
             (receipt_id, numeric_oid, target_mode, affiliate, cmts, modem_vendor,
-             modem_type, modem_mac, verified_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             modem_type, modem_mac, modem_ip, verified_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 receipt_id,
@@ -282,6 +285,7 @@ class CmSnmpQueryService:
                 vendor,
                 model,
                 str(modem_mac or "").strip().casefold() or None,
+                str(modem_ip or "").strip() or None,
                 verified_at.strftime("%Y-%m-%d %H:%M:%S"),
                 expires_at.strftime("%Y-%m-%d %H:%M:%S"),
             ),
@@ -298,13 +302,16 @@ class CmSnmpQueryService:
         vendor = self._scope_facet(scope, "modem_vendor", 64)
         model = self._scope_facet(scope, "modem_type", 128)
         target_mac: str | None = None
+        target_ip: str | None = None
         if scope_type == "single":
             cmts_value = self._scope_facet(scope, "cmts", 128)
             modem_mac = self._scope_facet(scope, "mac", 32)
-            if not cmts_value or not modem_mac:
-                raise ValueError("Single modem verification requires CMTS and MAC")
+            modem_ip = self._scope_facet(scope, "ip", 45)
+            if not cmts_value or bool(modem_mac) == bool(modem_ip):
+                raise ValueError("Single modem verification requires CMTS and exactly one of MAC or IP")
             cmts = cmts_value.casefold()
-            target_mac = modem_mac.casefold()
+            target_mac = modem_mac.casefold() if modem_mac else None
+            target_ip = modem_ip if modem_ip else None
         elif scope_type == "cmts":
             cmts_values = self._scope_strings(scope.get("cmts"), "cmts", 128)
             if len(cmts_values) != 1:
@@ -321,6 +328,7 @@ class CmSnmpQueryService:
             "modem_vendor": vendor,
             "modem_type": model,
             "modem_mac": target_mac,
+            "modem_ip": target_ip,
         }
 
     def _consume_verification_receipts(
@@ -801,17 +809,24 @@ class CmSnmpQueryService:
         if scope_type == "single":
             cmts_name = self._scope_facet(scope, "cmts", 128)
             modem_mac = self._scope_facet(scope, "mac", 32)
-            if not cmts_name or not modem_mac:
-                raise ValueError("single scope requires cmts and mac")
+            modem_ip = self._scope_facet(scope, "ip", 45)
+            if not cmts_name or bool(modem_mac) == bool(modem_ip):
+                raise ValueError("single scope requires cmts and exactly one of mac or ip")
+            identifier_column = "LOWER(TRIM(m.mac))" if modem_mac else "m.ip"
+            identifier_value = modem_mac if modem_mac else modem_ip
             rows = self._query(
                 "SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
                 "FROM modem_inventory_current m "
-                "WHERE LOWER(TRIM(m.mac))=LOWER(%s) "
+                f"WHERE {identifier_column}=" + ("LOWER(%s)" if modem_mac else "%s") + " "
                 "AND LOWER(TRIM(COALESCE(m.cmts,'')))=LOWER(%s) "
                 "AND m.inventory_state<>'retired' "
                 f"{online_filter} {affiliate_filter} {facet_filter} LIMIT 1",
-                (modem_mac, cmts_name, *affiliate_params, *facet_params),
+                (identifier_value, cmts_name, *affiliate_params, *facet_params),
             )
+            if not rows and modem_ip:
+                # An IP fallback may not have an inventory row; the worker only
+                # needs the target IP and the selected CMTS context.
+                rows = [{"mac": f"ip:{modem_ip}", "ip": modem_ip, "cmts": cmts_name, "cmts_ip": None, "fiber_node": None}]
         elif scope_type == "all_network":
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
@@ -1202,6 +1217,7 @@ class CmSnmpQueryService:
         modem_vendor: str | None = None,
         modem_type: str | None = None,
         modem_mac: str | None = None,
+        modem_ip: str | None = None,
         limit: int = 3,
     ) -> list[dict[str, str]]:
         """Return a bounded randomized modem sample without ORDER BY RAND()."""
@@ -1228,6 +1244,9 @@ class CmSnmpQueryService:
         if modem_mac:
             filters.append("LOWER(TRIM(m.mac))=%s")
             filter_params.append(str(modem_mac).strip().casefold())
+        if modem_ip:
+            filters.append("m.ip=%s")
+            filter_params.append(str(modem_ip).strip())
         if vendor:
             filters.append("TRIM(COALESCE(m.vendor,''))=%s")
             filter_params.append(vendor)

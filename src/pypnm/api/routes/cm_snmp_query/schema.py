@@ -47,7 +47,7 @@ class SnmpQueryPlanRequest(BaseModel):
     scope: dict[str, Any] = Field(
         description=(
             '{"type": "single", "cmts": "CMTS-NAME", "mac": "aa:bb:cc:dd:ee:ff", '
-            '"affiliate": "all|vfz|fziggo|fupc"} | '
+            '"ip": "192.0.2.10", "affiliate": "all|vfz|fziggo|fupc"} | '
             '{"type": "cmts", "cmts": ["CMTS-NAME"], "affiliate": "all|vfz|fziggo|fupc"} | '
             '{"type": "fiber_node", "cmts": "CMTS-NAME", "fiber_nodes": ["TECHNICAL-FN"], '
             '"affiliate": "all|vfz|fziggo|fupc"} | '
@@ -83,6 +83,7 @@ class SnmpOidVerifyRequest(BaseModel):
     affiliate: str = Field(default="all", pattern="^(all|vfz|fziggo|fupc)$")
     cmts: str | None = Field(default=None, max_length=128)
     modem_mac: str | None = Field(default=None, max_length=32)
+    modem_ip: str | None = Field(default=None, max_length=45)
     modem_vendor: str | None = Field(default=None, max_length=64)
     modem_type: str | None = Field(default=None, max_length=128)
 

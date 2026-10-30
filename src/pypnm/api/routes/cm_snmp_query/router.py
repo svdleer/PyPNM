@@ -347,27 +347,38 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                 for cmts in cmts_candidates
             ]
         else:
-            candidates = []
-            modem_limit = 3 if selected_cmts else 1
-            for cmts in cmts_candidates:
-                modems = await asyncio.to_thread(
-                    cm_snmp_query_service.get_verify_modem_candidates,
-                    cmts=cmts["hostname"],
-                    modem_vendor=payload.modem_vendor,
-                    modem_type=payload.modem_type,
-                    modem_mac=payload.modem_mac,
-                    limit=modem_limit,
-                )
-                candidates.extend(
-                    {
-                        "role": "cm",
-                        "ip": modem["ip"],
-                        "cmts": modem["cmts"],
-                        "cmts_ip": modem["cmts_ip"],
-                        "mac": modem["mac"],
-                    }
-                    for modem in modems
-                )
+            if payload.modem_ip:
+                cmts = cmts_candidates[0]
+                candidates = [{
+                    "role": "cm",
+                    "ip": payload.modem_ip,
+                    "cmts": cmts["hostname"],
+                    "cmts_ip": cmts["ip_address"],
+                    "mac": None,
+                }]
+            else:
+                candidates = []
+                modem_limit = 3 if selected_cmts else 1
+                for cmts in cmts_candidates:
+                    modems = await asyncio.to_thread(
+                        cm_snmp_query_service.get_verify_modem_candidates,
+                        cmts=cmts["hostname"],
+                        modem_vendor=payload.modem_vendor,
+                        modem_type=payload.modem_type,
+                        modem_mac=payload.modem_mac,
+                        modem_ip=payload.modem_ip,
+                        limit=modem_limit,
+                    )
+                    candidates.extend(
+                        {
+                            "role": "cm",
+                            "ip": modem["ip"],
+                            "cmts": modem["cmts"],
+                            "cmts_ip": modem["cmts_ip"],
+                            "mac": modem["mac"],
+                        }
+                        for modem in modems
+                    )
         if not candidates:
             raise HTTPException(status_code=404, detail="No eligible modem verification target found")
 
@@ -441,6 +452,7 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                             modem_vendor=payload.modem_vendor,
                             modem_type=payload.modem_type,
                             modem_mac=payload.modem_mac,
+                            modem_ip=payload.modem_ip,
                         ),
                         "attempts_used": len(attempts),
                         "attempts_limit": len(candidates),
