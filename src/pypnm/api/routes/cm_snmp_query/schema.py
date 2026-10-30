@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +14,10 @@ class OidEntry(BaseModel):
     """A single OID to query per modem."""
     oid: str = Field(description="OID — numeric (1.3.6.1.2.1.1.3.0) or MIB name (sysUpTime.0)")
     label: str | None = Field(default=None, description="Optional friendly column name for export")
+    operation: Literal["get", "walk"] = Field(
+        default="walk",
+        description="GET one value or WALK the OID subtree and return all descendants",
+    )
 
 
 # ── Templates ────────────────────────────────────────────────
@@ -80,6 +84,7 @@ class SnmpQueryJobStartRequest(BaseModel):
 class SnmpOidVerifyRequest(BaseModel):
     oid: str = Field(min_length=1)
     target_mode: str = Field(default="modem", pattern="^(modem|cmts)$")
+    operation: Literal["get", "walk"] = Field(default="walk")
     affiliate: str = Field(default="all", pattern="^(all|vfz|fziggo|fupc)$")
     cmts: str | None = Field(default=None, max_length=128)
     modem_mac: str | None = Field(default=None, max_length=32)

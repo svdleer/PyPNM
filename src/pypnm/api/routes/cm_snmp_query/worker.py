@@ -161,48 +161,71 @@ class CmSnmpQueryWorker:
                 raise RuntimeError("No cm_reachable agent connected")
 
             resolved_entries = [
-                (entry.get("label") or entry.get("oid", ""), resolve_oid(entry.get("oid", "")))
+                (
+                    entry.get("label") or entry.get("oid", ""),
+                    resolve_oid(entry.get("oid", "")),
+                    str(entry.get("operation") or "get").lower(),
+                )
                 for entry in oids
             ]
-            results: dict[str, Any] = {label: None for label, _ in resolved_entries}
-            params = {
-                "target_ip": modem_ip,
-                "oids": [numeric_oid for _, numeric_oid in resolved_entries],
-                "target_role": "cm",
-                "timeout": 5,
-                "retries": 1,
-                # Preserve the previous one-request-at-a-time modem load shape.
-                "max_concurrent": 1,
-            }
-            if community:
-                params["community"] = community
+            results: dict[str, Any] = {label: None for label, _, _ in resolved_entries}
 
-            task_id = await agent_manager.send_task(
-                agent.agent_id,
-                "snmp_bulk_get",
-                params,
-                timeout=30,
-                priority="bulk",
-            )
-            result = await agent_manager.wait_for_task_async(task_id, timeout=30)
-            if not result or result.get("type") != "response":
-                raise RuntimeError("Agent bulk SNMP task timed out")
-            response = result.get("result", {})
-            if not response.get("success"):
-                raise RuntimeError(response.get("error") or "Agent bulk SNMP task failed")
-            oid_results = response.get("results", {})
+            get_entries = [entry for entry in resolved_entries if entry[2] == "get"]
+            walk_entries = [entry for entry in resolved_entries if entry[2] == "walk"]
+            if get_entries:
+                params = {
+                    "target_ip": modem_ip,
+                    "oids": [numeric_oid for _, numeric_oid, _ in get_entries],
+                    "target_role": "cm",
+                    "timeout": 5,
+                    "retries": 1,
+                    "max_concurrent": 1,
+                }
+                if community:
+                    params["community"] = community
+                task_id = await agent_manager.send_task(
+                    agent.agent_id, "snmp_bulk_get", params, timeout=30, priority="bulk"
+                )
+                result = await agent_manager.wait_for_task_async(task_id, timeout=30)
+                if not result or result.get("type") != "response":
+                    raise RuntimeError("Agent bulk SNMP task timed out")
+                response = result.get("result", {})
+                if not response.get("success"):
+                    raise RuntimeError(response.get("error") or "Agent bulk SNMP task failed")
+                oid_results = response.get("results", {})
+                for label, numeric_oid, _ in get_entries:
+                    oid_result = oid_results.get(numeric_oid) or oid_results.get(numeric_oid.lstrip("."))
+                    if not isinstance(oid_result, dict) or not oid_result.get("success"):
+                        continue
+                    value = oid_result.get("value")
+                    if value is None and oid_result.get("results"):
+                        value = oid_result["results"][0].get("value")
+                    if value is None and oid_result.get("output") is not None:
+                        raw = str(oid_result["output"])
+                        value = raw.split(" = ", 1)[1].strip() if " = " in raw else raw.strip()
+                    results[label] = value
 
-            for label, numeric_oid in resolved_entries:
-                oid_result = oid_results.get(numeric_oid) or oid_results.get(numeric_oid.lstrip("."))
-                if not isinstance(oid_result, dict) or not oid_result.get("success"):
-                    continue
-                value = oid_result.get("value")
-                if value is None and oid_result.get("results"):
-                    value = oid_result["results"][0].get("value")
-                if value is None and oid_result.get("output") is not None:
-                    raw = str(oid_result["output"])
-                    value = raw.split(" = ", 1)[1].strip() if " = " in raw else raw.strip()
-                results[label] = value
+            for label, numeric_oid, _ in walk_entries:
+                walk_params = {
+                    "target_ip": modem_ip,
+                    "oid": numeric_oid,
+                    "target_role": "cm",
+                    "timeout": 5,
+                    "retries": 1,
+                    "max_repetitions": 25,
+                }
+                if community:
+                    walk_params["community"] = community
+                task_id = await agent_manager.send_task(
+                    agent.agent_id, "snmp_walk", walk_params, timeout=60, priority="bulk"
+                )
+                walk_result = await agent_manager.wait_for_task_async(task_id, timeout=60)
+                if not walk_result or walk_result.get("type") != "response":
+                    raise RuntimeError("Agent SNMP walk task timed out")
+                walk_response = walk_result.get("result", {})
+                if not walk_response.get("success"):
+                    raise RuntimeError(walk_response.get("error") or "Agent SNMP walk failed")
+                results[label] = walk_response.get("results") or []
 
             await asyncio.to_thread(
                 cm_snmp_query_service.record_target_result, target_id, results

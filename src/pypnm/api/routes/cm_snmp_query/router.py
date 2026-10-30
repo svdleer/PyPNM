@@ -403,9 +403,10 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                     raise RuntimeError(
                         f"No {capability} agent with interactive capacity"
                     )
+                command = "snmp_walk" if payload.operation == "walk" else "snmp_get"
                 task_id = await agent_manager.send_task(
                     agent_id,
-                    "snmp_get",
+                    command,
                     {
                         "target_ip": target["ip"],
                         "oid": oid,
@@ -413,25 +414,31 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                         "timeout": 3,
                         "retries": 0,
                     },
-                    timeout=5,
+                    timeout=30 if payload.operation == "walk" else 5,
                     priority="interactive",
                 )
-                result = await agent_manager.wait_for_task_async(task_id, timeout=5)
+                result = await agent_manager.wait_for_task_async(
+                    task_id, timeout=30 if payload.operation == "walk" else 5
+                )
                 response = result.get("result") if isinstance(result, dict) else None
                 if not isinstance(response, dict):
-                    error = (
-                        result.get("error")
-                        if isinstance(result, dict)
-                        else "Agent returned an invalid task response"
-                    )
+                    error = result.get("error") if isinstance(result, dict) else "Agent returned an invalid task response"
                     raise RuntimeError(str(error or "Agent task failed"))
 
-                output = str(response.get("output") or "")
-                value = output.split(" = ", 1)[1].strip() if " = " in output else output.strip()
-                if response.get("success") and value and value.lower() not in {
-                    "no such object",
-                    "no such instance",
-                }:
+                if payload.operation == "walk":
+                    value = response.get("results") or []
+                    success = bool(response.get("success") and value)
+                    display_value = f"{len(value)} descendant values"
+                else:
+                    output = str(response.get("output") or "")
+                    value = output.split(" = ", 1)[1].strip() if " = " in output else output.strip()
+                    success = bool(
+                        response.get("success")
+                        and value
+                        and value.lower() not in {"no such object", "no such instance"}
+                    )
+                    display_value = value
+                if success:
                     attempt["success"] = True
                     attempts.append(attempt)
                     modem_ip = target["ip"] if target["role"] == "cm" else None
@@ -441,6 +448,7 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                         "numeric_oid": oid,
                         "value": value,
                         "target_mode": payload.target_mode,
+                        "operation": payload.operation,
                         "modem_ip": modem_ip,
                         "cmts_ip": target["cmts_ip"],
                         "target": {**attempt, "modem_ip": modem_ip},
@@ -453,15 +461,14 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                             modem_type=payload.modem_type,
                             modem_mac=payload.modem_mac,
                             modem_ip=payload.modem_ip,
+                            operation=payload.operation,
                         ),
                         "attempts_used": len(attempts),
                         "attempts_limit": len(candidates),
                         "attempts": attempts,
                     }
-                error = response.get("error")
-                if not error and value:
-                    error = f"OID returned no usable value ({value})"
-                raise RuntimeError(str(error or "OID returned no value"))
+                error = response.get("error") or f"OID returned no usable value ({display_value})"
+                raise RuntimeError(str(error))
             except Exception as exc:
                 attempt["success"] = False
                 attempt["error"] = str(exc)

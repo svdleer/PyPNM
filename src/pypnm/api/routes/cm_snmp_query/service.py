@@ -110,6 +110,7 @@ class CmSnmpQueryService:
                 modem_type VARCHAR(128) NULL,
                 modem_mac VARCHAR(20) NULL,
                 modem_ip VARCHAR(45) NULL,
+                operation VARCHAR(8) NOT NULL DEFAULT 'get',
                 verified_at DATETIME NOT NULL,
                 expires_at DATETIME NOT NULL,
                 used_at DATETIME NULL,
@@ -178,6 +179,7 @@ class CmSnmpQueryService:
         for migration in (
             "ALTER TABLE snmp_query_oid_verification ADD COLUMN modem_mac VARCHAR(20) NULL",
             "ALTER TABLE snmp_query_oid_verification ADD COLUMN modem_ip VARCHAR(45) NULL",
+            "ALTER TABLE snmp_query_oid_verification ADD COLUMN operation VARCHAR(8) NOT NULL DEFAULT 'get'",
         ):
             try:
                 self._execute(migration)
@@ -259,6 +261,7 @@ class CmSnmpQueryService:
         modem_type: str | None,
         modem_mac: str | None = None,
         modem_ip: str | None = None,
+        operation: str = "get",
     ) -> dict[str, str]:
         """Persist a short-lived proof from a successful OID verification."""
         self.ensure_schema()
@@ -273,8 +276,8 @@ class CmSnmpQueryService:
             """
             INSERT INTO snmp_query_oid_verification
             (receipt_id, numeric_oid, target_mode, affiliate, cmts, modem_vendor,
-             modem_type, modem_mac, modem_ip, verified_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             modem_type, modem_mac, modem_ip, operation, verified_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 receipt_id,
@@ -286,6 +289,7 @@ class CmSnmpQueryService:
                 model,
                 str(modem_mac or "").strip().casefold() or None,
                 str(modem_ip or "").strip() or None,
+                operation if operation in {"get", "walk"} else "get",
                 verified_at.strftime("%Y-%m-%d %H:%M:%S"),
                 expires_at.strftime("%Y-%m-%d %H:%M:%S"),
             ),
@@ -375,6 +379,13 @@ class CmSnmpQueryService:
         current_time = datetime.now(timezone.utc).replace(tzinfo=None)
         for numeric_oid in numeric_oids:
             receipt = expected_by_oid[numeric_oid]
+            entry = next(
+                entry for entry in oids
+                if resolve_oid(str(entry.get("oid") or "").strip()) == numeric_oid
+            )
+            expected_operation = str(entry.get("operation") or "get").lower()
+            if (receipt.get("operation") or "get") != expected_operation:
+                raise ValueError("OID verification operation does not match the planned operation")
             if receipt.get("used_at") is not None:
                 raise ValueError("OID verification receipt has already been used")
             expires_at = receipt.get("expires_at")
