@@ -46,6 +46,8 @@ class SnmpQueryPlanRequest(BaseModel):
     """Create a custom SNMP query job."""
     scope: dict[str, Any] = Field(
         description=(
+            '{"type": "single", "cmts": "CMTS-NAME", "mac": "aa:bb:cc:dd:ee:ff", '
+            '"affiliate": "all|vfz|fziggo|fupc"} | '
             '{"type": "cmts", "cmts": ["CMTS-NAME"], "affiliate": "all|vfz|fziggo|fupc"} | '
             '{"type": "fiber_node", "cmts": "CMTS-NAME", "fiber_nodes": ["TECHNICAL-FN"], '
             '"affiliate": "all|vfz|fziggo|fupc"} | '
@@ -80,6 +82,7 @@ class SnmpOidVerifyRequest(BaseModel):
     target_mode: str = Field(default="modem", pattern="^(modem|cmts)$")
     affiliate: str = Field(default="all", pattern="^(all|vfz|fziggo|fupc)$")
     cmts: str | None = Field(default=None, max_length=128)
+    modem_mac: str | None = Field(default=None, max_length=32)
     modem_vendor: str | None = Field(default=None, max_length=64)
     modem_type: str | None = Field(default=None, max_length=128)
 
@@ -145,7 +148,7 @@ class SnmpQueryTargetListResponse(BaseModel):
 class SnmpQueryCapabilitiesResponse(BaseModel):
     status: str = "success"
     scope_types: list[str] = Field(
-        default_factory=lambda: ["all_network", "cmts", "fiber_node"]
+        default_factory=lambda: ["all_network", "cmts", "fiber_node", "single"]
     )
     max_oids: int = 50
     max_concurrency: int = 20

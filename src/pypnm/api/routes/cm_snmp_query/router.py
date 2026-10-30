@@ -65,6 +65,32 @@ def get_cmts_options(
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
 
+@router.get("/options/modems")
+def get_modem_options(
+    cmts: str = Query(min_length=1, max_length=128),
+    q: str = Query(min_length=2, max_length=32),
+    affiliate: str = Query(default="all", pattern="^(all|vfz|fziggo|fupc)$"),
+    limit: int = Query(default=10, ge=1, le=20),
+) -> dict:
+    try:
+        return {
+            "status": "success",
+            "modems": cm_snmp_query_service.get_modem_options(
+                cmts=cmts,
+                query=q,
+                affiliate=affiliate,
+                limit=limit,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CmtsDirectoryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="CMTS directory unavailable") from exc
+    except Exception as exc:
+        logger.error("Custom SNMP modem options failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
 @router.get("/options/fiber-nodes")
 def get_fiber_node_options(
     cmts: str = Query(max_length=128),
@@ -329,6 +355,7 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                     cmts=cmts["hostname"],
                     modem_vendor=payload.modem_vendor,
                     modem_type=payload.modem_type,
+                    modem_mac=payload.modem_mac,
                     limit=modem_limit,
                 )
                 candidates.extend(
@@ -413,6 +440,7 @@ async def verify_oid(payload: SnmpOidVerifyRequest) -> dict:
                             cmts=selected_cmts,
                             modem_vendor=payload.modem_vendor,
                             modem_type=payload.modem_type,
+                            modem_mac=payload.modem_mac,
                         ),
                         "attempts_used": len(attempts),
                         "attempts_limit": len(candidates),

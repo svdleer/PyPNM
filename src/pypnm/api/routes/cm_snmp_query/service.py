@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -107,6 +108,7 @@ class CmSnmpQueryService:
                 cmts VARCHAR(128) NULL,
                 modem_vendor VARCHAR(64) NULL,
                 modem_type VARCHAR(128) NULL,
+                modem_mac VARCHAR(20) NULL,
                 verified_at DATETIME NOT NULL,
                 expires_at DATETIME NOT NULL,
                 used_at DATETIME NULL,
@@ -172,6 +174,14 @@ class CmSnmpQueryService:
             conn.commit()
         finally:
             conn.close()
+        try:
+            self._execute(
+                "ALTER TABLE snmp_query_oid_verification "
+                "ADD COLUMN modem_mac VARCHAR(20) NULL"
+            )
+        except pymysql.err.OperationalError:
+            # Existing deployments already have this migration.
+            pass
         self._schema_ensured = True
 
     # ── Templates ─────────────────────────────────────────────
@@ -245,6 +255,7 @@ class CmSnmpQueryService:
         cmts: str | None,
         modem_vendor: str | None,
         modem_type: str | None,
+        modem_mac: str | None = None,
     ) -> dict[str, str]:
         """Persist a short-lived proof from a successful OID verification."""
         self.ensure_schema()
@@ -259,8 +270,8 @@ class CmSnmpQueryService:
             """
             INSERT INTO snmp_query_oid_verification
             (receipt_id, numeric_oid, target_mode, affiliate, cmts, modem_vendor,
-             modem_type, verified_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+             modem_type, modem_mac, verified_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 receipt_id,
@@ -270,6 +281,7 @@ class CmSnmpQueryService:
                 normalized_cmts,
                 vendor,
                 model,
+                str(modem_mac or "").strip().casefold() or None,
                 verified_at.strftime("%Y-%m-%d %H:%M:%S"),
                 expires_at.strftime("%Y-%m-%d %H:%M:%S"),
             ),
@@ -285,7 +297,15 @@ class CmSnmpQueryService:
         affiliate = self._normalize_affiliate(scope.get("affiliate"))
         vendor = self._scope_facet(scope, "modem_vendor", 64)
         model = self._scope_facet(scope, "modem_type", 128)
-        if scope_type == "cmts":
+        target_mac: str | None = None
+        if scope_type == "single":
+            cmts_value = self._scope_facet(scope, "cmts", 128)
+            modem_mac = self._scope_facet(scope, "mac", 32)
+            if not cmts_value or not modem_mac:
+                raise ValueError("Single modem verification requires CMTS and MAC")
+            cmts = cmts_value.casefold()
+            target_mac = modem_mac.casefold()
+        elif scope_type == "cmts":
             cmts_values = self._scope_strings(scope.get("cmts"), "cmts", 128)
             if len(cmts_values) != 1:
                 raise ValueError("Verified modem OIDs require exactly one CMTS per task")
@@ -300,6 +320,7 @@ class CmSnmpQueryService:
             "cmts": cmts,
             "modem_vendor": vendor,
             "modem_type": model,
+            "modem_mac": target_mac,
         }
 
     def _consume_verification_receipts(
@@ -488,7 +509,7 @@ class CmSnmpQueryService:
         self.ensure_schema()
         scope = dict(payload.get("scope") or {})
         scope_type = str(scope.get("type") or "all_network").strip().lower()
-        if scope_type not in {"all_network", "cmts", "fiber_node"}:
+        if scope_type not in {"all_network", "cmts", "fiber_node", "single"}:
             raise ValueError(f"Unsupported scope type: {scope_type}")
 
         # Resolve OIDs from template or inline
@@ -507,6 +528,8 @@ class CmSnmpQueryService:
         requested_by = str(payload.get("requested_by") or "admin").strip()[:64]
         verification_receipts = payload.get("verification_receipts")
         if bool(payload.get("all_matching_modems")):
+            if scope_type == "single":
+                raise ValueError("all_matching_modems cannot be used with a single modem scope")
             if max_modems is not None:
                 raise ValueError("all_matching_modems cannot be combined with max_modems")
             return self._create_all_matching_plan(
@@ -775,7 +798,21 @@ class CmSnmpQueryService:
             topology_join = ""
             fiber_node_col = "m.fiber_node AS fiber_node"
 
-        if scope_type == "all_network":
+        if scope_type == "single":
+            cmts_name = self._scope_facet(scope, "cmts", 128)
+            modem_mac = self._scope_facet(scope, "mac", 32)
+            if not cmts_name or not modem_mac:
+                raise ValueError("single scope requires cmts and mac")
+            rows = self._query(
+                "SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
+                "FROM modem_inventory_current m "
+                "WHERE LOWER(TRIM(m.mac))=LOWER(%s) "
+                "AND LOWER(TRIM(COALESCE(m.cmts,'')))=LOWER(%s) "
+                "AND m.inventory_state<>'retired' "
+                f"{online_filter} {affiliate_filter} {facet_filter} LIMIT 1",
+                (modem_mac, cmts_name, *affiliate_params, *facet_params),
+            )
+        elif scope_type == "all_network":
             rows = self._query(
                 f"SELECT m.mac, m.ip, m.cmts, m.cmts_ip, {fiber_node_col} "
                 f"FROM modem_inventory_current m {topology_join} "
@@ -1164,6 +1201,7 @@ class CmSnmpQueryService:
         cmts: str,
         modem_vendor: str | None = None,
         modem_type: str | None = None,
+        modem_mac: str | None = None,
         limit: int = 3,
     ) -> list[dict[str, str]]:
         """Return a bounded randomized modem sample without ORDER BY RAND()."""
@@ -1187,6 +1225,9 @@ class CmSnmpQueryService:
             "m.status IN ('operational','registrationComplete','ipComplete','online')",
         ]
         filter_params: list[str] = [normalized_cmts]
+        if modem_mac:
+            filters.append("LOWER(TRIM(m.mac))=%s")
+            filter_params.append(str(modem_mac).strip().casefold())
         if vendor:
             filters.append("TRIM(COALESCE(m.vendor,''))=%s")
             filter_params.append(vendor)
@@ -1218,6 +1259,42 @@ class CmSnmpQueryService:
                 "cmts_ip": str(row.get("cmts_ip") or ""),
             }
             for row in selected[:requested_limit]
+        ]
+
+    def get_modem_options(
+        self,
+        *,
+        cmts: str,
+        query: str,
+        affiliate: str = "all",
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return bounded active modem suggestions for one selected CMTS."""
+        normalized_cmts = self._scope_facet({"cmts": cmts}, "cmts", 128)
+        search = str(query or "").strip().lower()
+        compact = re.sub(r"[^0-9a-f]", "", search)
+        if len(compact) < 2 or not re.fullmatch(r"[0-9a-f]+", compact):
+            return []
+        normalized_affiliate = self._normalize_affiliate(affiliate)
+        affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(normalized_affiliate)
+        compact_mac_sql = "LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))"
+        rows = self._query(
+            f"SELECT m.mac, m.ip, m.vendor, m.model "
+            f"FROM modem_inventory_current m "
+            f"WHERE LOWER(TRIM(COALESCE(m.cmts,'')))=LOWER(%s) "
+            f"AND m.inventory_state<>'retired' {self._online_inventory_filter()} "
+            f"AND {compact_mac_sql} LIKE %s {affiliate_filter} "
+            f"ORDER BY m.mac LIMIT %s",
+            (normalized_cmts, f"{compact}%", *affiliate_params, max(1, min(int(limit), 20))),
+        )
+        return [
+            {
+                "mac": row.get("mac"),
+                "ip": row.get("ip"),
+                "vendor": row.get("vendor"),
+                "model": row.get("model"),
+            }
+            for row in rows
         ]
 
     def get_fiber_node_options(self, cmts: str, affiliate: str = "all") -> list[str]:
