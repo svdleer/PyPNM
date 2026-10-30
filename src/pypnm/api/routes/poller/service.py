@@ -6059,7 +6059,12 @@ class PollerService:
         return [self._map_inventory_row(row) for row in rows]
 
     def clear_inventory_modems(self, cmts: Optional[str] = None, cmts_ip: Optional[str] = None) -> int:
-        """Delete inventory rows scoped to a CMTS hostname and/or IP."""
+        """Delete inventory rows scoped to a CMTS hostname and/or IP.
+
+        Use exact predicates so MySQL can use the CMTS and CMTS-IP indexes on
+        large inventories. The configured hostname and IP are canonical values
+        from the GUI CMTS provider, so case-folding here only disables indexes.
+        """
         cmts_name = str(cmts or "").strip()
         cmts_addr = str(cmts_ip or "").strip()
         if not cmts_name and not cmts_addr:
@@ -6067,42 +6072,40 @@ class PollerService:
 
         where_parts: list[str] = []
         params: list[Any] = []
-        marker = "%s"
         if cmts_name:
-            where_parts.append(f"LOWER(COALESCE(cmts,'')) = LOWER({marker})")
+            where_parts.append("cmts=%s")
             params.append(cmts_name)
         if cmts_addr:
-            where_parts.append(f"LOWER(COALESCE(cmts_ip,'')) = LOWER({marker})")
+            where_parts.append("cmts_ip=%s")
             params.append(cmts_addr)
-
         where_sql = " OR ".join(where_parts)
+
         before_rows = self._query(
             f"SELECT COUNT(*) AS c FROM modem_inventory_current WHERE {where_sql}",
             tuple(params),
         )
         before_count = int((before_rows[0] or {}).get("c") or 0) if before_rows else 0
+
         if before_count > 0:
-            cpe_where: list[str] = []
-            cpe_params: list[Any] = []
-            if cmts_name:
-                cpe_where.append(
-                    "EXISTS (SELECT 1 FROM modem_inventory_current m "
-                    "WHERE m.mac=modem_cpe_ip_current.modem_mac "
-                    "AND LOWER(m.cmts)=LOWER(%s))"
-                )
-                cpe_params.append(cmts_name)
+            # Both branches use indexes: cmts_ip is indexed directly, while
+            # the hostname branch joins through indexed modem MAC values.
             if cmts_addr:
-                cpe_where.append("cmts_ip=%s")
-                cpe_params.append(cmts_addr)
-            if cpe_where:
                 self._execute(
-                    f"DELETE FROM modem_cpe_ip_current WHERE {' OR '.join(cpe_where)}",
-                    tuple(cpe_params),
+                    "DELETE FROM modem_cpe_ip_current WHERE cmts_ip=%s",
+                    (cmts_addr,),
+                )
+            if cmts_name:
+                self._execute(
+                    "DELETE cpe FROM modem_cpe_ip_current cpe "
+                    "INNER JOIN modem_inventory_current m ON m.mac=cpe.modem_mac "
+                    "WHERE m.cmts=%s",
+                    (cmts_name,),
                 )
             self._execute(
                 f"DELETE FROM modem_inventory_current WHERE {where_sql}",
                 tuple(params),
             )
+
         summary_rows = self._query(
             f"SELECT cmts_ip FROM inventory_summary_status WHERE {where_sql}",
             tuple(params),
