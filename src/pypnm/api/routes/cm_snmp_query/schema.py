@@ -15,7 +15,7 @@ class OidEntry(BaseModel):
     oid: str = Field(description="OID — numeric (1.3.6.1.2.1.1.3.0) or MIB name (sysUpTime.0)")
     label: str | None = Field(default=None, description="Optional friendly column name for export")
     operation: Literal["get", "walk"] = Field(
-        default="walk",
+        default="get",
         description="GET one value or WALK the OID subtree and return all descendants",
     )
 
@@ -84,7 +84,7 @@ class SnmpQueryJobStartRequest(BaseModel):
 class SnmpOidVerifyRequest(BaseModel):
     oid: str = Field(min_length=1)
     target_mode: str = Field(default="modem", pattern="^(modem|cmts)$")
-    operation: Literal["get", "walk"] = Field(default="walk")
+    operation: Literal["get", "walk"] = Field(default="get")
     affiliate: str = Field(default="all", pattern="^(all|vfz|fziggo|fupc)$")
     cmts: str | None = Field(default=None, max_length=128)
     modem_mac: str | None = Field(default=None, max_length=32)
