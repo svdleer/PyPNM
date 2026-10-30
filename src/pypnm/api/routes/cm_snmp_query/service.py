@@ -311,8 +311,8 @@ class CmSnmpQueryService:
             cmts_value = self._scope_facet(scope, "cmts", 128)
             modem_mac = self._scope_facet(scope, "mac", 32)
             modem_ip = self._scope_facet(scope, "ip", 45)
-            if not cmts_value or bool(modem_mac) == bool(modem_ip):
-                raise ValueError("Single modem verification requires CMTS and exactly one of MAC or IP")
+            if not cmts_value or not modem_mac and not modem_ip:
+                raise ValueError("Single modem verification requires CMTS and MAC or IP")
             cmts = cmts_value.casefold()
             target_mac = modem_mac.casefold() if modem_mac else None
             target_ip = modem_ip if modem_ip else None
@@ -821,18 +821,28 @@ class CmSnmpQueryService:
             cmts_name = self._scope_facet(scope, "cmts", 128)
             modem_mac = self._scope_facet(scope, "mac", 32)
             modem_ip = self._scope_facet(scope, "ip", 45)
-            if not cmts_name or bool(modem_mac) == bool(modem_ip):
-                raise ValueError("single scope requires cmts and exactly one of mac or ip")
-            identifier_column = "LOWER(TRIM(m.mac))" if modem_mac else "m.ip"
-            identifier_value = modem_mac if modem_mac else modem_ip
+            if not cmts_name or not modem_mac and not modem_ip:
+                raise ValueError("single scope requires cmts and mac or ip")
+            if modem_mac:
+                identifier_column = "LOWER(TRIM(m.mac))"
+                identifier_value = modem_mac
+            else:
+                identifier_column = "m.ip"
+                identifier_value = modem_ip
+            extra_ip_filter = " AND m.ip=%s" if modem_mac and modem_ip else ""
+            query_params = [identifier_value, cmts_name]
+            if extra_ip_filter:
+                query_params.append(modem_ip)
+            query_params.extend((*affiliate_params, *facet_params))
             rows = self._query(
                 "SELECT m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
-                "FROM modem_inventory_current m "
-                f"WHERE {identifier_column}=" + ("LOWER(%s)" if modem_mac else "%s") + " "
-                "AND LOWER(TRIM(COALESCE(m.cmts,'')))=LOWER(%s) "
-                "AND m.inventory_state<>'retired' "
+                f"FROM modem_inventory_current m WHERE {identifier_column}="
+                + ("LOWER(%s)" if modem_mac else "%s") + " "
+                "AND LOWER(TRIM(COALESCE(m.cmts,'')))=LOWER(%s)"
+                + extra_ip_filter
+                + " AND m.inventory_state<>'retired' "
                 f"{online_filter} {affiliate_filter} {facet_filter} LIMIT 1",
-                (identifier_value, cmts_name, *affiliate_params, *facet_params),
+                tuple(query_params),
             )
             if not rows and modem_ip:
                 # An IP fallback may not have an inventory row; the worker only
