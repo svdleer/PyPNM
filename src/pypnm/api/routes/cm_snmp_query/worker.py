@@ -148,6 +148,19 @@ class CmSnmpQueryWorker:
             )
             return
 
+        if str(target.get("mac") or "").startswith("ip:"):
+            resolved_mac = await asyncio.to_thread(
+                cm_snmp_query_service.resolve_inventory_mac_by_ip,
+                modem_ip,
+            )
+            if resolved_mac:
+                target["mac"] = resolved_mac
+                await asyncio.to_thread(
+                    cm_snmp_query_service.update_target_mac,
+                    target_id,
+                    resolved_mac,
+                )
+
         try:
             from pypnm.api.agent.manager import get_agent_manager
             from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid

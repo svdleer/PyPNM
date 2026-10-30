@@ -959,6 +959,21 @@ class CmSnmpQueryService:
         finally:
             conn.close()
 
+    def resolve_inventory_mac_by_ip(self, modem_ip: str) -> str | None:
+        rows = self._query(
+            "SELECT mac FROM modem_inventory_current "
+            "WHERE ip=%s AND inventory_state<>'retired' "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (str(modem_ip).strip(),),
+        )
+        return str(rows[0].get("mac") or "").strip() if rows else None
+
+    def update_target_mac(self, target_id: int, mac: str) -> None:
+        self._execute(
+            "UPDATE snmp_query_target SET mac=%s, updated_at=%s WHERE id=%s",
+            (mac, self._now(), int(target_id)),
+        )
+
     def record_target_result(self, target_id: int, results: dict[str, Any]) -> None:
         now = self._now()
         self._execute(
