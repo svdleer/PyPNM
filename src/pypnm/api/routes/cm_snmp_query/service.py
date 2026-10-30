@@ -1326,15 +1326,25 @@ class CmSnmpQueryService:
             return []
         normalized_affiliate = self._normalize_affiliate(affiliate)
         affiliate_filter, affiliate_params = self._affiliate_inventory_predicate(normalized_affiliate)
-        compact_mac_sql = "LOWER(REPLACE(REPLACE(REPLACE(m.mac, ':', ''), '-', ''), '.', ''))"
+        if "." in search or ":" in search:
+            is_ip_query = bool(re.fullmatch(r"[0-9a-f:.]+", search)) and search.count(".") >= 1
+        else:
+            is_ip_query = search.isdigit() and search.count(".") >= 1
+        if is_ip_query:
+            search_column = "m.ip"
+            search_pattern = f"{search}%"
+        else:
+            mac_parts = [compact[index:index + 2] for index in range(0, len(compact), 2)]
+            search_column = "m.mac"
+            search_pattern = ":".join(mac_parts) + "%"
         rows = self._query(
             f"SELECT m.mac, m.ip, m.vendor, m.model "
             f"FROM modem_inventory_current m "
-            f"WHERE LOWER(TRIM(COALESCE(m.cmts,'')))=LOWER(%s) "
-            f"AND m.inventory_state<>'retired' {self._online_inventory_filter()} "
-            f"AND {compact_mac_sql} LIKE %s {affiliate_filter} "
+            f"WHERE m.cmts=%s AND m.inventory_state<>'retired' "
+            f"{self._online_inventory_filter()} "
+            f"AND {search_column} LIKE %s {affiliate_filter} "
             f"ORDER BY m.mac LIMIT %s",
-            (normalized_cmts, f"{compact}%", *affiliate_params, max(1, min(int(limit), 20))),
+            (normalized_cmts, search_pattern, *affiliate_params, max(1, min(int(limit), 20))),
         )
         return [
             {
