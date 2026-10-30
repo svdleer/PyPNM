@@ -102,6 +102,30 @@ def display_oid(oid: str) -> str:
     if not numeric:
         return numeric
     try:
+        from pypnm.snmp.compiled_oids import COMPILED_OIDS
+
+        candidates = [
+            (str(value).lstrip("."), str(name))
+            for name, value in COMPILED_OIDS.items()
+            if numeric == str(value).lstrip(".")
+            or numeric.startswith(str(value).lstrip(".") + ".")
+        ]
+        if candidates:
+            base_oid, symbol = max(candidates, key=lambda item: len(item[0].split(".")))
+            module = (
+                "DOCS-IF31-MIB" if symbol.startswith("docsIf31")
+                else "DOCS-IF3-MIB" if symbol.startswith("docsIf3")
+                else "DOCS-IF-MIB" if symbol.startswith("docsIf")
+                else "SNMPv2-MIB" if symbol.startswith(("sys", "snmp"))
+                else None
+            )
+            suffix = numeric[len(base_oid):]
+            prefix = f"{module}::" if module else ""
+            return f"{prefix}{symbol}{suffix}"
+    except Exception:
+        pass
+
+    try:
         from pysnmp.smi.rfc1902 import ObjectIdentity
         from pysnmp.smi import builder, view
 
