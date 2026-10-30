@@ -1176,7 +1176,7 @@ class CmSnmpQueryService:
                                     if isinstance(value, (dict, list)) else value
                                     for key, value in results.items()
                                 })
-
+                            writer.writerow(entry)
                             yield buffer.getvalue()
                             buffer.seek(0)
                             buffer.truncate(0)
