@@ -1128,15 +1128,8 @@ class CmSnmpQueryService:
         else:
             oids = []
 
-        # Build column names from OID labels
-        oid_columns = []
-        for entry in oids:
-            label = entry.get("label") or entry.get("oid", "unknown")
-            oid_columns.append(label)
-
         normalized_format = str(report_format or "csv").lower()
         base_fields = ["mac", "modem_ip", "cmts", "fiber_node", "state"]
-        field_names = base_fields + oid_columns
 
         def generate() -> Iterator[str]:
             connection = self._connect(autocommit=True)
@@ -1163,8 +1156,13 @@ class CmSnmpQueryService:
                             yield json.dumps(entry, separators=(",", ":"), default=str)
                         yield "]}"
                     else:
+                        field_names = base_fields + ["oid_label", "oid", "mib", "value"]
                         buffer = io.StringIO()
-                        writer = csv.DictWriter(buffer, fieldnames=field_names, extrasaction='ignore')
+                        writer = csv.DictWriter(
+                            buffer,
+                            fieldnames=field_names,
+                            extrasaction='ignore',
+                        )
                         writer.writeheader()
                         yield buffer.getvalue()
                         buffer.seek(0)
@@ -1173,23 +1171,46 @@ class CmSnmpQueryService:
                             results = row.pop("results_json", None)
                             if isinstance(results, str):
                                 results = json.loads(results)
-                            entry = {
+                            base = {
                                 "mac": row.get("mac"),
                                 "modem_ip": row.get("modem_ip"),
                                 "cmts": row.get("cmts"),
                                 "fiber_node": row.get("fiber_node"),
                                 "state": row.get("state"),
                             }
-                            if isinstance(results, dict):
-                                entry.update({
-                                    key: json.dumps(value, separators=(",", ":"), default=str)
-                                    if isinstance(value, (dict, list)) else value
-                                    for key, value in results.items()
-                                })
-                            writer.writerow(entry)
-                            yield buffer.getvalue()
-                            buffer.seek(0)
-                            buffer.truncate(0)
+                            result_rows = []
+                            for label, value in ((results or {}).items() if isinstance(results, dict) else []):
+                                if isinstance(value, list):
+                                    for item in value:
+                                        if isinstance(item, dict):
+                                            result_rows.append({
+                                                "oid_label": label,
+                                                "oid": item.get("oid"),
+                                                "mib": item.get("mib"),
+                                                "value": item.get("value"),
+                                            })
+                                        else:
+                                            result_rows.append({
+                                                "oid_label": label,
+                                                "value": value,
+                                            })
+                                elif isinstance(value, dict) and "value" in value:
+                                    result_rows.append({
+                                        "oid_label": label,
+                                        "oid": value.get("oid"),
+                                        "mib": value.get("mib"),
+                                        "value": value.get("value"),
+                                    })
+                                else:
+                                    result_rows.append({
+                                        "oid_label": label,
+                                        "value": value,
+                                    })
+                            for result_row in result_rows or [{}]:
+                                writer.writerow({**base, **result_row})
+                                yield buffer.getvalue()
+                                buffer.seek(0)
+                                buffer.truncate(0)
             finally:
                 connection.close()
 
