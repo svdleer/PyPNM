@@ -1171,8 +1171,12 @@ class CmSnmpQueryService:
                                 "state": row.get("state"),
                             }
                             if isinstance(results, dict):
-                                entry.update(results)
-                            writer.writerow(entry)
+                                entry.update({
+                                    key: json.dumps(value, separators=(",", ":"), default=str)
+                                    if isinstance(value, (dict, list)) else value
+                                    for key, value in results.items()
+                                })
+
                             yield buffer.getvalue()
                             buffer.seek(0)
                             buffer.truncate(0)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
 import re
 
@@ -92,3 +93,23 @@ def resolve_oid(oid_input: str) -> str:
         logger.warning(f"MIB resolution unavailable: {exc}")
 
     return oid_input
+
+
+@lru_cache(maxsize=4096)
+def display_oid(oid: str) -> str:
+    """Return a loaded-MIB name for a numeric OID, or the numeric OID."""
+    numeric = str(oid or "").strip().lstrip(".")
+    if not numeric:
+        return numeric
+    try:
+        from pysnmp.smi.rfc1902 import ObjectIdentity
+        from pysnmp.smi import builder, view
+
+        mib_view = view.MibViewController(builder.MibBuilder())
+        identity = ObjectIdentity(numeric)
+        identity.resolve_with_mib(mib_view)
+        module, symbol, indices = identity.get_mib_symbol()
+        suffix = ".".join(str(index) for index in (indices or ()))
+        return f"{module}::{symbol}{'.' + suffix if suffix else ''}"
+    except Exception:
+        return numeric

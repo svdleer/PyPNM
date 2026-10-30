@@ -163,7 +163,7 @@ class CmSnmpQueryWorker:
 
         try:
             from pypnm.api.agent.manager import get_agent_manager
-            from pypnm.api.routes.cm_snmp_query.oid_resolver import resolve_oid
+            from pypnm.api.routes.cm_snmp_query.oid_resolver import display_oid, resolve_oid
 
             agent_manager = get_agent_manager()
             if not agent_manager:
@@ -216,7 +216,11 @@ class CmSnmpQueryWorker:
                     if value is None and oid_result.get("output") is not None:
                         raw = str(oid_result["output"])
                         value = raw.split(" = ", 1)[1].strip() if " = " in raw else raw.strip()
-                    results[label] = value
+                    results[label] = {
+                        "oid": numeric_oid,
+                        "mib": display_oid(numeric_oid),
+                        "value": value,
+                    }
 
             for label, numeric_oid, _ in walk_entries:
                 walk_params = {
@@ -238,7 +242,14 @@ class CmSnmpQueryWorker:
                 walk_response = walk_result.get("result", {})
                 if not walk_response.get("success"):
                     raise RuntimeError(walk_response.get("error") or "Agent SNMP walk failed")
-                results[label] = walk_response.get("results") or []
+                results[label] = [
+                    {
+                        **entry,
+                        "mib": display_oid(entry.get("oid")),
+                    }
+                    for entry in (walk_response.get("results") or [])
+                    if isinstance(entry, dict)
+                ]
 
             await asyncio.to_thread(
                 cm_snmp_query_service.record_target_result, target_id, results
