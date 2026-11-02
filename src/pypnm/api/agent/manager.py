@@ -215,7 +215,13 @@ class AgentManager:
                     if agent_id in self.agents:
                         try:
                             await websocket.send_text(json.dumps({'type': 'ping', 'timestamp': time.time()}))
-                        except Exception:
+                        except Exception as exc:
+                            self.logger.warning(
+                                "Agent ping failed for %s: %s; retiring connection",
+                                agent_id,
+                                exc,
+                            )
+                            self.remove_agent(websocket)
                             break
 
             asyncio.ensure_future(ping_loop())
@@ -232,8 +238,9 @@ class AgentManager:
         except Exception as e:
             self.logger.error(f"WebSocket error: {e}")
         finally:
-            if agent_id:
-                self.remove_agent(websocket)
+            # Removal is keyed by the exact WebSocket generation and is a no-op
+            # when authentication never registered this connection.
+            self.remove_agent(websocket)
     
     async def handle_message(self, websocket: WebSocket, message: str) -> Optional[str]:
         """Handle incoming message from agent. Returns response message or None."""
@@ -613,8 +620,13 @@ class AgentManager:
                     })
                 else:
                     self._cleanup_task(task_id)
+                # A failed send proves this exact WebSocket generation is not
+                # usable. Retire it so subsequent work can fail over or wait
+                # for the agent to reconnect instead of selecting it again.
+                self.remove_agent(agent.websocket)
             else:
                 self._cleanup_task(task_id)
+                self.remove_agent(agent.websocket)
                 raise
         else:
             if claim_send_outcome is not None and not claim_send_outcome("sent"):
