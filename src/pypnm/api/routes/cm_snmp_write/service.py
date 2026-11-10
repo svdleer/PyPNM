@@ -208,6 +208,7 @@ class CmWriteService:
         now=self._now(); self._execute("UPDATE cm_snmp_write_job SET status=%s, started_at=CASE WHEN %s='running' THEN COALESCE(started_at,%s) ELSE started_at END, updated_at=%s WHERE public_id=%s AND status IN ('planned','scheduled','queued')",(status,status,now,now,public_id))
 
     def due_jobs(self):
+        self.ensure_schema()
         return self._query("SELECT public_id FROM cm_snmp_write_job WHERE status='scheduled' AND scheduled_start<=UTC_TIMESTAMP() ORDER BY id LIMIT 20")
 
     def claim_results(self, job_id, limit):
