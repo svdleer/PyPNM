@@ -50,6 +50,7 @@ class CmResetWorker:
                     job_id=cm_reset_service.get_job_id_by_public_id(public_id),
                     lease_owner=lease_owner,
                     max_concurrency=concurrency,
+                    skip_window_check=skip_window_check,
                 ),
                 name=f"cm-reset-{public_id}",
             )
@@ -66,6 +67,7 @@ class CmResetWorker:
         job_id: int,
         lease_owner: str,
         max_concurrency: int,
+        skip_window_check: bool = False,
     ) -> None:
         heartbeat: asyncio.Task | None = None
         try:
@@ -80,7 +82,7 @@ class CmResetWorker:
             active_targets: set[asyncio.Task] = set()
             while True:
                 # Check execution window — pause if outside 01:00-06:00
-                if not cm_reset_service.is_within_execution_window():
+                if not skip_window_check and not cm_reset_service.is_within_execution_window():
                     logger.info(
                         f"CM reset job {public_id}: outside execution window, "
                         "pausing until next 01:00"
