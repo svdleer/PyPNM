@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Any
 
+from pypnm.api.agent.manager import AgentCapacityError, get_agent_manager
 from pypnm.api.routes.cm_reset.service import cm_reset_service
 
 logger = logging.getLogger(__name__)
@@ -195,16 +197,9 @@ class CmResetWorker:
             return
 
         try:
-            from pypnm.api.agent.manager import get_agent_manager
-
             agent_manager = get_agent_manager()
             if not agent_manager:
                 raise RuntimeError("Agent manager not available")
-
-            # Get cm-agent (modem-reachable) without a generic SNMP fallback.
-            agent = agent_manager.get_agent_for_capability("cm_reachable")
-            if not agent:
-                raise RuntimeError("No cm_reachable agent connected")
 
             params = {
                 "target_ip": modem_ip,
@@ -216,15 +211,38 @@ class CmResetWorker:
                 "retries": 0,
             }
 
-            # Fire-and-forget: send the SET but don't wait long for confirmation
-            # (modem will reset and drop the connection anyway)
-            task_id = await agent_manager.send_task(
-                agent.agent_id,
-                "snmp_set",
-                params,
-                timeout=10,
-                priority="bulk",
-            )
+            # Select a CM agent with a free bulk slot. Reset targets wait for
+            # transient capacity instead of failing when both agents are full.
+            deadline = time.monotonic() + 120
+            task_id = None
+            agent = None
+            while time.monotonic() < deadline:
+                agent_id = agent_manager.get_agent_id_for_capability(
+                    "cm_reachable",
+                    priority="bulk",
+                    warn_if_unavailable=False,
+                )
+                if agent_id:
+                    agent = agent_manager.get_agent(agent_id)
+                    if agent is None:
+                        continue
+                    try:
+                        task_id = await agent_manager.send_task(
+                            agent.agent_id,
+                            "snmp_set",
+                            params,
+                            timeout=10,
+                            priority="bulk",
+                        )
+                        break
+                    except (AgentCapacityError, ValueError):
+                        # A capacity slot or WebSocket can change between
+                        # selection and send; retry with the current pool.
+                        await asyncio.sleep(0.25)
+                        continue
+                await asyncio.sleep(0.5)
+            if task_id is None or agent is None:
+                raise RuntimeError("No cm_reachable agent bulk capacity available")
 
             # Brief wait — a timeout/disconnect can be consistent with the modem
             # rebooting, but an explicit agent rejection must fail the target.
