@@ -316,6 +316,14 @@ class PollerService:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        try:
+            self._execute(
+                "ALTER TABLE modem_cpe_ip_current "
+                "ADD INDEX idx_cpe_ip_lookup (ip_address, modem_mac, cmts_ip)"
+            )
+        except pymysql.err.OperationalError:
+            # Existing deployments already have the lookup index.
+            pass
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS poller_setting (
