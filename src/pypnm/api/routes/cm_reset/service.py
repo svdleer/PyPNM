@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -72,6 +73,13 @@ class CmResetService:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _normalize_mac(value: str) -> str:
+        compact = re.sub(r"[:.\-\s]", "", str(value or "").strip().lower())
+        if len(compact) != 12 or any(character not in "0123456789abcdef" for character in compact):
+            return ""
+        return ":".join(compact[index:index + 2] for index in range(0, 12, 2))
 
     # ── Schema ────────────────────────────────────────────────
 
@@ -275,21 +283,27 @@ class CmResetService:
         """Resolve MAC addresses from the given scope."""
         if scope_type == "single":
             mac = str(scope.get("mac") or "").strip()
-            if not mac:
-                raise ValueError("single scope requires 'mac'")
+            normalized_mac = self._normalize_mac(mac)
+            if not normalized_mac:
+                raise ValueError("single scope requires a valid modem MAC")
             # Look up in inventory for IP/CMTS info
             rows = self._query(
                 "SELECT mac, ip, cmts, cmts_ip, fiber_node "
                 "FROM modem_inventory_current "
                 "WHERE inventory_state<>'retired' AND mac=%s LIMIT 1",
-                (mac,),
+                (normalized_mac,),
             )
             if rows:
                 r = rows[0]
                 return [{"mac": r["mac"], "ip": r.get("ip"), "cmts": r.get("cmts"),
                          "cmts_ip": r.get("cmts_ip"), "fiber_node": r.get("fiber_node")}]
-            # Not in inventory — still allow reset with just the MAC
-            return [{"mac": mac}]
+            # Do not create a target that cannot be sent to a modem.
+            return [{
+                "mac": normalized_mac,
+                "_input_value": mac,
+                "_state": "failed",
+                "_error": "Modem MAC not found in current inventory",
+            }]
 
         elif scope_type == "cmts":
             cmts_names = [str(c).strip() for c in (scope.get("cmts") or []) if str(c).strip()]
@@ -346,24 +360,50 @@ class CmResetService:
             mac_list = [str(m).strip() for m in (scope.get("mac_list") or []) if str(m).strip()]
             if not mac_list:
                 raise ValueError("file scope requires 'mac_list' with at least one MAC address")
-            # Enrich from inventory where possible
-            placeholders = ",".join(["%s"] * len(mac_list))
+            normalized_inputs = []
+            invalid_targets = []
+            for raw_mac in mac_list:
+                normalized = self._normalize_mac(raw_mac)
+                if normalized:
+                    normalized_inputs.append((raw_mac, normalized))
+                else:
+                    invalid_targets.append({
+                        "mac": f"INVALID:{raw_mac}",
+                        "_input_value": raw_mac,
+                        "_state": "failed",
+                        "_error": "Invalid modem MAC address",
+                    })
+            normalized_values = list(dict.fromkeys(normalized for _, normalized in normalized_inputs))
+            if not normalized_values:
+                return invalid_targets
+            placeholders = ",".join(["%s"] * len(normalized_values))
             rows = self._query(
                 f"SELECT mac, ip, cmts, cmts_ip, fiber_node "
                 f"FROM modem_inventory_current "
                 f"WHERE inventory_state<>'retired' "
                 f"AND mac IN ({placeholders})",
-                mac_list,
+                normalized_values,
             )
-            found = {r["mac"].lower(): r for r in rows}
-            targets = []
-            for mac in mac_list:
-                r = found.get(mac.lower())
+            found = {self._normalize_mac(r["mac"]): r for r in rows}
+            targets = list(invalid_targets)
+            for raw_mac, normalized in normalized_inputs:
+                r = found.get(normalized)
                 if r:
-                    targets.append({"mac": r["mac"], "ip": r.get("ip"), "cmts": r.get("cmts"),
-                                    "cmts_ip": r.get("cmts_ip"), "fiber_node": r.get("fiber_node")})
+                    targets.append({
+                        "mac": r["mac"],
+                        "_input_value": raw_mac,
+                        "ip": r.get("ip"),
+                        "cmts": r.get("cmts"),
+                        "cmts_ip": r.get("cmts_ip"),
+                        "fiber_node": r.get("fiber_node"),
+                    })
                 else:
-                    targets.append({"mac": mac})
+                    targets.append({
+                        "mac": normalized,
+                        "_input_value": raw_mac,
+                        "_state": "failed",
+                        "_error": "Modem MAC not found in current inventory",
+                    })
             return targets
 
         elif scope_type == "cpe_address":
@@ -649,6 +689,10 @@ class CmResetService:
         )
         has_more = len(rows) > safe_limit
         page = rows[:safe_limit]
+        for row in page:
+            reset_at = row.get("reset_at")
+            if isinstance(reset_at, datetime):
+                row["reset_at"] = reset_at.replace(tzinfo=timezone.utc).isoformat()
         next_cursor = int(page[-1]["id"]) if has_more and page else None
         return {"targets": page, "next_cursor": next_cursor, "has_more": has_more}
 
