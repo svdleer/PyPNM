@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -170,7 +171,7 @@ class CmResetService:
 
         scope = dict(payload.get("scope") or {})
         scope_type = str(scope.get("type") or "").strip().lower()
-        if scope_type not in {"single", "cmts", "fiber_node", "file"}:
+        if scope_type not in {"single", "cmts", "fiber_node", "file", "cpe_address"}:
             raise ValueError(f"Unsupported scope type: {scope_type}")
 
         requested_by = str(payload.get("requested_by") or "admin").strip()[:64]
@@ -346,6 +347,68 @@ class CmResetService:
                 else:
                     targets.append({"mac": mac})
             return targets
+
+        elif scope_type == "cpe_address":
+            raw_addresses = [
+                str(value).strip()
+                for value in (scope.get("cpe_addresses") or [])
+                if str(value).strip()
+            ]
+            if not raw_addresses:
+                raise ValueError(
+                    "cpe_address scope requires 'cpe_addresses' with at least one address"
+                )
+            canonical_addresses = []
+            for raw_address in raw_addresses:
+                try:
+                    canonical_addresses.append(str(ipaddress.ip_address(raw_address)))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid CPE address: {raw_address}") from exc
+            placeholders = ",".join(["%s"] * len(canonical_addresses))
+            try:
+                rows = self._query(
+                    "SELECT c.ip_address, m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
+                    "FROM modem_cpe_ip_current c "
+                    "JOIN modem_inventory_current m "
+                    "ON m.mac=c.modem_mac AND m.cmts_ip=c.cmts_ip "
+                    "WHERE c.ip_address IN (" + placeholders + ") "
+                    "AND m.inventory_state='active' "
+                    "AND m.ip IS NOT NULL AND TRIM(m.ip)<>'' AND m.ip<>'0.0.0.0'",
+                    tuple(canonical_addresses),
+                )
+            except (pymysql.err.OperationalError, pymysql.err.ProgrammingError) as exc:
+                raise ValueError(
+                    "CPE address inventory is unavailable; run a CPE inventory first"
+                ) from exc
+            by_address: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                by_address.setdefault(str(row["ip_address"]), []).append(row)
+            missing = [address for address in canonical_addresses if address not in by_address]
+            if missing:
+                raise ValueError(
+                    "CPE address(es) not found in current inventory: "
+                    + ", ".join(missing[:10])
+                )
+            ambiguous = [
+                address for address, matches in by_address.items()
+                if len({str(match["mac"]).lower() for match in matches}) > 1
+            ]
+            if ambiguous:
+                raise ValueError(
+                    "CPE address(es) map to multiple modem parents: "
+                    + ", ".join(ambiguous[:10])
+                )
+            parents: dict[str, dict[str, Any]] = {}
+            for address in canonical_addresses:
+                row = by_address[address][0]
+                parents[str(row["mac"]).lower()] = {
+                    "mac": row["mac"],
+                    "ip": row.get("ip"),
+                    "cmts": row.get("cmts"),
+                    "cmts_ip": row.get("cmts_ip"),
+                    "fiber_node": row.get("fiber_node"),
+                }
+            return list(parents.values())
 
         return []
 

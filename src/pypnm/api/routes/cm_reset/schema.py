@@ -19,7 +19,8 @@ class CmResetPlanRequest(BaseModel):
             '{"type": "single", "mac": "aa:bb:cc:dd:ee:ff"} | '
             '{"type": "cmts", "cmts": ["CMTS-NAME"]} | '
             '{"type": "fiber_node", "cmts": "CMTS-NAME", "fiber_nodes": ["FN01"]} | '
-            '{"type": "file", "mac_list": ["aa:bb:...", ...]}'
+            '{"type": "file", "mac_list": ["aa:bb:...", ...]} | '
+            '{"type": "cpe_address", "cpe_addresses": ["192.0.2.10", ...]}'
         )
     )
     scheduled_start: str | None = Field(
@@ -110,7 +111,7 @@ class CmResetTargetListResponse(BaseModel):
 class CmResetCapabilitiesResponse(BaseModel):
     status: str = "success"
     scope_types: list[str] = Field(
-        default_factory=lambda: ["single", "cmts", "fiber_node", "file"]
+        default_factory=lambda: ["single", "cmts", "fiber_node", "file", "cpe_address"]
     )
     execution_window: dict[str, int] = Field(
         default_factory=lambda: {"start_hour": 1, "end_hour": 6}
