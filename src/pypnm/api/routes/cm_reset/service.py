@@ -110,7 +110,8 @@ class CmResetService:
             CREATE TABLE IF NOT EXISTS cm_reset_target (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 job_id BIGINT NOT NULL,
-                mac VARCHAR(20) NOT NULL,
+                mac VARCHAR(64) NOT NULL,
+                input_value VARCHAR(45) NULL,
                 modem_ip VARCHAR(45) NULL,
                 cmts VARCHAR(128) NULL,
                 cmts_ip VARCHAR(45) NULL,
@@ -137,12 +138,17 @@ class CmResetService:
             conn.commit()
         finally:
             conn.close()
-        migration = "ALTER TABLE cm_reset_job ADD COLUMN skip_window_check BOOLEAN NOT NULL DEFAULT FALSE"
-        try:
-            self._execute(migration)
-        except pymysql.err.OperationalError:
-            # Existing deployments already have the godmode persistence column.
-            pass
+        migrations = (
+            "ALTER TABLE cm_reset_job ADD COLUMN skip_window_check BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE cm_reset_target MODIFY COLUMN mac VARCHAR(64) NOT NULL",
+            "ALTER TABLE cm_reset_target ADD COLUMN input_value VARCHAR(45) NULL",
+        )
+        for migration in migrations:
+            try:
+                self._execute(migration)
+            except pymysql.err.OperationalError:
+                # Existing deployments already have this schema element.
+                pass
         self._schema_ensured = True
 
     # ── Execution window ──────────────────────────────────────
@@ -229,12 +235,24 @@ class CmResetService:
                 # Batch insert targets
                 insert_sql = """
                     INSERT INTO cm_reset_target
-                    (job_id, mac, modem_ip, cmts, cmts_ip, fiber_node, state, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'planned', %s, %s)
+                    (job_id, mac, input_value, modem_ip, cmts, cmts_ip, fiber_node,
+                     state, error_text, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
                 batch = [
-                    (job_id, t["mac"], t.get("ip"), t.get("cmts"), t.get("cmts_ip"),
-                     t.get("fiber_node"), now, now)
+                    (
+                        job_id,
+                        t["mac"],
+                        t.get("_input_value"),
+                        t.get("ip"),
+                        t.get("cmts"),
+                        t.get("cmts_ip"),
+                        t.get("fiber_node"),
+                        t.get("_state", "planned"),
+                        t.get("_error"),
+                        now,
+                        now,
+                    )
                     for t in targets
                 ]
                 cursor.executemany(insert_sql, batch)
@@ -358,57 +376,74 @@ class CmResetService:
                 raise ValueError(
                     "cpe_address scope requires 'cpe_addresses' with at least one address"
                 )
-            canonical_addresses = []
+            canonical_by_input: list[tuple[str, str | None]] = []
+            targets: list[dict[str, Any]] = []
             for raw_address in raw_addresses:
                 try:
-                    canonical_addresses.append(str(ipaddress.ip_address(raw_address)))
-                except ValueError as exc:
-                    raise ValueError(f"Invalid CPE address: {raw_address}") from exc
-            placeholders = ",".join(["%s"] * len(canonical_addresses))
-            try:
-                rows = self._query(
-                    "SELECT c.ip_address, m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
-                    "FROM modem_cpe_ip_current c "
-                    "JOIN modem_inventory_current m "
-                    "ON m.mac=c.modem_mac AND m.cmts_ip=c.cmts_ip "
-                    "WHERE c.ip_address IN (" + placeholders + ") "
-                    "AND m.inventory_state='active' "
-                    "AND m.ip IS NOT NULL AND TRIM(m.ip)<>'' AND m.ip<>'0.0.0.0'",
-                    tuple(canonical_addresses),
-                )
-            except (pymysql.err.OperationalError, pymysql.err.ProgrammingError) as exc:
-                raise ValueError(
-                    "CPE address inventory is unavailable; run a CPE inventory first"
-                ) from exc
+                    canonical_by_input.append(
+                        (raw_address, str(ipaddress.ip_address(raw_address)))
+                    )
+                except ValueError:
+                    targets.append({
+                        "mac": f"CPE:{raw_address}",
+                        "_input_value": raw_address,
+                        "_state": "failed",
+                        "_error": "Invalid CPE address",
+                    })
+            canonical_addresses = list(dict.fromkeys(
+                address for _, address in canonical_by_input if address
+            ))
             by_address: dict[str, list[dict[str, Any]]] = {}
-            for row in rows:
-                by_address.setdefault(str(row["ip_address"]), []).append(row)
-            missing = [address for address in canonical_addresses if address not in by_address]
-            if missing:
-                raise ValueError(
-                    "CPE address(es) not found in current inventory: "
-                    + ", ".join(missing[:10])
-                )
-            ambiguous = [
-                address for address, matches in by_address.items()
-                if len({str(match["mac"]).lower() for match in matches}) > 1
-            ]
-            if ambiguous:
-                raise ValueError(
-                    "CPE address(es) map to multiple modem parents: "
-                    + ", ".join(ambiguous[:10])
-                )
+            if canonical_addresses:
+                placeholders = ",".join(["%s"] * len(canonical_addresses))
+                try:
+                    rows = self._query(
+                        "SELECT c.ip_address, m.mac, m.ip, m.cmts, m.cmts_ip, m.fiber_node "
+                        "FROM modem_cpe_ip_current c "
+                        "JOIN modem_inventory_current m "
+                        "ON m.mac=c.modem_mac AND m.cmts_ip=c.cmts_ip "
+                        "WHERE c.ip_address IN (" + placeholders + ") "
+                        "AND m.inventory_state='active' "
+                        "AND m.ip IS NOT NULL AND TRIM(m.ip)<>'' AND m.ip<>'0.0.0.0'",
+                        tuple(canonical_addresses),
+                    )
+                except (pymysql.err.OperationalError, pymysql.err.ProgrammingError) as exc:
+                    raise ValueError(
+                        "CPE address inventory is unavailable; run a CPE inventory first"
+                    ) from exc
+                for row in rows:
+                    by_address.setdefault(str(row["ip_address"]), []).append(row)
             parents: dict[str, dict[str, Any]] = {}
-            for address in canonical_addresses:
-                row = by_address[address][0]
-                parents[str(row["mac"]).lower()] = {
+            for raw_address, canonical_address in canonical_by_input:
+                matches = by_address.get(canonical_address or "", [])
+                if not matches:
+                    targets.append({
+                        "mac": f"CPE:{raw_address}",
+                        "_input_value": raw_address,
+                        "_state": "failed",
+                        "_error": "No CPE-to-CM parent pair found",
+                    })
+                    continue
+                if len({str(match["mac"]).lower() for match in matches}) > 1:
+                    targets.append({
+                        "mac": f"CPE:{raw_address}",
+                        "_input_value": raw_address,
+                        "_state": "failed",
+                        "_error": "CPE address maps to multiple modem parents",
+                    })
+                    continue
+                row = matches[0]
+                parent_key = str(row["mac"]).lower()
+                parents[parent_key] = {
                     "mac": row["mac"],
                     "ip": row.get("ip"),
                     "cmts": row.get("cmts"),
                     "cmts_ip": row.get("cmts_ip"),
                     "fiber_node": row.get("fiber_node"),
+                    "_input_value": raw_address,
                 }
-            return list(parents.values())
+            targets.extend(parents.values())
+            return targets
 
         return []
 
@@ -608,7 +643,7 @@ class CmResetService:
             params.append(str(state).strip())
         where_sql = " AND ".join(filters)
         rows = self._query(
-            f"SELECT id, mac, modem_ip, cmts, fiber_node, state, error_text, reset_at "
+            f"SELECT id, mac, input_value, modem_ip, cmts, fiber_node, state, error_text, reset_at "
             f"FROM cm_reset_target WHERE {where_sql} ORDER BY id ASC LIMIT %s",
             (*params, safe_limit + 1),
         )

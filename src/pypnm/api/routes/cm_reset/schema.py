@@ -93,6 +93,7 @@ class CmResetJobActionResponse(BaseModel):
 class CmResetTarget(BaseModel):
     id: int
     mac: str
+    input_value: str | None = None
     modem_ip: str | None = None
     cmts: str | None = None
     fiber_node: str | None = None
