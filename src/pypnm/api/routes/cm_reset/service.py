@@ -89,6 +89,7 @@ class CmResetService:
                 requested_by VARCHAR(64) NULL,
                 idempotency_key VARCHAR(128) NULL,
                 max_concurrency SMALLINT NOT NULL DEFAULT 5,
+                skip_window_check BOOLEAN NOT NULL DEFAULT FALSE,
                 targets_total INT NOT NULL DEFAULT 0,
                 targets_succeeded INT NOT NULL DEFAULT 0,
                 targets_failed INT NOT NULL DEFAULT 0,
@@ -135,6 +136,12 @@ class CmResetService:
             conn.commit()
         finally:
             conn.close()
+        migration = "ALTER TABLE cm_reset_job ADD COLUMN skip_window_check BOOLEAN NOT NULL DEFAULT FALSE"
+        try:
+            self._execute(migration)
+        except pymysql.err.OperationalError:
+            # Existing deployments already have the godmode persistence column.
+            pass
         self._schema_ensured = True
 
     # ── Execution window ──────────────────────────────────────
@@ -358,6 +365,44 @@ class CmResetService:
             (max(1, min(int(limit), 200)),),
         )
         return [self._format_job(r) for r in rows]
+
+    def set_skip_window_check(self, public_id: str, enabled: bool) -> None:
+        self.ensure_schema()
+        self._execute(
+            "UPDATE cm_reset_job SET skip_window_check=%s, updated_at=%s "
+            "WHERE public_id=%s AND status IN ('planned','queued')",
+            (1 if enabled else 0, self._now(), public_id),
+        )
+
+    def recover_jobs(self) -> list[dict[str, Any]]:
+        """Recover jobs left active when the API process restarted."""
+        self.ensure_schema()
+        rows = self._query(
+            "SELECT id, public_id, status, max_concurrency, skip_window_check "
+            "FROM cm_reset_job WHERE status IN ('running','queued') ORDER BY id"
+        )
+        recovered = []
+        for row in rows:
+            job_id = int(row["id"])
+            if row.get("status") == "running":
+                self._execute(
+                    "UPDATE cm_reset_target SET state='failed', "
+                    "error_text=%s, updated_at=%s "
+                    "WHERE job_id=%s AND state='running'",
+                    (
+                        "Interrupted by PyPNM API restart; not retried automatically",
+                        self._now(),
+                        job_id,
+                    ),
+                )
+            self._execute(
+                "UPDATE cm_reset_job SET status='queued', lease_owner=NULL, "
+                "lease_until=NULL, updated_at=%s WHERE id=%s "
+                "AND status IN ('running','queued')",
+                (self._now(), job_id),
+            )
+            recovered.append(row)
+        return recovered
 
     def activate_job(self, public_id: str, lease_owner: str) -> None:
         """Move job to running state."""
@@ -586,6 +631,7 @@ class CmResetService:
             "finished_at": _dt(row.get("finished_at")),
             "created_at": _dt(row.get("created_at")),
             "requested_by": row.get("requested_by"),
+            "window_bypass": bool(row.get("skip_window_check")),
             "error_text": row.get("error_text"),
         }
 

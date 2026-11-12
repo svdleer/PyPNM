@@ -27,6 +27,11 @@ _CONFIRMATION_PASSPHRASE = "have you tried turning it on and off again?"
 _GODMODE_PASSPHRASE = "iddqd"
 
 
+@router.on_event("startup")
+async def recover_reset_jobs() -> None:
+    await cm_reset_worker.recover()
+
+
 @router.get("/capabilities", response_model=CmResetCapabilitiesResponse)
 def get_capabilities() -> CmResetCapabilitiesResponse:
     return CmResetCapabilitiesResponse()
@@ -109,7 +114,9 @@ async def start_job(public_id: str, payload: CmResetJobStartRequest) -> CmResetJ
 
     try:
         job = await cm_reset_worker.start(
-            public_id, max_concurrency=payload.max_concurrency, skip_window_check=godmode
+            public_id,
+            max_concurrency=payload.max_concurrency,
+            skip_window_check=godmode,
         )
         msg = "Job started (GODMODE — window bypassed)" if godmode else "Job started"
         return CmResetJobActionResponse(job=CmResetJob(**job), message=msg)

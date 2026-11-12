@@ -44,6 +44,7 @@ class CmResetWorker:
                     f"Next window opens at {next_start.strftime('%Y-%m-%d %H:%M')}."
                 )
 
+            cm_reset_service.set_skip_window_check(public_id, skip_window_check)
             task = asyncio.create_task(
                 self._run_job(
                     public_id=public_id,
@@ -56,6 +57,25 @@ class CmResetWorker:
             )
             self._tasks[public_id] = task
         return cm_reset_service.get_job(public_id)
+
+    async def recover(self) -> None:
+        """Resume durable jobs left by an API restart."""
+        rows = await asyncio.to_thread(cm_reset_service.recover_jobs)
+        for row in rows:
+            public_id = str(row["public_id"])
+            if public_id in self._tasks and not self._tasks[public_id].done():
+                continue
+            task = asyncio.create_task(
+                self._run_job(
+                    public_id=public_id,
+                    job_id=int(row["id"]),
+                    lease_owner=f"cm-reset-recovery-{uuid.uuid4()}",
+                    max_concurrency=max(1, min(int(row.get("max_concurrency") or 5), 10)),
+                    skip_window_check=bool(row.get("skip_window_check")),
+                ),
+                name=f"cm-reset-recovery-{public_id}",
+            )
+            self._tasks[public_id] = task
 
     async def cancel(self, public_id: str) -> dict[str, Any]:
         return await asyncio.to_thread(cm_reset_service.request_cancel, public_id)

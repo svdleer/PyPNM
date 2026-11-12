@@ -59,6 +59,7 @@ class CmResetJob(BaseModel):
     targets_succeeded: int = 0
     targets_failed: int = 0
     targets_pending: int = 0
+    window_bypass: bool = False
     scheduled_start: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
