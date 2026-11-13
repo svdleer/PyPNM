@@ -197,6 +197,14 @@ class CmResetWorker:
             return
 
         try:
+            current_target = await asyncio.to_thread(
+                cm_reset_service.resolve_target_for_execution,
+                target_id,
+                str(mac),
+            )
+            modem_ip = current_target.get("ip")
+            if not modem_ip:
+                raise RuntimeError("Reset blocked: modem has no current inventory IP")
             agent_manager = get_agent_manager()
             if not agent_manager:
                 raise RuntimeError("Agent manager not available")

@@ -239,6 +239,7 @@ class CmResetService:
                 targets = self._resolve_targets(cursor, scope_type, scope)
                 if not targets:
                     raise ValueError("No targets resolved from scope (check CMTS/fiber-node names or MAC addresses)")
+                self.assert_targets_inventory_safe(targets)
 
                 # Batch insert targets
                 insert_sql = """
@@ -486,6 +487,89 @@ class CmResetService:
             return targets
 
         return []
+
+    def _reset_inventory_max_age_seconds(self) -> int:
+        try:
+            return max(
+                60,
+                min(int(os.environ.get("CM_RESET_INVENTORY_MAX_AGE_SECONDS", "3600")), 86400),
+            )
+        except (TypeError, ValueError):
+            return 3600
+
+    def _assert_cmts_inventory_safe(self, cmts_ip: str) -> None:
+        """Require a recent authoritative inventory success after its last attempt."""
+        rows = self._query(
+            "SELECT h.cmts, h.last_attempt_at, h.last_attempt_succeeded, "
+            "h.last_success_at, h.last_failure_error, "
+            "TIMESTAMPDIFF(SECOND,h.last_success_at,UTC_TIMESTAMP()) AS age_seconds, "
+            "s.complete, s.truncated, s.authoritative, s.quarantined "
+            "FROM cmts_inventory_refresh_health h "
+            "LEFT JOIN cmts_inventory_snapshot s ON s.cmts_ip=h.cmts_ip "
+            "WHERE h.cmts_ip=%s LIMIT 1",
+            (str(cmts_ip or "").strip(),),
+        )
+        if not rows:
+            raise ValueError(
+                f"Reset blocked: no successful tracked inventory refresh for CMTS {cmts_ip}"
+            )
+        health = rows[0]
+        if not bool(health.get("last_attempt_succeeded")):
+            detail = str(health.get("last_failure_error") or "inventory refresh failed")
+            raise ValueError(
+                f"Reset blocked: CMTS {health.get('cmts') or cmts_ip} inventory refresh failed: {detail}"
+            )
+        if health.get("last_success_at") is None or int(health.get("age_seconds") or 0) > self._reset_inventory_max_age_seconds():
+            raise ValueError(
+                f"Reset blocked: CMTS {health.get('cmts') or cmts_ip} inventory is older than the reset safety limit"
+            )
+        if not (
+            bool(health.get("complete"))
+            and not bool(health.get("truncated"))
+            and bool(health.get("authoritative"))
+            and not bool(health.get("quarantined"))
+        ):
+            raise ValueError(
+                f"Reset blocked: CMTS {health.get('cmts') or cmts_ip} inventory is not complete and authoritative"
+            )
+
+    def assert_targets_inventory_safe(self, targets: list[dict[str, Any]]) -> None:
+        cmts_ips = {
+            str(target.get("cmts_ip") or "").strip()
+            for target in targets
+            if target.get("_state") != "failed"
+        }
+        if not cmts_ips:
+            return
+        if "" in cmts_ips:
+            raise ValueError("Reset blocked: target has no authoritative CMTS inventory ownership")
+        for cmts_ip in sorted(cmts_ips):
+            self._assert_cmts_inventory_safe(cmts_ip)
+
+    def resolve_target_for_execution(self, target_id: int, mac: str) -> dict[str, Any]:
+        """Refresh a reset target from current safe inventory before its SNMP SET."""
+        normalized_mac = self._normalize_mac(mac)
+        if not normalized_mac:
+            raise ValueError("Reset blocked: target modem MAC is invalid")
+        rows = self._query(
+            "SELECT mac, ip, cmts, cmts_ip, fiber_node FROM modem_inventory_current "
+            "WHERE mac=%s AND inventory_state='active' "
+            "AND ip IS NOT NULL AND TRIM(ip)<>'' AND ip<>'0.0.0.0' LIMIT 1",
+            (normalized_mac,),
+        )
+        if not rows:
+            raise ValueError("Reset blocked: modem is absent from current active inventory")
+        target = rows[0]
+        self._assert_cmts_inventory_safe(str(target.get("cmts_ip") or ""))
+        self._execute(
+            "UPDATE cm_reset_target SET modem_ip=%s, cmts=%s, cmts_ip=%s, "
+            "fiber_node=%s, updated_at=%s WHERE id=%s AND state='running'",
+            (
+                target.get("ip"), target.get("cmts"), target.get("cmts_ip"),
+                target.get("fiber_node"), self._now(), int(target_id),
+            ),
+        )
+        return target
 
     # ── Job lifecycle ─────────────────────────────────────────
 

@@ -326,6 +326,23 @@ class PollerService:
             pass
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS cmts_inventory_refresh_health (
+                cmts_ip VARCHAR(45) NOT NULL,
+                cmts VARCHAR(128) NOT NULL,
+                last_attempt_at DATETIME NOT NULL,
+                last_attempt_succeeded BOOLEAN NOT NULL DEFAULT FALSE,
+                last_success_at DATETIME NULL,
+                last_failure_at DATETIME NULL,
+                last_failure_error VARCHAR(512) NULL,
+                source_poller VARCHAR(64) NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (cmts_ip),
+                INDEX idx_inventory_refresh_health_attempt (last_attempt_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS poller_setting (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 name VARCHAR(64) NOT NULL,
@@ -2928,6 +2945,15 @@ class PollerService:
             finally:
                 conn.close()
 
+        self.record_inventory_refresh_health(
+            cmts=cmts_name,
+            cmts_ip=cmts_address,
+            succeeded=authoritative,
+            source_poller=source_poller,
+            error=None if authoritative else (
+                quarantine_reason or "non-authoritative inventory generation"
+            ),
+        )
         return {
             "snapshot_id": snapshot_id,
             "row_count": written,
@@ -3215,6 +3241,55 @@ class PollerService:
                 metadata.get("raw_legacy_mac_count"),
                 metadata.get("raw_d3_mac_count"),
                 revision_at,
+            ),
+        )
+
+    def record_inventory_refresh_health(
+        self,
+        *,
+        cmts: str,
+        cmts_ip: str,
+        succeeded: bool,
+        source_poller: str | None,
+        error: str | None = None,
+    ) -> None:
+        """Record whether the most recent CMTS modem inventory was safe to use."""
+        cmts_address = str(cmts_ip or "").strip()
+        if not cmts_address:
+            return
+        now = self._now()
+        if succeeded:
+            self._execute(
+                "INSERT INTO cmts_inventory_refresh_health "
+                "(cmts_ip,cmts,last_attempt_at,last_attempt_succeeded,last_success_at,"
+                "last_failure_at,last_failure_error,source_poller,updated_at) "
+                "VALUES (%s,%s,%s,TRUE,%s,NULL,NULL,%s,%s) "
+                "ON DUPLICATE KEY UPDATE cmts=VALUES(cmts), "
+                "last_attempt_at=VALUES(last_attempt_at), "
+                "last_attempt_succeeded=TRUE, last_success_at=VALUES(last_success_at), "
+                "last_failure_at=NULL, last_failure_error=NULL, "
+                "source_poller=VALUES(source_poller), updated_at=VALUES(updated_at)",
+                (cmts_address, str(cmts or cmts_address), now, now, source_poller, now),
+            )
+            return
+        self._execute(
+            "INSERT INTO cmts_inventory_refresh_health "
+            "(cmts_ip,cmts,last_attempt_at,last_attempt_succeeded,last_success_at,"
+            "last_failure_at,last_failure_error,source_poller,updated_at) "
+            "VALUES (%s,%s,%s,FALSE,NULL,%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE cmts=VALUES(cmts), "
+            "last_attempt_at=VALUES(last_attempt_at), "
+            "last_attempt_succeeded=FALSE, last_failure_at=VALUES(last_failure_at), "
+            "last_failure_error=VALUES(last_failure_error), "
+            "source_poller=VALUES(source_poller), updated_at=VALUES(updated_at)",
+            (
+                cmts_address,
+                str(cmts or cmts_address),
+                now,
+                now,
+                str(error or "inventory refresh failed")[:512],
+                source_poller,
+                now,
             ),
         )
 
@@ -4342,6 +4417,13 @@ class PollerService:
                         target_error = str(
                             outcome.get("last_target_error")
                             or "unknown CMTS fetch failure"
+                        )
+                        self.record_inventory_refresh_health(
+                            cmts=cmts_name,
+                            cmts_ip=cmts_ip,
+                            succeeded=False,
+                            source_poller=poller.get("name"),
+                            error=target_error,
                         )
                         breakdown_entry = {
                             "cmts": cmts_name,
