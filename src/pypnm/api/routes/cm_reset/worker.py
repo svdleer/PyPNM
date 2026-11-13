@@ -244,21 +244,22 @@ class CmResetWorker:
             if task_id is None or agent is None:
                 raise RuntimeError("No cm_reachable agent bulk capacity available")
 
-            # Brief wait — a timeout/disconnect can be consistent with the modem
-            # rebooting, but an explicit agent rejection must fail the target.
+            # A reset is successful only when the current API process receives
+            # an explicit successful SNMP SET response. A local wait timeout,
+            # lost agent response, or connection transition is operationally
+            # unknown and must never be represented as a completed reset.
             try:
-                result = await agent_manager.wait_for_task_async(task_id, timeout=8)
-            except Exception:
-                result = None
+                result = await agent_manager.wait_for_task_async(task_id, timeout=15)
+            except Exception as exc:
+                raise RuntimeError("CM reset agent wait failed") from exc
 
-            if result and result.get("type") == "error":
-                raise RuntimeError(result.get("error") or "Agent rejected CM reset")
-            if result and result.get("type") == "response":
-                operation = result.get("result") or {}
-                if not operation.get("success"):
-                    raise RuntimeError(
-                        operation.get("error") or "Agent CM reset SET failed"
-                    )
+            if not isinstance(result, dict) or result.get("type") != "response":
+                detail = result.get("error") if isinstance(result, dict) else None
+                raise RuntimeError(detail or "CM reset agent did not confirm SNMP SET")
+            operation = result.get("result")
+            if not isinstance(operation, dict) or operation.get("success") is not True:
+                detail = operation.get("error") if isinstance(operation, dict) else None
+                raise RuntimeError(detail or "CM reset SNMP SET failed")
 
             await asyncio.to_thread(cm_reset_service.mark_target_done, target_id)
             logger.debug(f"CM reset sent: {mac} ({modem_ip})")
