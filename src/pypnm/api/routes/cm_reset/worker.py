@@ -62,7 +62,13 @@ class CmResetWorker:
 
     async def recover(self) -> None:
         """Resume durable jobs left by an API restart."""
-        rows = await asyncio.to_thread(cm_reset_service.recover_jobs)
+        try:
+            rows = await asyncio.to_thread(cm_reset_service.recover_jobs)
+        except Exception as exc:
+            # CM reset tables are created lazily. A lab/API database may not
+            # have them until the first reset plan; startup must remain healthy.
+            logger.warning("CM reset recovery skipped: reset schema unavailable: %s", exc)
+            return
         for row in rows:
             public_id = str(row["public_id"])
             if public_id in self._tasks and not self._tasks[public_id].done():
