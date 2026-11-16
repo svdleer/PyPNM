@@ -75,8 +75,7 @@ class CmWriteService:
             """CREATE TABLE IF NOT EXISTS cm_snmp_write_target (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT, job_id BIGINT NOT NULL, mac VARCHAR(20) NOT NULL,
                 modem_ip VARCHAR(45) NULL, cmts VARCHAR(128) NULL, fiber_node VARCHAR(128) NULL,
-                created_at DATETIME NOT NULL, CONSTRAINT fk_cm_write_target_job FOREIGN KEY(job_id)
-                REFERENCES cm_snmp_write_job(id) ON DELETE CASCADE, INDEX idx_cm_write_target_job(job_id)
+                created_at DATETIME NOT NULL, INDEX idx_cm_write_target_job(job_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
             """CREATE TABLE IF NOT EXISTS cm_snmp_write_result (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT, job_id BIGINT NOT NULL, target_id BIGINT NOT NULL,
@@ -85,8 +84,6 @@ class CmWriteService:
                 state VARCHAR(24) NOT NULL DEFAULT 'planned', error_text TEXT NULL,
                 started_at DATETIME NULL, finished_at DATETIME NULL, duration_ms INT NULL,
                 agent_id VARCHAR(128) NULL, task_id VARCHAR(64) NULL,
-                CONSTRAINT fk_cm_write_result_job FOREIGN KEY(job_id) REFERENCES cm_snmp_write_job(id) ON DELETE CASCADE,
-                CONSTRAINT fk_cm_write_result_target FOREIGN KEY(target_id) REFERENCES cm_snmp_write_target(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_cm_write_result(target_id, operation_index), INDEX idx_cm_write_result_job_state(job_id,state)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
         ]
@@ -233,9 +230,28 @@ class CmWriteService:
         return bool(self._query("SELECT cancel_requested_at FROM cm_snmp_write_job WHERE id=%s AND cancel_requested_at IS NOT NULL",(job_id,)))
 
     def delete(self, public_id):
-        job_id=self.get_job_id(public_id); row=self._query("SELECT status FROM cm_snmp_write_job WHERE id=%s",(job_id,))[0]
-        if row['status']=='running': raise ValueError('Cannot delete a running job')
-        self._execute("DELETE FROM cm_snmp_write_job WHERE id=%s",(job_id,)); return {'status':'success','deleted':public_id}
+        self.ensure_schema()
+        with self._db_lock:
+            conn = self._connect(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, status FROM cm_snmp_write_job WHERE public_id=%s FOR UPDATE", (public_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise KeyError(public_id)
+                    if row["status"] == "running":
+                        raise ValueError("Cannot delete a running job")
+                    job_id = int(row["id"])
+                    cur.execute("DELETE FROM cm_snmp_write_result WHERE job_id=%s", (job_id,))
+                    cur.execute("DELETE FROM cm_snmp_write_target WHERE job_id=%s", (job_id,))
+                    cur.execute("DELETE FROM cm_snmp_write_job WHERE id=%s", (job_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return {"status": "success", "deleted": public_id}
 
     def list_results(self, public_id, cursor=0, limit=200):
         job_id=self.get_job_id(public_id); safe=max(1,min(int(limit),1000)); rows=self._query("SELECT r.id,t.mac,t.modem_ip,t.cmts,r.operation_index,r.oid,r.value_type,r.value_json,r.state,r.error_text,r.started_at,r.finished_at,r.duration_ms FROM cm_snmp_write_result r JOIN cm_snmp_write_target t ON t.id=r.target_id WHERE r.job_id=%s AND r.id>%s ORDER BY r.id LIMIT %s",(job_id,max(0,int(cursor)),safe+1)); more=len(rows)>safe; page=rows[:safe]
