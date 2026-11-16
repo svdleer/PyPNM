@@ -476,3 +476,17 @@ async def get_constellation(request: ConstellationRequest) -> ConstellationRespo
             mac_address=request.mac_address,
             error=str(e)
         )
+
+
+@router.post('/ofdm/channel-power-6mhz')
+async def get_ofdm_channel_power_6mhz(request: PNMModemRequest) -> dict:
+    """Return all DOCS-IF31 per-6MHz OFDM channel-power rows and API-rendered plots/PDF."""
+    agent_manager = get_agent_manager()
+    if not agent_manager or not agent_manager.get_available_agents():
+        raise HTTPException(status_code=503, detail='No agents available')
+    service = PNMDiagnosticsService(modem_ip=request.modem_ip, community=request.community, mac_address=request.mac_address)
+    try:
+        return await service.get_ofdm_channel_power_6mhz()
+    except Exception as exc:
+        logger.exception('OFDM channel-power error: %s', exc)
+        return {'success': False, 'modem_ip': request.modem_ip, 'mac_address': request.mac_address, 'error': str(exc)}

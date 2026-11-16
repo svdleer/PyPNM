@@ -712,6 +712,102 @@ class PNMDiagnosticsService:
     OID_DS_OFDM_PROFILES = '1.3.6.1.4.1.4491.2.1.28.1.2.1.2'
     OID_US_OFDMA_POWER = '1.3.6.1.4.1.4491.2.1.28.1.3.1.4'
 
+    async def get_ofdm_channel_power_6mhz(self) -> Dict[str, Any]:
+        """Return every DOCS-IF31 6 MHz OFDM power row grouped by ifIndex."""
+        center_oid = '1.3.6.1.4.1.4491.2.1.28.1.11.1.2'
+        power_oid = '1.3.6.1.4.1.4491.2.1.28.1.11.1.3'
+        channel_id_oid = '1.3.6.1.4.1.4491.2.1.28.1.9.1.1'
+        result = await self._snmp_parallel_walk([center_oid, power_oid, channel_id_oid])
+        if not result.get('success'):
+            return {'success': False, 'error': result.get('error', 'SNMP query failed'), 'mac_address': self.mac_address, 'modem_ip': self.modem_ip}
+
+        def indexed(item: dict, base: str):
+            parts = str(item.get('oid') or '').lstrip('.').split('.')
+            base_parts = base.lstrip('.').split('.')
+            suffix = parts[len(base_parts):] if parts[:len(base_parts)] == base_parts else parts[-2:]
+            if len(suffix) < 2:
+                return None
+            try:
+                return int(suffix[-2]), int(suffix[-1])
+            except (TypeError, ValueError):
+                return None
+
+        centers = {}
+        powers = {}
+        for item in result.get('results', {}).get(center_oid, []):
+            key = indexed(item, center_oid)
+            if key is not None:
+                try: centers[key] = float(item.get('value'))
+                except (TypeError, ValueError): pass
+        for item in result.get('results', {}).get(power_oid, []):
+            key = indexed(item, power_oid)
+            if key is not None:
+                try: powers[key] = float(item.get('value')) / 10.0
+                except (TypeError, ValueError): pass
+        channel_ids = {}
+        for item in result.get('results', {}).get(channel_id_oid, []):
+            parts = str(item.get('oid') or '').lstrip('.').split('.')
+            base_parts = channel_id_oid.split('.')
+            suffix = parts[len(base_parts):] if parts[:len(base_parts)] == base_parts else parts[-1:]
+            if suffix:
+                try: channel_ids[int(suffix[-1])] = int(item.get('value'))
+                except (TypeError, ValueError): pass
+
+        channels = {}
+        combined = []
+        for key in sorted(set(centers) | set(powers)):
+            ifindex, band_index = key
+            row = {
+                'ifindex': ifindex,
+                'channel_id': channel_ids.get(ifindex),
+                'band_index': band_index,
+                'is_plc': band_index == 0,
+                'center_frequency_hz': centers.get(key),
+                'power_dbmv': powers.get(key),
+            }
+            if row['center_frequency_hz'] is None or row['power_dbmv'] is None:
+                row['missing_sibling'] = True
+            channels.setdefault(ifindex, {'ifindex': ifindex, 'channel_id': channel_ids.get(ifindex), 'bands': []})['bands'].append(row)
+            if row['center_frequency_hz'] is not None and row['power_dbmv'] is not None:
+                combined.append(row)
+        channel_list = list(channels.values())
+        for channel in channel_list:
+            channel['bands'].sort(key=lambda row: (row['center_frequency_hz'] is None, row['center_frequency_hz'] or 0, row['band_index']))
+        combined.sort(key=lambda row: (row['center_frequency_hz'], row['ifindex'], row['band_index']))
+
+        plots = []
+        pdf_bytes = None
+        try:
+            import base64, io
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_pdf import PdfPages
+            def render(title, rows):
+                fig, ax = plt.subplots(figsize=(11, 5.5))
+                ax.plot([r['center_frequency_hz'] / 1e6 for r in rows], [r['power_dbmv'] for r in rows], marker='o', linewidth=1)
+                ax.set_title(title); ax.set_xlabel('6 MHz band center frequency (MHz)'); ax.set_ylabel('Received power (dBmV)'); ax.grid(True, alpha=.3); fig.tight_layout()
+                buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=150); png = base64.b64encode(buf.getvalue()).decode(); return fig, png
+            fig, png = render('OFDM downstream channel power - all active channels', combined)
+            plt.close(fig); plots.append({'name': 'ofdm_channel_power_combined.png', 'data': png, 'mime': 'image/png'})
+            for channel in channel_list:
+                rows = [r for r in channel['bands'] if r['power_dbmv'] is not None and r['center_frequency_hz'] is not None]
+                fig, png = render(f'OFDM channel ifIndex {channel["ifindex"]}', rows)
+                plt.close(fig); plots.append({'name': f'ofdm_channel_power_ifindex_{channel["ifindex"]}.png', 'data': png, 'mime': 'image/png'})
+            pdf = io.BytesIO()
+            with PdfPages(pdf) as writer:
+                for title, rows in [('OFDM downstream channel power - all active channels', combined), *[(f'OFDM channel ifIndex {c["ifindex"]}', [r for r in c['bands'] if r['power_dbmv'] is not None and r['center_frequency_hz'] is not None]) for c in channel_list]]:
+                    fig, _ = render(title, rows); writer.savefig(fig); plt.close(fig)
+            pdf_bytes = base64.b64encode(pdf.getvalue()).decode()
+        except Exception as exc:
+            self.logger.warning('OFDM channel-power plot generation failed: %s', exc)
+
+        return {'success': True, 'mac_address': self.mac_address, 'modem_ip': self.modem_ip, 'timestamp': datetime.now().isoformat(), 'channels': channel_list, 'combined': combined, 'plots': plots, 'pdf_base64': pdf_bytes, 'units': {'power': 'dBmV', 'frequency': 'Hz'}, 'warnings': result.get('warnings') or []}
+
+    # ============================================
+    # Channel Info
+    # ============================================
+
     async def get_channel_info(self) -> Dict[str, Any]:
         """
         Get comprehensive channel info (DS/US power, frequency, modulation).
