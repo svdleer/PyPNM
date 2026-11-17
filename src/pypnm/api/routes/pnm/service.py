@@ -713,7 +713,7 @@ class PNMDiagnosticsService:
     OID_US_OFDMA_POWER = '1.3.6.1.4.1.4491.2.1.28.1.3.1.4'
 
     async def get_ofdm_channel_power_6mhz(self) -> Dict[str, Any]:
-        """Return every DOCS-IF31 6 MHz OFDM power row grouped by ifIndex."""
+        """Return every DOCS-IF31 6 MHz OFDM power row grouped by channel number."""
         center_oid = '1.3.6.1.4.1.4491.2.1.28.1.11.1.2'
         power_oid = '1.3.6.1.4.1.4491.2.1.28.1.11.1.3'
         channel_id_oid = '1.3.6.1.4.1.4491.2.1.28.1.9.1.1'
@@ -792,11 +792,28 @@ class PNMDiagnosticsService:
             plt.close(fig); plots.append({'name': 'ofdm_channel_power_combined.png', 'data': png, 'mime': 'image/png'})
             for channel in channel_list:
                 rows = [r for r in channel['bands'] if r['power_dbmv'] is not None and r['center_frequency_hz'] is not None]
-                fig, png = render(f'OFDM channel ifIndex {channel["ifindex"]}', rows)
-                plt.close(fig); plots.append({'name': f'ofdm_channel_power_ifindex_{channel["ifindex"]}.png', 'data': png, 'mime': 'image/png'})
+                channel_number = channel.get('channel_id')
+                if channel_number is not None:
+                    title = f'OFDM channel Ch {channel_number}'
+                    plot_name = f'ofdm_channel_power_channel_{channel_number}.png'
+                else:
+                    title = f'OFDM channel ifIndex {channel["ifindex"]}'
+                    plot_name = f'ofdm_channel_power_ifindex_{channel["ifindex"]}.png'
+                fig, png = render(title, rows)
+                plt.close(fig); plots.append({'name': plot_name, 'data': png, 'mime': 'image/png'})
             pdf = io.BytesIO()
             with PdfPages(pdf) as writer:
-                for title, rows in [('OFDM downstream channel power - all active channels', combined), *[(f'OFDM channel ifIndex {c["ifindex"]}', [r for r in c['bands'] if r['power_dbmv'] is not None and r['center_frequency_hz'] is not None]) for c in channel_list]]:
+                pdf_sections = [('OFDM downstream channel power - all active channels', combined)]
+                for channel in channel_list:
+                    channel_number = channel.get('channel_id')
+                    title = (
+                        f'OFDM channel Ch {channel_number}'
+                        if channel_number is not None
+                        else f'OFDM channel ifIndex {channel["ifindex"]}'
+                    )
+                    rows = [r for r in channel['bands'] if r['power_dbmv'] is not None and r['center_frequency_hz'] is not None]
+                    pdf_sections.append((title, rows))
+                for title, rows in pdf_sections:
                     fig, _ = render(title, rows); writer.savefig(fig); plt.close(fig)
             pdf_bytes = base64.b64encode(pdf.getvalue()).decode()
         except Exception as exc:
